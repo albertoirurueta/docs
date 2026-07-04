@@ -51,5 +51,9 @@ Once node and Antora is installed, we need to set the current working directory 
 ```
 npx antora antora-playbook.yml
 ```
+If your want to updated already downloaded repository branches, use the following command instead:
+```
+npx antora --fetch antora-playbook.yml  
+```
 
 Documentation will be generated in the `build/site` directory as a static website.
