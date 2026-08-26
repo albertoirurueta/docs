@@ -143,8 +143,8 @@ for mermaid diagrams of the browser/server request flow and any figures in SVG f
 **Parallelizable: no** — depends on `web/cors.adoc` (Group 2) existing to link to.
 
 - [x] Task 3. Wire the new page into the site's navigation and landing page
-  - [x] Task 3.1. Add `**** xref:web/cors.adoc[What is CORS?]` to `modules/ROOT/nav.adoc`, directly under the
-    `*** xref:web/index.adoc[Web Development]` line's own bullet (i.e. as a `***`-level entry, a sibling of
+  - [x] Task 3.1. Add `*** xref:web/cors.adoc[What is CORS?]` to `modules/ROOT/nav.adoc`, directly under the
+    `** xref:web/index.adoc[Web Development]` line's own bullet (i.e. as a `***`-level entry, a sibling of
     `xref:web/html-css/index.adoc[...]`/`xref:web/sass/index.adoc[...]`/`xref:web/javascript/index.adoc[...]`/
     `xref:web/bootstrap/index.adoc[...]`, not nested under any of them) — placed first, before the four existing
     subsections, since it's a short standalone concept page rather than a multi-page reference.
