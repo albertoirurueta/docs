@@ -1,0 +1,250 @@
+= Storage internals, security & administration
+:description: How the Couchbase managed cache, disk write queue, Couchstore and Magma storage engines, compaction, DCP, and warm-up move data to disk; the RBAC, authentication, TLS, and auditing model; and the console, CLI, backup, import/export, and monitoring tooling for running a cluster.
+:keywords: couchbase, managed cache, working set, ejection, resident ratio, couchstore, magma, ephemeral bucket, compaction, auto-compaction, disk write queue, dcp, tap, tombstone, metadata purge interval, warm-up, rbac, roles, groups, privileges, built-in roles, ldap, pam, saml, x.509 certificate, tls, node-to-node encryption, encryption at rest, auditing, _system scope, web console, rest api, couchbase-cli, cbq, cbsh, cbbackupmgr, cbimport, cbexport, cbstats, prometheus, autonomous operator
+
+include::partial$couchbase-disclaimer.adoc[]
+
+This page covers the parts of Couchbase you tune and secure rather than write code against: how a mutation
+travels from RAM to disk, how access is authenticated and authorised, and the tools that build, back up,
+monitor, and automate a cluster.
+
+== Storage internals
+
+The Data service is *memory-first*. Every read and write goes through the *managed cache*, an in-process
+cache sized by the bucket's RAM quota. Item *metadata* for every key is pinned in the cache at all times;
+values are held while there is room. The set of values currently in cache is the *working set*, and the share
+of items whose value is resident is the *resident ratio*. When the cache fills, the least-recently-used clean
+items are *ejected* (value dropped, metadata kept); a later read of an ejected key fetches its value from
+disk. A collapsing resident ratio is the primary signal that a bucket needs more RAM or a Magma backend.
+
+Writes are acknowledged from the cache and drained to disk asynchronously through the *disk write queue*.
+The queue absorbs bursts; a persistently long queue means disk cannot keep up with the write rate. Durable
+writes and `cbbackupmgr` care about what has drained -- see
+xref:database/couchbase/concurrency-locking-and-durability.adoc[Concurrency, locking & durable writes].
+
+Two on-disk *storage engines* back a Couchbase bucket:
+
+* *Couchstore* -- the default. One append-only B-tree file per vBucket; every mutation appends, so the file
+  grows until compaction rewrites it without the stale blocks. Simple and fast when the whole data set is
+  comfortably larger than RAM only by a small factor.
+* *Magma* -- an LSM-style engine for large, dense data sets (roughly > 1 TB per node, or a low target
+  resident ratio). It keeps far less metadata in RAM, writes more efficiently under heavy mutation, and
+  compacts incrementally.
+
+----
+# Choose the engine at bucket-create time (it cannot be changed later).
+couchbase-cli bucket-create -c 10.0.0.1:8091 -u Administrator -p password \
+  --bucket app --bucket-type couchbase --storage-backend magma \
+  --bucket-ramsize 4096 --bucket-replica 1
+# https://docs.couchbase.com/server/current/learn/buckets-memory-and-storage/storage-engines.html
+----
+
+*Ephemeral buckets* skip the storage engine entirely -- data lives only in the managed cache and its
+replicas, so a full-cluster restart loses it. They give predictable latency with no disk I/O and are suited
+to sessions, caches, and transient state; eviction is configured as `noEviction` (reject writes when full) or
+`nruEviction` (drop not-recently-used items).
+
+----
+couchbase-cli bucket-create -c 10.0.0.1:8091 -u Administrator -p password \
+  --bucket sessions --bucket-type ephemeral --bucket-ramsize 1024 \
+  --bucket-eviction-policy nruEviction
+----
+
+*Compaction* reclaims the space that appended, superseded blocks leave behind. *Auto-compaction* triggers it
+per file once fragmentation crosses a threshold; it can also be scheduled for a quiet window.
+
+----
+# Cluster-wide auto-compaction at 30% database and 30% view fragmentation.
+couchbase-cli setting-compaction -c 10.0.0.1:8091 -u Administrator -p password \
+  --compaction-db-percentage 30 --compaction-view-percentage 30
+----
+
+Deletes and expirations do not erase an item immediately; they write a *tombstone* (key + metadata, no
+value) so the removal can replicate to replicas and over XDCR. The *metadata purge interval* (per bucket,
+three days by default) is how long tombstones are retained before compaction sweeps them.
+
+----
+couchbase-cli bucket-edit -c 10.0.0.1:8091 -u Administrator -p password \
+  --bucket app --purge-interval 2
+----
+
+*DCP* -- the Database Change Protocol -- is the single ordered mutation stream every downstream consumer
+reads: replicas, GSI, Search, Analytics, Eventing, XDCR, and the Kafka/Spark connectors. It replaced the
+older TAP protocol and adds restart-from-sequence-number so a consumer that disconnects resumes without a
+full resync.
+
+After a restart a Data node performs *warm-up*: it loads all key metadata (and, depending on the engine and
+quota, values) back into the managed cache before the node reports healthy and starts serving. Warm-up time
+scales with item count, which is one reason Magma -- with less resident metadata -- restarts faster on large
+data sets.
+
+[mermaid]
+....
+flowchart TD
+    W[Write / mutation] --> MC[Managed cache in RAM]
+    MC --> DWQ[Disk write queue]
+    DWQ --> SE[(Storage engine: Couchstore or Magma)]
+    MC --> DCP{{DCP stream}}
+    SE --> DCP
+    DCP --> RParts[Replica vBuckets]
+    DCP --> GSI[Global secondary indexes]
+    DCP --> FTS[Search service]
+    DCP --> ANA[Analytics service]
+    DCP --> XDCR[XDCR to remote cluster]
+....
+
+The memory-first cache with an asynchronous drain and periodic compaction is the same shape as MongoDB's
+WiredTiger cache plus checkpoints -- see xref:database/mongodb/storage-and-durability.adoc[MongoDB
+WiredTiger] -- with Couchbase making the cache an explicit, quota-sized tier and exposing the resident ratio
+as a first-class health metric.
+
+== Security
+
+Authorisation is *role-based access control (RBAC)*. A *user* (or a *group* the user belongs to) is granted
+*roles*; each role is a *privilege* (read data, write data, run a query, manage a bucket, ...) optionally
+scoped to a bucket, scope, or collection. Couchbase ships a large set of *built-in roles* -- `data_reader`,
+`data_writer`, `query_select`, `bucket_admin`, `cluster_admin`, `security_admin`, `ro_admin`, and many more
+-- and custom roles cannot be defined, so least privilege is expressed by combining narrowly scoped built-in
+roles.
+
+----
+# A user that can only read and write one collection.
+couchbase-cli user-manage -c 10.0.0.1:8091 -u Administrator -p password \
+  --set --rbac-username appuser --rbac-password s3cret --auth-domain local \
+  --roles 'data_reader[app:sales.orders],data_writer[app:sales.orders]'
+# https://docs.couchbase.com/server/current/learn/security/authorization-overview.html
+----
+
+----
+-- The same grant from SQL++.
+GRANT query_select ON `app`.`sales`.`orders` TO appuser;
+----
+
+*Authentication* is either *local* (credentials stored in the cluster) or *external*:
+
+* *LDAP* -- bind against a directory for password checks and map LDAP groups to Couchbase groups.
+* *PAM* -- delegate to the host's PAM stack (Linux users, etc.).
+* *SAML SSO* -- browser single sign-on to the Web Console via an external IdP.
+* *Client X.509 certificates* -- the client presents a certificate and Couchbase derives the username from a
+  configured field (CN or a SAN), so no password crosses the wire.
+
+----
+couchbase-cli setting-ldap -c 10.0.0.1:8091 -u Administrator -p password \
+  --authentication-enabled 1 --hosts ldap1.example.com --port 636 --encryption tls \
+  --user-dn-query 'uid=%u,ou=people,dc=example,dc=com'
+# https://docs.couchbase.com/server/current/learn/security/security-overview.html
+----
+
+*Transport security*: enable TLS for client connections and, separately, *node-to-node encryption* so
+intra-cluster traffic (replication, rebalance, DCP) is also encrypted. `--cluster-encryption-level strict`
+refuses all non-TLS ports.
+
+----
+couchbase-cli node-to-node-encryption -c 10.0.0.1:8091 -u Administrator -p password --enable
+couchbase-cli setting-security -c 10.0.0.1:8091 -u Administrator -p password \
+  --set --cluster-encryption-level strict --tls-min-version 1.2
+----
+
+*Encryption at rest* (Enterprise Edition) protects the data files, typically layered with OS or volume
+encryption; it is linked from the disclaimer, not detailed here. *Auditing* records administrative and
+optionally data events to a rotating JSON log for review.
+
+----
+couchbase-cli setting-audit -c 10.0.0.1:8091 -u Administrator -p password \
+  --set --audit-enabled 1 --audit-log-rotate-interval 86400
+----
+
+The *`_system` scope* is a reserved per-bucket scope Couchbase uses for internal collections (transactions,
+Eventing, mobile). Do not create application collections in it; RBAC on it is managed by the server.
+
+*Network hardening*: bind admin ports to a management network, put client ports behind a firewall that allows
+only application subnets, and open only the ports a deployment actually uses (`8091`/`18091` console,
+`11210`/`11207` KV, `8093`/`18093` Query, `8094` Search, plus the rest per service).
+
+*Security checklist:*
+
+* Change the built-in Administrator password; create named admins with `security_admin` / `cluster_admin`
+  instead of sharing it.
+* Give every application its own user with only the scoped `data_reader` / `data_writer` / `query_*` roles it
+  needs; prefer groups over per-user grants.
+* Enable client TLS and node-to-node encryption; set `cluster-encryption-level` to `strict` once clients are
+  migrated.
+* Use LDAP/PAM/SAML or X.509 for human and service identity; disable unused local accounts.
+* Turn on auditing and ship the audit log off-box.
+* Restrict admin and service ports at the network layer; keep encryption at rest on where required by policy.
+* Review roles after every schema or team change.
+
+For the relational-database parallel, see xref:database/mongodb/security.adoc[MongoDB Security]; the
+concepts (authentication sources, RBAC, TLS, auditing) line up, with Couchbase scoping roles down to the
+collection.
+
+== Administration & tooling
+
+* *Web Console* (`:8091`) -- cluster setup, buckets, users, rebalance, XDCR, indexes, query workbench, and
+  the built-in stats charts.
+* *REST API* -- everything the console does is an HTTP endpoint under the same port; automation and the CLI
+  are thin wrappers over it.
+* *`couchbase-cli`* -- the administrative CLI used throughout this page (nodes, buckets, RBAC, XDCR,
+  settings).
+* *`cbq`* -- the interactive SQL++ shell for the Query service.
+* *Couchbase Shell (`cbsh`)* -- a modern, scriptable shell that can drive multiple clusters and pipe results,
+  covering both admin and data tasks.
+
+----
+cbq -e couchbase://10.0.0.1 -u appuser -p s3cret
+cbsh --connstr couchbase://10.0.0.1 --username Administrator
+# https://docs.couchbase.com/server/current/cli/cli-intro.html
+----
+
+*Backup and restore* is the *Backup service* (schedules and a repository, configurable in the console) with
+`cbbackupmgr` as its command-line form. `cbbackupmgr` does incremental, compressed, resumable backups and is
+the current tool; the earlier `cbbackup`, `cbrestore`, and `cbtransfer` utilities are removed from current
+releases and their use cases are covered by `cbbackupmgr` plus `cbimport` / `cbexport`.
+
+----
+cbbackupmgr config  --archive /backups --repo daily
+cbbackupmgr backup  --archive /backups --repo daily \
+  --cluster couchbase://10.0.0.1 --username Administrator --password password
+cbbackupmgr restore --archive /backups --repo daily \
+  --cluster couchbase://dr1.example.com --username Administrator --password password
+# https://docs.couchbase.com/server/current/manage/manage-backup-and-restore/manage-backup-and-restore.html
+----
+
+*Bulk import / export* moves JSON and CSV between files and a collection:
+
+----
+cbimport json --format lines -c couchbase://10.0.0.1 -u Administrator -p password \
+  -b app --scope-collection-exp sales.orders -d file://orders.jsonl --generate-key %id%
+
+cbexport json -c couchbase://10.0.0.1 -u Administrator -p password \
+  -b app --scope-field _scope --collection-field _collection -f lines -o dump.jsonl
+----
+
+*Monitoring*: `GET /pools/default` returns cluster and per-node health; the stats REST API and the
+per-service `/metrics` endpoint expose time series in *Prometheus* exposition format for scraping; `cbstats`
+reads low-level Data-service counters directly from a node; logs land under the install's `logs/` directory
+and named *alerts* (auto-failover fired, disk nearly full, metadata overhead high, IP changed) surface in the
+console and can be emailed.
+
+----
+curl -u Administrator:password http://10.0.0.1:8091/pools/default
+curl -u Administrator:password http://10.0.0.1:8091/metrics
+cbstats 10.0.0.1:11210 -u Administrator -p password -b app all
+# https://docs.couchbase.com/server/current/cli/cli-intro.html
+----
+
+The *Autonomous Operator* runs Couchbase on Kubernetes and OpenShift. A `CouchbaseCluster` custom resource
+declares size, per-node services, volumes, and backup schedules; the Operator reconciles the running cluster
+to it -- performing adds, removes, rebalances, failovers, rolling upgrades, and scheduled backups without
+manual `couchbase-cli` steps.
+
+----
+kubectl get couchbaseclusters
+kubectl describe couchbasecluster cb-example
+# https://docs.couchbase.com/operator/current/overview.html
+----
+
+For the equivalent operational surface on the other database in this section, see
+xref:database/mongodb/administration-and-monitoring.adoc[MongoDB Administration].
+
+Continue with xref:database/couchbase/sdks-and-mobile.adoc[SDKs, connectors & Couchbase Mobile].
