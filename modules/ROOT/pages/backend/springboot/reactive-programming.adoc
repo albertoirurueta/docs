@@ -1,6 +1,6 @@
 = Reactive Programming with Project Reactor
-:description: Mono and Flux, the assembly vs. subscription phases, core operators, backpressure, schedulers, context propagation, error handling, and testing reactive streams with StepVerifier.
-:keywords: Project Reactor, Mono, Flux, reactive streams, backpressure, Scheduler, Reactor Context, onErrorResume, retry, StepVerifier, Spring WebFlux, R2DBC, reactive Spring Data, publisher, subscriber
+:description: Mono and Flux, the assembly vs. subscription phases, core operators, backpressure, schedulers, context propagation, error handling, testing reactive streams with StepVerifier, how reactive transactions ride the Reactor Context instead of a ThreadLocal, and how to bridge to blocking code safely.
+:keywords: Project Reactor, Mono, Flux, reactive streams, backpressure, Scheduler, Reactor Context, onErrorResume, retry, StepVerifier, Spring WebFlux, R2DBC, reactive Spring Data, publisher, subscriber, ReactiveTransactionManager, TransactionalOperator, R2dbcTransactionManager, reactive transactions, thread affinity, block(), blockFirst, IllegalStateException, boundedElastic, Schedulers.newBoundedElastic, BlockHound, toFuture
 
 include::partial$springboot-disclaimer.adoc[]
 
@@ -11,9 +11,9 @@ troubleshoot reactive code.
 
 == Mono and Flux
 
-Reactor exposes two publishers. `Mono\<T>` emits at most one element (or an error, or completes empty) --
-the reactive analogue of `Optional\<T>` or a `CompletableFuture\<T>`. `Flux\<T>` emits zero to many elements
-over time -- the reactive analogue of a `Stream\<T>` or a `List\<T>`, except items may arrive asynchronously.
+Reactor exposes two publishers. `Mono<T>` emits at most one element (or an error, or completes empty) --
+the reactive analogue of `Optional<T>` or a `CompletableFuture<T>`. `Flux<T>` emits zero to many elements
+over time -- the reactive analogue of a `Stream<T>` or a `List<T>`, except items may arrive asynchronously.
 
 [source,java]
 ----
@@ -196,6 +196,175 @@ Mono<String> withContext = Mono.deferContextual(contextView ->
         .contextWrite(Context.of("user", "alice"));    // visible to operators upstream of this point
 ----
 
+[#reactive-transactions-and-thread-affinity]
+== Reactive transactions and thread affinity
+
+Imperative Spring transactions are thread-bound. `JpaTransactionManager` and `DataSourceTransactionManager`
+bind the JDBC `Connection` to the calling thread through `TransactionSynchronizationManager`, which holds it
+in a `ThreadLocal`; every `@Transactional` method further down the call stack finds the same connection
+because it runs on the same thread. A reactive pipeline offers no such guarantee. Reactive transaction
+managers -- `ReactiveTransactionManager` implementations such as `R2dbcTransactionManager` or
+`ReactiveMongoTransactionManager` -- therefore bind the transactional resources to the `Context` described
+above instead of to a thread. As the Spring team puts it, *"Reactor `Context` is to reactive programming what
+`ThreadLocal` is to imperative programming"*: the `Context` carries the transaction state, its resources and
+its synchronizations, and because a `Context` belongs to a single `Subscription`, the transaction covers
+exactly one subscription of one chain.
+
+This section is about whether a given statement takes part in the transaction at all. For the orthogonal
+questions of what a transaction is allowed to see and how competing writers are serialised, see
+xref:backend/springboot/transaction-isolation-and-locking.adoc[Transaction Isolation & Locking].
+
+Anything that leaves the chain leaves the transaction. The common ways to do that by accident:
+
+* **An inner `.subscribe()`.** Calling `subscribe()` on a nested publisher starts a *new* subscription with a
+  fresh, empty `Context`, so that work never sees the transaction.
+* **A publisher fired from `doOnNext` or `doOnEach`.** These callbacks exist for side effects on the signal,
+  not for composing work; a publisher created inside one is either never subscribed to at all or subscribed
+  to separately, and neither outcome is part of the unit of work.
+* **A `CompletableFuture` bridged in by hand.** A future that is already running when the chain is assembled
+  executes on its own executor. Wrap it as `Mono.fromFuture(() -> ...)` so the call is deferred to
+  subscription time and stays inside the chain.
+* **`@Async` methods.** The proxy hands the call to a `TaskExecutor` thread that has neither the caller's
+  `ThreadLocal` state nor its Reactor `Context`.
+* **A blocking `@Transactional` proxy method that returns a publisher.** With a `PlatformTransactionManager`
+  the interceptor commits when the *method* returns -- and what it returns is an unsubscribed publisher, so
+  the transaction opens and commits around a value that has not touched the database yet. The data access
+  then runs afterwards, outside any transaction.
+
+In each case a later failure rolls back only the work that stayed inside the chain. The detached write has
+committed independently and survives the rollback.
+
+The failure mode is *breaking the chain*, not *switching threads*. `publishOn`, `subscribeOn` and
+`parallel()` all change which thread executes an operator, but none of them starts a new subscription, so the
+`Context` -- and with it the transaction -- crosses the hop untouched. A single correctly composed chain
+stays transactional however many schedulers it visits.
+
+Concurrency *within* the chain is a different matter. `flatMap` subscribes to up to 256 inner publishers at
+once by default, while an R2DBC transaction runs over a single connection, so those inner statements end up
+serialised onto that one connection in a non-deterministic order. Inside a transaction prefer `concatMap`, or
+`flatMap(fn, 1)`, so the statements execute in the order they were written.
+
+[source,java]
+----
+// TransactionalOperator.create(reactiveTransactionManager)
+private final TransactionalOperator txOperator;
+
+Mono<Void> transferFunds(String from, String to, BigDecimal amount) {
+    Mono<Void> unitOfWork = accounts.debit(from, amount)
+            .then(accounts.credit(to, amount))          // both writes, one chain, one Context
+            .then();
+
+    return unitOfWork.as(txOperator::transactional)     // commits on completion; rolls back on error
+            .onErrorResume(InsufficientFundsException.class,   // handled AFTER the operator, so the
+                    ex -> auditLog.record(from, ex));          // rollback has already happened
+}
+----
+
+The same unit of work can be expressed declaratively: `@Transactional` on a method whose return type is a
+`Publisher` routes to Spring's *reactive* transaction management, which needs a `ReactiveTransactionManager`
+bean rather than a `PlatformTransactionManager`. Since Spring Framework 5.3 a cancel signal also triggers a
+rollback, so a `Flux` inside a transaction must be consumed in full for that transaction to commit --
+truncating it with `take(n)` downstream of the transactional operator rolls the whole thing back.
+
+Written the wrong way, the second write escapes:
+
+[source,java]
+----
+Mono<Void> brokenTransfer(String from, String to, BigDecimal amount) {
+    return accounts.debit(from, amount)
+            .doOnNext(debited ->
+                    accounts.credit(to, amount).subscribe())    // WRONG: a new subscription with an
+            .then()                                             // empty Context -- no transaction
+            .as(txOperator::transactional);
+}
+----
+
+The credit runs on its own subscription, outside the transaction. If the debit is rolled back the credit is
+not, and the two accounts silently disagree.
+
+[#bridging-to-blocking-code-safely]
+== Bridging to blocking code safely
+
+The rule stated above -- never block a `parallel()` or event-loop thread -- is one Reactor partly enforces on
+its own. Calling `block()`, `blockFirst()` or `blockLast()` from a thread created by `Schedulers.parallel()`
+or `Schedulers.single()` fails immediately:
+
+....
+java.lang.IllegalStateException: block()/blockFirst()/blockLast() are blocking, which is not supported in
+thread reactor-http-nio-3
+....
+
+Those threads implement Reactor's `NonBlocking` marker interface, and so do Netty's event-loop threads under
+WebFlux -- which is why this exception typically surfaces with a `reactor-http-*` thread name in a request
+handler rather than in a scheduler of your own making.
+
+Where blocking is *not* forbidden it is still hazardous. `boundedElastic()` is a capped pool -- by default
+ten threads per CPU core, with a queue of up to 100 000 further tasks behind it -- so a task that blocks
+while waiting on work that itself needs a thread from that same pool holds its own thread hostage. Under load
+enough of these starve the pool and deadlock it. On an event loop the failure is faster and total: a few
+threads serve all I/O for the entire application, so a blocked event-loop thread cannot process the very
+response it is waiting for, and the wait can never end.
+
+[mermaid]
+....
+flowchart TD
+    Need["Need a value from\na Mono or Flux"] --> Compose{"Can you compose it?\nflatMap / zip / expand"}
+    Compose -->|Yes| Chain["Stay in the chain.\nNever call block()"]
+    Compose -->|"No: legacy blocking library"| Offload["Mono.fromCallable(...)\n.subscribeOn(boundedElastic())"]
+    Compose -->|"No: non-reactive SPI\ndemands a value now"| Guarded["Dedicated Scheduler\n+ subscribeOn\n+ toFuture().get(timeout)"]
+    Guarded --> Which{"Which thread is\nthe caller on?"}
+    Which -->|"Event loop or parallel()"| Refuse["Unsafe. Move the boundary\noutwards instead"]
+    Which -->|Worker thread| Last["Acceptable last resort"]
+....
+
+In order of preference:
+
+. **Compose instead of bridging.** `flatMap`, `zip`, `then` and `expand` express nearly every "I need this
+  value before I can continue" case without ever leaving the reactive world.
+. **Offload an unavoidable blocking client.** Wrap it as
+  `Mono.fromCallable(() -> legacyBlockingCall()).subscribeOn(Schedulers.boundedElastic())`, which keeps the
+  blocking call on a pool built for exactly that and off every non-blocking thread.
+. **In tests, use `StepVerifier` rather than `block()`** -- see
+  <<testing-reactive-streams-with-stepverifier,Testing reactive streams with StepVerifier>> below. Tests are
+  where `block()` creeps in most easily, and a `StepVerifier` asserts more precisely anyway.
+. **Install BlockHound to catch the accidents.** BlockHound
+  (`io.projectreactor.tools:blockhound`, a separate artifact from `reactor-tools`) instruments the JVM so
+  that any blocking call made from a thread marked `NonBlocking` throws a `BlockingOperationError` pointing
+  at the offending line. A single `BlockHound.install()` in a development or test profile turns a class of
+  production-only latency bugs into loud, local failures.
+
+When a non-reactive SPI genuinely demands a value synchronously and none of the above applies, the bridge
+must be guarded rather than improvised:
+
+[source,java]
+----
+// A dedicated pool: exhausting it degrades this adapter only, never the shared boundedElastic().
+private final Scheduler bridgeScheduler =
+        Schedulers.newBoundedElastic(16, 64, "legacy-spi-bridge");
+
+@PreDestroy
+void shutdown() {
+    bridgeScheduler.dispose();
+}
+
+// Precondition: never called from an event-loop or parallel() thread.
+Report renderReport(String id) throws Exception {
+    return reportService.build(id)          // the inner flow subscribes on our own pool,
+            .subscribeOn(bridgeScheduler)   // so it cannot be blocked by the caller's thread
+            .toFuture()
+            .get(5, TimeUnit.SECONDS);      // always bounded -- never get() with no timeout
+}
+----
+
+Four precautions make this pattern survivable, and all four are load-bearing. The pool is **dedicated**, so
+saturating it cannot take down unrelated blocking work sharing `boundedElastic()`. The method is **never
+invoked from a non-blocking thread**, which is the precondition Reactor cannot check for you here because
+`get()` is `Future`'s method, not Reactor's, and therefore raises no `IllegalStateException`. Pool exhaustion
+is treated as **backpressure** -- reject the request with a 503 rather than queueing without limit. And the
+reactive `Context` does **not** cross the `toFuture()` boundary, so anything riding in it, transaction
+context very much included, is gone: the inner flow needs its own `contextWrite`, and it can never join a
+transaction owned by the caller.
+
 == Error handling
 
 Errors are a terminal signal in Reactive Streams: once `onError` fires, the sequence is over unless an
@@ -223,6 +392,7 @@ error. `retry(n)` re-subscribes immediately up to `n` times; `retryWhen(Retry.ba
 `reactor-extra`'s `reactor.util.retry.Retry`) adds exponential backoff and jitter, and should be scoped with
 `.filter(...)` so only genuinely transient failures are retried.
 
+[#testing-reactive-streams-with-stepverifier]
 == Testing reactive streams with StepVerifier
 
 `StepVerifier` subscribes to a `Publisher` and asserts, step by step, exactly which signals it emits --
@@ -267,7 +437,7 @@ directly, `PublisherProbe` and a manually-driven `TestPublisher` complement `Ste
 
 Reactor is the foundation the rest of Spring's reactive stack is written against:
 
-* **Spring WebFlux** controllers and `RouterFunction` handlers may return `Mono\<T>`/`Flux\<T>` directly; the
+* **Spring WebFlux** controllers and `RouterFunction` handlers may return `Mono<T>`/`Flux<T>` directly; the
   framework subscribes to them as part of handling each request, on Netty's (or another server's) event-loop
   threads.
 * **R2DBC** (Reactive Relational Database Connectivity) exposes SQL access through `Mono`/`Flux`-returning
@@ -303,7 +473,11 @@ class OrderController {
 Because a reactive controller method, an R2DBC query, and a reactive repository call all speak the same
 `Mono`/`Flux` vocabulary, the assembly/subscription model, the operators, and the `StepVerifier`-based
 testing approach described above carry over unchanged from a plain Reactor pipeline to a full WebFlux
-request handling chain.
+request handling chain. Combining those pieces in a real request path does add two caveats that a standalone
+pipeline never runs into: the transaction now rides the subscription rather than the thread
+(<<reactive-transactions-and-thread-affinity,Reactive transactions and thread affinity>>), and the handler
+runs on an event-loop thread where blocking is fatal
+(<<bridging-to-blocking-code-safely,Bridging to blocking code safely>>).
 
 == Further learning
 
