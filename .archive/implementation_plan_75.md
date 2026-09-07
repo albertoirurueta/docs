@@ -60,14 +60,14 @@ nav/index wiring edits) — no application source code exists in this repository
 ### Group 1 (Parallelizable: no — the nav/index edits reference the new page's exact path and title, and the
 functions.adoc cross-link points at the new page, so the page must be drafted first)
 
-- [ ] Task 1. Create `modules/ROOT/pages/web/python/docstrings.adoc`
-  - [ ] Task 1.1. Page header: `= Docstrings`, a `:description:` and `:keywords:` line following the sibling
+- [x] Task 1. Create `modules/ROOT/pages/web/python/docstrings.adoc`
+  - [x] Task 1.1. Page header: `= Docstrings`, a `:description:` and `:keywords:` line following the sibling
     pages' style (e.g. keywords covering `docstring`, `__doc__`, `help()`, PEP 257, Google style, NumPy style,
     reStructuredText, Sphinx, autodoc, napoleon, pdoc, MkDocs, mkdocstrings), then
     `include::partial$python-disclaimer.adoc[]`, then a short intro paragraph framing the page (docstrings as
     Python's built-in mechanism for attaching documentation to code, retrievable at runtime and consumed by
     both humans and tooling).
-  - [ ] Task 1.2. `== What Is a Docstring?` section: a string literal as the first statement of a module,
+  - [x] Task 1.2. `== What Is a Docstring?` section: a string literal as the first statement of a module,
     class, function, or method body; PEP 257 conventions (one-line vs. multi-line form, closing `"""` on its
     own line for multi-line docstrings, no blank line before/after for one-liners); accessible via `.__doc__`
     and `help()`. Include a `[source,python]` example showing a module-level docstring, a class docstring, and
@@ -75,12 +75,12 @@ functions.adoc cross-link points at the new page, so the page must be drafted fi
     https://peps.python.org/pep-0257/[PEP 257] and
     https://docs.python.org/3/tutorial/controlflow.html#documentation-strings[the tutorial's Documentation
     Strings section] (the same source `functions.adoc` already cites).
-  - [ ] Task 1.3. `== Documenting Code with Docstrings` section: what belongs in a well-documented public
+  - [x] Task 1.3. `== Documenting Code with Docstrings` section: what belongs in a well-documented public
     API's docstring (summary line, parameters, return value, raised exceptions, examples) — framed as "what a
     docstring should say", not tied to one style yet. Note the doctest angle briefly: an interactive-session
     snippet inside a docstring can be run as a test via
     https://docs.python.org/3/library/doctest.html[`doctest`].
-  - [ ] Task 1.4. `== Docstring Styles` section, `===` per style, each with a short `[source,python]` example
+  - [x] Task 1.4. `== Docstring Styles` section, `===` per style, each with a short `[source,python]` example
     of the same function documented in that style, so they're directly comparable:
     - `=== Google Style` — `Args:`/`Returns:`/`Raises:` sections, link to
       https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings[the Google Python Style
@@ -92,7 +92,7 @@ functions.adoc cross-link points at the new page, so the page must be drafted fi
     - `=== Epytext` — noted explicitly as a legacy style (predates the above three, rarely used in new code
       today, listed here for completeness/historical context since older codebases still use it), `@param`/
       `@return`-style fields.
-  - [ ] Task 1.5. `== Generating Static Documentation Sites from Docstrings` section, `===` per tool, each
+  - [x] Task 1.5. `== Generating Static Documentation Sites from Docstrings` section, `===` per tool, each
     covering what it consumes and a minimal setup/usage snippet:
     - `=== Sphinx` — the `autodoc` extension pulling docstrings from live code via `automodule`/`autoclass`/
       `autofunction` directives, and the `napoleon` extension translating Google/NumPy style into Sphinx's
@@ -112,27 +112,27 @@ functions.adoc cross-link points at the new page, so the page must be drafted fi
       long-standing default for large projects (including CPython itself); `pdoc` is the fastest path to a
       browsable API reference with no config; MkDocs + `mkdocstrings` suits projects that already publish a
       Markdown-based docs site and want API reference pages folded into it.
-  - [ ] Task 1.6. `== See Also` section cross-linking `xref:web/python/functions.adoc[]` (function-level
+  - [x] Task 1.6. `== See Also` section cross-linking `xref:web/python/functions.adoc[]` (function-level
     docstrings, already covered briefly there) and `xref:web/python/debugging-and-tooling.adoc[]` (the
     adjacent developer-tooling page).
-- [ ] Task 2. Add one cross-link sentence in `modules/ROOT/pages/web/python/functions.adoc`'s existing
+- [x] Task 2. Add one cross-link sentence in `modules/ROOT/pages/web/python/functions.adoc`'s existing
   `=== Docstrings` subsection (around line 43, after the `help()` example), pointing to the new page for
   multi-line docstrings, style conventions, and documentation-generation tooling — e.g. `"See
   xref:web/python/docstrings.adoc[] for multi-line docstrings, style conventions (Google, NumPy, reST,
   Epytext), and tools that generate documentation sites from docstrings."` — without duplicating the new
   page's content here.
-- [ ] Task 3. Add the nav entry in `modules/ROOT/nav.adoc`: insert
+- [x] Task 3. Add the nav entry in `modules/ROOT/nav.adoc`: insert
   `**** xref:web/python/docstrings.adoc[Docstrings]` immediately after the
   `**** xref:web/python/debugging-and-tooling.adoc[Debugging \& Tooling]` line (around line 398) and before the
   `**** xref:web/python/testing.adoc[Testing]` line.
-- [ ] Task 4. Add the index entry in `modules/ROOT/pages/web/python/index.adoc`: append one bullet to the end
+- [x] Task 4. Add the index entry in `modules/ROOT/pages/web/python/index.adoc`: append one bullet to the end
   of the "Modern Python & standard library" list (after the `debugging-and-tooling.adoc` bullet, before the
   `=== Testing & reference` heading) — `* xref:web/python/docstrings.adoc[Docstrings] -- what docstrings are,
   common style conventions (Google, NumPy, reST, Epytext), and generating static documentation sites with
   Sphinx, pdoc, and MkDocs.` Also add `docstrings`/`sphinx`/`pdoc`/`mkdocstrings` to `index.adoc`'s own
   `:keywords:` line (line 3) so the section landing page's SEO metadata reflects the new page, consistent with
   how every other page's addition has kept that line current.
-- [ ] Task 5. Verify the site builds cleanly. Delegate to the `iru-gate-runner` agent:
+- [x] Task 5. Verify the site builds cleanly. Delegate to the `iru-gate-runner` agent:
   ```
   Agent({
     description: "Build Antora site and check for errors",
