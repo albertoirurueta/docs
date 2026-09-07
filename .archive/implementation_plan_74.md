@@ -81,72 +81,72 @@ constructors and its methods. Wire the page into `modules/ROOT/nav.adoc` and
 
 ### Group 1 — Write the new Javadoc page (Parallelizable: yes — single task)
 
-- [ ] Task 1. Create `modules/ROOT/pages/backend/java/javadoc.adoc`
-  - [ ] Task 1.1. Add the page header: `= Javadoc`, a `:description:` summarizing doc comments, block/inline
+- [x] Task 1. Create `modules/ROOT/pages/backend/java/javadoc.adoc`
+  - [x] Task 1.1. Add the page header: `= Javadoc`, a `:description:` summarizing doc comments, block/inline
         tags, package/module docs, documentation inheritance, and worked examples; a `:keywords:` line listing
         `javadoc, doc comment, @param, @return, @throws, @see, @since, @deprecated, {@code}, {@link},
         {@inheritDoc}, {@value}, {@snippet}, package-info.java, module-info.java, Xdoclint` (extend as needed);
         then `include::partial$java-disclaimer.adoc[]`.
-  - [ ] Task 1.2. Add an intro paragraph: what `javadoc` is (the JDK-bundled tool that turns doc comments into
+  - [x] Task 1.2. Add an intro paragraph: what `javadoc` is (the JDK-bundled tool that turns doc comments into
         linked HTML API documentation, the same format as the published Java SE API spec), and one sentence
         pointing forward to `xref:backend/java/build-and-tooling.adoc#generating-api-docs[Build & Tooling]` for
         running the tool via the CLI/Maven/Gradle.
-  - [ ] Task 1.3. `== What Javadoc Is` — the tool's role (parses declarations + doc comments, generates HTML);
+  - [x] Task 1.3. `== What Javadoc Is` — the tool's role (parses declarations + doc comments, generates HTML);
         one `[mermaid]` flowchart: `.java source with a doc comment -> javadoc tool -> linked HTML pages
         (index, package-summary, class pages)`.
-  - [ ] Task 1.4. `== Doc Comments vs. Other Comments` — `/** ... */` vs `//` and `/* ... */` (only `/** */` is
+  - [x] Task 1.4. `== Doc Comments vs. Other Comments` — `/** ... */` vs `//` and `/* ... */` (only `/** */` is
         read); placement rule: recognized only immediately before a module (`module-info.java`), package
         (`package-info.java`), class/interface/enum/record, constructor, method, or field declaration; one
         comment documents exactly one declaration. Short `[source,java]` snippet contrasting all three comment
         forms above one method.
-  - [ ] Task 1.5. `== Anatomy of a Doc Comment`
-    - [ ] Task 1.5.1. `=== Description and Summary Sentence` — free-text description, allowed inline HTML
+  - [x] Task 1.5. `== Anatomy of a Doc Comment`
+    - [x] Task 1.5.1. `=== Description and Summary Sentence` — free-text description, allowed inline HTML
           (`<p>`, `<ul>`/`<li>`, `<b>`) vs. disallowed (`<h1>`-`<h6>`, which collide with generated headings);
           the classic first-sentence/summary rule (terminated at the first period followed by whitespace or a
           tag) and its "Prof. Knuth" ambiguity; the `{@summary ...}` inline tag (JDK 10+, JDK-8173425) as the
           unambiguous alternative, with a short `[source,java]` example showing both forms.
-    - [ ] Task 1.5.2. `=== The Tag Section` — block tags start a new line with `@`, appear after the
+    - [x] Task 1.5.2. `=== The Tag Section` — block tags start a new line with `@`, appear after the
           description, same-kind tags grouped together, in Oracle's recommended order: `@author`, `@version`,
           `@param`, `@return`, `@throws`, `@see`, `@since`, `@serial`, `@deprecated`.
-  - [ ] Task 1.6. `== Standard Block Tags` — an AsciiDoc `|===` table (`Tag` | `Applies to` | `Meaning`) covering
+  - [x] Task 1.6. `== Standard Block Tags` — an AsciiDoc `|===` table (`Tag` | `Applies to` | `Meaning`) covering
         `@author`, `@version`, `@param` (incl. `@param <T>` for type parameters), `@return` (omitted for `void`/
         constructors), `@throws`/`@exception` (synonyms, repeatable), `@see` (its three forms: plain text,
         `<a href="">`, `package.class#member`), `@since`, `@deprecated` (paired with the `@Deprecated`
         annotation), `@serial`/`@serialField`/`@serialData`, `@hidden`. Below the table, one short paragraph on
         the `@apiNote`/`@implSpec`/`@implNote` JDK-source convention (JDK-8008632) — not standard tags, enabled
         via `-tag`, used to separate contract vs. default-implementation behavior vs. implementation notes.
-  - [ ] Task 1.7. `== Standard Inline Tags` — an AsciiDoc `|===` table covering `{@code}`, `{@literal}`,
+  - [x] Task 1.7. `== Standard Inline Tags` — an AsciiDoc `|===` table covering `{@code}`, `{@literal}`,
         `{@link}` / `{@linkplain}`, `{@value}`, `{@inheritDoc}`, `{@docRoot}`, `{@summary}` (cross-ref back to
         Task 1.5.1), `{@snippet}` (JDK 18+ / JEP 413 — inline and external `snippet-files` forms, `region`/
         `highlight`/`replace` attributes, and how it improves on wrapping examples in `{@code}`/`<pre>`).
-  - [ ] Task 1.8. `== Package and Module Documentation` — a minimal `package-info.java` `[source,java]` example
+  - [x] Task 1.8. `== Package and Module Documentation` — a minimal `package-info.java` `[source,java]` example
         with its own doc comment; a `module-info.java` doc-comment example; the `-overview` option and an
         overview HTML file for the all-packages summary page (one sentence, cross-linking
         `build-and-tooling.adoc` for the CLI option itself rather than re-explaining `-overview` in depth).
-  - [ ] Task 1.9. `== Documentation Inheritance` — how an `@Override`d/implemented method with no doc comment
+  - [x] Task 1.9. `== Documentation Inheritance` — how an `@Override`d/implemented method with no doc comment
         (or one that omits `@param`/`@return`/`@throws`) inherits the missing parts from the superclass/
         interface method automatically; `{@inheritDoc}` to invoke this explicitly within an otherwise-present
         comment. One `[source,java]` example: an interface method with a full doc comment, an implementing
         class relying on implicit inheritance, and a second implementation using `{@inheritDoc}` to add to it.
-  - [ ] Task 1.10. `== Running javadoc` — short paragraph only: the access-level filters (`-public`/
+  - [x] Task 1.10. `== Running javadoc` — short paragraph only: the access-level filters (`-public`/
         `-protected` default/`-package`/`-private`), `-author`/`-version` (opt-in tag inclusion), `-link`/
         `-linkoffline` (cross-linking other API docs), `-doctitle`/`-windowtitle`, and `-Xdoclint` (doc-comment
         validation — html/syntax/reference/accessibility/missing categories, on by default since JDK 8, and how
         to wire it into CI so broken doc comments fail the build). Close with
         "See xref:backend/java/build-and-tooling.adoc#generating-api-docs[Generating API Docs with javadoc] for
         the command line and the Maven/Gradle plugin wiring." — no CLI/Maven/Gradle block duplicated here.
-  - [ ] Task 1.11. `== Putting It All Together` — one fully documented example class combining: a class-level
+  - [x] Task 1.11. `== Putting It All Together` — one fully documented example class combining: a class-level
         doc comment (summary, description, `@author`, `@since`), a documented constructor, a documented method
         with the full `@param`/`@return`/`@throws`/`@see` set in declaration order, a documented `static final`
         constant using `{@value}`, and one `{@snippet ...}` usage (inline form is enough — an external
         `snippet-files` example was already shown conceptually in Task 1.7, this section just needs one
         concrete inline snippet in context).
-  - [ ] Task 1.12. `== Best Practices` — bullet list: write a self-contained summary sentence; document every
+  - [x] Task 1.12. `== Best Practices` — bullet list: write a self-contained summary sentence; document every
         public/protected member; document the contract (preconditions, edge cases, thread-safety, nullability),
         not the signature restated in prose; prefer `{@code}` over raw `<code>`; keep `@param` order in sync
         with the declaration; avoid dangling `{@link}` targets; run with `-Xdoclint` (or the Maven/Gradle
         equivalents from `build-and-tooling.adoc`) in CI.
-  - [ ] Task 1.13. `== References` — link: the `javadoc` command
+  - [x] Task 1.13. `== References` — link: the `javadoc` command
         (`https://docs.oracle.com/en/java/javase/25/docs/specs/man/javadoc.html`), the Documentation Comment
         Specification (`https://docs.oracle.com/en/java/javase/25/docs/specs/javadoc/doc-comment-spec.html`),
         "How to Write Doc Comments for the Javadoc Tool"
@@ -157,37 +157,53 @@ constructors and its methods. Wire the page into `modules/ROOT/nav.adoc` and
         (`https://bugs.openjdk.org/browse/JDK-8173425`), JDK-8008632
         (`https://bugs.openjdk.org/browse/JDK-8008632`), and the Java Tutorials Javadoc section
         (`https://docs.oracle.com/javase/tutorial/java/javaOO/javadoc.html`).
+  - **Result**: `modules/ROOT/pages/backend/java/javadoc.adoc` created (all 13 sections, one mermaid flowchart,
+    two `|===` tables, natural-title `<<...>>` cross-refs for `{@inheritDoc}`/`{@summary}` back-references).
+    Content-only AsciiDoc authoring; no test suite applies per `CLAUDE.md`. Verified in Task 5's Antora build.
 
 ### Group 2 — Wire the page in and trim the duplicate coverage (Parallelizable: yes — three independent files)
 
-- [ ] Task 2. Add the nav entry in `modules/ROOT/nav.adoc`
-  - [ ] Task 2.1. Insert `**** xref:backend/java/javadoc.adoc[Javadoc]` between the existing line 430
+- [x] Task 2. Add the nav entry in `modules/ROOT/nav.adoc`
+  - [x] Task 2.1. Insert `**** xref:backend/java/javadoc.adoc[Javadoc]` between the existing line 430
         (`Build & Tooling`) and line 431 (`Unit Testing with JUnit 5 & Mockito`).
-- [ ] Task 3. Add the page to `modules/ROOT/pages/backend/java/index.adoc`
-  - [ ] Task 3.1. Insert a new bullet in the `=== Modularity, packaging & tooling` list (after the
+  - **Result**: `modules/ROOT/nav.adoc` updated — one line inserted.
+- [x] Task 3. Add the page to `modules/ROOT/pages/backend/java/index.adoc`
+  - [x] Task 3.1. Insert a new bullet in the `=== Modularity, packaging & tooling` list (after the
         `build-and-tooling.adoc` bullet, before `=== Testing & reference`):
         `* xref:backend/java/javadoc.adoc[Javadoc] -- doc comments, block and inline tags, package and module
         documentation, documentation inheritance, and worked examples.`
-  - [ ] Task 3.2. Refresh the page's `:description:` (line 2) and `:keywords:` (line 3) to mention Javadoc/doc
+  - [x] Task 3.2. Refresh the page's `:description:` (line 2) and `:keywords:` (line 3) to mention Javadoc/doc
         comments (e.g. add "and documenting code with Javadoc" to the description's tooling clause; add
         `Javadoc, doc comment, @param, @return, @throws, {@code}, {@link}` to the keywords).
-- [ ] Task 4. Trim `modules/ROOT/pages/backend/java/build-and-tooling.adoc`'s javadoc section
-  - [ ] Task 4.1. In `[#generating-api-docs]` / `== Generating API Docs with \`javadoc\`` (lines 679–719): keep
+  - **Result**: `modules/ROOT/pages/backend/java/index.adoc` updated — new bullet added, `:description:`/
+    `:keywords:` refreshed.
+- [x] Task 4. Trim `modules/ROOT/pages/backend/java/build-and-tooling.adoc`'s javadoc section
+  - [x] Task 4.1. In `[#generating-api-docs]` / `== Generating API Docs with \`javadoc\`` (lines 679–719): keep
         the anchor, keep the intro paragraph's tool-role sentence, **remove** the full worked-method
         `[source,java]` example and the "the common tags are..." sentence, and add one sentence:
         "For the doc-comment format itself -- block and inline tags, package/module docs, documentation
         inheritance, and worked examples -- see xref:backend/java/javadoc.adoc[Javadoc]." Keep the
         `[source,bash]` CLI/`mvn`/`gradle` block unchanged.
+  - **Result**: `modules/ROOT/pages/backend/java/build-and-tooling.adoc` trimmed — worked-method example and
+    tag-naming sentence removed and replaced with the cross-link sentence; anchor, intro sentence, and CLI/
+    `mvn`/`gradle` block left unchanged.
 
 ### Group 3 — Verify the build (Parallelizable: yes — single task; depends on Groups 1–2)
 
-- [ ] Task 5. Verify the Antora build with no new warnings, out of the main context
-  - [ ] Task 5.1. Delegate to `iru-gate-runner`:
+- [x] Task 5. Verify the Antora build with no new warnings, out of the main context
+  - [x] Task 5.1. Delegate to `iru-gate-runner`:
         `Agent({description: "Build Antora site and check for xref/AsciiDoc warnings", subagent_type:
         "iru-gate-runner", prompt: "Invoke Skill({skill: \"iru-build-docs\"}) to build this Antora site (npx
         antora antora-playbook.yml, local content only). Report back only: whether the build succeeded, and
         the exact text of any new xref/AsciiDoc warnings or errors introduced (ignore pre-existing warnings
         unrelated to backend/java/javadoc.adoc, backend/java/build-and-tooling.adoc,
         backend/java/index.adoc, or nav.adoc). Do not dump the full build log."})`
-  - [ ] Task 5.2. If the sub-agent reports any new warning/error tied to the changed files, fix it directly
+  - [x] Task 5.2. If the sub-agent reports any new warning/error tied to the changed files, fix it directly
         (e.g. a broken `xref:`, a malformed table, a mismatched anchor) and re-run Task 5.1 until clean.
+  - **Result**: `npx antora antora-playbook.yml` completed with exit code 0 and zero warnings/errors of any
+    kind. `build/site/backend/java/javadoc.html` generated; cross-links from `index.html` (2 refs) and
+    `build-and-tooling.html` (4 refs) resolve; the `[mermaid]` block renders with the same script wiring as
+    other pages using the extension. No `Agent`/subagent-spawn tool was available in this execution
+    environment, so the build was run directly in the main context instead of via `iru-gate-runner` — the
+    verification itself (build success, no new warnings) is unaffected; only the context-isolation benefit
+    the plan intended was not obtained.
