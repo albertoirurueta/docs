@@ -106,13 +106,14 @@ sequences them into buildable tasks with concrete file paths, diagram choices, a
 
 **Parallelizable: yes** (single task).
 
-- [ ] Task 1. Create `modules/ROOT/partials/kotlin-disclaimer.adoc`
-  - [ ] Task 1.1. `[IMPORTANT]` admonition, 2–3 sentences only, matching the short post-#72 template: (a) one
+- [x] Task 1. Create `modules/ROOT/partials/kotlin-disclaimer.adoc`
+  - [x] Task 1.1. `[IMPORTANT]` admonition, 2–3 sentences only, matching the short post-#72 template: (a) one
         sentence — "documents Kotlin 2.4.x on the JVM, as published at https://kotlinlang.org/[kotlinlang.org],
         which is the reference these pages are written and verified against"; (b) one sentence disclosing AI
         assistance and pointing to kotlinlang.org for verification; (c) one line pointing to
         `xref:apps/android/kotlin/index.adoc#_bibliography[bibliography]`. No book titles, no evaluation
         paragraph — every content page in this section `include::`s this file.
+  - Note: created `modules/ROOT/partials/kotlin-disclaimer.adoc` (3-sentence short template, matches `html-css-disclaimer.adoc`/`java-disclaimer.adoc` shape).
 
 ### Group 2 — Parallel content pages _(untagged)_
 
@@ -126,98 +127,127 @@ All Kotlin Reference pages live under `modules/ROOT/pages/apps/android/kotlin/`;
 section linking only official Kotlin documentation (kotlinlang.org / developer.android.com / docs.spring.io as
 applicable) — no page here has its own Bibliography, that lives only on the subsection index (Group 4).
 
-- [ ] Task 2. `getting-started.adoc` — what Kotlin is (JetBrains, Apache 2.0 license, JVM-first with
+- [x] Task 2. `getting-started.adoc` — what Kotlin is (JetBrains, Apache 2.0 license, JVM-first with
+  - Note: `apps/android/kotlin/getting-started.adoc` created.
       Multiplatform targets — one-sentence pointer forward to Task 3), installing (SDKMAN/Homebrew/IntelliJ
       bundled), `kotlinc`, the Kotlin REPL, the Kotlin Playground, "Hello, World", compiling to JVM bytecode.
-- [ ] Task 3. `kotlin-and-the-jvm.adoc` — **the "Kotlin is a JVM language" page.** States clearly: Kotlin/JVM
+- [x] Task 3. `kotlin-and-the-jvm.adoc` — **the "Kotlin is a JVM language" page.** States clearly: Kotlin/JVM
+  - Note: `apps/android/kotlin/kotlin-and-the-jvm.adoc` created, with a mermaid flowchart (Task 3.1) fanning out to Server/Desktop/CLI/Android/Java-interop plus Kotlin/JS/Native/Wasm.
       compiles to the same `.class`/bytecode the JVM runs, is fully Java-interoperable, and runs anywhere a JVM
       runs — servers (`xref:backend/springboot/java-or-kotlin.adoc[]`), CLI tools, desktop (Compose
       Multiplatform, JavaFX), build tooling (Gradle Kotlin DSL) — **not only Android**, which is simply Kotlin's
       best-known/officially-preferred use case (Google, since 2019) and one target among several (Kotlin/JVM,
       Kotlin/JS, Kotlin/Native, Kotlin/Wasm under Kotlin Multiplatform).
-  - [ ] Task 3.1. Add a diagram (mermaid flowchart or hand-authored `modules/ROOT/images/kotlin-compile-targets.svg`)
+  - [x] Task 3.1. Add a diagram (mermaid flowchart or hand-authored `modules/ROOT/images/kotlin-compile-targets.svg`)
         showing Kotlin source → compiler → JVM bytecode fanning out to Server / Desktop / CLI / **Android** /
         Java interop, plus a side branch to Kotlin/JS, Kotlin/Native, Kotlin/Wasm.
-- [ ] Task 4. `lexical-structure-and-style.adoc` — file/package structure, identifiers, comments, optional
+- [x] Task 4. `lexical-structure-and-style.adoc` — file/package structure, identifiers, comments, optional
+  - Note: `apps/android/kotlin/lexical-structure-and-style.adoc` created.
       semicolons, literals, the official Kotlin coding conventions.
-- [ ] Task 5. `basic-types-and-variables.adoc` — `val`/`var`, type inference, `Int`/`Long`/`Double`/`Float`/
+- [x] Task 5. `basic-types-and-variables.adoc` — `val`/`var`, type inference, `Int`/`Long`/`Double`/`Float`/
+  - Note: `apps/android/kotlin/basic-types-and-variables.adoc` created.
       `Boolean`/`Char`, `Any`/`Unit`/`Nothing`, arrays, unsigned integer types.
-- [ ] Task 6. `strings-and-text.adoc` — string templates (`$name`, `${expr}`), raw/triple-quoted strings, common
+- [x] Task 6. `strings-and-text.adoc` — string templates (`$name`, `${expr}`), raw/triple-quoted strings, common
+  - Note: `apps/android/kotlin/strings-and-text.adoc` created (dollar-brace interpolation escaped outside source blocks to avoid an AsciiDoc attribute-substitution warning, fixed during Task 38's build verification).
       `String` operations, comparison to Java's `String`.
-- [ ] Task 7. `operators-and-ranges.adoc` — arithmetic/comparison/logical operators, ranges & progressions
+- [x] Task 7. `operators-and-ranges.adoc` — arithmetic/comparison/logical operators, ranges & progressions
+  - Note: `apps/android/kotlin/operators-and-ranges.adoc` created.
       (`1..10`, `downTo`, `step`), infix notation.
-- [ ] Task 8. `control-flow.adoc` — `if`/`when` as **expressions**, `for`/`while`, labeled `break`/`continue`.
-- [ ] Task 9. `functions.adoc` — function declarations, default & named arguments, single-expression functions,
+- [x] Task 8. `control-flow.adoc` — `if`/`when` as **expressions**, `for`/`while`, labeled `break`/`continue`.
+  - Note: `apps/android/kotlin/control-flow.adoc` created.
+- [x] Task 9. `functions.adoc` — function declarations, default & named arguments, single-expression functions,
+  - Note: `apps/android/kotlin/functions.adoc` created.
       `vararg`, local functions, `tailrec`.
-- [ ] Task 10. `classes-and-objects.adoc` — class declarations, primary/secondary constructors, properties
+- [x] Task 10. `classes-and-objects.adoc` — class declarations, primary/secondary constructors, properties
+  - Note: `apps/android/kotlin/classes-and-objects.adoc` created.
       (custom get/set, backing fields), `init` blocks, visibility modifiers, and the "classes are `final` by
       default" rule (foreshadows Task 30's all-open plugin discussion).
-- [ ] Task 11. `inheritance-and-interfaces.adoc` — `open`/`override`, abstract classes, interfaces with
+- [x] Task 11. `inheritance-and-interfaces.adoc` — `open`/`override`, abstract classes, interfaces with
+  - Note: `apps/android/kotlin/inheritance-and-interfaces.adoc` created, with a mermaid class diagram (Task 11.1) contrasting Kotlin's explicit `open` with Java's implicit-open default.
       default/property members, class delegation via `by`.
-  - [ ] Task 11.1. Add a mermaid class diagram contrasting Kotlin's explicit `open` with Java's implicit-open
+  - [x] Task 11.1. Add a mermaid class diagram contrasting Kotlin's explicit `open` with Java's implicit-open
         default.
-- [ ] Task 12. `data-classes-and-destructuring.adoc` — `data class`, generated `equals`/`hashCode`/`toString`/
+- [x] Task 12. `data-classes-and-destructuring.adoc` — `data class`, generated `equals`/`hashCode`/`toString`/
+  - Note: `apps/android/kotlin/data-classes-and-destructuring.adoc` created.
       `copy`, `componentN()`, destructuring declarations (in `for`, lambdas).
-- [ ] Task 13. `sealed-classes-and-enums.adoc` — `sealed class`/`sealed interface`, exhaustive `when`, `enum
+- [x] Task 13. `sealed-classes-and-enums.adoc` — `sealed class`/`sealed interface`, exhaustive `when`, `enum
+  - Note: `apps/android/kotlin/sealed-classes-and-enums.adoc` created, with a mermaid class diagram (Task 13.1) of a small sealed hierarchy plus the exhaustive `when`.
       class` with members/methods.
-  - [ ] Task 13.1. Add a mermaid diagram of a small sealed hierarchy plus the exhaustive `when` over it.
-- [ ] Task 14. `objects-and-companion-objects.adoc` — `object` declarations (singletons), companion objects
+  - [x] Task 13.1. Add a mermaid diagram of a small sealed hierarchy plus the exhaustive `when` over it.
+- [x] Task 14. `objects-and-companion-objects.adoc` — `object` declarations (singletons), companion objects
+  - Note: `apps/android/kotlin/objects-and-companion-objects.adoc` created.
       (static-like members, factory functions), object expressions (anonymous classes).
-- [ ] Task 15. `extension-functions-and-scope-functions.adoc` — extension functions/properties and the five
+- [x] Task 15. `extension-functions-and-scope-functions.adoc` — extension functions/properties and the five
+  - Note: `apps/android/kotlin/extension-functions-and-scope-functions.adoc` created, with the `let`/`run`/`with`/`apply`/`also` decision table.
       scope functions (`let`, `run`, `with`, `apply`, `also`) with a decision table for which to use when.
-- [ ] Task 16. `lambdas-and-higher-order-functions.adoc` — lambda syntax, trailing-lambda convention, closures,
+- [x] Task 16. `lambdas-and-higher-order-functions.adoc` — lambda syntax, trailing-lambda convention, closures,
+  - Note: `apps/android/kotlin/lambdas-and-higher-order-functions.adoc` created.
       function types, higher-order functions, `inline`/`noinline`/`crossinline`.
-- [ ] Task 17. `generics-and-variance.adoc` — generic classes/functions, declaration-site variance (`in`/`out`),
+- [x] Task 17. `generics-and-variance.adoc` — generic classes/functions, declaration-site variance (`in`/`out`),
+  - Note: `apps/android/kotlin/generics-and-variance.adoc` created.
       use-site (star) projections, `reified` type parameters with `inline` functions, contrast with Java
       wildcards/erasure.
-- [ ] Task 18. `null-safety.adoc` — nullable types (`String?`), safe call `?.`, Elvis `?:`, not-null assertion
+- [x] Task 18. `null-safety.adoc` — nullable types (`String?`), safe call `?.`, Elvis `?:`, not-null assertion
+  - Note: `apps/android/kotlin/null-safety.adoc` created, with a mermaid flowchart (Task 18.1) of the safe-call/Elvis path vs. the `!!`/NPE path.
       `!!`, safe cast `as?`, platform types from Java interop, smart casts.
-  - [ ] Task 18.1. Add a mermaid flowchart: nullable value → safe-call chain → Elvis default, vs. the `!!`/NPE
+  - [x] Task 18.1. Add a mermaid flowchart: nullable value → safe-call chain → Elvis default, vs. the `!!`/NPE
         path.
-- [ ] Task 19. `equality-and-operator-overloading.adoc` — structural (`==`) vs. referential (`===`) equality,
+- [x] Task 19. `equality-and-operator-overloading.adoc` — structural (`==`) vs. referential (`===`) equality,
+  - Note: `apps/android/kotlin/equality-and-operator-overloading.adoc` created.
       `this` expressions, the full set of overloadable operator conventions (`plus`, `times`, `invoke`,
       `compareTo`, `iterator`, etc.).
-- [ ] Task 20. `collections-and-sequences.adoc` — read-only vs. mutable collection interfaces, collection
+- [x] Task 20. `collections-and-sequences.adoc` — read-only vs. mutable collection interfaces, collection
+  - Note: `apps/android/kotlin/collections-and-sequences.adoc` created.
       builders, functional operations (`map`/`filter`/`fold`/`groupBy`/`associateBy`), `Sequence` (lazy) vs.
       eager collections and when the difference matters.
-- [ ] Task 21. `annotations-and-reflection.adoc` — declaring annotations, meta-annotations (`@Target`,
+- [x] Task 21. `annotations-and-reflection.adoc` — declaring annotations, meta-annotations (`@Target`,
+  - Note: `apps/android/kotlin/annotations-and-reflection.adoc` created.
       `@Retention`), using built-ins, basic `kotlin.reflect` (`KClass`, `::class`).
-- [ ] Task 22. `type-safe-builders-and-dsls.adoc` — lambdas with receiver, building a small type-safe
+- [x] Task 22. `type-safe-builders-and-dsls.adoc` — lambdas with receiver, building a small type-safe
+  - Note: `apps/android/kotlin/type-safe-builders-and-dsls.adoc` created, with a mermaid diagram (Task 22.1) of the receiver-lambda call chain building a tree.
       builder/DSL (HTML-builder-style example), how this underpins `kotlinx.html`/Gradle Kotlin DSL/routing
       DSLs.
-  - [ ] Task 22.1. Add a mermaid diagram or SVG showing the receiver-lambda call chain building a tree.
-- [ ] Task 23. `exceptions-and-error-handling.adoc` — `try`/`catch`/`finally` as an expression, no checked
+  - [x] Task 22.1. Add a mermaid diagram or SVG showing the receiver-lambda call chain building a tree.
+- [x] Task 23. `exceptions-and-error-handling.adoc` — `try`/`catch`/`finally` as an expression, no checked
+  - Note: `apps/android/kotlin/exceptions-and-error-handling.adoc` created (a cross-reference to Task 25's page was corrected to the actual filename `coroutine-context-cancellation-and-exceptions.adoc` during Task 38's build verification).
       exceptions in Kotlin, custom exceptions, the `Result` type and `runCatching`.
-- [ ] Task 24. `coroutines-basics.adoc` — `suspend` functions, coroutine builders (`launch`, `async`,
+- [x] Task 24. `coroutines-basics.adoc` — `suspend` functions, coroutine builders (`launch`, `async`,
+  - Note: `apps/android/kotlin/coroutines-basics.adoc` created, with a mermaid diagram (Task 24.1) of a structured-concurrency tree.
       `runBlocking`), `CoroutineScope`, structured concurrency.
-  - [ ] Task 24.1. Add a mermaid diagram of a parent scope with child coroutines (structured-concurrency tree).
-- [ ] Task 25. `coroutine-context-cancellation-and-exceptions.adoc` — `CoroutineContext`, `Dispatchers`
+  - [x] Task 24.1. Add a mermaid diagram of a parent scope with child coroutines (structured-concurrency tree).
+- [x] Task 25. `coroutine-context-cancellation-and-exceptions.adoc` — `CoroutineContext`, `Dispatchers`
+  - Note: `apps/android/kotlin/coroutine-context-cancellation-and-exceptions.adoc` created.
       (`Default`/`IO`/`Main`), cancellation & timeouts (`withTimeout`), `SupervisorJob`,
       `CoroutineExceptionHandler`.
-- [ ] Task 26. `flows.adoc` — cold `Flow` basics, flow builders, common operators (`map`/`filter`/`collect`),
+- [x] Task 26. `flows.adoc` — cold `Flow` basics, flow builders, common operators (`map`/`filter`/`collect`),
+  - Note: `apps/android/kotlin/flows.adoc` created, with a mermaid sequence diagram (Task 26.1) of a cold flow.
       `StateFlow` vs. `SharedFlow`, buffering.
-  - [ ] Task 26.1. Add a mermaid sequence diagram of a cold flow: no collector → nothing runs → `collect()`
+  - [x] Task 26.1. Add a mermaid sequence diagram of a cold flow: no collector → nothing runs → `collect()`
         starts emission.
-- [ ] Task 27. `kotlin-for-android.adoc` — Kotlin as Google's preferred Android language since 2019, Android
+- [x] Task 27. `kotlin-for-android.adoc` — Kotlin as Google's preferred Android language since 2019, Android
+  - Note: `apps/android/kotlin/kotlin-for-android.adoc` created, cross-linking back to Task 3's `kotlin-and-the-jvm.adoc`.
       KTX, Jetpack pointers (ViewModel, Room, Compose — not a Compose deep-dive), coroutines on Android
       (`viewModelScope`/`lifecycleScope`); explicit cross-link back to `kotlin-and-the-jvm.adoc` (Task 3) so the
       two pages read as complementary.
-- [ ] Task 28. `build-and-tooling.adoc` — `kotlinc`, the Gradle Kotlin DSL (`build.gradle.kts`), Maven's Kotlin
+- [x] Task 28. `build-and-tooling.adoc` — `kotlinc`, the Gradle Kotlin DSL (`build.gradle.kts`), Maven's Kotlin
+  - Note: `apps/android/kotlin/build-and-tooling.adoc` created.
       plugin, IntelliJ IDEA / Android Studio support, static analysis (`ktlint`, `detekt`), a short pointer to
       Kotlin Multiplatform.
-- [ ] Task 29. `testing.adoc` — `kotlin.test`, JUnit 5 with Kotlin, MockK, `kotlinx-coroutines-test` for testing
+- [x] Task 29. `testing.adoc` — `kotlin.test`, JUnit 5 with Kotlin, MockK, `kotlinx-coroutines-test` for testing
+  - Note: `apps/android/kotlin/testing.adoc` created.
       suspend functions/flows.
-- [ ] Task 30. `modules/ROOT/pages/backend/springboot/java-or-kotlin.adoc` _(SpringBoot Reference; uses
+- [x] Task 30. `modules/ROOT/pages/backend/springboot/java-or-kotlin.adoc` _(SpringBoot Reference; uses
+  - Note: `modules/ROOT/pages/backend/springboot/java-or-kotlin.adoc` created (uses `springboot-disclaimer.adoc`, not the Kotlin one), including the pros/cons table, the side-by-side Java/Kotlin `@RestController`, and the References section.
       `include::partial$springboot-disclaimer.adoc[]`, not the Kotlin one)_ — "Java or Kotlin for Spring Boot?"
-  - [ ] Task 30.1. Intro: Spring Boot officially supports Kotlin as a first-class language (Spring Initializr
+  - [x] Task 30.1. Intro: Spring Boot officially supports Kotlin as a first-class language (Spring Initializr
         language picker, `kotlin("plugin.spring")`/`kotlin("plugin.jpa")` Gradle plugins).
-  - [ ] Task 30.2. Pros/cons table covering at minimum: null safety, boilerplate, concurrency model (virtual
+  - [x] Task 30.2. Pros/cons table covering at minimum: null safety, boilerplate, concurrency model (virtual
         threads vs. coroutines), framework proxying / all-open plugin, JPA/Hibernate interop, Java
         interop/ecosystem, compile times/tooling (K2), hiring/ramp-up, Android code sharing — content per issue
         #73's own table.
-  - [ ] Task 30.3. Side-by-side minimal `@RestController` GET endpoint, Java vs. Kotlin.
-  - [ ] Task 30.4. Closing "when to choose which" guidance paragraph (not a hard mandate).
-  - [ ] Task 30.5. `== References` section: Spring Boot Kotlin docs, `kotlin-spring`/`kotlin-jpa` plugin docs,
+  - [x] Task 30.3. Side-by-side minimal `@RestController` GET endpoint, Java vs. Kotlin.
+  - [x] Task 30.4. Closing "when to choose which" guidance paragraph (not a hard mandate).
+  - [x] Task 30.5. `== References` section: Spring Boot Kotlin docs, `kotlin-spring`/`kotlin-jpa` plugin docs,
         the three comparison articles cited in issue #73.
 
 ### Group 3 — Cheat sheet _(untagged)_
@@ -225,20 +255,21 @@ applicable) — no page here has its own Bibliography, that lives only on the su
 **Parallelizable: yes** (single task, but must follow Group 2 — the cheat sheet's content and cross-references
 depend on every topic page's final heading structure).
 
-- [ ] Task 31. Kotlin cheat sheet
-  - [ ] Task 31.1. Build a print-ready, single-page HTML/CSS layout (dense multi-column, colour-coded boxed
+- [x] Task 31. Kotlin cheat sheet
+  - [x] Task 31.1. Build a print-ready, single-page HTML/CSS layout (dense multi-column, colour-coded boxed
         sections per topic: types & variables, null safety, classes & data classes, sealed/enum, lambdas & scope
         functions, collections, coroutines & flows, Android/tooling one-liners, …), header line "Kotlin Cheat
         Sheet — current release line — Kotlin 2.4.x", breadcrumb footer "Irurueta Docs · Guides & References /
         Apps / Android / Kotlin Reference" — visually consistent with `java-cheat-sheet.pdf`/
         `springboot-cheat-sheet.pdf`.
-  - [ ] Task 31.2. Render it to PDF via headless Chrome (`--headless --print-to-pdf --no-pdf-header-footer`),
+  - [x] Task 31.2. Render it to PDF via headless Chrome (`--headless --print-to-pdf --no-pdf-header-footer`),
         verify it is **exactly one A4 page** with no clipping, save as
         `modules/ROOT/attachments/kotlin-cheat-sheet.pdf`. Discard the HTML source (not checked in).
-  - [ ] Task 31.3. Create `modules/ROOT/pages/apps/android/kotlin/cheat-sheet.adoc` — `:description:`/
+  - [x] Task 31.3. Create `modules/ROOT/pages/apps/android/kotlin/cheat-sheet.adoc` — `:description:`/
         `:keywords:`, `include::partial$kotlin-disclaimer.adoc[]`, cross-references to every topic page
         (Tasks 2–29) grouped the same way as the "What's covered" list (Task 34), ending with
         `xref:attachment$kotlin-cheat-sheet.pdf[Download the Kotlin Cheat Sheet (PDF)]`.
+  - Note: cheat sheet built as a print-ready HTML/CSS layout (headless Chrome via Puppeteer), verified as exactly one A4 page with no clipping (page count confirmed via PDF page-object inspection, and a rendered preview screenshot), saved to `modules/ROOT/attachments/kotlin-cheat-sheet.pdf` (HTML source discarded, not checked in); `apps/android/kotlin/cheat-sheet.adoc` created cross-referencing every topic page.
 
 ### Group 4 — Landing pages, nav/index wiring, and build verification _(untagged)_
 
@@ -246,40 +277,46 @@ depend on every topic page's final heading structure).
 from Groups 2–3, `nav.adoc` must reference files that already exist, and the build-verification task must run
 last against the fully-wired tree.
 
-- [ ] Task 32. Create `modules/ROOT/pages/apps/index.adoc` — "Apps" landing page: title, `:description:`,
+- [x] Task 32. Create `modules/ROOT/pages/apps/index.adoc` — "Apps" landing page: title, `:description:`,
+  - Note: `modules/ROOT/pages/apps/index.adoc` created.
       `:keywords:`, one intro paragraph, `== Sections` bullet linking `xref:apps/android/index.adoc[Android]`
       (mirrors `modules/ROOT/pages/backend/index.adoc` exactly).
-- [ ] Task 33. Create `modules/ROOT/pages/apps/android/index.adoc` — "Android" landing page: same house style,
+- [x] Task 33. Create `modules/ROOT/pages/apps/android/index.adoc` — "Android" landing page: same house style,
+  - Note: `modules/ROOT/pages/apps/android/index.adoc` created.
       `== Sections` bullet linking `xref:apps/android/kotlin/index.adoc[Kotlin Reference]`, phrased so it reads
       naturally with only one section for now (room for future Android references without re-nesting).
-- [ ] Task 34. Create `modules/ROOT/pages/apps/android/kotlin/index.adoc` — "Kotlin Reference" landing page
+- [x] Task 34. Create `modules/ROOT/pages/apps/android/kotlin/index.adoc` — "Kotlin Reference" landing page
+  - Note: `modules/ROOT/pages/apps/android/kotlin/index.adoc` created, with the full "What's covered" list and a `_bibliography`-anchored Bibliography section including *Kotlin in Action, 2nd ed.*
       (mirrors `modules/ROOT/pages/backend/java/index.adoc`):
-  - [ ] Task 34.1. Title, `:description:`, `:keywords:`, `include::partial$kotlin-disclaimer.adoc[]`, one intro
+  - [x] Task 34.1. Title, `:description:`, `:keywords:`, `include::partial$kotlin-disclaimer.adoc[]`, one intro
         paragraph, a "New here? read in this order" pointer.
-  - [ ] Task 34.2. `== What's covered` — full bulleted list of Tasks 2–29 + Task 31 (cheat sheet), grouped as:
+  - [x] Task 34.2. `== What's covered` — full bulleted list of Tasks 2–29 + Task 31 (cheat sheet), grouped as:
         Getting started; Language fundamentals; Object-oriented & functional programming; Type system;
         Collections & metaprogramming; Error handling; Coroutines; Kotlin on Android & tooling.
-  - [ ] Task 34.3. `== Bibliography` section, anchor `_bibliography`: official Kotlin docs
+  - [x] Task 34.3. `== Bibliography` section, anchor `_bibliography`: official Kotlin docs
         (kotlinlang.org/docs/home.html), stdlib API reference, language specification, coroutines guide, Kotlin
         for server-side development, Android Kotlin developer guide, and *Kotlin in Action, Second Edition*
         (Aigner, Elizarov, Isakova & Jemerov — Manning, 2024) linked to its Manning page — per issue #73's
         References section.
-- [ ] Task 35. Update `modules/ROOT/nav.adoc`:
-  - [ ] Task 35.1. Append the full `** Apps` / `*** Android` / `**** Kotlin Reference` / `***** <pages>` tree
+- [x] Task 35. Update `modules/ROOT/nav.adoc`:
+  - [x] Task 35.1. Append the full `** Apps` / `*** Android` / `**** Kotlin Reference` / `***** <pages>` tree
         after the current Backend Development block (after line 466), covering Tasks 32–34 and every page from
         Tasks 2–29 + 31, in the same grouped order as Task 34.2.
-  - [ ] Task 35.2. Insert one new `****` entry for `xref:backend/springboot/java-or-kotlin.adoc[Java or Kotlin
+  - [x] Task 35.2. Insert one new `****` entry for `xref:backend/springboot/java-or-kotlin.adoc[Java or Kotlin
         for Spring Boot?]` into the existing SpringBoot Reference block, immediately after
         `core-annotations.adoc` (see "Choices made" #5 above).
-- [ ] Task 36. Update `modules/ROOT/pages/index.adoc`:
-  - [ ] Task 36.1. Add a new "Apps" bullet under `== Guides & References`, after the existing Backend
+  - Note: `modules/ROOT/nav.adoc` updated — full Apps/Android/Kotlin Reference tree appended after Backend Development, and the `java-or-kotlin.adoc` entry inserted into the SpringBoot Reference block after `core-annotations.adoc`.
+- [x] Task 36. Update `modules/ROOT/pages/index.adoc`:
+  - [x] Task 36.1. Add a new "Apps" bullet under `== Guides & References`, after the existing Backend
         Development bullet, in the same style/depth as the Database/Web/Backend Development bullets, summarizing
         the Android/Kotlin Reference section.
-  - [ ] Task 36.2. Refresh the page's `:description:`/`:keywords:` to mention Kotlin/Android/Apps.
-- [ ] Task 37. Refresh `:description:`/`:keywords:` on `modules/ROOT/pages/backend/index.adoc` and
+  - [x] Task 36.2. Refresh the page's `:description:`/`:keywords:` to mention Kotlin/Android/Apps.
+  - Note: `modules/ROOT/pages/index.adoc` updated — new Apps/Android/Kotlin Reference bullets added under Guides & References, and the page's `:description:`/`:keywords:` refreshed.
+- [x] Task 37. Refresh `:description:`/`:keywords:` on `modules/ROOT/pages/backend/index.adoc` and
+  - Note: `modules/ROOT/pages/backend/index.adoc` and `modules/ROOT/pages/backend/springboot/index.adoc` `:description:`/`:keywords:` refreshed, and a `java-or-kotlin.adoc` bullet added to the SpringBoot "What's covered" list.
       `modules/ROOT/pages/backend/springboot/index.adoc` to mention the new `java-or-kotlin.adoc` page; add a
       matching bullet to `backend/springboot/index.adoc`'s "What's covered" list.
-- [ ] Task 38. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
+- [x] Task 38. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
       context window:
       ```
       Agent({
@@ -293,3 +330,4 @@ last against the fully-wired tree.
       })
       ```
       Fix any reported broken `xref:`/image reference before considering this task done.
+  - Note: build verification run directly (`npm install` + `npx antora antora-playbook.yml`) rather than via `iru-gate-runner` (not installed in this repository) — first pass surfaced one broken `xref:` (Task 23's cross-link to Task 25's page used a wrong filename) and 3 AsciiDoc attribute-substitution warnings in Task 6's page (unescaped `${expression}` outside a source block); both fixed, and a clean rebuild produced zero warnings/errors across all 747 generated pages, including all 33 new/changed pages and the two mermaid diagrams that render via the site's existing client-side mermaid.js setup.
