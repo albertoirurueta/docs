@@ -1,0 +1,404 @@
+= Performance & the storage/caching model
+:description: How to tune Elasticsearch for indexing speed (bulk sizing, refresh_interval, replicas, auto-generated ids, the translog, and the refresh/flush/merge segment lifecycle), for search speed (filter context, the node query cache and shard request cache, preference, search_after, speed-oriented mapping), the fielddata trap and doc_values, and for disk usage (best_compression, _source, synthetic _source, norms).
+:keywords: elasticsearch, performance tuning, indexing speed, bulk, refresh_interval, number_of_replicas, auto-generated id, translog, index.translog.durability, segment, refresh, flush, merge, forcemerge, near real-time, search speed, filter context, node query cache, shard request cache, preference, search_after, eager_global_ordinals, index false, fielddata, doc_values, disk usage, index.codec, best_compression, source, synthetic source, norms
+
+include::partial$elasticsearch-disclaimer.adoc[]
+
+Elasticsearch stores each shard as a growing set of immutable Lucene *segments*, buffers writes in
+memory, and serves reads from several caches layered on top. Tuning is mostly a matter of
+understanding that model: how often buffered writes become searchable, how segments are persisted
+and merged, and which query shapes and mapping choices let a cache do the work. This page groups the
+knobs by the goal they serve -- indexing speed, search speed, and disk usage.
+
+== Indexing speed
+
+=== Size your _bulk requests
+
+Index through the xref:database/elasticsearch/indexing-crud-and-bulk.adoc[`_bulk` API], not
+single-document requests: one round trip carries many actions and amortises coordination cost. There
+is no universally correct batch size -- start around 5--15 MB of raw data per request, measure
+indexing throughput, and increase until it plateaus or you see `es_rejected_execution_exception`
+from a full write queue. Send bulk requests from several client threads in parallel to keep every
+data node busy.
+
+[source,console]
+----
+# One request, many documents. Each action is two lines: metadata, then the doc.
+POST /logs-2024.05/_bulk
+{ "index": {} }
+{ "@timestamp": "2024-05-01T10:00:00Z", "level": "INFO",  "msg": "started" }
+{ "index": {} }
+{ "@timestamp": "2024-05-01T10:00:01Z", "level": "ERROR", "msg": "boom" }
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-indexing-speed.html
+----
+
+=== Let Elasticsearch generate the _id
+
+Omitting `_id` (the empty `index` action line above) lets Elasticsearch assign a UID it knows is
+new, so it skips the "does this id already exist?" lookup that every explicit-id index or upsert
+must do against existing segments. That check gets more expensive as the shard grows, so
+auto-generated ids keep bulk-load speed flat. Use an explicit id only when the source system's key
+is the natural identity and you need idempotent re-indexing.
+
+=== Raise refresh_interval and drop replicas during a bulk load
+
+A *refresh* turns the in-memory indexing buffer into a new searchable segment. It happens
+automatically about once per second on an index that is being searched, which is what makes
+Elasticsearch *near real-time* rather than real-time -- see
+https://www.elastic.co/guide/en/elasticsearch/reference/current/near-real-time.html[Near real-time search].
+Each refresh has a fixed cost, so during a large one-off load, lengthen the interval (or disable it)
+and force one refresh at the end.
+
+[source,console]
+----
+# Before a bulk backfill into a fresh index: no periodic refresh, no replicas.
+PUT /events/_settings
+{
+  "index": {
+    "refresh_interval": "-1",
+    "number_of_replicas": 0
+  }
+}
+
+# ... run the parallel _bulk load ...
+
+# Restore normal behaviour; setting replicas back triggers a fast segment copy
+# rather than replaying every indexing operation on the replica.
+PUT /events/_settings
+{
+  "index": {
+    "refresh_interval": "1s",
+    "number_of_replicas": 1
+  }
+}
+
+POST /events/_refresh
+----
+
+Indexing into `events` with one primary and zero replicas means each document is indexed once
+instead of twice; adding the replica afterwards copies finished segments over the network, which is
+cheaper than concurrent indexing on both copies. Keep at least one replica for anything you cannot
+afford to rebuild.
+
+=== The translog and index.translog.durability
+
+A refresh makes writes *visible*; it does not make them *durable*. Durability comes from the
+*translog*, an append-only log each shard writes every operation to. By default
+(`index.translog.durability: request`) the translog is `fsync`-ed before every indexing request is
+acknowledged, so an acknowledged write survives a node crash. Setting it to `async` fsyncs only
+every `index.translog.sync_interval` (default `5s`), which raises indexing throughput at the cost of
+losing the last few seconds of acknowledged writes on a crash -- acceptable for data you can replay
+from an upstream source.
+
+[source,console]
+----
+PUT /metrics/_settings
+{
+  "index": {
+    "translog.durability": "async",
+    "translog.sync_interval": "30s"
+  }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules-translog.html
+----
+
+A *flush* writes the current in-memory segments to disk via a Lucene commit and then trims the
+translog. It runs automatically when the translog grows past `index.translog.flush_threshold_size`
+(default `512mb`); you rarely trigger it by hand.
+
+=== Segments: refresh, flush, merge
+
+Because segments are immutable, every refresh creates another one, a delete only marks a document as
+gone in a `.liv` file, and an update is a delete plus a re-index. Left alone, a busy shard would
+accumulate thousands of small segments, each an extra file to open and search. Lucene continuously
+*merges* smaller segments into fewer larger ones in the background, physically dropping deleted
+documents as it goes. Merging is I/O- and CPU-heavy; `indices.merge.scheduler.max_thread_count`
+bounds it per shard.
+
+[mermaid]
+....
+flowchart TD
+  W[Index / update / delete request] --> B[In-memory buffer + translog append]
+  B -->|refresh, ~1s| S[New searchable segment in memory/filesystem cache]
+  S --> V[Visible to search -- near real-time]
+  B -->|flush: Lucene commit| D[Segments fsynced to disk, translog truncated]
+  S --> M{Many small segments?}
+  M -->|background merge| L[Fewer, larger segments; deleted docs purged]
+  L --> D
+  D -->|read-only index| F[_forcemerge max_num_segments=1]
+....
+
+=== _forcemerge for indices that stop changing
+
+Once a time-based index (yesterday's logs, last month's orders) will receive no more writes, merge
+it down to one segment. This removes all deleted-document overhead and gives the fastest possible
+searches, but it is expensive and must run only on indices that are truly read-only -- a
+force-merged segment is never picked for automatic merging again, so if writes resume you can be
+left with one huge segment full of deletes.
+
+[source,console]
+----
+POST /logs-2024.04.30/_forcemerge?max_num_segments=1
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/indices-forcemerge.html
+----
+
+xref:database/elasticsearch/index-lifecycle-and-scaling.adoc[Index lifecycle & scaling] automates
+the rollover-then-forcemerge pattern with ILM.
+
+== Search speed
+
+Full guidance is in
+https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-search-speed.html[Tune for search speed];
+the highest-leverage points follow.
+
+=== Put binary conditions in filter context
+
+A clause in *filter context* answers yes/no, computes no `_score`, and its result bitset is cached
+in the *node query cache* for reuse across queries on the same shard. A clause in *query context*
+computes relevance and is not cached. Move every exact condition -- terms, ranges, dates, status
+flags -- into `filter` (or `must_not`), and keep only the clauses whose ranking you actually use in
+`must` / `should`.
+
+[source,console]
+----
+GET /products/_search
+{
+  "query": {
+    "bool": {
+      "must":   [ { "match": { "title": "wireless headphones" } } ],
+      "filter": [
+        { "term":  { "in_stock": true } },
+        { "range": { "price": { "lte": 200 } } },
+        { "terms": { "brand": [ "acme", "globex" ] } }
+      ]
+    }
+  }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/query-filter-context.html
+----
+
+xref:database/elasticsearch/search-api-and-pagination.adoc[Search API & pagination] covers the two
+contexts in more detail.
+
+=== The node query cache and the shard request cache
+
+Two independent caches sit in front of shard-level work:
+
+* *Node query cache* -- caches the document bitset produced by a filter-context clause, per segment,
+  shared by all shards on the node. Governed by `indices.queries.cache.size` (default 10% of heap).
+  It kicks in only for segments large enough to be worth caching and for filters reused often
+  enough.
+* *Shard request cache* -- caches the *whole response* of a search per shard, keyed by the exact
+  request body. By default it caches only requests with `size: 0` (that is, pure aggregation and
+  hit-count requests), which is why dashboard panels benefit most. It is invalidated on the next
+  refresh of the shard.
+
+[source,console]
+----
+# Force the shard request cache on for a request that returns hits too.
+GET /logs-*/_search?request_cache=true
+{
+  "size": 0,
+  "aggs": { "by_level": { "terms": { "field": "level" } } }
+}
+
+GET /logs-*/_stats/request_cache,query_cache
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/shard-request-cache.html
+----
+
+=== preference for cache locality
+
+By default Elasticsearch spreads successive searches across shard copies (adaptive replica
+selection). Passing a stable `preference` string -- a user id, a session id -- routes that user's
+repeated searches to the same copies, so they hit warm filesystem cache, node query cache, and (for
+`size: 0`) shard request cache.
+
+[source,console]
+----
+GET /products/_search?preference=session_4f21c9
+{ "query": { "match": { "title": "laptop stand" } } }
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/search-shard-routing.html
+----
+
+=== search_after instead of deep from / size
+
+`from` / `size` paging makes every shard build `from + size` hits and is capped at
+`index.max_result_window` (10000). For anything beyond the first few pages use `search_after` with a
+point-in-time, which costs the same per page no matter how deep you are. See
+https://www.elastic.co/guide/en/elasticsearch/reference/current/paginate-search-results.html[Paginate search results]
+and the worked example in
+xref:database/elasticsearch/search-api-and-pagination.adoc[Search API & pagination].
+
+=== Map for the query you run
+
+* Index identifiers, enums, and anything you filter or aggregate on as `keyword`, not `text`:
+  `keyword` is a single un-analysed term with `doc_values`, so `term` filters and aggregations are
+  fast and exact. Reserve `text` for fields you run `match` / `match_phrase` relevance queries
+  against.
+* `eager_global_ordinals: true` on a `keyword` field you run `terms` aggregations or
+  `significant_terms` on moves the global-ordinal build from first-query time to refresh time, so
+  the first aggregation after each refresh is not slow. It costs a little refresh time, so set it
+  only where it pays off.
+* `index: false` on a field you store and return but never filter by (an opaque payload, a
+  pre-computed URL) removes it from the inverted index -- smaller index, faster indexing. It stays
+  in `_source` and, for most types, in `doc_values` for sorting and aggregation.
+
+[source,console]
+----
+PUT /orders
+{
+  "mappings": {
+    "properties": {
+      "status":      { "type": "keyword", "eager_global_ordinals": true },
+      "description":  { "type": "text" },
+      "receipt_url":  { "type": "keyword", "index": false }
+    }
+  }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/eager-global-ordinals.html
+----
+
+xref:database/elasticsearch/mapping-and-field-types.adoc[Mapping & field types] is the full
+reference for these parameters.
+
+== The fielddata trap
+
+Sorting, aggregating, or scripting on a field needs its values in a columnar structure. For
+`keyword`, numeric, `date`, `boolean`, and `geo_point` fields that structure is *`doc_values`*:
+built at index time, stored on disk, memory-mapped, essentially free. For analysed `text` fields
+there are no `doc_values`; the only way to get per-document terms is *fielddata*, an on-heap
+structure built by un-inverting the index on first use. It can consume a large fraction of the heap
+and cause circuit-breaker trips or `OutOfMemoryError`, which is why `fielddata` is *disabled by
+default* on `text`.
+
+[source,console]
+----
+# Fails: "Fielddata is disabled on [title] in [books]. Set fielddata=true ..."
+GET /books/_search
+{
+  "size": 0,
+  "aggs": { "titles": { "terms": { "field": "title" } } }
+}
+
+# Right fix: aggregate on the keyword multi-field.
+GET /books/_search
+{
+  "size": 0,
+  "aggs": { "titles": { "terms": { "field": "title.keyword" } } }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/text.html#fielddata-mapping-param
+----
+
+A standard `text` mapping from dynamic mapping already gives you a `.keyword` sub-field (up to
+`ignore_above: 256`). Sort and aggregate on `field.keyword`; enable `"fielddata": true` only for the
+rare case of aggregating on analysed tokens, and then bound it with `fielddata_frequency_filter`.
+
+Going the other way: set `"doc_values": false` on a `keyword` or numeric field you are certain will
+never be sorted, aggregated, or scripted on. That reclaims the disk the column would use. You cannot
+add `doc_values` back without reindexing.
+
+[source,console]
+----
+PUT /events
+{
+  "mappings": {
+    "properties": {
+      "trace_id": { "type": "keyword", "doc_values": false }
+    }
+  }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/doc-values.html
+----
+
+== Disk usage
+
+Full list in
+https://www.elastic.co/guide/en/elasticsearch/reference/current/tune-for-disk-usage.html[Tune for disk usage].
+
+=== Better compression
+
+`index.codec: best_compression` switches stored fields and `_source` from LZ4 to DEFLATE, typically
+cutting on-disk size 15--25% in exchange for slightly slower fetches and merges. Set it at creation
+time; it applies to segments written afterwards, so pair it with `_forcemerge` on existing read-only
+indices.
+
+[source,console]
+----
+PUT /archive-2023
+{
+  "settings": { "index.codec": "best_compression" }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/index-modules.html#index-codec
+----
+
+=== _source: the cost of turning it off
+
+`_source` is the stored original JSON. Disabling it saves disk, but you lose everything that reads
+the document back: xref:database/elasticsearch/indexing-crud-and-bulk.adoc[reindex], update and
+update-by-query, the `highlight` feature, and the ability to reindex into a new mapping at all.
+Prefer `_source` filtering on the way out, or synthetic `_source`, over disabling it. If you still
+must:
+
+[source,console]
+----
+PUT /telemetry
+{
+  "mappings": { "_source": { "enabled": false } }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-source-field.html
+----
+
+=== Synthetic _source
+
+Synthetic `_source` stops storing the raw JSON and instead *reconstructs* it on demand from
+`doc_values` and the inverted index. You keep reindex, update, and highlight while paying roughly
+the storage of the fields themselves and no more. The reconstructed document is normalised (fields
+sorted, values de-duplicated, some formatting lost), which is fine for most uses.
+
+[source,console]
+----
+PUT /logs-synthetic
+{
+  "mappings": {
+    "_source": { "mode": "synthetic" },
+    "properties": {
+      "@timestamp": { "type": "date" },
+      "level":      { "type": "keyword" },
+      "message":    { "type": "text" }
+    }
+  }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/mapping-source-field.html#synthetic-source
+----
+
+=== Turn off norms and doc_values you do not use
+
+* `"norms": false` on a `keyword`-heavy `text` field, or on any field you match but never rank by,
+  removes the per-document length factor Elasticsearch keeps for scoring -- a small per-field saving
+  that adds up across many fields.
+* `"doc_values": false` (above) on fields never sorted or aggregated.
+* `"index": false` (above) on fields never filtered.
+
+[source,console]
+----
+PUT /catalog
+{
+  "mappings": {
+    "properties": {
+      "sku":         { "type": "keyword", "doc_values": false },
+      "notes":       { "type": "text",    "norms": false },
+      "vendor_blob": { "type": "keyword", "index": false }
+    }
+  }
+}
+# https://www.elastic.co/guide/en/elasticsearch/reference/current/norms.html
+----
+
+== See also
+
+* xref:database/elasticsearch/cluster-nodes-and-shards.adoc[The distributed model] -- shards,
+  replicas, and how a search fans out across them.
+* xref:database/elasticsearch/search-api-and-pagination.adoc[Search API & pagination] -- query vs.
+  filter context and `search_after` in full.
+* xref:database/elasticsearch/mapping-and-field-types.adoc[Mapping & field types] -- every mapping
+  parameter named on this page.
