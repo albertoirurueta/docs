@@ -1,0 +1,276 @@
+= Distributed indexing & search
+:description: How SolrCloud spreads a collection across shards -- the compositeId and implicit document routers, composite-ID prefixes and custom hashing, the leader-to-replica distributed update flow, the two-stage distributed query (query stage then get-fields stage), shards.tolerant and shards.preference, near-real-time visibility, and how a node recovers via peer sync or full replication.
+:keywords: apache solr, solrcloud, document routing, compositeid, implicit router, router.field, _route_, composite id, shard splitting prefix, leader, replica, distributed update, versioning, distributed search, two-phase query, query stage, get-fields stage, distrib.singlepass, shards.tolerant, partialresults, shards.preference, replica.type, replica.location, near real time, nrt, commitwithin, achieved replication factor, min_rf, recovery, peersync, peer sync, full replication
+
+include::partial$solr-disclaimer.adoc[]
+
+A SolrCloud collection is only useful if a write lands on the *right* shard and a query can gather
+results from *every* shard without the caller having to know the topology. This page covers how a
+document is routed to a shard (the `compositeId` and `implicit` routers, composite-ID prefixes,
+custom hashing, and the `_route_` query parameter), how a write then travels from the shard's leader
+out to its replicas, how a distributed search runs as two internal round trips, the
+`shards.tolerant` and `shards.preference` parameters that shape that fan-out, near-real-time
+visibility for a request that must see its own write, and how a replica that falls behind recovers.
+The shard/replica topology itself -- how many shards a collection has and how replicas are placed on
+nodes -- is xref:database/solr/solrcloud-architecture.adoc[SolrCloud architecture]; creating and
+configuring collections is xref:database/solr/collections-and-configsets.adoc[Collections &
+configsets].
+
+== Document routing
+
+Routing answers one question for every document: *which shard does this id belong to?* The router is
+chosen once, at collection creation, and applies to every document the collection ever holds.
+
+=== compositeId (the default)
+
+With the default `compositeId` router, Solr hashes the document's `id` field and maps the hash into
+one of the shard's hash ranges -- no configuration needed, and documents spread evenly. The useful
+twist is that the *id itself* can steer that hash: prefixing it with `<prefix>!` folds the prefix into
+the hash calculation instead of the whole id, so every id sharing a prefix lands on the *same* shard.
+
+[cols="1,3",options="header"]
+|===
+| ID shape | Effect
+
+| `12345` | Plain id -- hashed as-is, spread across all shards.
+| `IBM!12345` | Single-level prefix -- every id starting `IBM!` hashes to one shard, so a query scoped to that tenant can be routed to just it.
+| `USA!IBM!12345` | Two-level prefix -- the first two `!`-delimited segments both participate in the hash, useful for a two-level tenant/sub-tenant scheme.
+| `IBM/3!12345` | Prefix *with a bit-count suffix* -- spreads one otherwise-oversized prefix across 3 bits' worth of shards instead of pinning it to one, avoiding a hot shard for a large tenant.
+|===
+
+[source,bash]
+----
+# Two documents for tenant "IBM" -- the compositeId router sends both to the
+# same shard because they share the "IBM!" prefix.
+curl "http://localhost:8983/solr/books/update?commit=true" \
+  -H 'Content-Type: application/json' \
+  -d '[
+        { "id": "IBM!1001", "title": "Annual Report 2025" },
+        { "id": "IBM!1002", "title": "Quarterly Filing Q3" }
+      ]'
+
+# A query can then be told which shard(s) actually hold that prefix, instead
+# of fanning out to all of them -- Solr resolves _route_ to the matching shard.
+curl "http://localhost:8983/solr/books/select?q=*:*&_route_=IBM!"
+# https://solr.apache.org/guide/solr/latest/deployment-guide/solrcloud-shards-indexing.html
+----
+
+Prefix routing trades even distribution for query cheapness, exactly like Elasticsearch's custom
+`routing` parameter: a filtered query touches one shard instead of every shard, but a single
+outsized prefix (a huge tenant) still creates a hot shard unless it is split across bits with the
+`/N` suffix above.
+
+=== implicit router and custom hashing
+
+The `implicit` router does no hashing at all: shard names are assigned up front at collection
+creation, and every add must say which shard it goes to, either directly with the `_route_`
+parameter or, more commonly, by naming a `router.field` whose *value* is itself a shard name. This
+hands routing entirely to the application -- useful for time-based sharding (a `router.field` holding
+a month or day bucket that already matches a shard name) or any scheme `compositeId`'s hash can't
+express -- at the cost of losing automatic rebalancing: a shard split still has to be driven by
+whatever logic assigned documents to shards in the first place.
+
+[source,bash]
+----
+# Explicit routing with the implicit router: this add is pinned to "shard2"
+# by name, bypassing any hash calculation.
+curl "http://localhost:8983/solr/logs/update?commit=true&_route_=shard2" \
+  -H 'Content-Type: application/json' \
+  -d '[{ "id": "evt-9001", "message": "checkout failed" }]'
+# https://solr.apache.org/guide/solr/latest/deployment-guide/solrcloud-shards-indexing.html
+----
+
+`_route_` (an alias for `shard.keys` in older syntax) works the same way on the query side for
+*both* routers: pass it to restrict a search to the shard(s) that own a given key instead of
+scattering to the whole collection, which is the main reason to prefer prefixed ids or a
+`router.field` scheme over plain hashing in a multi-tenant collection with skewed query patterns.
+
+== Leader -> replica distributed update flow
+
+A client can send a write to *any* node in the cluster -- there is no dedicated "coordinator" role for
+indexing. That node:
+
+. Resolves which shard the document's id (or `_route_`) belongs to, using the collection's router.
+. Looks up the current *leader* replica of that shard in cluster state (ZooKeeper-backed) and
+  forwards the request to it, if the receiving node is not the leader itself.
+. The leader applies the write locally, assigns it an internal version, and forwards it *in parallel*
+  to every other replica of that shard, tagged with that same version so every copy converges on the
+  same value even under concurrent/out-of-order delivery.
+. The leader waits for enough replicas to acknowledge before replying to the client. The response
+  header's `rf` (*Achieved Replication Factor*) reports how many replicas actually got the write
+  (leader included) -- across a multi-shard request it is the minimum over all shards touched, so a
+  client that cares about durability can inspect it and re-queue anything that came back degraded.
+
+[mermaid]
+....
+sequenceDiagram
+  participant C as Client
+  participant N as Any node
+  participant L as Shard leader
+  participant R1 as Replica 1
+  participant R2 as Replica 2
+  C->>N: add document (any node)
+  N->>N: resolve shard via router
+  N->>L: forward to current leader
+  L->>L: apply locally, assign version
+  par fan out
+    L->>R1: forward with version
+    L->>R2: forward with version
+  end
+  R1-->>L: ack
+  R2-->>L: ack
+  L-->>C: ack, rf = replicas that received it
+....
+
+[source,bash]
+----
+# Sent to a node that is not the leader for this shard -- Solr forwards it
+# internally; the caller never has to know the topology.
+curl "http://localhost:8983/solr/books/update?commit=true" \
+  -H 'Content-Type: application/json' \
+  -d '[{ "id": "IBM!1003", "title": "Sustainability Report" }]'
+# rf is reported in the JSON response header, e.g. "rf":2
+# https://solr.apache.org/guide/solr/latest/deployment-guide/solrcloud-recoveries-and-write-tolerance.html
+----
+
+This is the same shape as Elasticsearch's primary-forwards-to-replicas write path -- the difference is
+naming (*leader*/*replica* vs. *primary*/*replica shard*) and that Solr elects the leader per shard via
+ZooKeeper rather than the cluster master assigning primaries.
+
+== Two-stage distributed search
+
+A search sent to any node makes that node the *aggregator* for the request. It does not know the
+answer itself -- it fans the query out to shards and stitches the results together in (up to) two
+internal round trips:
+
+. *Query stage* -- the aggregator sends the query to one replica of *every* shard (chosen per
+  `shards.preference`, below). Each shard matches and sorts locally and returns just enough to
+  reconstruct the global top N: document ids, sort/score values, and any data needed to merge facets
+  or grouping -- not the stored fields themselves.
+. The aggregator merges those per-shard results and determines the *global* top N document ids.
+. *Get-fields stage* -- a second round of internal requests asks only the shards that own those
+  surviving ids for their stored fields (and highlighting, if requested), and the aggregator assembles
+  the final response in order.
+
+[mermaid]
+....
+sequenceDiagram
+  participant C as Client
+  participant A as Aggregator node
+  participant S1 as Shard 1 replica
+  participant S2 as Shard 2 replica
+  C->>A: search request
+  par query stage
+    A->>S1: query (ids + sort values only)
+    A->>S2: query (ids + sort values only)
+  end
+  S1-->>A: local top N ids
+  S2-->>A: local top N ids
+  A->>A: merge, pick global top N
+  par get-fields stage
+    A->>S1: fetch stored fields for surviving ids
+    A->>S2: fetch stored fields for surviving ids
+  end
+  S1-->>A: fields
+  S2-->>A: fields
+  A-->>C: assembled response
+....
+
+[source,bash]
+----
+curl "http://localhost:8983/solr/books/select?q=title:report&rows=10"
+# The aggregator handling this request runs the query stage against one
+# replica per shard, then a get-fields stage against just the shards that
+# own the top 10 ids.
+# https://solr.apache.org/guide/solr/latest/deployment-guide/solrcloud-distributed-requests.html
+----
+
+When every requested field is already available from the query stage (no highlighting, no
+uninverted-only fields), `distrib.singlePass=true` skips the get-fields round trip entirely and
+returns everything from the first pass -- a latency win worth reaching for on a request that does not
+need it. This two-round-trip shape is the direct counterpart of Elasticsearch's *query-then-fetch*
+covered in
+xref:database/elasticsearch/cluster-nodes-and-shards.adoc[Elasticsearch's cluster, nodes & shards];
+the mechanics differ in naming only.
+
+== shards.tolerant and shards.preference
+
+Two request parameters shape how the fan-out above behaves when shards are unavailable or when more
+than one replica could answer:
+
+[cols="1,3",options="header"]
+|===
+| Parameter | What it controls
+
+| `shards.tolerant=true` | Let the query stage succeed with whichever shards *did* respond, marking the response `partialResults:true`, instead of failing the whole request because one shard is down.
+| `shards.tolerant=requireZkConnected` | The stricter opposite: fail outright if the aggregator's own ZooKeeper connection is unhealthy, rather than risk answering from stale cluster state.
+| `shards.preference` | Orders which replica of each shard the query stage prefers, by `replica.type` (e.g. prefer `PULL` replicas over `TLOG`), `replica.location` (`local`, or a named host/prefix, to keep traffic on the aggregator's own node/rack), `replica.leader` (avoid or prefer the leader, which is also busy taking writes), or `node.sysprop` (route by an operator-defined node property).
+|===
+
+[source,bash]
+----
+# Tolerate a down shard and still get a (partial) answer.
+curl "http://localhost:8983/solr/books/select?q=*:*&shards.tolerant=true"
+
+# Prefer replicas on the aggregator's own node first, falling back to any
+# other replica -- reduces cross-node network hops for the query stage.
+curl "http://localhost:8983/solr/books/select?q=*:*&shards.preference=replica.location:local,replica.location:*"
+# https://solr.apache.org/guide/solr/latest/deployment-guide/solrcloud-distributed-requests.html
+----
+
+`shards.tolerant` is a request-time choice between availability and completeness -- always check
+`partialResults` in the response before trusting a result set from a query that used it.
+
+== Near-real-time visibility
+
+The query stage above only ever sees what the target replica's *searcher* currently has open, so
+visibility for distributed search follows the same soft-commit/`autoSoftCommit`/`commitWithin` rules
+covered in xref:database/solr/indexing-and-updates.adoc[Indexing & updates] -- a document acknowledged
+by the leader is durable immediately but not searchable on any replica, including the one that
+indexed it, until that replica's own searcher reopens. A write's `commitWithin` value travels with it
+through the distributed update flow, so every replica independently honors the same deadline rather
+than only the leader.
+
+[source,bash]
+----
+# Guarantee this write is searchable across the whole shard within 2s,
+# without the caller deciding hard vs. soft commit itself.
+curl "http://localhost:8983/solr/books/update" \
+  -H 'Content-Type: application/json' \
+  -d '[{ "id": "IBM!1004", "title": "Risk Factors 2026", "commitWithin": 2000 }]'
+----
+
+An application that must read its own write *before* that deadline should use RealTime Get
+(`/get`, covered in xref:database/solr/indexing-and-updates.adoc[Indexing & updates]) instead of
+`/select` -- it reads the transaction log directly and is unaffected by commit timing.
+
+== Node recovery and peer sync
+
+When a replica falls behind -- it was briefly down, missed updates during a network blip, or just
+restarted -- it must catch back up before it can safely serve queries or, if it is a leader
+candidate, take over the shard. Recovery tries the cheap path first and only falls back to the
+expensive one:
+
+. *Peer sync* -- the recovering replica compares its recent update history against the leader's
+  *transaction log* (the same tlog described in
+  xref:database/solr/indexing-and-updates.adoc[Indexing & updates]) and replays just the missing
+  operations. This works only when the gap is small enough that the leader's tlog still holds every
+  update the replica is missing.
+. *Full replication* -- if peer sync cannot reconcile the two (the replica is too far behind, or its
+  own index is corrupt), the replica instead pulls a complete copy of the leader's index files, the
+  same mechanism user-managed replication uses, and only rejoins as a live replica once that copy is
+  in place and current.
+
+Throughout recovery the affected replica is marked *down* in cluster state and receives no query
+traffic (and no write traffic beyond what the leader forwards to bring it current), so a client never
+sees inconsistent results from a node mid-recovery -- it simply sees one fewer replica to choose from
+until recovery completes. See
+https://solr.apache.org/guide/solr/latest/deployment-guide/solrcloud-recoveries-and-write-tolerance.html[SolrCloud
+Recoveries and Write Tolerance] for leader-failover timing, the `rf`/Achieved Replication Factor
+response header in full, and tuning how aggressively Solr retries a struggling replica before giving
+up on peer sync.
+
+Continue with xref:database/solr/solrcloud-architecture.adoc[SolrCloud architecture] for how shard
+count and replica placement are decided, or
+xref:database/solr/user-managed-mode-and-replication.adoc[User-managed mode & replication] for the
+older, ZooKeeper-free leader/follower replication these leader/replica mechanics are modeled on.
