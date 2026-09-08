@@ -1,0 +1,268 @@
+= Indexing internals & performance
+:description: Lucene segments and TieredMergePolicy, forceMerge/optimize and when not to use it, transaction-log durability, DirectoryFactory choice, autoSoftCommit tuning for near real-time search, docValues vs. the field cache, stored-field vs. docValues retrieval, best_compression, JVM/GC and heap sizing, SSD/OS page cache, and load testing.
+:keywords: apache solr, lucene segment, tieredmergepolicy, mergepolicyfactory, mergescheduler, forcemerge, optimize, transaction log, tlog durability, directoryfactory, mmapdirectoryfactory, nrtcachingdirectoryfactory, autosoftcommit, near real time, nrt, docvalues, field cache, uninverting, stored field, best_compression, compressionmode, jvm, garbage collection, g1gc, heap sizing, solr_heap, ssd, page cache, load testing
+
+include::partial$solr-disclaimer.adoc[]
+
+Query and indexing latency in Solr almost always trace back to a handful of physical realities:
+how many Lucene segments a core has to open and search, whether a document's columnar values live
+in `docValues` or have to be built on the fly, how much of the index the OS page cache can actually
+hold, and how the JVM's heap and garbage collector behave under load. This page is the tuning
+counterpart to xref:database/solr/core-concepts-and-architecture.adoc[Core concepts & architecture]
+(which introduces commits and the segment model) and
+xref:database/solr/indexing-and-updates.adoc[Indexing & updates] (which covers the `/update` handler,
+`autoCommit`, and the transaction log itself) -- here the focus is what to configure once documents
+are already flowing, to keep both indexing throughput and query latency predictable at scale.
+Runtime cache sizing (filter cache, query result cache, document cache) is
+xref:database/solr/configuration-and-caches.adoc[Configuration & caches]; this page is about the
+storage and merge machinery underneath those caches.
+
+== Segments and TieredMergePolicy
+
+Every hard commit (and, in RAM, every soft commit) can add a new immutable Lucene *segment* --
+deletes only flag documents as removed in that segment, they do not rewrite it. Left unchecked, a
+long-running core accumulates many small segments, and a search has to consult every one of them, so
+Solr runs a background *merge policy* that folds smaller segments into fewer, larger ones.
+
+The default is `TieredMergePolicy`, driven by a `mergePolicyFactory` in `solrconfig.xml`:
+
+[source,xml]
+----
+<indexConfig>
+  <mergePolicyFactory class="org.apache.solr.index.TieredMergePolicyFactory">
+    <int name="maxMergeAtOnce">10</int>
+    <int name="segmentsPerTier">10</int>
+  </mergePolicyFactory>
+
+  <!-- Runs merges on background threads instead of blocking the indexing thread. -->
+  <mergeScheduler class="org.apache.solr.update.ConcurrentMergeScheduler"/>
+</indexConfig>
+----
+
+`segmentsPerTier` bounds how many segments of roughly the same size Solr tolerates before merging;
+`maxMergeAtOnce` bounds how many of them one merge operation folds together. Lower values keep the
+segment count (and so per-query overhead) down at the cost of more background merge I/O; higher
+values do the opposite -- favor indexing throughput. `ConcurrentMergeScheduler` runs merges on
+separate threads sized from the number of CPU cores by default, so a merge does not stall the
+indexing thread that triggered it, only the I/O and CPU it competes for. See
+https://solr.apache.org/guide/solr/latest/configuration-guide/index-segments-merging.html[Index
+Segments and Merging] for the full parameter set, including `useCompoundFile` and per-merge-policy
+CFS ratios.
+
+== forceMerge / optimize -- and when not to
+
+`optimize=true` on a commit (or the admin UI's "Optimize" button, which calls the same
+`forceMerge`) merges an entire core down to `maxSegments` segments, purging deleted documents and
+giving the fastest possible query time against that core. It is also one of the most expensive
+operations Solr can run -- I/O- and CPU-heavy, and it briefly needs up to roughly double the core's
+disk space while old and new segments coexist.
+
+[source,bash]
+----
+# Collapse a read-only, no-longer-updated core to one segment.
+curl "http://localhost:8983/solr/archive-2024-01/update?optimize=true&maxSegments=1"
+# https://solr.apache.org/guide/solr/latest/configuration-guide/index-segments-merging.html
+----
+
+Reserve it for cores that have genuinely stopped changing -- a rolled-over time-based collection, a
+nightly-rebuilt catalog -- the same pattern xref:database/elasticsearch/index-lifecycle-and-scaling.adoc[Elasticsearch's
+`_forcemerge`] follows. Do *not* run it as a routine maintenance job against a core that keeps
+receiving writes: a force-merged segment is excluded from `TieredMergePolicy`'s normal size-based
+selection until enough of it is deleted again, so once writes resume you are left with one
+oversized segment that resists being merged away, working against the tiered policy rather than
+with it.
+
+== Transaction-log durability
+
+xref:database/solr/indexing-and-updates.adoc[Indexing & updates] introduces the transaction log
+(tlog) as what makes a hard commit's fsync safe to defer and what a recovering replica replays.
+The durability knob that matters at scale is how often -- and under what conditions -- Solr issues a
+hard commit versus how much unflushed tlog content an unclean shutdown could lose:
+
+[source,xml]
+----
+<updateHandler class="solr.DirectUpdateHandler2">
+  <updateLog>
+    <str name="dir">${solr.ulog.dir:}</str>
+    <!-- Bound tlog replay time/size independently of how long autoCommit's interval is. -->
+    <int name="numRecordsToKeep">100</int>
+    <int name="maxNumLogsToKeep">10</int>
+  </updateLog>
+
+  <autoCommit>
+    <maxTime>60000</maxTime>
+    <openSearcher>false</openSearcher>
+  </autoCommit>
+</updateHandler>
+----
+
+A shorter `autoCommit.maxTime` bounds how much the tlog can grow (and how much a crash could lose or
+a recovering replica must replay) at the cost of more frequent fsyncs; a longer one favors indexing
+throughput. `numRecordsToKeep` / `maxNumLogsToKeep` cap how much of the *already-committed* log Solr
+retains for peer-sync after a hard commit truncates it, which trades replica-recovery speed
+(peer-sync a few missed updates versus a full index replication) against disk. See
+https://solr.apache.org/guide/solr/latest/configuration-guide/commits-transaction-logs.html[Commits
+and Transaction Logs] for the complete `updateLog` reference.
+
+== DirectoryFactory
+
+`DirectoryFactory` in `solrconfig.xml` chooses the Lucene `Directory` implementation a core reads
+and writes its index through -- effectively how index files map onto the OS:
+
+[source,xml]
+----
+<directoryFactory name="DirectoryFactory" class="${solr.directoryFactory:solr.NRTCachingDirectoryFactory}"/>
+----
+
+`NRTCachingDirectoryFactory` (the default) wraps `MMapDirectory` and keeps small, recently-written
+segments in memory briefly to smooth out the flurry of tiny files a soft commit produces, before
+they are large enough to be worth memory-mapping directly. `MMapDirectoryFactory` maps index files
+straight into the process's virtual address space, letting the OS page cache -- not the JVM heap --
+hold hot index pages, which is why Solr deployments run with a comparatively small heap next to a
+large amount of free system RAM. `RAMDirectoryFactory` is non-persistent and unsuitable for anything
+but throwaway tests. See
+https://solr.apache.org/guide/solr/latest/configuration-guide/index-location-format.html[Index
+Location and Format] for the full set of factories and `dataDir` placement.
+
+== autoSoftCommit and NRT tuning
+
+A soft commit opens a new searcher over segments already sitting in memory/OS cache without an
+fsync, which is what makes newly-indexed documents visible in near real time. Tuning
+`autoSoftCommit` is a direct trade between visibility latency and the cost of opening a searcher too
+often -- each new searcher discards warm entries in the query result cache and document cache and
+(unless `autowarmCount` is configured) starts them cold:
+
+[source,xml]
+----
+<updateHandler class="solr.DirectUpdateHandler2">
+  <!-- Visible within ~1s: standard for a search-facing collection. -->
+  <autoSoftCommit>
+    <maxTime>1000</maxTime>
+  </autoSoftCommit>
+</updateHandler>
+----
+
+A `maxTime` in the low seconds is typical for interactive search; a bulk-load pipeline that does not
+need immediate visibility should lengthen it (or disable `autoSoftCommit` and issue one explicit
+`softCommit=true` at the end) the same way an Elasticsearch bulk load raises `refresh_interval` --
+see xref:database/elasticsearch/performance-tuning.adoc[Elasticsearch's performance tuning page] for
+the equivalent trade-off. Never drive NRT visibility from a per-write `commit=true`: that forces a
+full hard commit, complete with fsync, on every single request.
+
+== docValues vs. the field cache
+
+Sorting, faceting, and function queries need a column of per-document values, not the inverted
+(term-to-document) index. `docValues="true"` on a field builds that column at *index* time and
+stores it on disk, memory-mapped through the same `DirectoryFactory` as everything else -- cheap to
+open, no heap cost. Without it, Solr falls back to the legacy *field cache* (`fc` in
+`facet.method`, or automatically for sorting on a non-`docValues` field): it builds the same columnar
+structure by un-inverting the index *on the heap*, lazily, the first time it is needed after each
+searcher opens. That rebuild happens on every `autoSoftCommit`, and the structure can consume a
+large share of the heap on a high-cardinality field, which is why any field you sort, facet, or run
+xref:database/solr/function-queries.adoc[function queries] against should have `docValues="true"` in
+the xref:database/solr/schema-and-fields.adoc[schema]. See
+https://solr.apache.org/guide/solr/latest/indexing-guide/docvalues.html[DocValues] for which field
+types support it and the numeric-field caveat (`precisionStep` interacts with `docValues` sizing).
+
+== Stored-field vs. docValues retrieval
+
+Returning a field's value in the `response.docs[]` of a query can be satisfied two ways: from the
+*stored* value (the original, row-oriented copy kept alongside the index) or, for a `docValues`
+field, reconstructed from the columnar structure via `useDocValuesAsStored` (the schema-and-fields
+page covers the flag itself). Stored fields are compressed together per document and cheap for
+returning many fields of one matching document; `docValues` retrieval reads one column at a time and
+is cheaper when few fields of many documents are returned, or when you want the field back *without*
+paying for a separate stored copy. Marking a field `docValues="true" stored="false"` is the usual
+way to get both sort/facet support and result output from a single on-disk structure, saving the
+duplicate storage a `docValues="true" stored="true"` field would otherwise pay.
+
+== best_compression
+
+The stored-fields format defaults to a `BEST_SPEED` compression mode (LZ4-family). Switching a
+core's codec to `best_compression` trades some CPU on write and on stored-field retrieval for a
+smaller on-disk footprint -- broadly the same trade-off as Elasticsearch's `index.codec:
+best_compression`:
+
+[source,xml]
+----
+<codecFactory class="solr.SchemaCodecFactory">
+  <str name="compressionMode">BEST_COMPRESSION</str>
+</codecFactory>
+----
+
+It only affects segments written after the change, so pair it with a one-time `forceMerge` (above)
+on an existing, read-only core to compress what is already on disk; leave a still-growing core to
+pick it up gradually as normal merges rewrite its segments.
+
+== JVM, GC, and heap sizing
+
+Because `MMapDirectory` lets the OS page cache hold the hot index, Solr's own heap only needs to
+cover query execution, caches (xref:database/solr/configuration-and-caches.adoc[Configuration &
+caches]), and any field cache built for non-`docValues` fields (above) -- oversizing it starves the
+page cache of RAM it would otherwise use to keep index pages resident. `bin/solr` sets the heap via
+`SOLR_HEAP` (or `SOLR_JAVA_MEM` for a raw `-Xms`/`-Xmx` pair) and its GC tuning via `GC_TUNE` in
+`solr.in.sh`:
+
+[source,bash]
+----
+# solr.in.sh
+SOLR_HEAP="8g"
+GC_TUNE="-XX:+UseG1GC -XX:+PerfDisableSharedMem -XX:+ParallelRefProcEnabled \
+         -XX:MaxGCPauseMillis=250 -XX:InitiatingHeapOccupancyPercent=25"
+----
+
+G1GC (Solr's shipped default) favors bounded pause times over raw throughput, which matters more for
+query latency than a marginally higher indexing rate. Start from the shipped defaults, load test
+(below) with production-shaped queries, and only grow the heap in response to observed
+`OutOfMemoryError`s or old-generation pressure in GC logs -- a bigger heap you don't need is RAM
+taken directly from the page cache. See
+https://solr.apache.org/guide/solr/latest/deployment-guide/taking-solr-to-production.html[Taking
+Solr to Production] for the full set of `bin/solr`/`solr.in.sh` variables, including ulimits and
+swap.
+
+== SSD and the OS page cache
+
+Query latency on a cold core is dominated by reading segment files from disk; on a warm one it is
+dominated by CPU, because the pages are already in the OS page cache thanks to `MMapDirectory`.
+Concretely this means: leave enough free system RAM (outside the JVM heap) for the page cache to
+hold the working set of your index, prefer SSD over spinning disk for anything that does not
+comfortably fit in page cache, and expect the first queries after a node restart or a large merge to
+be slow purely from page-cache misses rather than any configuration problem. `autowarmCount` on the
+xref:database/solr/configuration-and-caches.adoc[query result cache and filter cache] mitigates the
+*Solr*-level cold-cache cost of a new searcher; it does nothing for the OS-level page-cache cost of a
+cold disk.
+
+== Load testing
+
+Tune the settings above against realistic load, not synthetic single-query timing: replay a sample
+of production queries (including the facet/sort/function-query shapes that actually exercise
+`docValues`) at realistic concurrency while a separate process drives the indexing rate you expect in
+production, and watch segment count, GC pause times, and query latency percentiles together --
+merge, commit, and GC activity all compete for the same CPU and I/O a concurrent query is trying to
+use.
+
+[source,bash]
+----
+# Cheap concurrency smoke test: N parallel curl loops against a representative query mix.
+for i in $(seq 1 20); do
+  curl -s "http://localhost:8983/solr/books/select?q=title:darkness&sort=year_i+desc&rows=20" \
+    -o /dev/null -w "%{http_code} %{time_total}s\n" &
+done
+wait
+----
+
+Watch `\{!cache=false}` in your own test scripts if you deliberately want to bypass Solr's caches and
+measure worst-case segment-read cost rather than a warm cache hit -- see
+xref:database/solr/query-parsers.adoc[Query parsers] for local-params syntax in general. For a
+heavier, repeatable load profile, drive the same query mix with a dedicated HTTP load-testing tool
+(JMeter, `k6`, Gatling) pointed at `/select` and `/update`, ramping concurrency until latency
+percentiles or error rate cross the threshold you actually care about in production.
+
+== See also
+
+* xref:database/solr/indexing-and-updates.adoc[Indexing & updates] -- the `/update` handler,
+  `autoCommit`/`autoSoftCommit`, and the transaction log's role in RealTime Get.
+* xref:database/solr/configuration-and-caches.adoc[Configuration & caches] -- filter cache, query
+  result cache, and document cache sizing, and `autowarmCount`.
+* xref:database/solr/schema-and-fields.adoc[Schema & fields] -- the `docValues`, `stored`, and
+  `useDocValuesAsStored` field flags in full.
