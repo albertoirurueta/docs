@@ -1,0 +1,188 @@
+= Near-real-time search
+:description: Making uncommitted IndexWriter changes searchable with DirectoryReader.open(writer) and openIfChanged, managing readers with SearcherManager and ControlledRealTimeReopenThread, stable paging with SearcherLifetimeManager, and the reference-counting rules that keep it safe.
+:keywords: apache lucene, near real time, nrt, directoryreader, openifchanged, searchermanager, searcherfactory, controlledrealtimereopenthread, searcherlifetimemanager, reference counting, incref, decref, indexsearcher, reopen
+
+include::partial$lucene-disclaimer.adoc[]
+
+*Near-real-time (NRT) search* makes documents visible to queries milliseconds after they are written,
+without a durable `commit`. A `DirectoryReader` opened directly on the `IndexWriter` sees the writer's
+flushed in-memory segments; periodically reopening that reader refreshes what searches can find. This
+page covers the reopen APIs, the helpers that manage them, and the reference-counting discipline that
+makes sharing a reader across threads safe.
+
+== Opening and reopening an NRT reader
+
+`DirectoryReader.open(IndexWriter)` returns a reader that includes everything the writer has flushed,
+committed or not. To refresh it, never open a brand-new reader in a loop -- call
+`DirectoryReader.openIfChanged(oldReader)`, which returns a new reader that *shares* unchanged
+segments with the old one (cheap) or `null` when nothing has changed. Close the old reader only once
+no thread is still using it.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/DirectoryReader.html
+DirectoryReader reader = DirectoryReader.open(writer);   // NRT: sees uncommitted flushes
+IndexSearcher searcher = new IndexSearcher(reader);
+
+// ... time passes, more documents are indexed ...
+
+DirectoryReader refreshed = DirectoryReader.openIfChanged(reader);
+if (refreshed != null) {
+    // Hand new queries the refreshed reader, then release the old one.
+    reader.close();          // safe only if no in-flight search still holds it
+    reader = refreshed;
+    searcher = new IndexSearcher(reader);
+}
+----
+
+Doing that safely by hand across many threads is fiddly, which is what the next two helpers are for.
+
+== SearcherManager and SearcherFactory
+
+`SearcherManager` owns the current `IndexSearcher` and hands it out under a reference count.
+Threads call `acquire()`, run their query, and `release()` in a `finally`; a background caller
+invokes `maybeRefresh()` to swap in a reader built from `openIfChanged`. In-flight searches keep
+running against the old reader, which is closed automatically when its last user releases it. A
+`SearcherFactory` customises each new `IndexSearcher` -- attaching an `Executor` for
+xref:database/lucene/collectors-and-concurrent-search.adoc[intra-query concurrency], setting a
+similarity, or warming caches.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/SearcherManager.html
+var searcherFactory = new SearcherFactory() {
+    @Override
+    public IndexSearcher newSearcher(IndexReader reader, IndexReader previous) {
+        var s = new IndexSearcher(reader, queryExecutor);
+        s.setSimilarity(new BM25Similarity());
+        return s;
+    }
+};
+var searcherManager = new SearcherManager(writer, searcherFactory);
+
+// Per query:
+IndexSearcher searcher = searcherManager.acquire();
+try {
+    TopDocs hits = searcher.search(query, 10);
+} finally {
+    searcherManager.release(searcher);
+}
+
+// On a schedule, or after a write that must be visible now:
+searcherManager.maybeRefresh();
+----
+
+== ControlledRealTimeReopenThread for bounded staleness
+
+`ControlledRealTimeReopenThread` drives `maybeRefresh()` on a timer with two intervals -- a long one
+for background reopens and a short one used when a caller is actively waiting. `IndexWriter` hands out
+a monotonically increasing generation from `updateDocument`/`addDocument`; a caller that needs its own
+write to be visible passes that generation to `waitForGeneration(gen)` and blocks only until a reopen
+has caught up to it. This bounds staleness without reopening on every write.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/ControlledRealTimeReopenThread.html
+var nrtReopenThread = new ControlledRealTimeReopenThread<>(
+        writer, searcherManager,
+        5.0,    // max stale seconds for ordinary background reopens
+        0.025); // max stale seconds when someone is waiting on a generation
+nrtReopenThread.setDaemon(true);
+nrtReopenThread.start();
+
+long gen = writer.updateDocument(new Term("id", "p-1"), doc);
+nrtReopenThread.waitForGeneration(gen);   // return once this write is searchable
+IndexSearcher searcher = searcherManager.acquire();
+----
+
+== SearcherLifetimeManager for stable paging
+
+When a user pages through results, each page is a separate request and the index may have changed
+between them, so page 2 built on a newer searcher can drop or reorder rows already shown.
+`SearcherLifetimeManager` records a searcher under a token, returns that token to the client, and
+hands the *same* searcher back on the follow-up request; a pruning pass retires searchers older than a
+chosen age.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/SearcherLifetimeManager.html
+var lifetimeManager = new SearcherLifetimeManager();
+
+// First page: record the searcher, send token to the client.
+long token = lifetimeManager.record(searcher);
+
+// Later page: reuse the searcher pinned by that token (null if it was pruned).
+IndexSearcher paged = lifetimeManager.acquire(token);
+if (paged == null) {
+    paged = searcherManager.acquire();   // fell out of the window: restart from page 1
+}
+try {
+    // ... search for the next page against "paged" ...
+} finally {
+    lifetimeManager.release(paged);
+}
+
+// Housekeeping, on a schedule:
+lifetimeManager.prune(new SearcherLifetimeManager.PruneByAge(600.0)); // keep 10 minutes
+----
+
+== Reference counting: incRef, decRef and release
+
+Every `IndexReader` carries a reference count that starts at 1. `incRef()` claims a share, `decRef()`
+releases one, and the underlying files are closed when the count hits 0 -- `close()` is just a
+`decRef` of that initial reference. `SearcherManager.acquire()`/`release()` and
+`SearcherLifetimeManager` do this bookkeeping for you; you only touch `incRef`/`decRef` directly if
+you hold a reader outside those helpers.
+
+The rule that matters: *never `close()` a reader another thread might still be reading.* Closing frees
+the segment files out from under an in-flight search and throws `AlreadyClosedException` (or worse).
+Always go through `acquire`/`release` so the last releaser -- not whichever thread happens to call
+first -- does the closing.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/IndexReader.html#incRef()
+reader.incRef();               // I now hold a share; someone else may too
+try {
+    var s = new IndexSearcher(reader);
+    s.search(query, 10);
+} finally {
+    reader.decRef();           // release my share; last one out closes the files
+}
+----
+
+[mermaid]
+....
+sequenceDiagram
+    participant W as IndexWriter
+    participant R as ControlledRealTimeReopenThread
+    participant M as SearcherManager
+    participant T as Search thread
+    W->>W: updateDocument -> flush in-memory segment (gen N)
+    T->>M: acquire()
+    M-->>T: searcher on reader gen N-1
+    R->>M: maybeRefresh()
+    M->>W: DirectoryReader.openIfChanged(writer)
+    W-->>M: new reader gen N (shares old segments)
+    M->>M: swap current searcher, decRef old reader
+    T->>M: release() old searcher
+    M->>M: old reader refcount hits 0 -> files closed
+    Note over T,M: next acquire() returns the gen N searcher
+....
+
+== Related pages
+
+* xref:database/lucene/indexing-and-merge-policies.adoc[Indexing operations & merge policies] --
+  commit vs. flush, and how flushed segments become NRT-visible.
+* xref:database/lucene/architecture-and-data-flow.adoc[Architecture & data flow] -- readers,
+  searchers and segments.
+* xref:database/lucene/collectors-and-concurrent-search.adoc[Collectors & concurrent search] -- the
+  `Executor` a `SearcherFactory` attaches to each `IndexSearcher`.
+* xref:database/solr/core-concepts-and-architecture.adoc[Solr: core concepts & architecture] -- soft
+  commits and NRT one abstraction layer up.
+* https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/SearcherManager.html[SearcherManager
+  Javadoc] and
+  https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/ControlledRealTimeReopenThread.html[ControlledRealTimeReopenThread
+  Javadoc].
+* https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/package-summary.html#package-description[The
+  `org.apache.lucene.index` package summary] -- the NRT overview in the Lucene core Javadoc.

@@ -1,0 +1,316 @@
+= Performance tuning
+:description: How to tune Apache Lucene for indexing throughput (RAM buffer sizing, one shared IndexWriter, deferred merges, forceMerge for a static index, parallel build with addIndexes) and for search latency (a reused IndexSearcher via SearcherManager, reader warming, the page-cache/heap split for MMapDirectory, the LRUQueryCache, DocValues sorting, capped hit counting), plus how to measure with the nightly benchmarks and luceneutil.
+:keywords: apache lucene, performance tuning, indexing throughput, setrambuffersizemb, indexwriter, tieredmergepolicy, concurrentmergescheduler, forcemerge, addindexes, codecreader, search latency, indexsearcher, searchermanager, reader warming, mmapdirectory, page cache, lruquerycache, docvalues, total hits threshold, luceneutil, nightly benchmarks
+
+include::partial$lucene-disclaimer.adoc[]
+
+Lucene performance work splits cleanly in two: making an `IndexWriter` consume documents faster, and
+making an `IndexSearcher` answer queries faster. The two goals pull in different directions -- a large
+in-memory buffer and infrequent commits help writes, while frequent reopen and aggressive warming
+help reads -- so tune each against a workload you can replay, not in the abstract. This page collects
+the highest-leverage knobs for each side and points at the harness the Lucene project uses on itself.
+The Lucene site's own https://cwiki.apache.org/confluence/display/LUCENE/ImproveIndexingSpeed[ImproveIndexingSpeed]
+and https://cwiki.apache.org/confluence/display/LUCENE/ImproveSearchSpeed[ImproveSearchSpeed] notes,
+plus the https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/package-summary.html[search-package
+overview], cover the same basic concepts in prose.
+
+== Indexing throughput
+
+=== Size the RAM buffer, not the document count
+
+`IndexWriter` buffers new documents in memory and flushes a segment when the buffer fills. Drive that
+by bytes: set `IndexWriterConfig.setRAMBufferSizeMB(...)` and leave `setMaxBufferedDocs(...)`
+disabled. A bigger buffer means fewer, larger initial segments and therefore less merging downstream.
+256--512 MB is a common bulk-load figure; the ceiling is heap you can spare and the point past which
+merge parallelism, not flush frequency, is the bottleneck.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/IndexWriterConfig.html
+IndexWriterConfig iwc = new IndexWriterConfig(analyzer)
+    .setOpenMode(IndexWriterConfig.OpenMode.CREATE)
+    .setRAMBufferSizeMB(384.0)                                   // flush by memory, ...
+    .setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH);   // ... not by doc count
+----
+
+=== Share one IndexWriter across all indexing threads
+
+`IndexWriter` is thread-safe and built to be fed concurrently: it hands each calling thread its own
+document-writer state and flushes those independently. Open it once, share the single instance across
+your loader threads, and let it manage the parallelism. Opening a second writer on the same directory
+is not allowed (the write lock forbids it), and funnelling every `addDocument` through one
+`synchronized` caller throws the throughput away.
+
+[source,java]
+----
+// One writer, many producer threads.
+try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+    ExecutorService pool = Executors.newFixedThreadPool(8);
+    for (Path shardFile : inputFiles) {
+        pool.submit(() -> {
+            for (Document doc : parse(shardFile)) {
+                writer.addDocument(doc);          // safe from any thread
+            }
+            return null;
+        });
+    }
+    // ... await pool termination ...
+}
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/IndexWriter.html
+----
+
+=== Raise or defer merges during a bulk load
+
+Merging competes with indexing for CPU and I/O. `TieredMergePolicy` (the default) and
+`ConcurrentMergeScheduler` expose the trade-off: during a big one-off load, raise `setSegmentsPerTier`
+/ `setMaxMergeAtOnce` so small segments accumulate instead of being merged eagerly, and raise the
+scheduler's `setMaxMergesAndThreads(...)` if the target disk is fast enough to merge in parallel with
+the load. Restore the defaults afterwards so steady-state search does not degrade under a growing
+segment count.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/TieredMergePolicy.html
+TieredMergePolicy tmp = new TieredMergePolicy();
+tmp.setSegmentsPerTier(20);         // tolerate more small segments mid-load
+tmp.setMaxMergeAtOnce(20);
+iwc.setMergePolicy(tmp);
+
+ConcurrentMergeScheduler cms = new ConcurrentMergeScheduler();
+cms.setMaxMergesAndThreads(6, 3);   // NVMe can merge while you load
+iwc.setMergeScheduler(cms);
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/ConcurrentMergeScheduler.html
+----
+
+=== forceMerge(1) only for an index that has stopped changing
+
+`writer.forceMerge(1)` rewrites the whole index into a single segment. It makes searches and
+term-dictionary lookups as fast as they get and physically drops every deleted document, but it is
+expensive (it reads and rewrites the entire index) and the resulting huge segment is never chosen for
+natural merging again -- so if writes resume you are left with one giant segment slowly filling with
+deletes. Run it once, after the final commit, on an index you will only search from now on.
+
+[source,java]
+----
+try (IndexWriter writer = new IndexWriter(dir, iwc)) {
+    // ... load everything ...
+    writer.forceMerge(1);   // static index only
+    writer.commit();
+}
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/IndexWriter.html#forceMerge(int)
+----
+
+=== Build shards in parallel, then addIndexes(CodecReader...)
+
+The fastest way to build a large index on one machine is to build several smaller ones concurrently
+-- separate directories, separate writers, no lock contention -- and then fold them into one with
+`IndexWriter.addIndexes(CodecReader...)`. That call copies segments in at the byte level (no
+re-analysis), and the `CodecReader` wrapper can apply an index `Sort` or drop fields as it goes.
+
+[source,java]
+----
+// Merge N independently built indexes into one, at segment-copy speed.
+try (IndexWriter target = new IndexWriter(finalDir, iwc)) {
+    List<CodecReader> readers = new ArrayList<>();
+    for (Directory part : partDirs) {
+        DirectoryReader r = DirectoryReader.open(part);
+        for (LeafReaderContext ctx : r.leaves()) {
+            readers.add((CodecReader) ctx.reader());
+        }
+    }
+    target.addIndexes(readers.toArray(CodecReader[]::new));
+    target.commit();
+}
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/index/IndexWriter.html#addIndexes(org.apache.lucene.index.CodecReader...)
+----
+
+For the segment and merge-policy mechanics behind all of the above, see
+xref:database/lucene/indexing-and-merge-policies.adoc[Indexing & merge policies].
+
+== Search latency
+
+=== Reuse one IndexSearcher through SearcherManager
+
+Constructing an `IndexSearcher` per query, or reopening a `DirectoryReader` per query, throws away
+every warmed cache and every memory-mapped page you just paid for. Hold one searcher, serve all
+queries from it, and swap it for a fresh one only when new data must become visible. `SearcherManager`
+does exactly this: `acquire()` / `release()` around each request, `maybeRefresh()` on a schedule or
+after a commit.
+
+[source,java]
+----
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/SearcherManager.html
+SearcherManager mgr = new SearcherManager(writer, new SearcherFactory());
+
+// per request:
+IndexSearcher searcher = mgr.acquire();
+try {
+    TopDocs hits = searcher.search(query, 10);
+} finally {
+    mgr.release(searcher);
+}
+
+// on a timer / after a commit, on one background thread:
+mgr.maybeRefresh();
+----
+
+Reopen frequency is the key dial -- see xref:database/lucene/near-real-time-search.adoc[Near-real-time
+search]. Reopening every second or few seconds is fine; reopening on every write is not.
+
+=== Warm a new reader before it serves traffic
+
+A freshly reopened reader has cold DocValues, cold norms, and an empty query cache; the first queries
+after each refresh pay for all of it. Pass a `SearcherFactory` that runs representative queries
+against the new searcher -- touching the sort fields and facet fields -- before `SearcherManager`
+publishes it, and set `IndexWriterConfig.setMergedSegmentWarmer(...)` so freshly merged segments are
+warmed too.
+
+[source,java]
+----
+SearcherManager mgr = new SearcherManager(writer, new SearcherFactory() {
+    @Override
+    public IndexSearcher newSearcher(IndexReader reader, IndexReader previous) throws IOException {
+        IndexSearcher s = new IndexSearcher(reader);
+        for (Query warm : warmingQueries) {
+            s.search(warm, 20, WARMING_SORT);   // pull DocValues + fill caches
+        }
+        return s;
+    }
+});
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/SearcherFactory.html
+----
+
+=== Leave the OS page cache room next to the heap
+
+`MMapDirectory` (the default on 64-bit platforms) maps index files into virtual memory and lets the
+operating system cache the hot pages. That cache lives *outside* the JVM heap, so an oversized heap
+starves the very cache that makes mmap fast. Give the JVM the heap it needs and no more -- often well
+under half of RAM -- and leave the rest for the page cache. Lucene 10's `MMapDirectory` uses the
+Java 21 foreign-memory API and no longer suffers the per-mapping size limits of the old
+implementation.
+
+[source,java]
+----
+// Explicit; this is also what FSDirectory.open(...) picks on a 64-bit JVM.
+Directory dir = new MMapDirectory(Path.of("/var/lib/app/index"));
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/store/MMapDirectory.html
+----
+
+See xref:database/lucene/directories-and-storage.adoc[Directories & storage] for the `Directory`
+implementations and their trade-offs.
+
+=== The searcher's LRUQueryCache is on by default
+
+Every `IndexSearcher` shares a process-wide `LRUQueryCache` that caches the doc-id set produced by a
+`BooleanClause.Occur.FILTER` query, per segment, and a `UsageTrackingQueryCachingPolicy` that only
+caches a query once it has been seen often enough and only on segments large enough to be worth it.
+You get this for free; the levers are its size and, rarely, replacing it.
+
+[source,java]
+----
+// Inspect / resize the shared cache (defaults: a few MB, up to ~1000 entries).
+LRUQueryCache cache = new LRUQueryCache(1500, 64L * 1024 * 1024);
+IndexSearcher.setDefaultQueryCache(cache);
+IndexSearcher.setDefaultQueryCachingPolicy(new UsageTrackingQueryCachingPolicy());
+
+// Disable for a searcher that only ever runs one-shot unique filters:
+searcher.setQueryCache(null);
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/LRUQueryCache.html
+----
+
+Put binary conditions in a `FILTER` clause so they are cache-eligible and skip scoring -- see
+xref:database/lucene/filtering-and-faceting.adoc[Filtering & faceting].
+
+=== Sort and facet on DocValues, not stored fields
+
+Sorting or faceting needs a column of values per document. That is what the `*DocValuesField` types
+build at index time; reading them back is a memory-mapped columnar scan. Sorting that has to obtain
+values any other way is the slow path. Add the doc-values field alongside the indexed field when you
+index.
+
+[source,java]
+----
+doc.add(new StringField("brand", brand, Field.Store.NO));
+doc.add(new SortedDocValuesField("brand", new BytesRef(brand)));   // enables sort + facet
+doc.add(new NumericDocValuesField("price_cents", priceCents));
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/document/SortedDocValuesField.html
+----
+
+=== Cap total-hit counting
+
+Counting every match is more work than finding the top N. `TopScoreDocCollectorManager` and
+`TopFieldCollectorManager` take a `totalHitsThreshold`: once that many hits are known, scoring can
+skip non-competitive documents (block-max WAND) and `TopDocs.totalHits` becomes a
+`GREATER_THAN_OR_EQUAL_TO` lower bound instead of an exact count. Use a small threshold (1000 is
+typical) unless the UI truly needs an exact result count.
+
+[source,java]
+----
+int topN = 10, totalHitsThreshold = 1000;
+TopScoreDocCollectorManager cm = new TopScoreDocCollectorManager(topN, totalHitsThreshold);
+TopDocs top = searcher.search(query, cm);
+// top.totalHits.relation may be GREATER_THAN_OR_EQUAL_TO
+// https://lucene.apache.org/core/10_0_0/core/org/apache/lucene/search/TopScoreDocCollectorManager.html
+----
+
+`IndexSearcher` can also parallelise a single query across segments when constructed with an
+`Executor`; see xref:database/lucene/collectors-and-concurrent-search.adoc[Collectors & concurrent
+search].
+
+== Measuring: the nightly benchmarks and luceneutil
+
+Do not trust a tuning change you have not measured against a replayable workload. The Lucene project
+runs the *Lucene nightly benchmarks* -- a fixed Wikipedia corpus and query set exercised against
+`main` every night, with indexing rate, query latency, and reopen latency plotted over years so a
+regression shows up as a step in a graph. The harness that drives them is *luceneutil*, a separate
+repository of indexing and search benchmark scripts you can point at your own corpus.
+
+* https://home.apache.org/~mikemccand/lucenebench/[Lucene nightly benchmarks] -- the published graphs.
+* https://github.com/mikemccand/luceneutil[luceneutil] -- the benchmark harness itself.
+* The bundled xref:database/lucene/testing-tools-and-modules.adoc[`benchmark` module] runs `.alg`
+  task files -- a smaller, in-tree option for repeatable local runs.
+
+For a quick local A/B, wrap the change in a JMH benchmark or a plain timed loop over a captured query
+log, run it against a warm searcher, and compare p50/p95 -- the same discipline the
+xref:database/elasticsearch/performance-tuning.adoc[Elasticsearch] and
+xref:database/solr/indexing-internals-and-performance.adoc[Solr] tuning pages describe one layer up.
+
+=== The flush -> commit -> merge lifecycle
+
+[mermaid]
+....
+flowchart TD
+  A[addDocument / updateDocument] --> B[RAM buffer, per indexing thread]
+  B -->|buffer reaches setRAMBufferSizeMB| C[flush: new immutable segment]
+  B -->|getReader / SearcherManager.maybeRefresh| C
+  C --> D[Segment visible to a near-real-time reader]
+  C -->|commit / close| E[fsync + segments_N written: crash-durable]
+  C --> F{TieredMergePolicy: too many segments in a tier?}
+  F -->|ConcurrentMergeScheduler| G[merge: fewer, larger segments; deletes purged]
+  G --> D
+  G -.forceMerge 1, static index only.-> H[single segment]
+....
+
+A *flush* turns the RAM buffer into a searchable segment; a *commit* fsyncs and writes a new
+`segments_N` so the flushed data survives a crash; a *merge* folds small segments into larger ones in
+the background. Reopen frequency controls how quickly a flush becomes visible, commit frequency
+controls how much work a crash loses, and merge policy controls the steady-state segment count every
+query pays for.
+
+== Related pages
+
+* xref:database/lucene/indexing-and-merge-policies.adoc[Indexing & merge policies] -- `TieredMergePolicy`,
+  `ConcurrentMergeScheduler`, and `forceMerge` in full.
+* xref:database/lucene/near-real-time-search.adoc[Near-real-time search] -- `SearcherManager`,
+  `ControlledRealTimeReopenThread`, and reopen cadence.
+* xref:database/lucene/collectors-and-concurrent-search.adoc[Collectors & concurrent search] --
+  `CollectorManager`, the total-hits threshold, and per-segment concurrency.
+* xref:database/lucene/directories-and-storage.adoc[Directories & storage] -- `MMapDirectory` and the
+  page-cache model.
+* xref:database/lucene/filtering-and-faceting.adoc[Filtering & faceting] -- `FILTER` clauses and the
+  query cache.
+* xref:database/lucene/retrieving-results.adoc[Retrieving results] -- `storedFields()` and paging cost.
+* xref:database/elasticsearch/performance-tuning.adoc[Elasticsearch: performance & the storage/caching
+  model] -- the same indexing/search split one layer up.
+* xref:database/solr/indexing-internals-and-performance.adoc[Solr: indexing internals & performance] --
+  the Solr-server view of the same segment lifecycle.
