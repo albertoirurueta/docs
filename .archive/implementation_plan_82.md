@@ -505,23 +505,23 @@ authors any `spring-batch-*.svg` figure it embeds. Consolidated validation for t
 **Parallelizable: no** — Task 28 renders the PDF that Task 27's page links, and Task 27's back-links reference
 the Group 2 page titles. Depends on Group 2.
 
-- [ ] Task 27. Create `modules/ROOT/pages/backend/spring-batch/cheat-sheet.adoc`
-  - [ ] Task 27.1. Header (`= Spring Batch Cheat Sheet`, `:description:`, `:keywords:`) +
+- [x] Task 27. Create `modules/ROOT/pages/backend/spring-batch/cheat-sheet.adoc`
+  - [x] Task 27.1. Header (`= Spring Batch Cheat Sheet`, `:description:`, `:keywords:`) +
     `include::partial$spring-batch-disclaimer.adoc[]` + a short intro sentence, then grouped `xref:` back-links
     to every Group 2 page (grouped as in the section index — see Task 29.2's grouping), modelled on
     `modules/ROOT/pages/database/elasticsearch/cheat-sheet.adoc`. No literal `{ }` braces in prose; every `xref:`
     target verified present on disk.
-  - [ ] Task 27.2. End with `xref:attachment$spring-batch-cheat-sheet.pdf[Download the Spring Batch Cheat Sheet
+  - [x] Task 27.2. End with `xref:attachment$spring-batch-cheat-sheet.pdf[Download the Spring Batch Cheat Sheet
     (PDF)]`. **No mention of the book** (all bibliography lives in `index.adoc`).
-- [ ] Task 28. Build `modules/ROOT/attachments/spring-batch-cheat-sheet.pdf`
-  - [ ] Task 28.1. In a scratch location (not the repo), hand-build a print-ready single-page HTML/CSS layout —
+- [x] Task 28. Build `modules/ROOT/attachments/spring-batch-cheat-sheet.pdf`
+  - [x] Task 28.1. In a scratch location (not the repo), hand-build a print-ready single-page HTML/CSS layout —
     colour-coded boxes summarizing: the `Job`/`Step`/`JobInstance`/`JobExecution`/`StepExecution` domain model;
     the chunk-loop (read/process/write + commit interval); `new JobBuilder(...)`/`new StepBuilder(...).chunk(...)`
     skeletons; the metadata table names; `spring.batch.*` properties; the `@EnableBatchProcessing`-off-under-Boot
     warning; skip/retry (`.faultTolerant().skip(...).retry(...)`) skeleton; step-flow transition syntax
     (`.on("FAILED").to(...)`); the partitioning topology; the `spring-batch-test` `JobOperatorTestUtils`
     one-liners; and the `spring.batch.job`/`spring.batch.step` Micrometer meter names.
-  - [ ] Task 28.2. Render to PDF with headless Chrome (`--headless --print-to-pdf --no-pdf-header-footer`),
+  - [x] Task 28.2. Render to PDF with headless Chrome (`--headless --print-to-pdf --no-pdf-header-footer`),
     verify it is **exactly one page** with no clipped content (a rendered preview check), then copy the PDF to
     `modules/ROOT/attachments/spring-batch-cheat-sheet.pdf`. Do **not** check in the HTML source.
 
@@ -530,14 +530,14 @@ the Group 2 page titles. Depends on Group 2.
 **Parallelizable: no** — Tasks 29–33 each edit a shared wiring file and Task 34 builds on all prior groups; the
 build must run last.
 
-- [ ] Task 29. Create `modules/ROOT/pages/backend/spring-batch/index.adoc`
-  - [ ] Task 29.1. Header (`= Spring Batch Reference`, `:description:`, `:keywords:`) +
+- [x] Task 29. Create `modules/ROOT/pages/backend/spring-batch/index.adoc`
+  - [x] Task 29.1. Header (`= Spring Batch Reference`, `:description:`, `:keywords:`) +
     `include::partial$spring-batch-disclaimer.adoc[]` + a lead paragraph introducing Spring Batch (a lightweight
     framework for finite, bounded bulk processing, built on the `Job`/`Step`/`ItemReader`-`ItemProcessor`-
     `ItemWriter` model) and pointing new readers to `getting-started.adoc` →
     `jobs-instances-and-parameters.adoc` → `chunk-oriented-processing.adoc` first; a short line pointing to the
     sibling `xref:backend/springboot/spring-batch.adoc[Spring Batch (SpringBoot Reference)]` short overview page.
-  - [ ] Task 29.2. `== What's covered` — one bullet per Group 2 page + the cheat sheet, grouped: *Getting
+  - [x] Task 29.2. `== What's covered` — one bullet per Group 2 page + the cheat sheet, grouped: *Getting
     started* (getting-started); *Architecture & domain language* (architecture-and-processing-strategies,
     jobs-instances-and-parameters, steps-executions-and-context); *Configuring & running jobs*
     (batch-infrastructure-configuration, job-repository-and-metadata-schema, configuring-a-job, running-a-job,
@@ -547,7 +547,7 @@ build must run last.
     item-writers-databases-and-adapters, repeat-and-retry-internals); *Scaling & tuning*
     (scaling-and-parallel-processing, profiling-and-tuning); *Integration, observability & cloud-native batch*
     (spring-batch-integration, observability, cloud-native-batch); *Testing* (testing); *Cheat sheet*.
-  - [ ] Task 29.3. `== Bibliography` — **the only place any source is named.** List:
+  - [x] Task 29.3. `== Bibliography` — **the only place any source is named.** List:
     - https://docs.spring.io/spring-batch/reference/ — the Spring Batch Reference Documentation (6.0.x), the
       source every page is written and verified against — with the specific sub-area links used across the
       pages (introduction, architecture, domain, job/step configuration, readers & writers, item processing,
@@ -571,8 +571,8 @@ build must run last.
     - A closing sentence: the book is a consulted bibliography reference only and is **not** the primary
       reference for the section; the official documentation at https://docs.spring.io/spring-batch/reference/
       wins on any discrepancy.
-- [ ] Task 30. Wire `modules/ROOT/nav.adoc`
-  - [ ] Task 30.1. Insert a `*** xref:backend/spring-batch/index.adoc[Spring Batch Reference]` block with one
+- [x] Task 30. Wire `modules/ROOT/nav.adoc`
+  - [x] Task 30.1. Insert a `*** xref:backend/spring-batch/index.adoc[Spring Batch Reference]` block with one
     `****` line per page **in the section-index order**, **after** the SpringBoot Reference block's
     `**** xref:backend/springboot/cheat-sheet.adoc[Cheat Sheet (PDF)]` line (`nav.adoc:535`) and **before**
     `** xref:apps/index.adoc[Apps]` (`nav.adoc:536`). Page order: getting-started,
@@ -591,42 +591,42 @@ build must run last.
     `[ItemReaders: Databases]`, `[ItemProcessors]`, `[ItemWriters: Files & XML/JSON]`,
     `[ItemWriters: Databases & Adapters]`, `[Repeat & Retry Internals]`, `[Scaling & Parallel Processing]`,
     `[Profiling & Tuning]`, `[Spring Batch Integration]`, `[Observability]`, `[Cloud-Native Batch]`, `[Testing]`).
-- [ ] Task 31. Update `modules/ROOT/pages/backend/index.adoc`
-  - [ ] Task 31.1. Add a `== Sections` bullet after the SpringBoot Reference one:
+- [x] Task 31. Update `modules/ROOT/pages/backend/index.adoc`
+  - [x] Task 31.1. Add a `== Sections` bullet after the SpringBoot Reference one:
     `xref:backend/spring-batch/index.adoc[Spring Batch Reference] -- finite, bounded batch processing: the Job/
     Step/JobRepository domain model, configuring and running jobs, chunk-oriented and tasklet steps, fault
     tolerance (skip & retry), ItemReader/ItemProcessor/ItemWriter, scaling and partitioning, Spring Batch
     Integration, observability, cloud-native batch, and testing, plus a downloadable cheat sheet.`
-  - [ ] Task 31.2. Extend the page `:description:` and `:keywords:` to mention Spring Batch, Job, Step,
+  - [x] Task 31.2. Extend the page `:description:` and `:keywords:` to mention Spring Batch, Job, Step,
     ItemReader, ItemProcessor, ItemWriter, chunk-oriented processing.
-- [ ] Task 32. Update `modules/ROOT/pages/backend/springboot/spring-batch.adoc`
-  - [ ] Task 32.1. In `== What batch processing is`, replace *"A dedicated in-depth guide to Spring Batch will
+- [x] Task 32. Update `modules/ROOT/pages/backend/springboot/spring-batch.adoc`
+  - [x] Task 32.1. In `== What batch processing is`, replace *"A dedicated in-depth guide to Spring Batch will
     follow; here the goal is only to place the moving parts and show one runnable job."* with a pointer to
     `xref:backend/spring-batch/index.adoc[Spring Batch Reference]` as that in-depth guide.
-  - [ ] Task 32.2. Add one additional `xref:backend/spring-batch/index.adoc[...]` cross-link near the top of the
+  - [x] Task 32.2. Add one additional `xref:backend/spring-batch/index.adoc[...]` cross-link near the top of the
     page (e.g. in the opening paragraph). **Do not restate any Spring Batch Reference content on this page** —
     it stays the short Spring-Boot-integration-focused version.
-  - [ ] Task 32.3. In `== Scaling (in brief)`, update the closing sentence's "the future deep-dive guide" wording
+  - [x] Task 32.3. In `== Scaling (in brief)`, update the closing sentence's "the future deep-dive guide" wording
     to reference `xref:backend/spring-batch/scaling-and-parallel-processing.adoc[Scaling & Parallel Processing]`
     directly instead of a forward-looking promise.
-- [ ] Task 33. Update `modules/ROOT/pages/backend/springboot/index.adoc`
-  - [ ] Task 33.1. In `=== ORM, search & batch`, update the one-line `spring-batch.adoc` blurb to also point at
+- [x] Task 33. Update `modules/ROOT/pages/backend/springboot/index.adoc`
+  - [x] Task 33.1. In `=== ORM, search & batch`, update the one-line `spring-batch.adoc` blurb to also point at
     `xref:backend/spring-batch/index.adoc[Spring Batch Reference]` for the in-depth guide. Leave the
     `== Bibliography` entry for the Minella book as-is (unchanged by this plan).
-- [ ] Task 34. Build & verify
-  - [ ] Task 34.1. Run `npx antora antora-playbook.yml` (via an `iru-gate-runner`/generic sub-agent to keep the
+- [x] Task 34. Build & verify
+  - [x] Task 34.1. Run `npx antora antora-playbook.yml` (via an `iru-gate-runner`/generic sub-agent to keep the
     main context clean). Fix any `xref`/AsciiDoc/missing-image/mermaid errors and any "skipping reference to
     missing attribute" warnings (unescaped `{ }` in prose, especially the SpEL expressions in
     `step-flow-and-listeners.adoc`) introduced by the new pages until the build completes clean.
-  - [ ] Task 34.2. Confirm every new page is reachable from both
+  - [x] Task 34.2. Confirm every new page is reachable from both
     `modules/ROOT/pages/backend/spring-batch/index.adoc` and `modules/ROOT/nav.adoc`, that
     `build/site/backend/spring-batch/…` HTML renders (spot-check a page with a `[mermaid]` diagram and one with
     an SVG), and that `xref:attachment$spring-batch-cheat-sheet.pdf` resolves to the checked-in PDF.
-  - [ ] Task 34.3. Re-open `modules/ROOT/attachments/spring-batch-cheat-sheet.pdf` and confirm it is a single
+  - [x] Task 34.3. Re-open `modules/ROOT/attachments/spring-batch-cheat-sheet.pdf` and confirm it is a single
     printable page with no clipped content.
-  - [ ] Task 34.4. Grep the new pages and `spring-batch-disclaimer.adoc` for any admonition (`[NOTE]`, `[TIP]`,
+  - [x] Task 34.4. Grep the new pages and `spring-batch-disclaimer.adoc` for any admonition (`[NOTE]`, `[TIP]`,
     `[IMPORTANT]`, `[WARNING]`, `[CAUTION]`) and confirm none names Michael Minella, "the book", "consulted", or
     "the sources" — all source attribution must be in `index.adoc`'s `== Bibliography` only (choice 4).
-  - [ ] Task 34.5. Confirm `backend/springboot/spring-batch.adoc` and `backend/springboot/index.adoc` were edited
+  - [x] Task 34.5. Confirm `backend/springboot/spring-batch.adoc` and `backend/springboot/index.adoc` were edited
     as scoped (Tasks 32–33) with no unrelated content changes, and that no page in this section restates content
     already covered by `backend/springboot/spring-batch.adoc` in full (only cross-links back to it).
