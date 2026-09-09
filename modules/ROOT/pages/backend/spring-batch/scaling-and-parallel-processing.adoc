@@ -1,0 +1,316 @@
+= Scaling & parallel processing
+:description: Making a Spring Batch job faster -- measuring first, then choosing between a multi-threaded step, parallel steps via split flows, the 6.0 producer/consumer concurrency model and local chunking, AsyncItemProcessor and AsyncItemWriter, partitioning with a Partitioner, StepExecutionSplitter and PartitionHandler, and remote chunking and remote partitioning over Spring Integration -- with the restartability, ordering and durability trade-offs of each.
+:keywords: scaling, multi-threaded step, taskExecutor, throttle, SynchronizedItemStreamReader, thread safety, split flow, parallel steps, producer consumer, local chunking, ChunkTaskExecutorItemWriter, AsyncItemProcessor, AsyncItemWriter, partitioning, Partitioner, StepExecutionSplitter, PartitionHandler, TaskExecutorPartitionHandler, gridSize, remote chunking, remote partitioning, MessageChannelPartitionHandler, remote step, DeployerPartitionHandler
+
+include::partial$spring-batch-disclaimer.adoc[]
+
+Spring Batch offers several ways to use more than one thread or more than one machine. They differ in what
+they parallelise, and choosing the wrong one adds complexity without adding speed.
+
+== Measure first
+
+Before any of this: *find out what is slow*. Most batch jobs that "need to be parallelised" are actually
+waiting on one query without an index, an `ItemProcessor` that issues a lookup per item, or a chunk size of 1.
+Parallelising a job with those problems multiplies the load without improving the elapsed time -- and often
+makes it worse by adding contention.
+
+Establish a baseline from the step's own counters and timings
+(xref:backend/spring-batch/profiling-and-tuning.adoc[Profiling & tuning]), fix the obvious costs, and only
+then reach for the options below. Every one of them makes the job harder to reason about and to restart.
+
+=== Choosing an option
+
+[cols="1,1,2",options="header"]
+|===
+| Option | Parallelises | Choose it when
+
+| Multi-threaded step | Chunks of one step, in one JVM | One step dominates and the reader can be made thread-safe or is naturally stateless.
+| Parallel steps (split flow) | Whole steps, in one JVM | Several *independent* steps can run at once.
+| `AsyncItemProcessor`/`AsyncItemWriter` | The processing stage, in one JVM | The processor is slow and I/O-bound (a remote call) while reading and writing are cheap.
+| Local partitioning | One step, over disjoint slices, in one JVM | The input splits cleanly by key and each slice can be read independently.
+| Remote partitioning | One step, over disjoint slices, across JVMs | As above, but one machine is not enough; workers can reach the data source.
+| Remote chunking | Processing and writing, across JVMs | Processing/writing dominates, reading is cheap, and durable middleware is available.
+|===
+
+== Single-JVM options
+
+=== Multi-threaded step
+
+Give the step a `TaskExecutor` and each chunk is processed on its own thread:
+
+[source,java]
+----
+@Bean
+public Step multiThreadedStep(JobRepository jobRepository, PlatformTransactionManager tx,
+                              ItemReader<Trade> reader, ItemWriter<Trade> writer,
+                              TaskExecutor batchTaskExecutor) {
+    return new StepBuilder("multiThreadedStep", jobRepository)
+            .<Trade, Trade>chunk(500, tx)
+            .reader(reader)
+            .writer(writer)
+            .taskExecutor(batchTaskExecutor)
+            .build();
+}
+
+@Bean
+public TaskExecutor batchTaskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(8);
+    executor.setMaxPoolSize(8);
+    executor.setQueueCapacity(16);
+    executor.setThreadNamePrefix("batch-");
+    return executor;
+}
+----
+
+The catch is *state*. `read()` is called concurrently, and most stateful readers -- cursor readers above all --
+are not thread-safe. Three ways out:
+
+* use a naturally restartable, stateless reader such as `JdbcPagingItemReader` with a unique sort key;
+* wrap the reader: `SynchronizedItemStreamReader` serialises `read()` while leaving processing and writing
+  parallel;
+* partition instead, so each thread has its own reader over its own slice (usually the better answer).
+
+[source,java]
+----
+@Bean
+public SynchronizedItemStreamReader<Trade> synchronizedReader(JdbcCursorItemReader<Trade> delegate) {
+    SynchronizedItemStreamReader<Trade> reader = new SynchronizedItemStreamReader<>();
+    reader.setDelegate(delegate);
+    return reader;
+}
+----
+
+The processor and writer must be thread-safe too -- no mutable instance fields -- and note that the
+step-scoped `ExecutionContext` saved by a multi-threaded step cannot describe a single "position", so such a
+step is *not reliably restartable*. Set `saveState(false)` on the reader and plan to rerun the whole step.
+
+=== Parallel steps
+
+A split flow runs independent steps concurrently -- see
+xref:backend/spring-batch/step-flow-and-listeners.adoc[Step flow & listeners]:
+
+[source,java]
+----
+@Bean
+public Job parallelLoadJob(JobRepository jobRepository, Flow customerFlow, Flow productFlow,
+                           Step aggregateStep) {
+    return new JobBuilder("parallelLoadJob", jobRepository)
+            .start(customerFlow)
+            .split(new SimpleAsyncTaskExecutor("split-"))
+            .add(productFlow)
+            .next(aggregateStep)
+            .end()
+            .build();
+}
+----
+
+This is the cheapest and safest option when it applies: each step keeps its own single-threaded semantics and
+remains individually restartable.
+
+=== The 6.0 concurrency model and local chunking
+
+Spring Batch 6.0 reworks the chunk step into an explicit *producer/consumer* model: reading produces chunks
+into a queue, and consumers process and write them. That separation is what lets the read side stay
+single-threaded (and therefore restartable) while the expensive side scales out.
+
+`ChunkTaskExecutorItemWriter` is the local-chunking piece: it hands each chunk to a `TaskExecutor`, so several
+chunks are processed and written concurrently while one thread keeps reading:
+
+[source,java]
+----
+@Bean
+public Step localChunkingStep(JobRepository jobRepository, PlatformTransactionManager tx,
+                              ItemReader<Trade> reader, ItemWriter<Trade> delegateWriter,
+                              TaskExecutor batchTaskExecutor) {
+
+    ChunkTaskExecutorItemWriter<Trade> concurrentWriter =
+            new ChunkTaskExecutorItemWriter<>(delegateWriter, batchTaskExecutor);
+
+    return new ChunkOrientedStepBuilder<Trade, Trade>("localChunkingStep", jobRepository, 500)
+            .reader(reader)
+            .writer(concurrentWriter)
+            .transactionManager(tx)
+            .build();
+}
+----
+
+Compared with a multi-threaded step this keeps a single reader thread, so a restartable reader stays
+restartable.
+
+== Multi-process options
+
+=== `AsyncItemProcessor` / `AsyncItemWriter`
+
+These come from `spring-batch-integration` and parallelise only the *processing* stage. The async processor
+returns a `Future` per item; the async writer unwraps them before delegating:
+
+[source,java]
+----
+@Bean
+public AsyncItemProcessor<Trade, Trade> asyncProcessor(ItemProcessor<Trade, Trade> delegate,
+                                                       TaskExecutor batchTaskExecutor) {
+    AsyncItemProcessor<Trade, Trade> processor = new AsyncItemProcessor<>();
+    processor.setDelegate(delegate);
+    processor.setTaskExecutor(batchTaskExecutor);
+    return processor;
+}
+
+@Bean
+public AsyncItemWriter<Trade> asyncWriter(ItemWriter<Trade> delegate) {
+    AsyncItemWriter<Trade> writer = new AsyncItemWriter<>();
+    writer.setDelegate(delegate);
+    return writer;
+}
+
+@Bean
+public Step asyncStep(JobRepository jobRepository, PlatformTransactionManager tx,
+                      ItemReader<Trade> reader,
+                      AsyncItemProcessor<Trade, Trade> asyncProcessor,
+                      AsyncItemWriter<Trade> asyncWriter) {
+    return new StepBuilder("asyncStep", jobRepository)
+            .<Trade, Future<Trade>>chunk(500, tx)
+            .reader(reader)
+            .processor(asyncProcessor)
+            .writer(asyncWriter)
+            .build();
+}
+----
+
+Note the step's output type: `Future<Trade>`. This is the right tool when the processor waits on something
+remote; it does nothing for a CPU-bound processor.
+
+=== Partitioning
+
+Partitioning splits one step into N *step executions*, each over a disjoint slice, each with its own reader,
+processor, writer, transaction, counters and restartability.
+
+image::spring-batch-partitioning-topology.svg[Manager step with a Partitioner and PartitionHandler fanning out to N worker step executions over disjoint slices]
+
+The pieces:
+
+* *`Partitioner`* -- produces one named `ExecutionContext` per partition, holding whatever the worker needs
+  (a key range, a file name). The six classic break-up approaches are compared in
+  xref:backend/spring-batch/architecture-and-processing-strategies.adoc[Architecture & processing strategies].
+* *`StepExecutionSplitter`* -- turns those contexts into persisted `StepExecution`s, so each partition is
+  visible and restartable in the `JobRepository`.
+* *`PartitionHandler`* -- runs them. `TaskExecutorPartitionHandler` runs them locally on a thread pool;
+  `MessageChannelPartitionHandler` sends them to remote workers.
+* *`gridSize`* -- how many partitions to create. A hint to the `Partitioner`, not a thread count; the pool size
+  governs how many run at once.
+
+[source,java]
+----
+@Bean
+public Partitioner tradeIdRangePartitioner(JdbcTemplate jdbcTemplate) {
+    return gridSize -> {
+        long min = jdbcTemplate.queryForObject("SELECT MIN(id) FROM trade", Long.class);
+        long max = jdbcTemplate.queryForObject("SELECT MAX(id) FROM trade", Long.class);
+        long targetSize = (max - min) / gridSize + 1;
+
+        Map<String, ExecutionContext> partitions = new HashMap<>();
+        long start = min;
+        for (int i = 0; i < gridSize; i++) {
+            ExecutionContext context = new ExecutionContext();
+            context.putLong("minId", start);
+            context.putLong("maxId", Math.min(start + targetSize - 1, max));
+            partitions.put("partition" + i, context);
+            start += targetSize;
+        }
+        return partitions;
+    };
+}
+
+@Bean
+public Step partitionedLoadStep(JobRepository jobRepository,
+                                Partitioner tradeIdRangePartitioner,
+                                Step workerStep,
+                                TaskExecutor batchTaskExecutor) {
+
+    TaskExecutorPartitionHandler handler = new TaskExecutorPartitionHandler();
+    handler.setStep(workerStep);
+    handler.setTaskExecutor(batchTaskExecutor);
+    handler.setGridSize(8);
+
+    return new StepBuilder("partitionedLoadStep", jobRepository)
+            .partitioner("workerStep", tradeIdRangePartitioner)
+            .partitionHandler(handler)
+            .build();
+}
+----
+
+The worker step binds its slice by late binding, which is why its reader must be `@StepScope`:
+
+[source,java]
+----
+@Bean
+@StepScope
+public JdbcPagingItemReader<Trade> partitionedReader(
+        DataSource dataSource,
+        @Value("#{stepExecutionContext['minId']}") Long minId,
+        @Value("#{stepExecutionContext['maxId']}") Long maxId) {
+    return new JdbcPagingItemReaderBuilder<Trade>()
+            .name("partitionedReader")
+            .dataSource(dataSource)
+            .selectClause("SELECT id, isin, quantity, price")
+            .fromClause("FROM trade")
+            .whereClause("WHERE id BETWEEN :minId AND :maxId")
+            .parameterValues(Map.of("minId", minId, "maxId", maxId))
+            .sortKeys(Map.of("id", Order.ASCENDING))
+            .pageSize(1000)
+            .rowMapper(new TradeRowMapper())
+            .build();
+}
+----
+
+Partitioning is usually the best of these options: each partition is an ordinary single-threaded step, so
+restart, skip and retry all behave normally, and only the failed partitions rerun.
+
+=== Remote chunking
+
+image::spring-batch-remote-chunking-topology.svg[Manager JVM reading and dispatching chunks over a durable queue to worker JVMs that process and write them]
+
+In remote chunking the *manager reads* every item and sends chunks over a `MessageChannel`; remote workers
+process and write them and reply with the outcome. Reading is not parallelised, so this only pays when
+processing or writing dominates.
+
+The wiring, with `ChunkMessageChannelItemWriter` on the manager and `ChunkProcessorChunkHandler` on the
+workers, is shown in
+xref:backend/spring-batch/spring-batch-integration.adoc[Spring Batch Integration]. Two requirements are
+non-negotiable: the middleware must be *durable and transactional* (an in-memory channel loses chunks), and
+the items must be serialisable.
+
+=== Remote partitioning and the remote step
+
+Remote partitioning keeps the partitioning model but runs the workers in other JVMs:
+`MessageChannelPartitionHandler` sends each partition's `StepExecution` request over Spring Integration, and
+workers execute the step against the shared `JobRepository`. Because each worker reads its own slice, the
+manager is not a bottleneck -- which is why remote partitioning usually scales further than remote chunking.
+
+Spring Batch 6.0 adds a *remote step* abstraction that formalises "execute this step somewhere else", so the
+manager side no longer needs the hand-rolled aggregation that earlier versions required.
+
+The `DeployerPartitionHandler` (from Spring Cloud Task) launches each partition as a *new deployed
+application* -- a Kubernetes pod, a Cloud Foundry task -- instead of a long-running worker. It is *linked, not
+documented in depth* here; see xref:backend/spring-batch/cloud-native-batch.adoc[Cloud-native batch].
+
+== Trade-offs
+
+[cols="1,1,1,1",options="header"]
+|===
+| Option | Restartability | Ordering | Middleware
+
+| Multi-threaded step | Poor -- position cannot be saved reliably; rerun the step | Not preserved | None
+| Parallel steps (split) | Good -- each step restarts independently | Per step | None
+| `AsyncItemProcessor`/`Writer` | As the underlying step | Preserved (the writer unwraps in order) | None
+| Local partitioning | Excellent -- only failed partitions rerun | Per partition | None
+| Remote partitioning | Excellent -- per-partition `StepExecution`s persist | Per partition | Required, durable
+| Remote chunking | Moderate -- depends on reply handling | Not preserved across chunks | Required, durable and transactional
+|===
+
+== Further reading
+
+For the full detail behind this page:
+
+* https://docs.spring.io/spring-batch/reference/scalability.html[Scaling and parallel processing]
+* https://docs.spring.io/spring-batch/reference/spring-batch-integration.html[Spring Batch Integration]

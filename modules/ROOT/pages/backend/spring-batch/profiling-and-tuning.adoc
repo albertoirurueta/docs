@@ -1,0 +1,159 @@
+= Profiling & tuning
+:description: Making a Spring Batch job fast before making it parallel -- profiling CPU and memory with VisualVM or Java Flight Recorder, choosing a chunk size, the cursor-versus-paging cost, turning off saveState for non-restartable readers, keeping the ExecutionContext small, the cost of metadata writes per chunk and indexing the metadata tables, and the common anti-patterns.
+:keywords: profiling, tuning, VisualVM, Java Flight Recorder, JFR, async-profiler, chunk size, commit interval, cursor vs paging, fetchSize, saveState, ExecutionContext size, metadata writes, indexing metadata tables, batch anti-patterns, per-item transaction, chatty reader, N+1
+
+include::partial$spring-batch-disclaimer.adoc[]
+
+Tuning a batch job is mostly about finding the one thing that dominates the elapsed time. Doing that first is
+what stops a team from parallelising a job that simply needed an index.
+
+== Profiling a batch job
+
+Start from what the framework already records. Every `StepExecution` carries `readCount`, `writeCount`,
+`commitCount`, `rollbackCount` and the timings, so the first question -- which step is slow, and is it slow
+per item or slow per chunk -- is answerable from the metadata alone
+(xref:backend/spring-batch/job-repository-and-metadata-schema.adoc[The job repository & metadata schema]).
+
+Then attach a profiler to a representative run:
+
+* *VisualVM* -- free, adequate for a first look. The sampler quickly shows whether time goes to JDBC, to
+  serialisation, or to your own code, and the memory sampler shows what is accumulating.
+* *Java Flight Recorder* -- low overhead, safe on production-like runs, and the right tool for a long job.
+  Record the whole run and inspect it afterwards:
++
+[source,bash]
+----
+java -XX:StartFlightRecording=duration=30m,filename=batch.jfr,settings=profile \
+     -jar batch-app.jar --spring.batch.job.name=endOfDayJob run.date=2026-01-31
+----
++
+Spring Batch 6.0 emits its *own* JFR events for jobs, steps and chunks, so the recording shows framework
+phases alongside JVM activity -- see xref:backend/spring-batch/observability.adoc[Observability].
+* *Database-side timing* -- an execution plan for the reader's query and the writer's statement usually
+  explains more than any JVM profiler. A missing index on the reader's `WHERE`/`ORDER BY` columns is the single
+  most common cause of a slow step.
+
+Watch memory as well as CPU: a batch job that survives 10 000 rows and dies at 10 million is almost always
+accumulating something per item -- a persistence context, a log buffer, a growing `ExecutionContext`, or an
+unbounded collection in a processor.
+
+== Choosing a chunk size
+
+The chunk size is the commit interval and the transaction boundary, so it trades three things off against each
+other:
+
+[cols="1,3",options="header"]
+|===
+| Chunk size | Consequence
+
+| *Too small* (1--10) | One commit and one metadata write per handful of items. Throughput collapses -- the framework's bookkeeping dominates the actual work.
+| *Reasonable* (100--1000) | Amortises commits and enables JDBC batching, while keeping memory bounded and restart granularity useful.
+| *Too large* (10 000+) | Long transactions, more locks held longer, a bigger rollback when anything fails, higher memory for the buffered chunk, and a coarse restart granularity.
+|===
+
+There is no universal number. Start at a few hundred, measure, and change one variable at a time. Two
+constraints usually settle it: how long a transaction may hold locks (which the online system dictates), and
+how much work you are prepared to redo on a rollback.
+
+Remember that a fault-tolerant step *replays and scans* a failed chunk item by item
+(xref:backend/spring-batch/fault-tolerance-skip-and-retry.adoc[Fault tolerance: skip & retry]), so a very
+large chunk makes each skip disproportionately expensive.
+
+== Reader and writer costs
+
+* *Cursor vs. paging.* A cursor reader is cheaper per row -- one query, one plan, streamed rows -- but holds a
+  connection and a transaction for the whole step and is single-threaded. A paging reader re-queries per page,
+  which costs more in total but keeps transactions short and works under partitioning. The comparison table is
+  in xref:backend/spring-batch/item-readers-databases.adoc[ItemReaders: databases].
+* *`fetchSize`.* For cursor readers, set it deliberately. Drivers that default to fetching a few rows per
+  round-trip make a large read needlessly chatty; drivers that default to fetching everything exhaust the heap.
+* *Deep offsets.* Paging with a plain offset degrades as the offset grows. Page on an indexed, unique sort key
+  so each page is a range scan rather than "skip a million rows".
+* *Batched writes.* `JdbcBatchItemWriter` issues one JDBC batch per chunk; a `RepositoryItemWriter` or
+  `ItemWriterAdapter` issues one call per item. When write throughput matters, prefer the batch writer
+  (xref:backend/spring-batch/item-writers-databases-and-adapters.adoc[ItemWriters: databases & alternative
+  destinations]).
+* *`saveState`.* Every stateful reader and writer persists its position into the step `ExecutionContext` at
+  each commit. When a step is deliberately *not* restartable -- a multi-threaded step, or one that is always
+  rerun from scratch -- turn that off:
++
+[source,java]
+----
+@Bean
+public JdbcPagingItemReader<Trade> nonRestartableReader(DataSource dataSource,
+                                                        PagingQueryProvider queryProvider) {
+    return new JdbcPagingItemReaderBuilder<Trade>()
+            .name("nonRestartableReader")
+            .dataSource(dataSource)
+            .queryProvider(queryProvider)
+            .pageSize(1000)
+            .rowMapper(new TradeRowMapper())
+            .saveState(false)      // no ExecutionContext writes; the step cannot be resumed
+            .build();
+}
+----
+
+== Keeping the `ExecutionContext` small
+
+The step-scoped `ExecutionContext` is serialised and written to
+`BATCH_STEP_EXECUTION_CONTEXT` **at every commit point**. Anything put there is therefore written once per
+chunk, for the life of the step.
+
+* store positions, counts and identifiers -- not collections, not payloads, not caches;
+* promote only the few keys another step actually needs
+  (xref:backend/spring-batch/steps-executions-and-context.adoc[Steps, executions & the `ExecutionContext`]);
+* remember every value must be `Serializable`, and that a large graph is slow to serialise as well as large to
+  store.
+
+A context that has grown to megabytes turns every commit into a large `UPDATE` and is a common, and easily
+missed, cause of a job that gets slower as it runs.
+
+== Metadata write cost, and indexing the metadata tables
+
+Each commit updates `BATCH_STEP_EXECUTION` and rewrites `BATCH_STEP_EXECUTION_CONTEXT`. That is a fixed
+overhead per chunk, which is another reason a chunk size of 1 is disastrous, and a reason to keep the
+repository on storage that is not contended by the business writes.
+
+Over time the tables themselves become a problem:
+
+* *index them* for the queries you actually run -- `BATCH_JOB_INSTANCE(JOB_NAME, JOB_KEY)` is already unique,
+  but `BATCH_JOB_EXECUTION(JOB_INSTANCE_ID)`, `BATCH_JOB_EXECUTION(STATUS, START_TIME)` and
+  `BATCH_STEP_EXECUTION(JOB_EXECUTION_ID)` are worth adding when history grows;
+* *prune them* on a schedule. `JobRepositoryTestUtils` removes executions in tests; in production a retention
+  job that deletes executions older than N months (children first) keeps the tables bounded. Deleting metadata
+  destroys restartability for those instances, so retain at least a full business cycle.
+
+[source,sql]
+----
+CREATE INDEX ix_batch_job_execution_instance ON BATCH_JOB_EXECUTION (JOB_INSTANCE_ID);
+CREATE INDEX ix_batch_step_execution_job     ON BATCH_STEP_EXECUTION (JOB_EXECUTION_ID);
+CREATE INDEX ix_batch_job_execution_status   ON BATCH_JOB_EXECUTION (STATUS, START_TIME);
+----
+
+== Common anti-patterns
+
+[cols="1,3",options="header"]
+|===
+| Anti-pattern | Why it hurts
+
+| *Huge chunks* | Long transactions, held locks, large rollbacks, memory pressure, coarse restart. "Bigger is faster" stops being true quickly.
+| *Per-item transactions* (chunk size 1, or a writer that commits itself) | The commit and the metadata write dominate; throughput can be an order of magnitude worse.
+| *Chatty readers* | A reader (or processor) that issues one query per item -- the batch form of the N+1 problem. Fetch what is needed in the reader's query, or use the driving-query pattern deliberately.
+| *Side effects in the processor* | Besides being wrong under replay (xref:backend/spring-batch/item-processors.adoc[ItemProcessors]), a remote call per item serialises the whole step on latency.
+| *A growing `ExecutionContext`* | Every commit rewrites it; the job slows as it progresses.
+| *Parallelising before measuring* | Multiplies load, adds contention, and hides the real bottleneck.
+| *Sorting in Java what the database can sort* | An `ORDER BY` on an indexed column beats an in-memory sort of a million objects.
+| *Logging per item at INFO* | The log becomes the bottleneck, and nobody reads a million lines anyway.
+|===
+
+Once the job is genuinely I/O- or CPU-bound at its irreducible minimum, the scaling options in
+xref:backend/spring-batch/scaling-and-parallel-processing.adoc[Scaling & parallel processing] are the next
+step -- in that order.
+
+== Further reading
+
+For the full detail behind this page:
+
+* https://docs.spring.io/spring-batch/reference/spring-batch-architecture.html[Batch processing and Spring
+  Batch's architecture]
+* https://docs.spring.io/spring-batch/reference/spring-batch-observability.html[Spring Batch observability]

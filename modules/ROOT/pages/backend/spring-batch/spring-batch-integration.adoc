@@ -1,0 +1,271 @@
+= Spring Batch Integration
+:description: The bridge between Spring Batch and Spring Integration -- launching jobs from messages with JobLaunchRequest and JobLaunchingGateway, informational feedback on a reply channel, AsyncItemProcessor and AsyncItemWriter, the BlockingQueueItemReader and BlockingQueueItemWriter for SEDA-style stage decoupling, and how remote chunking and remote partitioning are wired over MessageChannels.
+:keywords: spring-batch-integration, JobLaunchRequest, JobLaunchingMessageHandler, JobLaunchingGateway, MessageChannel, ServiceActivator, reply channel, AsyncItemProcessor, AsyncItemWriter, BlockingQueueItemReader, BlockingQueueItemWriter, SEDA, remote chunking, ChunkMessageChannelItemWriter, ChunkProcessorChunkHandler, remote partitioning, MessageChannelPartitionHandler, StepExecutionRequestHandler, outbound channel adapter, inbound channel adapter
+
+include::partial$spring-batch-disclaimer.adoc[]
+
+`spring-batch-integration` connects batch jobs to messaging. It covers three distinct needs: starting a job
+because a message arrived, overlapping slow processing with reading, and distributing work across JVMs.
+
+== Launching a job from a message
+
+A file lands on a share, an event arrives on a queue -- and a job should start. `JobLaunchRequest` packages a
+`Job` and its `JobParameters` as a message payload; `JobLaunchingMessageHandler` (or the
+`JobLaunchingGateway` wrapper) executes it.
+
+The usual shape is a transformer that turns the inbound payload into a request, then the gateway:
+
+[source,java]
+----
+@Component
+public class FileToJobLaunchRequestTransformer {
+
+    private final Job importJob;
+
+    public FileToJobLaunchRequestTransformer(Job importJob) {
+        this.importJob = importJob;
+    }
+
+    @Transformer(inputChannel = "incomingFiles", outputChannel = "jobRequests")
+    public JobLaunchRequest toRequest(Message<File> message) {
+        File file = message.getPayload();
+        JobParameters parameters = new JobParametersBuilder()
+                .addString("input.file", file.getAbsolutePath())
+                .addLocalDateTime("arrival.time", LocalDateTime.now())
+                .toJobParameters();
+        return new JobLaunchRequest(importJob, parameters);
+    }
+}
+----
+
+[source,java]
+----
+@Configuration
+public class JobLaunchingFlowConfiguration {
+
+    @Bean
+    @ServiceActivator(inputChannel = "jobRequests", outputChannel = "jobExecutions")
+    public JobLaunchingGateway jobLaunchingGateway(JobOperator jobOperator) {
+        return new JobLaunchingGateway(jobOperator);
+    }
+
+    @Bean
+    public IntegrationFlow incomingFileFlow() {
+        return IntegrationFlow
+                .from(Files.inboundAdapter(new File("/data/in"))
+                                .patternFilter("trades-*.csv"),
+                        poller -> poller.poller(Pollers.fixedDelay(Duration.ofSeconds(10))))
+                .channel("incomingFiles")
+                .get();
+    }
+}
+----
+
+The gateway's *reply* is the resulting `JobExecution`, so a downstream endpoint can report on the outcome --
+informational feedback without polling the repository:
+
+[source,java]
+----
+@ServiceActivator(inputChannel = "jobExecutions")
+public void report(JobExecution execution) {
+    log.info("{} #{} finished as {}",
+            execution.getJobInstance().getJobName(),
+            execution.getId(),
+            execution.getStatus());
+    if (execution.getStatus() == BatchStatus.FAILED) {
+        alertService.raise(execution);
+    }
+}
+----
+
+Whether the gateway blocks depends on the `JobOperator`'s `TaskExecutor` -- synchronous means the reply
+carries a finished execution, asynchronous means it carries one that has only just started. See
+xref:backend/spring-batch/running-a-job.adoc[Running a job].
+
+== Asynchronous processing inside a step
+
+`AsyncItemProcessor` submits each `process()` call to a `TaskExecutor` and returns a `Future`;
+`AsyncItemWriter` collects the futures and passes the resolved items to its delegate. Together they overlap a
+slow, I/O-bound processor with reading and writing:
+
+[source,java]
+----
+@Bean
+public AsyncItemProcessor<Trade, EnrichedTrade> asyncEnrichingProcessor(
+        ItemProcessor<Trade, EnrichedTrade> delegate, TaskExecutor taskExecutor) {
+    AsyncItemProcessor<Trade, EnrichedTrade> processor = new AsyncItemProcessor<>();
+    processor.setDelegate(delegate);           // calls a slow pricing service
+    processor.setTaskExecutor(taskExecutor);
+    return processor;
+}
+
+@Bean
+public AsyncItemWriter<EnrichedTrade> asyncEnrichedWriter(ItemWriter<EnrichedTrade> delegate) {
+    AsyncItemWriter<EnrichedTrade> writer = new AsyncItemWriter<>();
+    writer.setDelegate(delegate);
+    return writer;
+}
+----
+
+The step's output type becomes `Future<EnrichedTrade>`, as shown in
+xref:backend/spring-batch/scaling-and-parallel-processing.adoc[Scaling & parallel processing]. The delegate
+processor must be thread-safe, and it still must be idempotent
+(xref:backend/spring-batch/item-processors.adoc[ItemProcessors]).
+
+== SEDA-style stage decoupling
+
+`BlockingQueueItemWriter` and `BlockingQueueItemReader` let one step's output become another step's input
+through an in-memory queue, so producer and consumer run concurrently at their own paces -- the staged
+event-driven architecture idea applied to a job:
+
+[source,java]
+----
+@Bean
+public BlockingQueue<Trade> stagingQueue() {
+    return new LinkedBlockingQueue<>(10_000);   // bounded: back-pressure on the producer
+}
+
+@Bean
+public BlockingQueueItemWriter<Trade> queueWriter(BlockingQueue<Trade> stagingQueue) {
+    return new BlockingQueueItemWriter<>(stagingQueue);
+}
+
+@Bean
+public BlockingQueueItemReader<Trade> queueReader(BlockingQueue<Trade> stagingQueue) {
+    BlockingQueueItemReader<Trade> reader = new BlockingQueueItemReader<>(stagingQueue);
+    reader.setTimeout(5_000L);   // how long to wait before deciding the queue is exhausted
+    return reader;
+}
+----
+
+Bound the queue: an unbounded one turns a fast producer into an out-of-memory error. And note the trade-off --
+items in the queue are *in memory only*, so a crash loses them; the two stages are not restartable as one.
+
+== Remote chunking
+
+The manager reads and dispatches; workers process and write. On the manager, the writer is a
+`ChunkMessageChannelItemWriter` that sends the chunk to a request channel and correlates the reply:
+
+[source,java]
+----
+@Configuration
+public class RemoteChunkingManagerConfiguration {
+
+    @Bean
+    public DirectChannel chunkRequests() {
+        return new DirectChannel();
+    }
+
+    @Bean
+    public QueueChannel chunkReplies() {
+        return new QueueChannel();
+    }
+
+    @Bean
+    public IntegrationFlow outboundChunks(ConnectionFactory connectionFactory) {
+        return IntegrationFlow.from(chunkRequests())
+                .handle(Amqp.outboundAdapter(new RabbitTemplate(connectionFactory))
+                        .routingKey("batch.chunk.requests"))
+                .get();
+    }
+
+    @Bean
+    public IntegrationFlow inboundReplies(ConnectionFactory connectionFactory) {
+        return IntegrationFlow
+                .from(Amqp.inboundAdapter(connectionFactory, "batch.chunk.replies"))
+                .channel(chunkReplies())
+                .get();
+    }
+
+    @Bean
+    public Step managerStep(RemoteChunkingManagerStepBuilderFactory managerStepBuilderFactory,
+                            ItemReader<Trade> reader) {
+        return managerStepBuilderFactory.get("managerStep")
+                .<Trade, Trade>chunk(500)
+                .reader(reader)
+                .outputChannel(chunkRequests())
+                .inputChannel(chunkReplies())
+                .build();
+    }
+}
+----
+
+On the worker, a `ChunkProcessorChunkHandler` applies the processor and writer and replies:
+
+[source,java]
+----
+@Configuration
+public class RemoteChunkingWorkerConfiguration {
+
+    @Bean
+    public IntegrationFlow workerFlow(RemoteChunkingWorkerBuilder<Trade, Trade> workerBuilder,
+                                      ItemProcessor<Trade, Trade> processor,
+                                      ItemWriter<Trade> writer,
+                                      ConnectionFactory connectionFactory) {
+        return workerBuilder
+                .itemProcessor(processor)
+                .itemWriter(writer)
+                .inputChannel(workerRequests(connectionFactory))
+                .outputChannel(workerReplies(connectionFactory))
+                .build();
+    }
+}
+----
+
+Requirements worth repeating: the middleware must be *durable and transactional*, and items must be
+serialisable. The topology and its trade-offs are pictured in
+xref:backend/spring-batch/scaling-and-parallel-processing.adoc[Scaling & parallel processing].
+
+== Remote partitioning
+
+Remote partitioning sends *step execution requests*, not chunks -- each worker reads its own slice. The
+manager uses a `MessageChannelPartitionHandler`; workers run a `StepExecutionRequestHandler` against the
+shared `JobRepository`:
+
+[source,java]
+----
+@Bean
+public Step remotePartitionedStep(
+        RemotePartitioningManagerStepBuilderFactory managerStepBuilderFactory,
+        Partitioner tradeIdRangePartitioner,
+        DirectChannel partitionRequests,
+        QueueChannel partitionReplies) {
+
+    return managerStepBuilderFactory.get("remotePartitionedStep")
+            .partitioner("workerStep", tradeIdRangePartitioner)
+            .gridSize(8)
+            .outputChannel(partitionRequests)
+            .inputChannel(partitionReplies)     // or .pollInterval(...) for polling the repository
+            .build();
+}
+----
+
+[source,java]
+----
+@Bean
+public Step workerStep(RemotePartitioningWorkerStepBuilderFactory workerStepBuilderFactory,
+                       ItemReader<Trade> partitionedReader,
+                       ItemWriter<Trade> writer,
+                       DirectChannel workerRequests) {
+    return workerStepBuilderFactory.get("workerStep")
+            .inputChannel(workerRequests)
+            .<Trade, Trade>chunk(500)
+            .reader(partitionedReader)          // @StepScope, bound to its slice
+            .writer(writer)
+            .build();
+}
+----
+
+Because each partition is a real, persisted `StepExecution`, remote partitioning keeps normal restart
+semantics: only the partitions that failed are rerun.
+
+Writers that publish to a channel, a JMS destination or an SMTP server also live here, which is where the
+messaging and mail destinations mentioned in
+xref:backend/spring-batch/item-writers-databases-and-adapters.adoc[ItemWriters: databases & alternative
+destinations] come from.
+
+== Further reading
+
+For the full detail behind this page:
+
+* https://docs.spring.io/spring-batch/reference/spring-batch-integration.html[Spring Batch Integration]

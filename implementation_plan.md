@@ -194,9 +194,9 @@ task groups. This plan follows that same four-group shape.
 
 **Parallelizable: yes** (single task; every Group 2–3 page includes the partial it creates).
 
-- [ ] Task 1. Create the Spring Batch disclaimer partial —
+- [x] Task 1. Create the Spring Batch disclaimer partial —
   `modules/ROOT/partials/spring-batch-disclaimer.adoc`
-  - [ ] Task 1.1. Author it as an `[IMPORTANT]` / `====` admonition following the `elasticsearch-disclaimer.adoc`
+  - [x] Task 1.1. Author it as an `[IMPORTANT]` / `====` admonition following the `elasticsearch-disclaimer.adoc`
     shape (choice 4). It must state, in order: (a) this section documents **the current Spring Batch line**
     (6.0.x on Spring Framework 7 / Spring Boot 4.1.x, Java 17+ baseline) as published at
     https://docs.spring.io/spring-batch/reference/[the Spring Batch reference documentation]; no specific patch
@@ -205,7 +205,7 @@ task groups. This plan follows that same four-group shape.
     generated with the assistance of AI and should be verified against
     https://docs.spring.io/spring-batch/reference/[the official documentation] before being relied on in
     production. **It must not name any book, "consulted references", or "the sources below".**
-  - [ ] Task 1.2. Confirm the include path is `include::partial$spring-batch-disclaimer.adoc[]` (Antora resolves
+  - [x] Task 1.2. Confirm the include path is `include::partial$spring-batch-disclaimer.adoc[]` (Antora resolves
     `partial$` to `modules/ROOT/partials/`) — this exact line is placed after the header on every page created in
     Groups 2–3.
 
@@ -215,290 +215,290 @@ task groups. This plan follows that same four-group shape.
 only cross-links other pages by `xref:` (no page needs another Group 2 page's finished text). Each page also
 authors any `spring-batch-*.svg` figure it embeds. Consolidated validation for the group is the final build task.
 
-- [ ] Task 2. Create `modules/ROOT/pages/backend/spring-batch/getting-started.adoc` — What Spring Batch is &
+- [x] Task 2. Create `modules/ROOT/pages/backend/spring-batch/getting-started.adoc` — What Spring Batch is &
   running a first job
-  - [ ] Task 2.1. Spring Batch as a lightweight framework for **finite, bounded bulk processing** — explicitly
+  - [x] Task 2.1. Spring Batch as a lightweight framework for **finite, bounded bulk processing** — explicitly
     **not** a scheduler (runs under cron / Quartz / Control-M / a Kubernetes `CronJob`); a short history
     (Accenture + SpringSource origin, JSR-352 alignment).
-  - [ ] Task 2.2. Module layout: `spring-batch-core`, `spring-batch-infrastructure`, `spring-batch-test`,
+  - [x] Task 2.2. Module layout: `spring-batch-core`, `spring-batch-infrastructure`, `spring-batch-test`,
     `spring-batch-integration`, and `spring-boot-starter-batch`; the release line (6.0.x on Spring Framework 7 /
     Spring Boot 4.1.x, Java 17+).
-  - [ ] Task 2.3. A first runnable "Hello, World" job with `new JobBuilder("...", jobRepository)` /
+  - [x] Task 2.3. A first runnable "Hello, World" job with `new JobBuilder("...", jobRepository)` /
     `new StepBuilder("...", jobRepository)` and a single tasklet step; how to run it (Boot startup via
     `spring.batch.job.name` vs. on demand).
-  - [ ] Task 2.4. Forward-pointers to `jobs-instances-and-parameters.adoc`, `chunk-oriented-processing.adoc`, and
+  - [x] Task 2.4. Forward-pointers to `jobs-instances-and-parameters.adoc`, `chunk-oriented-processing.adoc`, and
     `xref:backend/springboot/spring-batch.adoc[Spring Batch (SpringBoot Reference)]` for the Boot
     auto-configuration specifics.
-  - [ ] Task 2.5. Links: https://docs.spring.io/spring-batch/reference/spring-batch-intro.html,
+  - [x] Task 2.5. Links: https://docs.spring.io/spring-batch/reference/spring-batch-intro.html,
     https://docs.spring.io/spring-batch/reference/whatsnew.html,
     https://docs.spring.io/spring-boot/reference/io/spring-batch.html
-- [ ] Task 3. Create `modules/ROOT/pages/backend/spring-batch/architecture-and-processing-strategies.adoc` —
+- [x] Task 3. Create `modules/ROOT/pages/backend/spring-batch/architecture-and-processing-strategies.adoc` —
   Architecture & processing strategies
-  - [ ] Task 3.1. The layered architecture (application / core / infrastructure) and the batch stereotypes
+  - [x] Task 3.1. The layered architecture (application / core / infrastructure) and the batch stereotypes
     overview; general batch principles & guidelines (idempotent steps, keep steps small, log liberally). Embed a
     `[mermaid]` diagram of the layered architecture if it clarifies the layering more than prose.
-  - [ ] Task 3.2. Batch processing strategies: the normal batch window, concurrent batch + online access with
+  - [x] Task 3.2. Batch processing strategies: the normal batch window, concurrent batch + online access with
     logical locking, parallel processing, and partitioning — with the six partitioning break-up approaches
     (fixed-length, range, list, hashing, modulus, and custom).
-  - [ ] Task 3.3. Links: https://docs.spring.io/spring-batch/reference/spring-batch-architecture.html
-- [ ] Task 4. Create `modules/ROOT/pages/backend/spring-batch/jobs-instances-and-parameters.adoc` — Jobs,
+  - [x] Task 3.3. Links: https://docs.spring.io/spring-batch/reference/spring-batch-architecture.html
+- [x] Task 4. Create `modules/ROOT/pages/backend/spring-batch/jobs-instances-and-parameters.adoc` — Jobs,
   instances & parameters
-  - [ ] Task 4.1. `Job` as a container of an ordered sequence of `Step`s plus global configuration.
+  - [x] Task 4.1. `Job` as a container of an ordered sequence of `Step`s plus global configuration.
     `JobInstance` = a `Job` + its *identifying* `JobParameters`. `JobParameters`: typing, the `identifying` flag,
     and what "resume where you left off" vs. "start fresh" means in practice.
-  - [ ] Task 4.2. `JobExecution` — `BatchStatus`, `ExitStatus`, `startTime`/`endTime`/`failureExceptions`; the
+  - [x] Task 4.2. `JobExecution` — `BatchStatus`, `ExitStatus`, `startTime`/`endTime`/`failureExceptions`; the
     job lifecycle as a small state machine. Embed a `[mermaid]` state diagram of `BatchStatus` transitions
     (choice 7).
-  - [ ] Task 4.3. Runnable example: a `JobParametersValidator`-friendly job launched with a unique `run.id` via
+  - [x] Task 4.3. Runnable example: a `JobParametersValidator`-friendly job launched with a unique `run.id` via
     `RunIdIncrementer`, showing two `JobExecution`s of the same `JobInstance`.
-  - [ ] Task 4.4. Links: https://docs.spring.io/spring-batch/reference/domain.html
-- [ ] Task 5. Create `modules/ROOT/pages/backend/spring-batch/steps-executions-and-context.adoc` — Steps,
+  - [x] Task 4.4. Links: https://docs.spring.io/spring-batch/reference/domain.html
+- [x] Task 5. Create `modules/ROOT/pages/backend/spring-batch/steps-executions-and-context.adoc` — Steps,
   executions & the `ExecutionContext`
-  - [ ] Task 5.1. `Step` as an independent, sequential phase; `StepExecution` and its counters (`readCount`,
+  - [x] Task 5.1. `Step` as an independent, sequential phase; `StepExecution` and its counters (`readCount`,
     `writeCount`, `commitCount`, `rollbackCount`, `filterCount`, `readSkipCount`, `processSkipCount`,
     `writeSkipCount`).
-  - [ ] Task 5.2. The `ExecutionContext` — one per `JobExecution`, one per `StepExecution`; step-scoped context is
+  - [x] Task 5.2. The `ExecutionContext` — one per `JobExecution`, one per `StepExecution`; step-scoped context is
     saved at each commit point, job-scoped context between steps; the `Serializable` constraint on stored values.
-  - [ ] Task 5.3. Reading/writing the context and **promoting keys job-ward** with
+  - [x] Task 5.3. Reading/writing the context and **promoting keys job-ward** with
     `ExecutionContextPromotionListener` to pass data between steps — a runnable `@Bean` example.
-  - [ ] Task 5.4. Links: https://docs.spring.io/spring-batch/reference/domain.html,
+  - [x] Task 5.4. Links: https://docs.spring.io/spring-batch/reference/domain.html,
     https://docs.spring.io/spring-batch/reference/common-patterns.html
-- [ ] Task 6. Create `modules/ROOT/pages/backend/spring-batch/batch-infrastructure-configuration.adoc` —
+- [x] Task 6. Create `modules/ROOT/pages/backend/spring-batch/batch-infrastructure-configuration.adoc` —
   Infrastructure configuration
-  - [ ] Task 6.1. `@EnableBatchProcessing` and why to **leave it off under Spring Boot** (it disables the
+  - [x] Task 6.1. `@EnableBatchProcessing` and why to **leave it off under Spring Boot** (it disables the
     auto-configuration); the 6.0 split into `@EnableBatchProcessing` (common attributes, e.g. `taskExecutorRef`)
     plus `@EnableJdbcJobRepository` / `@EnableMongoJobRepository` for explicit manual configuration.
-  - [ ] Task 6.2. `DefaultBatchConfiguration` for full manual control (extending it and overriding beans); the
+  - [x] Task 6.2. `DefaultBatchConfiguration` for full manual control (extending it and overriding beans); the
     **resourceless infrastructure default** (`ResourcelessJobRepository` / `ResourcelessTransactionManager` — no
     database needed to try Spring Batch).
-  - [ ] Task 6.3. The 6.0 interface unification: `JobRepository` extends `JobExplorer`; `JobOperator` extends
+  - [x] Task 6.3. The 6.0 interface unification: `JobRepository` extends `JobExplorer`; `JobOperator` extends
     `JobLauncher`; `JobRegistry` is optional with automatic registration.
-  - [ ] Task 6.4. Cross-link `xref:backend/springboot/spring-batch.adoc[Spring Batch (SpringBoot Reference)]` for
+  - [x] Task 6.4. Cross-link `xref:backend/springboot/spring-batch.adoc[Spring Batch (SpringBoot Reference)]` for
     the concrete `spring-boot-starter-batch` auto-configuration walkthrough (not restated here).
-  - [ ] Task 6.5. Links: https://docs.spring.io/spring-batch/reference/job.html,
+  - [x] Task 6.5. Links: https://docs.spring.io/spring-batch/reference/job.html,
     https://docs.spring.io/spring-batch/reference/whatsnew.html,
     https://docs.spring.io/spring-boot/reference/io/spring-batch.html
-- [ ] Task 7. Create `modules/ROOT/pages/backend/spring-batch/job-repository-and-metadata-schema.adoc` — The job
+- [x] Task 7. Create `modules/ROOT/pages/backend/spring-batch/job-repository-and-metadata-schema.adoc` — The job
   repository & metadata schema
-  - [ ] Task 7.1. The metadata tables: `BATCH_JOB_INSTANCE`, `BATCH_JOB_EXECUTION`,
+  - [x] Task 7.1. The metadata tables: `BATCH_JOB_INSTANCE`, `BATCH_JOB_EXECUTION`,
     `BATCH_JOB_EXECUTION_PARAMS`, `BATCH_JOB_EXECUTION_CONTEXT`, `BATCH_STEP_EXECUTION`,
     `BATCH_STEP_EXECUTION_CONTEXT`, and the sequences; a `[source,sql]` excerpt of the schema shape. Consider
     embedding `image::spring-batch-metadata-schema.svg[…]` (an ER diagram of the tables) (choice 7).
-  - [ ] Task 7.2. Per-vendor DDL location (`org/springframework/batch/core/schema-*.sql`);
+  - [x] Task 7.2. Per-vendor DDL location (`org/springframework/batch/core/schema-*.sql`);
     `spring.batch.jdbc.initialize-schema` (`always` / `embedded` / `never`), `table-prefix`, `platform`.
-  - [ ] Task 7.3. JDBC vs. MongoDB vs. resourceless repositories; the `ISOLATION_SERIALIZABLE` transaction
+  - [x] Task 7.3. JDBC vs. MongoDB vs. resourceless repositories; the `ISOLATION_SERIALIZABLE` transaction
     isolation used when creating a `JobExecution`, and why. Cross-link
     `xref:database/sql/ddl.adoc[SQL DDL]`/`xref:database/sql/transactions.adoc[SQL Transactions]`.
-  - [ ] Task 7.4. Querying history with `JobExplorer`/`JobRegistry`/the `JobOperator` read methods — a runnable
+  - [x] Task 7.4. Querying history with `JobExplorer`/`JobRegistry`/the `JobOperator` read methods — a runnable
     example listing past executions of a job.
-  - [ ] Task 7.5. Links: https://docs.spring.io/spring-batch/reference/job.html,
+  - [x] Task 7.5. Links: https://docs.spring.io/spring-batch/reference/job.html,
     https://docs.spring.io/spring-batch/reference/schema-appendix.html
-- [ ] Task 8. Create `modules/ROOT/pages/backend/spring-batch/configuring-a-job.adoc` — Configuring a job
-  - [ ] Task 8.1. `new JobBuilder("name", jobRepository)`; step ordering with `.start(...)`/`.next(...)`/`.flow(...)`;
+- [x] Task 8. Create `modules/ROOT/pages/backend/spring-batch/configuring-a-job.adoc` — Configuring a job
+  - [x] Task 8.1. `new JobBuilder("name", jobRepository)`; step ordering with `.start(...)`/`.next(...)`/`.flow(...)`;
     restartability (`.preventRestart()`) and start limits.
-  - [ ] Task 8.2. `JobParametersValidator` — `DefaultJobParametersValidator` (required/optional keys) and a
+  - [x] Task 8.2. `JobParametersValidator` — `DefaultJobParametersValidator` (required/optional keys) and a
     custom validator example.
-  - [ ] Task 8.3. `JobParametersIncrementer` — `RunIdIncrementer` and a custom date-based incrementer.
-  - [ ] Task 8.4. `JobExecutionListener` (`@BeforeJob`/`@AfterJob`) — a runnable example logging start/end.
-  - [ ] Task 8.5. Links: https://docs.spring.io/spring-batch/reference/job.html
-- [ ] Task 9. Create `modules/ROOT/pages/backend/spring-batch/running-a-job.adoc` — Running a job
-  - [ ] Task 9.1. `JobLauncher` vs. `JobOperator` (`start`/`stop`/`restart`/`startNextInstance`/`abandon`/
+  - [x] Task 8.3. `JobParametersIncrementer` — `RunIdIncrementer` and a custom date-based incrementer.
+  - [x] Task 8.4. `JobExecutionListener` (`@BeforeJob`/`@AfterJob`) — a runnable example logging start/end.
+  - [x] Task 8.5. Links: https://docs.spring.io/spring-batch/reference/job.html
+- [x] Task 9. Create `modules/ROOT/pages/backend/spring-batch/running-a-job.adoc` — Running a job
+  - [x] Task 9.1. `JobLauncher` vs. `JobOperator` (`start`/`stop`/`restart`/`startNextInstance`/`abandon`/
     `recover`); `TaskExecutorJobOperator` and synchronous vs. asynchronous launching.
-  - [ ] Task 9.2. Spring Boot's `JobLauncherApplicationRunner` with `spring.batch.job.name` /
+  - [x] Task 9.2. Spring Boot's `JobLauncherApplicationRunner` with `spring.batch.job.name` /
     `spring.batch.job.enabled`; the 6.0 `CommandLineJobOperator` (replacing `CommandLineJobRunner`) for
     standalone/CLI launches — note the replacement explicitly.
-  - [ ] Task 9.3. Launching on demand from a `@RestController` endpoint, a `@Scheduled` method, or a Quartz job;
+  - [x] Task 9.3. Launching on demand from a `@RestController` endpoint, a `@Scheduled` method, or a Quartz job;
     converting `--key=value` args to `JobParameters`; graceful shutdown.
-  - [ ] Task 9.4. Links: https://docs.spring.io/spring-batch/reference/job.html,
+  - [x] Task 9.4. Links: https://docs.spring.io/spring-batch/reference/job.html,
     https://docs.spring.io/spring-boot/reference/io/spring-batch.html
-- [ ] Task 10. Create `modules/ROOT/pages/backend/spring-batch/stopping-restart-and-recovery.adoc` — Stopping,
+- [x] Task 10. Create `modules/ROOT/pages/backend/spring-batch/stopping-restart-and-recovery.adoc` — Stopping,
   restart & recovery
-  - [ ] Task 10.1. Natural completion vs. programmatic stop — the `stop()` transition,
+  - [x] Task 10.1. Natural completion vs. programmatic stop — the `stop()` transition,
     `StepExecution.setTerminateOnly()`, and the 6.0 `StoppableStep` making external stop work for every step type
     (not just chunk steps).
-  - [ ] Task 10.2. Job failure and `ExitStatus`; controlling restart (`restartable(false)`, `startLimit`,
+  - [x] Task 10.2. Job failure and `ExitStatus`; controlling restart (`restartable(false)`, `startLimit`,
     `allowStartIfComplete`); rerunning a completed step.
-  - [ ] Task 10.3. The 6.0 `JobOperator.recover()` for stranded executions (e.g. after a process crash);
+  - [x] Task 10.3. The 6.0 `JobOperator.recover()` for stranded executions (e.g. after a process crash);
     `NoWorkFoundStepExecutionListener` to fail a step that read nothing.
-  - [ ] Task 10.4. Links: https://docs.spring.io/spring-batch/reference/step.html,
+  - [x] Task 10.4. Links: https://docs.spring.io/spring-batch/reference/step.html,
     https://docs.spring.io/spring-batch/reference/common-patterns.html,
     https://docs.spring.io/spring-batch/reference/whatsnew.html
-- [ ] Task 11. Create `modules/ROOT/pages/backend/spring-batch/chunk-oriented-processing.adoc` — Chunk-oriented
+- [x] Task 11. Create `modules/ROOT/pages/backend/spring-batch/chunk-oriented-processing.adoc` — Chunk-oriented
   processing
-  - [ ] Task 11.1. The read-one / process-one / accumulate / write-chunk loop; the **commit interval** = chunk
+  - [x] Task 11.1. The read-one / process-one / accumulate / write-chunk loop; the **commit interval** = chunk
     size = transaction boundary. Promote/adapt the existing Mermaid chunk-loop diagram from
     `backend/springboot/spring-batch.adoc` here as the canonical version (choice 7); leave a simpler pointer in
     the SpringBoot page rather than duplicating it in full.
-  - [ ] Task 11.2. `CompletionPolicy` for dynamic chunk sizing; the classic
+  - [x] Task 11.2. `CompletionPolicy` for dynamic chunk sizing; the classic
     `new StepBuilder("step", jobRepository).<In,Out>chunk(size, tx)` and the new 6.0 `ChunkOrientedStep` /
     `ChunkOrientedStepBuilder(name, jobRepository, chunkSize)` — note both, current idiom first.
-  - [ ] Task 11.3. Transaction attributes (propagation, isolation, timeout, `noRollback`); registering an
+  - [x] Task 11.3. Transaction attributes (propagation, isolation, timeout, `noRollback`); registering an
     `ItemStream` with the step.
-  - [ ] Task 11.4. Links: https://docs.spring.io/spring-batch/reference/step.html
-- [ ] Task 12. Create `modules/ROOT/pages/backend/spring-batch/tasklet-steps.adoc` — Tasklet steps
-  - [ ] Task 12.1. The `Tasklet` interface and `RepeatStatus.FINISHED`/`CONTINUABLE`; `TaskletStep`.
-  - [ ] Task 12.2. The adapter tasklets: `MethodInvokingTaskletAdapter`, `CallableTaskletAdapter`,
+  - [x] Task 11.4. Links: https://docs.spring.io/spring-batch/reference/step.html
+- [x] Task 12. Create `modules/ROOT/pages/backend/spring-batch/tasklet-steps.adoc` — Tasklet steps
+  - [x] Task 12.1. The `Tasklet` interface and `RepeatStatus.FINISHED`/`CONTINUABLE`; `TaskletStep`.
+  - [x] Task 12.2. The adapter tasklets: `MethodInvokingTaskletAdapter`, `CallableTaskletAdapter`,
     `SystemCommandTasklet` — a runnable example wrapping an existing service method.
-  - [ ] Task 12.3. Transaction semantics of a tasklet (one transaction, succeed/fail as a whole); when a tasklet
+  - [x] Task 12.3. Transaction semantics of a tasklet (one transaction, succeed/fail as a whole); when a tasklet
     beats a chunk step (DDL, file move, single remote call, stored-proc invocation).
-  - [ ] Task 12.4. Links: https://docs.spring.io/spring-batch/reference/step.html#tasklet-step
-- [ ] Task 13. Create `modules/ROOT/pages/backend/spring-batch/fault-tolerance-skip-and-retry.adoc` — Fault
+  - [x] Task 12.4. Links: https://docs.spring.io/spring-batch/reference/step.html#tasklet-step
+- [x] Task 13. Create `modules/ROOT/pages/backend/spring-batch/fault-tolerance-skip-and-retry.adoc` — Fault
   tolerance: skip & retry
-  - [ ] Task 13.1. `.faultTolerant()`; **skip** — `.skip(...)`/`.skipLimit(...)`, `SkipPolicy` /
+  - [x] Task 13.1. `.faultTolerant()`; **skip** — `.skip(...)`/`.skipLimit(...)`, `SkipPolicy` /
     `LimitCheckingExceptionHierarchySkipPolicy`, `SkipListener`, `.noSkip(...)`.
-  - [ ] Task 13.2. **Retry** — `.retry(...)`/`.retryLimit(...)`, `RetryPolicy` — **now built on Spring Framework
+  - [x] Task 13.2. **Retry** — `.retry(...)`/`.retryLimit(...)`, `RetryPolicy` — **now built on Spring Framework
     7's retry support, not the Spring Retry library** — state this explicitly — `BackOffPolicy`, `RetryListener`.
-  - [ ] Task 13.3. `.noRollback(...)`; the read/process/write replay semantics on a rolled-back chunk, and why the
+  - [x] Task 13.3. `.noRollback(...)`; the read/process/write replay semantics on a rolled-back chunk, and why the
     `ItemProcessor` must be **idempotent**.
-  - [ ] Task 13.4. Links: https://docs.spring.io/spring-batch/reference/step.html,
+  - [x] Task 13.4. Links: https://docs.spring.io/spring-batch/reference/step.html,
     https://docs.spring.io/spring-batch/reference/retry.html,
     https://docs.spring.io/spring-batch/reference/whatsnew.html
-- [ ] Task 14. Create `modules/ROOT/pages/backend/spring-batch/step-flow-and-listeners.adoc` — Step flow &
+- [x] Task 14. Create `modules/ROOT/pages/backend/spring-batch/step-flow-and-listeners.adoc` — Step flow &
   listeners
-  - [ ] Task 14.1. Sequential (`.next(...)`), conditional (`.on("FAILED").to(...)`, `.from(...)`, wildcards),
+  - [x] Task 14.1. Sequential (`.next(...)`), conditional (`.on("FAILED").to(...)`, `.from(...)`, wildcards),
     `JobExecutionDecider`; `.end()`/`.fail()`/`.stopAndRestart()`. Embed a `[mermaid]` flowchart of a conditional
     step flow with a decider (choice 7).
-  - [ ] Task 14.2. Split flows for parallel steps; externalized/reusable flows (`FlowStep`).
-  - [ ] Task 14.3. Listener interfaces — `StepExecutionListener`, `ChunkListener`, `ItemReadListener` /
+  - [x] Task 14.2. Split flows for parallel steps; externalized/reusable flows (`FlowStep`).
+  - [x] Task 14.3. Listener interfaces — `StepExecutionListener`, `ChunkListener`, `ItemReadListener` /
     `ItemProcessListener` / `ItemWriteListener`, `SkipListener`, `RetryListener` — and their annotation
     equivalents.
-  - [ ] Task 14.4. **Late binding** with `@StepScope`/`@JobScope` and SpEL expressions
+  - [x] Task 14.4. **Late binding** with `@StepScope`/`@JobScope` and SpEL expressions
     `#{jobParameters['run.date']}` / `#{stepExecutionContext['fileName']}` — a runnable example. Keep the SpEL
     expressions inside `[source]` blocks (AsciiDoc gotcha).
-  - [ ] Task 14.5. Links: https://docs.spring.io/spring-batch/reference/step.html
-- [ ] Task 15. Create `modules/ROOT/pages/backend/spring-batch/item-readers-files.adoc` — `ItemReader`s: files &
+  - [x] Task 14.5. Links: https://docs.spring.io/spring-batch/reference/step.html
+- [x] Task 15. Create `modules/ROOT/pages/backend/spring-batch/item-readers-files.adoc` — `ItemReader`s: files &
   XML/JSON
-  - [ ] Task 15.1. The `ItemReader`/`ItemStreamReader` contract.
-  - [ ] Task 15.2. `FlatFileItemReader` and the `LineMapper` → `LineTokenizer`
+  - [x] Task 15.1. The `ItemReader`/`ItemStreamReader` contract.
+  - [x] Task 15.2. `FlatFileItemReader` and the `LineMapper` → `LineTokenizer`
     (`DelimitedLineTokenizer`/`FixedLengthTokenizer`) → `FieldSet` → `FieldSetMapper` chain, via
     `FlatFileItemReaderBuilder` — a runnable example reading a delimited CSV.
-  - [ ] Task 15.3. Multi-format lines (`PatternMatchingCompositeLineMapper`), multi-line records,
+  - [x] Task 15.3. Multi-format lines (`PatternMatchingCompositeLineMapper`), multi-line records,
     `MultiResourceItemReader` for reading a directory of files.
-  - [ ] Task 15.4. `StaxEventItemReader` for XML; `JsonItemReader` for JSON (Jackson 3); custom readers; "dealing
+  - [x] Task 15.4. `StaxEventItemReader` for XML; `JsonItemReader` for JSON (Jackson 3); custom readers; "dealing
     with no input" (pointer to `NoWorkFoundStepExecutionListener` in `stopping-restart-and-recovery.adoc`).
-  - [ ] Task 15.5. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html
-- [ ] Task 16. Create `modules/ROOT/pages/backend/spring-batch/item-readers-databases.adoc` — `ItemReader`s:
+  - [x] Task 15.5. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html
+- [x] Task 16. Create `modules/ROOT/pages/backend/spring-batch/item-readers-databases.adoc` — `ItemReader`s:
   databases
-  - [ ] Task 16.1. `JdbcCursorItemReader` vs. `JdbcPagingItemReader` (+ `PagingQueryProvider` /
+  - [x] Task 16.1. `JdbcCursorItemReader` vs. `JdbcPagingItemReader` (+ `PagingQueryProvider` /
     `SqlPagingQueryProviderFactoryBean`); the cursor-vs-paging trade-off (one long transaction & thread affinity
     vs. restartable stateless pages).
-  - [ ] Task 16.2. `JpaCursorItemReader`/`JpaPagingItemReader`, `HibernateCursorItemReader`/
+  - [x] Task 16.2. `JpaCursorItemReader`/`JpaPagingItemReader`, `HibernateCursorItemReader`/
     `HibernatePagingItemReader`, `StoredProcedureItemReader`. Cross-link
     `xref:backend/springboot/spring-data-jpa.adoc[Spring Data JPA]` and
     `xref:backend/hibernate/index.adoc[Hibernate Reference]` instead of restating JPA/Hibernate basics.
-  - [ ] Task 16.3. Spring Data readers (`RepositoryItemReader`, `MongoPagingItemReader`); the **driving-query
+  - [x] Task 16.3. Spring Data readers (`RepositoryItemReader`, `MongoPagingItemReader`); the **driving-query
     pattern** (read keys, hydrate in the processor). Cross-link `xref:database/sql/dml-queries.adoc[SQL Queries]`.
-  - [ ] Task 16.4. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html,
+  - [x] Task 16.4. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html,
     https://docs.spring.io/spring-batch/reference/common-patterns.html
-- [ ] Task 17. Create `modules/ROOT/pages/backend/spring-batch/item-processors.adoc` — `ItemProcessor`s
-  - [ ] Task 17.1. `ItemProcessor<I, O>` — transform, including a type change; **filtering** by returning `null`
+- [x] Task 17. Create `modules/ROOT/pages/backend/spring-batch/item-processors.adoc` — `ItemProcessor`s
+  - [x] Task 17.1. `ItemProcessor<I, O>` — transform, including a type change; **filtering** by returning `null`
     (vs. skipping via `SkipPolicy`).
-  - [ ] Task 17.2. `CompositeItemProcessor` and `ClassifierCompositeItemProcessor`; `ItemProcessorAdapter` over an
+  - [x] Task 17.2. `CompositeItemProcessor` and `ClassifierCompositeItemProcessor`; `ItemProcessorAdapter` over an
     existing service.
-  - [ ] Task 17.3. Validation — `ValidatingItemProcessor`, `BeanValidatingItemProcessor` (Jakarta Bean
+  - [x] Task 17.3. Validation — `ValidatingItemProcessor`, `BeanValidatingItemProcessor` (Jakarta Bean
     Validation); `ScriptItemProcessor`.
-  - [ ] Task 17.4. Processor **idempotency** under retry/skip — why a processor with side effects breaks replay
+  - [x] Task 17.4. Processor **idempotency** under retry/skip — why a processor with side effects breaks replay
     semantics from `fault-tolerance-skip-and-retry.adoc`.
-  - [ ] Task 17.5. Links: https://docs.spring.io/spring-batch/reference/processor.html
-- [ ] Task 18. Create `modules/ROOT/pages/backend/spring-batch/item-writers-files.adoc` — `ItemWriter`s: files &
+  - [x] Task 17.5. Links: https://docs.spring.io/spring-batch/reference/processor.html
+- [x] Task 18. Create `modules/ROOT/pages/backend/spring-batch/item-writers-files.adoc` — `ItemWriter`s: files &
   XML/JSON
-  - [ ] Task 18.1. The `ItemWriter`/`ItemStreamWriter` contract — write a whole chunk at once.
-  - [ ] Task 18.2. `FlatFileItemWriter` and the `LineAggregator` (`DelimitedLineAggregator`,
+  - [x] Task 18.1. The `ItemWriter`/`ItemStreamWriter` contract — write a whole chunk at once.
+  - [x] Task 18.2. `FlatFileItemWriter` and the `LineAggregator` (`DelimitedLineAggregator`,
     `FormatterLineAggregator`) → `FieldExtractor` chain; header/footer callbacks; file-management options
     (`shouldDeleteIfExists`, `appendAllowed`, `transactional`).
-  - [ ] Task 18.3. `StaxEventItemWriter` for XML; `JsonFileItemWriter` for JSON; `MultiResourceItemWriter` for
+  - [x] Task 18.3. `StaxEventItemWriter` for XML; `JsonFileItemWriter` for JSON; `MultiResourceItemWriter` for
     output rollover; `CompositeItemWriter`/`ClassifierCompositeItemWriter`.
-  - [ ] Task 18.4. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html
-- [ ] Task 19. Create `modules/ROOT/pages/backend/spring-batch/item-writers-databases-and-adapters.adoc` —
+  - [x] Task 18.4. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html
+- [x] Task 19. Create `modules/ROOT/pages/backend/spring-batch/item-writers-databases-and-adapters.adoc` —
   `ItemWriter`s: databases & alternative destinations
-  - [ ] Task 19.1. `JdbcBatchItemWriter` (bean-mapped vs. `ItemPreparedStatementSetter`/
+  - [x] Task 19.1. `JdbcBatchItemWriter` (bean-mapped vs. `ItemPreparedStatementSetter`/
     `ItemSqlParameterSourceProvider`); `JpaItemWriter`/`HibernateItemWriter`. Cross-link
     `xref:backend/springboot/spring-data-jpa.adoc[Spring Data JPA]`.
-  - [ ] Task 19.2. Spring Data writers (`RepositoryItemWriter`, `MongoItemWriter`).
-  - [ ] Task 19.3. Alternative-destination adapters: `ItemWriterAdapter`,
+  - [x] Task 19.2. Spring Data writers (`RepositoryItemWriter`, `MongoItemWriter`).
+  - [x] Task 19.3. Alternative-destination adapters: `ItemWriterAdapter`,
     `PropertyExtractingDelegatingItemWriter`; a pointer to the messaging/mail writers via
     `xref:backend/spring-batch/spring-batch-integration.adoc[Spring Batch Integration]`.
-  - [ ] Task 19.4. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html,
+  - [x] Task 19.4. Links: https://docs.spring.io/spring-batch/reference/readersAndWriters.html,
     https://docs.spring.io/spring-batch/reference/common-patterns.html
-- [ ] Task 20. Create `modules/ROOT/pages/backend/spring-batch/repeat-and-retry-internals.adoc` — Repeat & retry
+- [x] Task 20. Create `modules/ROOT/pages/backend/spring-batch/repeat-and-retry-internals.adoc` — Repeat & retry
   internals
-  - [ ] Task 20.1. `RepeatOperations`/`RepeatTemplate` with `CompletionPolicy` and `ExceptionHandler` — the
+  - [x] Task 20.1. `RepeatOperations`/`RepeatTemplate` with `CompletionPolicy` and `ExceptionHandler` — the
     lower-level abstraction the chunk loop is built on.
-  - [ ] Task 20.2. `RetryOperations`/`RetryTemplate` (Spring Framework 7 retry) with `RetryPolicy`/
+  - [x] Task 20.2. `RetryOperations`/`RetryTemplate` (Spring Framework 7 retry) with `RetryPolicy`/
     `BackOffPolicy`/`RetryListener`; stateful vs. stateless retry, and how skip/retry in a fault-tolerant step map
     onto them (cross-link `xref:backend/spring-batch/fault-tolerance-skip-and-retry.adoc[Fault Tolerance]`).
-  - [ ] Task 20.3. Links: https://docs.spring.io/spring-batch/reference/repeat.html,
+  - [x] Task 20.3. Links: https://docs.spring.io/spring-batch/reference/repeat.html,
     https://docs.spring.io/spring-batch/reference/retry.html
-- [ ] Task 21. Create `modules/ROOT/pages/backend/spring-batch/scaling-and-parallel-processing.adoc` — Scaling &
+- [x] Task 21. Create `modules/ROOT/pages/backend/spring-batch/scaling-and-parallel-processing.adoc` — Scaling &
   parallel processing
-  - [ ] Task 21.1. The "measure first" warning and a decision table of the options below.
-  - [ ] Task 21.2. **Single-JVM**: multi-threaded step (`taskExecutor` on the step, reader thread-safety and
+  - [x] Task 21.1. The "measure first" warning and a decision table of the options below.
+  - [x] Task 21.2. **Single-JVM**: multi-threaded step (`taskExecutor` on the step, reader thread-safety and
     `SynchronizedItemStreamReader`, processor thread-safety); parallel steps via split flows; the 6.0
     producer/consumer concurrency model + **local chunking** (`ChunkTaskExecutorItemWriter`).
-  - [ ] Task 21.3. **Multi-process**: `AsyncItemProcessor`/`AsyncItemWriter`; **partitioning** (`Partitioner` →
+  - [x] Task 21.3. **Multi-process**: `AsyncItemProcessor`/`AsyncItemWriter`; **partitioning** (`Partitioner` →
     per-partition `ExecutionContext`, `StepExecutionSplitter`, `PartitionHandler`/
     `TaskExecutorPartitionHandler`/`gridSize`, binding partition data with `#{stepExecutionContext[...]}`). Embed
     `image::spring-batch-partitioning-topology.svg[…]` — manager step → `PartitionHandler` → N worker step
     executions (choice 7).
-  - [ ] Task 21.4. **Remote chunking & remote partitioning** (`MessageChannelPartitionHandler` over Spring
+  - [x] Task 21.4. **Remote chunking & remote partitioning** (`MessageChannelPartitionHandler` over Spring
     Integration), the 6.0 **remote step**, and the `DeployerPartitionHandler` (linked, not documented in depth).
     Embed `image::spring-batch-remote-chunking-topology.svg[…]` — manager reads → durable queue → workers
     process + write (choice 7).
-  - [ ] Task 21.5. Each option's restartability/ordering/middleware-durability trade-offs, summarized in a small
+  - [x] Task 21.5. Each option's restartability/ordering/middleware-durability trade-offs, summarized in a small
     table.
-  - [ ] Task 21.6. Links: https://docs.spring.io/spring-batch/reference/scalability.html,
+  - [x] Task 21.6. Links: https://docs.spring.io/spring-batch/reference/scalability.html,
     https://docs.spring.io/spring-batch/reference/spring-batch-integration.html
-- [ ] Task 22. Create `modules/ROOT/pages/backend/spring-batch/profiling-and-tuning.adoc` — Profiling & tuning
-  - [ ] Task 22.1. Profiling a batch job (CPU/memory — e.g. VisualVM, Java Flight Recorder — cross-link
+- [x] Task 22. Create `modules/ROOT/pages/backend/spring-batch/profiling-and-tuning.adoc` — Profiling & tuning
+  - [x] Task 22.1. Profiling a batch job (CPU/memory — e.g. VisualVM, Java Flight Recorder — cross-link
     `xref:backend/spring-batch/observability.adoc[Observability]` for the 6.0 JFR events).
-  - [ ] Task 22.2. Choosing a chunk size; cursor vs. paging cost; turning off `saveState` for non-restartable
+  - [x] Task 22.2. Choosing a chunk size; cursor vs. paging cost; turning off `saveState` for non-restartable
     readers; keeping the `ExecutionContext` small.
-  - [ ] Task 22.3. The cost of metadata writes per chunk, and indexing the metadata tables (cross-link
+  - [x] Task 22.3. The cost of metadata writes per chunk, and indexing the metadata tables (cross-link
     `xref:backend/spring-batch/job-repository-and-metadata-schema.adoc[Job Repository & Metadata Schema]`).
-  - [ ] Task 22.4. Common anti-patterns: huge chunks, per-item transactions, chatty readers.
-  - [ ] Task 22.5. Links: https://docs.spring.io/spring-batch/reference/spring-batch-architecture.html,
+  - [x] Task 22.4. Common anti-patterns: huge chunks, per-item transactions, chatty readers.
+  - [x] Task 22.5. Links: https://docs.spring.io/spring-batch/reference/spring-batch-architecture.html,
     https://docs.spring.io/spring-batch/reference/spring-batch-observability.html
-- [ ] Task 23. Create `modules/ROOT/pages/backend/spring-batch/spring-batch-integration.adoc` — Spring Batch
+- [x] Task 23. Create `modules/ROOT/pages/backend/spring-batch/spring-batch-integration.adoc` — Spring Batch
   Integration
-  - [ ] Task 23.1. Launching jobs from messages — `JobLaunchRequest`, `JobLaunchingMessageHandler` /
+  - [x] Task 23.1. Launching jobs from messages — `JobLaunchRequest`, `JobLaunchingMessageHandler` /
     `JobLaunchingGateway`; informational-message feedback on a reply channel.
-  - [ ] Task 23.2. `AsyncItemProcessor`/`AsyncItemWriter` (cross-referenced from
+  - [x] Task 23.2. `AsyncItemProcessor`/`AsyncItemWriter` (cross-referenced from
     `xref:backend/spring-batch/scaling-and-parallel-processing.adoc[Scaling & Parallel Processing]`); the
     `BlockingQueueItemReader`/`BlockingQueueItemWriter` SEDA-style stage decoupling.
-  - [ ] Task 23.3. How remote chunking/remote partitioning are wired over Spring Integration `MessageChannel`s —
+  - [x] Task 23.3. How remote chunking/remote partitioning are wired over Spring Integration `MessageChannel`s —
     a runnable outbound/inbound channel adapter example.
-  - [ ] Task 23.4. Links: https://docs.spring.io/spring-batch/reference/spring-batch-integration.html
-- [ ] Task 24. Create `modules/ROOT/pages/backend/spring-batch/observability.adoc` — Observability
-  - [ ] Task 24.1. Micrometer meters under the `spring.batch.*` prefix: `spring.batch.job`,
+  - [x] Task 23.4. Links: https://docs.spring.io/spring-batch/reference/spring-batch-integration.html
+- [x] Task 24. Create `modules/ROOT/pages/backend/spring-batch/observability.adoc` — Observability
+  - [x] Task 24.1. Micrometer meters under the `spring.batch.*` prefix: `spring.batch.job`,
     `spring.batch.job.active`, `spring.batch.step`, `spring.batch.item.read`, `spring.batch.item.process`,
     `spring.batch.chunk.write`.
-  - [ ] Task 24.2. Tracing via the Observation API — one observation per job/step/chunk; wiring a
+  - [x] Task 24.2. Tracing via the Observation API — one observation per job/step/chunk; wiring a
     `MeterRegistry`/`ObservationRegistry`. Cross-link
     `xref:backend/springboot/metrics-and-observability.adoc[Metrics & Observability]` for the general
     Micrometer/OTel/Prometheus/Grafana setup (not restated here).
-  - [ ] Task 24.3. The 6.0 **Java Flight Recorder (JFR)** events, and what Spring Boot Actuator adds.
-  - [ ] Task 24.4. Links: https://docs.spring.io/spring-batch/reference/spring-batch-observability.html,
+  - [x] Task 24.3. The 6.0 **Java Flight Recorder (JFR)** events, and what Spring Boot Actuator adds.
+  - [x] Task 24.4. Links: https://docs.spring.io/spring-batch/reference/spring-batch-observability.html,
     https://docs.spring.io/spring-batch/reference/spring-batch-observability/micrometer.html,
     https://docs.spring.io/spring-batch/reference/spring-batch-observability/jfr.html
-- [ ] Task 25. Create `modules/ROOT/pages/backend/spring-batch/cloud-native-batch.adoc` — Cloud-native batch
-  - [ ] Task 25.1. The twelve-factor lens applied to a batch app; externalized config with Spring Cloud Config;
+- [x] Task 25. Create `modules/ROOT/pages/backend/spring-batch/cloud-native-batch.adoc` — Cloud-native batch
+  - [x] Task 25.1. The twelve-factor lens applied to a batch app; externalized config with Spring Cloud Config;
     guarding a remote call in a step with a circuit breaker.
-  - [ ] Task 25.2. **Spring Cloud Task** (`@EnableTask`, task-execution metadata, exit codes) and how it
+  - [x] Task 25.2. **Spring Cloud Task** (`@EnableTask`, task-execution metadata, exit codes) and how it
     complements Spring Batch — linked, not documented in depth (this material is mostly grounded in the
     sibling-project docs).
-  - [ ] Task 25.3. Orchestration with **Spring Cloud Data Flow** (task / composed-task launcher) — linked.
-  - [ ] Task 25.4. Running batch on Kubernetes (`Job`/`CronJob`) and the `DeployerPartitionHandler` (linked).
-  - [ ] Task 25.5. Links: https://spring.io/projects/spring-cloud-task, https://dataflow.spring.io/docs/,
+  - [x] Task 25.3. Orchestration with **Spring Cloud Data Flow** (task / composed-task launcher) — linked.
+  - [x] Task 25.4. Running batch on Kubernetes (`Job`/`CronJob`) and the `DeployerPartitionHandler` (linked).
+  - [x] Task 25.5. Links: https://spring.io/projects/spring-cloud-task, https://dataflow.spring.io/docs/,
     https://docs.spring.io/spring-batch/reference/spring-batch-integration.html
-- [ ] Task 26. Create `modules/ROOT/pages/backend/spring-batch/testing.adoc` — Testing batch jobs
-  - [ ] Task 26.1. The `spring-batch-test` module; `@SpringBatchTest` + `@SpringJUnitConfig`;
+- [x] Task 26. Create `modules/ROOT/pages/backend/spring-batch/testing.adoc` — Testing batch jobs
+  - [x] Task 26.1. The `spring-batch-test` module; `@SpringBatchTest` + `@SpringJUnitConfig`;
     `JobOperatorTestUtils` (`startJob()`/`startStep("stepName")`); `JobRepositoryTestUtils`.
-  - [ ] Task 26.2. `MetaDataInstanceFactory` for building domain objects in isolation; testing `@StepScope`/
+  - [x] Task 26.2. `MetaDataInstanceFactory` for building domain objects in isolation; testing `@StepScope`/
     `@JobScope` beans (`StepScopeTestExecutionListener` via a `getStepExecution()` method, or
     `StepScopeTestUtils.doInStepScope`).
-  - [ ] Task 26.3. End-to-end job assertions on `JobExecution`/`ExitStatus`; testing a single step; validating
+  - [x] Task 26.3. End-to-end job assertions on `JobExecution`/`ExitStatus`; testing a single step; validating
     output; mocking with Mockito. **State explicitly: JUnit 4 support was removed in 6.0 — JUnit Jupiter only.**
-  - [ ] Task 26.4. Links: https://docs.spring.io/spring-batch/reference/testing.html
+  - [x] Task 26.4. Links: https://docs.spring.io/spring-batch/reference/testing.html
 
 ### Group 3 — Cheat sheet page & PDF
 
