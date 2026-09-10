@@ -86,15 +86,18 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
 
 ### Group 1 — Author the three new sections (Parallelizable: yes — three independent files, no task depends on another's result)
 
-- [ ] **Task 1. Add `== Geospatial queries` to `modules/ROOT/pages/backend/springboot/spring-data-jpa.adoc`**,
+- [x] **Task 1. Add `== Geospatial queries` to `modules/ROOT/pages/backend/springboot/spring-data-jpa.adoc`**,
       inserted between the end of `== @Query, dynamic queries, and projections` (current line 312) and the start
       of `== Transactions, optimistic locking, and auditing` (current line 314) — docs-only, no tests/coverage/
       static-analysis applicable (Antora build verified in Group 2).
-  - [ ] Task 1.1. Opening paragraph: state that plain JPA/Hibernate has no built-in spatial type or query-derivation
+      - Files touched: `modules/ROOT/pages/backend/springboot/spring-data-jpa.adoc` (new `== Geospatial queries`
+        section, inserted at former line 313, between projections and transactions). Docs-only; no tests/
+        coverage/code-quality tooling applies.
+  - [x] Task 1.1. Opening paragraph: state that plain JPA/Hibernate has no built-in spatial type or query-derivation
         keyword the way Spring Data MongoDB/Neo4j do — spatial support comes from **Hibernate Spatial**
         (`org.hibernate:hibernate-spatial`) layered on top, mapping JTS (`org.locationtech.jts.geom.Point`/
         `Geometry`) types against a spatially-enabled database (PostGIS on PostgreSQL is the common case).
-  - [ ] Task 1.2. `=== Mapping a JTS Point with Hibernate Spatial` sub-section: an `@Entity` with a JTS `Point`
+  - [x] Task 1.2. `=== Mapping a JTS Point with Hibernate Spatial` sub-section: an `@Entity` with a JTS `Point`
         field, using `columnDefinition`/`@JdbcTypeCode` as needed for the dialect:
         ```java
         @Entity
@@ -116,7 +119,7 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
         `https://in.relation.to/2022/04/21/hibernate-spatial/[Hibernate Spatial]` and
         `https://docs.jboss.org/hibernate/orm/current/userguide/html_single/Hibernate_User_Guide.html#spatial[the
         Hibernate User Guide's spatial chapter]`.
-  - [ ] Task 1.3. `=== Querying spatial columns with native and JPQL @Query` sub-section: explain that derived
+  - [x] Task 1.3. `=== Querying spatial columns with native and JPQL @Query` sub-section: explain that derived
         keywords (`Near`/`Within`) are **not** in Spring Data JPA's supported keyword list the way they are for
         MongoDB/Neo4j, so spatial queries go through `@Query` — native SQL where JPQL doesn't expose the dialect
         function, or JPQL directly where the provider does:
@@ -142,16 +145,21 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
         Note `nativeQuery = true` is required here because PostGIS functions (`ST_DWithin`, `ST_MakePoint`,
         `ST_Distance`) are not part of JPQL's function set. Link inline to
         `https://postgis.net/docs/reference.html[the PostGIS spatial function reference]`.
-  - [ ] Task 1.4. Verify the new section's two `xref:`-free (no internal cross-reference needed here, per "no
+  - [x] Task 1.4. Verify the new section's two `xref:`-free (no internal cross-reference needed here, per "no
         `database/sql/` spatial page" above) links use this page's existing plain-`https://` inline-link style
         (no `== References` block, per choice 3), and read cleanly in the flow between the surrounding sections.
+        — Confirmed: both links are plain `https://` inline links matching the page's style; no `database/sql/`
+        page mentions spatial content so no internal xref was needed.
 
-- [ ] **Task 2. Extend `== Full-text and vector search integration` in
+- [x] **Task 2. Extend `== Full-text and vector search integration` in
       `modules/ROOT/pages/backend/springboot/spring-data-couchbase.adoc`** with a geo-specific sub-section,
       inserted after the existing `HotelSearchService` example (current line 237) and before
       `== Custom queries with CouchbaseTemplate` (current line 244) — docs-only, no tests/coverage/static-analysis
       applicable.
-  - [ ] Task 2.1. `=== Geospatial queries` sub-section (nested under the existing FTS/vector-search `==` section,
+      - Files touched: `modules/ROOT/pages/backend/springboot/spring-data-couchbase.adoc` (new
+        `=== Geospatial queries` sub-section nested inside `== Full-text and vector search integration`).
+        Docs-only; no tests/coverage/code-quality tooling applies.
+  - [x] Task 2.1. `=== Geospatial queries` sub-section (nested under the existing FTS/vector-search `==` section,
         matching its established `@Query`-style-search-method-plus-SDK-builder pattern): explain that Couchbase's
         geo capability is reached the same way — through the SDK's `geoDistance`/`geoBoundingBox`/`geoPolygon`
         query builders — rather than a dedicated repository keyword or annotation. Include one repository/service
@@ -180,16 +188,21 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
         Cross-reference `xref:database/couchbase/search-analytics-eventing.adoc[]` (FTS geo distance/bounding-box/
         polygon query types) and `xref:database/couchbase/indexes-and-views.adoc[]` (legacy spatial views) for the
         underlying index/query theory instead of repeating it here.
-  - [ ] Task 2.2. Verify the two `xref:` targets resolve (both files confirmed present in the repo) and the section
+  - [x] Task 2.2. Verify the two `xref:` targets resolve (both files confirmed present in the repo) and the section
         reads as a natural continuation of the existing FTS/vector-search content, not a disconnected addition.
+        — Confirmed both target files exist (`database/couchbase/search-analytics-eventing.adoc`,
+        `database/couchbase/indexes-and-views.adoc`); build verification in Task 4 confirms the xrefs resolve.
 
-- [ ] **Task 3. Add `== Geospatial queries` to `modules/ROOT/pages/backend/springboot/spring-data-neo4j.adoc`**,
+- [x] **Task 3. Add `== Geospatial queries` to `modules/ROOT/pages/backend/springboot/spring-data-neo4j.adoc`**,
       inserted between the end of `== Custom Cypher with @Query` (current line 224) and the start of
       `== Projections` (current line 226) — docs-only, no tests/coverage/static-analysis applicable.
-  - [ ] Task 3.1. Opening paragraph: state that Neo4j has a native `Point` spatial type (Cartesian or WGS-84/
+      - Files touched: `modules/ROOT/pages/backend/springboot/spring-data-neo4j.adoc` (new
+        `== Geospatial queries` section, inserted between custom Cypher and projections).
+        Docs-only; no tests/coverage/code-quality tooling applies.
+  - [x] Task 3.1. Opening paragraph: state that Neo4j has a native `Point` spatial type (Cartesian or WGS-84/
         geographic), Cypher `point()`/`distance()` functions, and point indexes, and that Spring Data Neo4j maps
         this through its own `Point` type.
-  - [ ] Task 3.2. `=== Mapping a Point field and querying with a derived Near method` sub-section: a `@Node` entity
+  - [x] Task 3.2. `=== Mapping a Point field and querying with a derived Near method` sub-section: a `@Node` entity
         with a `Point` field, and a derived `Neo4jRepository` `Near` query method:
         ```java
         @Node("Place")
@@ -212,7 +225,7 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
         List<Place> nearby = placeRepository.findByLocationNear(
                 new Point(-3.7038, 40.4168), new Distance(5, Metrics.KILOMETERS));
         ```
-  - [ ] Task 3.3. `=== Custom Cypher with point() and distance()` sub-section: an equivalent custom `@Query` using
+  - [x] Task 3.3. `=== Custom Cypher with point() and distance()` sub-section: an equivalent custom `@Query` using
         Cypher's `point()`/`distance()` directly, for cases the derived `Near` keyword can't express (e.g. a
         computed distance value returned alongside each match):
         ```java
@@ -231,13 +244,15 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
         Link inline to `https://neo4j.com/docs/cypher-manual/current/values-and-types/spatial/[Neo4j Cypher
         spatial values and functions]` and `https://docs.spring.io/spring-data/neo4j/reference/[the Spring Data
         Neo4j reference guide]`.
-  - [ ] Task 3.4. Verify the section reads consistently with the surrounding derived-query/custom-Cypher sections
+  - [x] Task 3.4. Verify the section reads consistently with the surrounding derived-query/custom-Cypher sections
         (same structure as `== Derived query methods` / `== Custom Cypher with @Query` immediately above it) and
         uses this page's existing plain-`https://` inline-link style (no `== References` block, per choice 3).
+        — Confirmed: same two-subsection structure (derived-method example, then custom-Cypher example) as the
+        sections above it; both links are plain `https://` inline links.
 
 ### Group 2 — Build verification (Parallelizable: yes — single task; requires Group 1 complete)
 
-- [ ] **Task 4. Verify the Antora build is clean** — delegate to `iru-gate-runner` to keep build output out of the
+- [x] **Task 4. Verify the Antora build is clean** — delegate to `iru-gate-runner` to keep build output out of the
       main context:
       ```
       Agent({
@@ -249,11 +264,18 @@ documentation. `spring-data-mongodb.adoc` itself is **not** touched (out of scop
           search-analytics-eventing.adoc, or indexes-and-views.adoc. Do not paste the full build log."
       })
       ```
-  - [ ] Task 4.1. Confirm the build exits successfully with zero xref/AsciiDoc warnings or errors.
-  - [ ] Task 4.2. If any warning/error references one of the three edited pages or their cross-referenced targets,
+      - Ran `npx antora antora-playbook.yml` directly (no `Agent`-spawning tool available in this session) —
+        exit 0, zero xref/AsciiDoc warnings or errors in the build log (only unrelated npm-version notices).
+        `build/site/backend/springboot/{spring-data-jpa,spring-data-couchbase,spring-data-neo4j}.html` all
+        generated with a rendered "Geospatial queries" section.
+  - [x] Task 4.1. Confirm the build exits successfully with zero xref/AsciiDoc warnings or errors.
+        — Confirmed: exit code 0, no WARN/ERROR lines in the build output.
+  - [x] Task 4.2. If any warning/error references one of the three edited pages or their cross-referenced targets,
         fix it and re-run verification before checking this task complete.
-  - [ ] Task 4.3. Sanity-check each new/extended section against its acceptance criterion: JPA section has a JTS
+        — N/A: no warnings or errors were produced.
+  - [x] Task 4.3. Sanity-check each new/extended section against its acceptance criterion: JPA section has a JTS
         `Point`-mapped `@Entity` and a native `@Query` example using a PostGIS spatial function; Couchbase section
         extends the FTS pattern with a `geoDistance`/`geoBoundingBox` example and both required `xref:`s; Neo4j
         section has a `Point`-typed `@Node` field, a derived `Near` method, and a Cypher `point()`/`distance()`
         `@Query`; `spring-data-mongodb.adoc` remains untouched.
+        — Confirmed all criteria met; `git diff --stat` on `spring-data-mongodb.adoc` is empty (untouched).
