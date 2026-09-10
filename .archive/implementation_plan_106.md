@@ -127,8 +127,8 @@ targets.
 
 **Parallelizable: yes** (single task).
 
-- [ ] Task 1. Create `modules/ROOT/partials/cpp-disclaimer.adoc`
-  - [ ] Task 1.1. `[IMPORTANT]` admonition, 3 sentences only, matching `kotlin-disclaimer.adoc`'s shape: (a) one
+- [x] Task 1. Create `modules/ROOT/partials/cpp-disclaimer.adoc`
+  - [x] Task 1.1. `[IMPORTANT]` admonition, 3 sentences only, matching `kotlin-disclaimer.adoc`'s shape: (a) one
         sentence — "documents C++23 (ISO/IEC 14882:2024), as published by ISO/IEC JTC1/SC22/WG21
         (https://www.open-std.org/jtc1/sc22/wg21/[wg21]), verified against the freely available working draft
         N5046 (https://eel.is/c++draft/[eel.is/c++draft]) and https://en.cppreference.com/w/cpp[cppreference.com]";
@@ -151,181 +151,181 @@ no page here has its own Bibliography, that lives only on the landing page (Grou
 
 #### Getting started
 
-- [ ] Task 2. `getting-started.adoc` — what C++ is, the standard editions (C++98/03/11/14/17/20/23/26) and who
+- [x] Task 2. `getting-started.adoc` — what C++ is, the standard editions (C++98/03/11/14/17/20/23/26) and who
       publishes them (WG21), compilers (GCC, Clang, MSVC), "Hello, World" with `std::println`, compiling with
       `-std=c++23 -Wall -Wextra`, Compiler Explorer.
-  - [ ] Task 2.1. Add an SVG (`modules/ROOT/images/cpp-compilation-pipeline.svg`) of the compilation pipeline
+  - [x] Task 2.1. Add an SVG (`modules/ROOT/images/cpp-compilation-pipeline.svg`) of the compilation pipeline
         (preprocess → compile → assemble → link).
-  - [ ] Task 2.2. Per Choice 4: the `std::println` "Hello, World" example is standard-conformant C++23 but
+  - [x] Task 2.2. Per Choice 4: the `std::println` "Hello, World" example is standard-conformant C++23 but
         `<print>` isn't in this environment's libstdc++ — verify the syntax against cppreference and note in the
         page (one sentence) that it needs GCC 14+ or a recent libc++/MSVC, alongside a `<cstdio>`/`std::cout`
         fallback that *does* compile locally, matching the issue's own "how to fall back on C++17" framing.
-- [ ] Task 3. `program-structure-and-compilation.adoc` — translation units, declarations vs. definitions, the
+- [x] Task 3. `program-structure-and-compilation.adoc` — translation units, declarations vs. definitions, the
       One Definition Rule, headers and include guards, linkage, `main`, a first look at modules, static vs.
       dynamic libraries.
-  - [ ] Task 3.1. Add an SVG (`modules/ROOT/images/cpp-headers-tus-objects.svg`) of headers/TUs/objects/executable.
+  - [x] Task 3.1. Add an SVG (`modules/ROOT/images/cpp-headers-tus-objects.svg`) of headers/TUs/objects/executable.
 
 #### Language fundamentals
 
-- [ ] Task 4. `lexical-structure-and-style.adoc` — tokens, identifiers and reserved names, keywords, literals
+- [x] Task 4. `lexical-structure-and-style.adoc` — tokens, identifiers and reserved names, keywords, literals
       (integer, floating, character, string, raw, user-defined), comments, attributes, and the C++ Core
       Guidelines naming/formatting conventions.
-- [ ] Task 5. `basic-types-and-values.adoc` — fundamental types, fixed-width integers, `char8_t`/`char16_t`/
+- [x] Task 5. `basic-types-and-values.adoc` — fundamental types, fixed-width integers, `char8_t`/`char16_t`/
       `char32_t`, `bool`, `auto` and `decltype`, type aliases and alias templates, implicit/explicit
       conversions, `<limits>`, `sizeof`/`alignof`.
-- [ ] Task 6. `constants-enumerations-and-initialization.adoc` — `const`, `constexpr`, `consteval`,
+- [x] Task 6. `constants-enumerations-and-initialization.adoc` — `const`, `constexpr`, `consteval`,
       `constinit`, scoped and unscoped enumerations (`std::to_underlying`, `using enum`), uniform/list
       initialization and its pitfalls, default member initializers, aggregate initialization and designated
       initializers.
-- [ ] Task 7. `operators-and-expressions.adoc` — operator precedence and associativity, value categories
+- [x] Task 7. `operators-and-expressions.adoc` — operator precedence and associativity, value categories
       (lvalue/prvalue/xvalue), sequencing, integer promotions, `<=>` three-way comparison, safe integer
       comparison (`std::cmp_less`), bit manipulation.
-- [ ] Task 8. `control-flow.adoc` — `if`/`switch` with initializers, `if constexpr`/`if consteval`, loops and
+- [x] Task 8. `control-flow.adoc` — `if`/`switch` with initializers, `if constexpr`/`if consteval`, loops and
       range-based `for` (including for custom types), structured bindings, `[[likely]]`, `goto`.
-- [ ] Task 9. `functions-and-lambdas.adoc` — declarations and overloading, default arguments, defaulted/deleted
+- [x] Task 9. `functions-and-lambdas.adoc` — declarations and overloading, default arguments, defaulted/deleted
       functions, lambdas (captures, generic, template lambdas, recursive), `std::function`, `std::invoke`,
       higher-order functions (map/fold), function composition, `noexcept` and `[[nodiscard]]`.
-- [ ] Task 10. `strings-and-text.adoc` — `std::string`/`std::string_view`, character types and Unicode, raw
+- [x] Task 10. `strings-and-text.adoc` — `std::string`/`std::string_view`, character types and Unicode, raw
       string literals, user-defined literals, `<charconv>` conversions, `std::format`/`std::print` (including
       custom formatters), `<regex>`.
-  - [ ] Task 10.1. Per Choice 4: `<format>`/`std::format` compiles locally; `std::print` doesn't (no `<print>`)
+  - [x] Task 10.1. Per Choice 4: `<format>`/`std::format` compiles locally; `std::print` doesn't (no `<print>`)
         — show `std::format` fully verified, and give `std::print` the same one-sentence toolchain note as
         Task 2.2.
-- [ ] Task 11. `numbers-and-math.adoc` — numeric types and `<limits>`, floating point pitfalls, `<cmath>`,
+- [x] Task 11. `numbers-and-math.adoc` — numeric types and `<limits>`, floating point pitfalls, `<cmath>`,
       `<numbers>`, `<random>` engines/distributions and seeding, `<bit>` utilities, `std::bitset`, checked
       conversions.
 
 #### Object-oriented programming
 
-- [ ] Task 12. `classes-and-objects.adoc` — members, constructors and member-initializer lists, special member
+- [x] Task 12. `classes-and-objects.adoc` — members, constructors and member-initializer lists, special member
       functions, the rule of zero/three/five, `explicit`, `static` members, `friend`, `const`/`mutable`
       correctness, `this`.
-  - [ ] Task 12.1. Add a mermaid diagram of the special-member generation decision (which of the six special
+  - [x] Task 12.1. Add a mermaid diagram of the special-member generation decision (which of the six special
         members the compiler implicitly declares/deletes, and why).
-- [ ] Task 13. `inheritance-and-polymorphism.adoc` — public/protected/private inheritance, virtual functions,
+- [x] Task 13. `inheritance-and-polymorphism.adoc` — public/protected/private inheritance, virtual functions,
       `override`/`final`, abstract classes, virtual destructors, object slicing, `dynamic_cast` and RTTI, the
       casts (`static_cast`, `reinterpret_cast`, `const_cast`).
-  - [ ] Task 13.1. Add an SVG (`modules/ROOT/images/cpp-object-layout-vtable.svg`) of object layout with a
+  - [x] Task 13.1. Add an SVG (`modules/ROOT/images/cpp-object-layout-vtable.svg`) of object layout with a
         vtable pointer.
-- [ ] Task 14. `operator-overloading-and-conversions.adoc` — member vs. non-member operators, `operator<=>` and
+- [x] Task 14. `operator-overloading-and-conversions.adoc` — member vs. non-member operators, `operator<=>` and
       defaulted comparisons, `operator[]` (multidimensional in C++23), `operator()`, conversion operators,
       `explicit`, user-defined literals, stream operators.
-- [ ] Task 15. `move-semantics-and-value-categories.adoc` — rvalue references, `std::move`, `std::forward`, move
+- [x] Task 15. `move-semantics-and-value-categories.adoc` — rvalue references, `std::move`, `std::forward`, move
       constructors/assignment, copy elision and guaranteed elision, `noexcept` moves, returning by value.
-  - [ ] Task 15.1. Add an SVG (`modules/ROOT/images/cpp-copy-vs-move.svg`) contrasting copy vs. move of a
+  - [x] Task 15.1. Add an SVG (`modules/ROOT/images/cpp-copy-vs-move.svg`) contrasting copy vs. move of a
         buffer-owning object.
-- [ ] Task 16. `memory-management-and-smart-pointers.adoc` — stack vs. free store, `new`/`delete`, RAII,
+- [x] Task 16. `memory-management-and-smart-pointers.adoc` — stack vs. free store, `new`/`delete`, RAII,
       `std::unique_ptr`, `std::shared_ptr`/`std::weak_ptr`, `make_unique`/`make_shared`, custom deleters,
       alignment, allocators overview.
-  - [ ] Task 16.1. Add an SVG (`modules/ROOT/images/cpp-smart-pointer-ownership.svg`) of the ownership graph of
+  - [x] Task 16.1. Add an SVG (`modules/ROOT/images/cpp-smart-pointer-ownership.svg`) of the ownership graph of
         `unique_ptr`/`shared_ptr`/`weak_ptr`.
 
 #### Generic and compile-time programming
 
-- [ ] Task 17. `templates.adoc` — function and class templates, template argument deduction, CTAD and deduction
+- [x] Task 17. `templates.adoc` — function and class templates, template argument deduction, CTAD and deduction
       guides, non-type template parameters, alias templates, variadic templates and fold expressions,
       specialization and partial specialization, two-phase lookup basics.
-- [ ] Task 18. `concepts-and-constraints.adoc` — `concept`, `requires` clauses and `requires` expressions,
+- [x] Task 18. `concepts-and-constraints.adoc` — `concept`, `requires` clauses and `requires` expressions,
       standard concepts (`std::integral`, `std::same_as`, …), abbreviated function templates, subsumption.
-  - [ ] Task 18.1. Add a mermaid diagram of the constraint-check flow (candidate → constraints evaluated →
+  - [x] Task 18.1. Add a mermaid diagram of the constraint-check flow (candidate → constraints evaluated →
         satisfied/not satisfied → overload chosen).
-- [ ] Task 19. `compile-time-programming.adoc` — `constexpr` functions and variables, `consteval` immediate
+- [x] Task 19. `compile-time-programming.adoc` — `constexpr` functions and variables, `consteval` immediate
       functions, `constinit`, `static_assert`, `<type_traits>` (querying and writing traits),
       `std::conditional`, `std::enable_if` vs. concepts, `if constexpr`, `std::is_constant_evaluated`,
       constexpr virtual functions.
-- [ ] Task 20. `namespaces-modules-and-the-preprocessor.adoc` — namespaces, unnamed and inline namespaces,
+- [x] Task 20. `namespaces-modules-and-the-preprocessor.adoc` — namespaces, unnamed and inline namespaces,
       `using`-declarations/directives, ADL, the preprocessor (conditional compilation, stringification and
       concatenation indirection, `__VA_OPT__`), modules and module partitions, feature-test macros and
       `<version>`.
 
 #### Standard library
 
-- [ ] Task 21. `standard-library-overview.adoc` — how the library is organized (headers by area), the `std`
+- [x] Task 21. `standard-library-overview.adoc` — how the library is organized (headers by area), the `std`
       namespace, C compatibility headers, freestanding vs. hosted, `std::size`/`std::data`/`std::ssize`,
       `std::hash` and hashing custom types, `std::exit`/`std::atexit`.
-- [ ] Task 22. `containers.adoc` — sequence (`vector`, `array`, `deque`, `list`, `forward_list`), associative
+- [x] Task 22. `containers.adoc` — sequence (`vector`, `array`, `deque`, `list`, `forward_list`), associative
       (`map`, `set`, `multimap`) and unordered containers, `flat_map`/`flat_set` (C++23), container adaptors,
       `std::span` and `std::mdspan`, `std::bitset`/`vector<bool>`, choosing the right container and invalidation
       rules.
-  - [ ] Task 22.1. Add an SVG (`modules/ROOT/images/cpp-container-decision-chart.svg`) container decision
+  - [x] Task 22.1. Add an SVG (`modules/ROOT/images/cpp-container-decision-chart.svg`) container decision
         chart.
-  - [ ] Task 22.2. Per Choice 4: `flat_map`/`flat_set`/`mdspan` aren't in this environment's libstdc++ — write
+  - [x] Task 22.2. Per Choice 4: `flat_map`/`flat_set`/`mdspan` aren't in this environment's libstdc++ — write
         both to verified-correct C++23 syntax per cppreference and add the same one-sentence toolchain note as
         Task 2.2; every other container in this page compiles locally.
-- [ ] Task 23. `iterators-and-algorithms.adoc` — iterator categories, `begin`/`end` and non-member access,
+- [x] Task 23. `iterators-and-algorithms.adoc` — iterator categories, `begin`/`end` and non-member access,
       `<algorithm>` and `<numeric>` (finding, sorting, set operations, `iota`, `fill`, `generate`), insert
       iterators, writing a random-access iterator, `std::erase_if`.
-  - [ ] Task 23.1. Add an SVG (`modules/ROOT/images/cpp-iterator-category-hierarchy.svg`) of the iterator
+  - [x] Task 23.1. Add an SVG (`modules/ROOT/images/cpp-iterator-category-hierarchy.svg`) of the iterator
         category hierarchy.
-- [ ] Task 24. `ranges-and-views.adoc` — ranges concepts, `std::ranges` constrained algorithms, projections,
+- [x] Task 24. `ranges-and-views.adoc` — ranges concepts, `std::ranges` constrained algorithms, projections,
       views and range adaptors (`filter`, `transform`, `take`, `drop`, `zip`, `enumerate`, `chunk`, …),
       `ranges::to`, writing a custom view.
-  - [ ] Task 24.1. Add a mermaid diagram of a lazy view pipeline.
-- [ ] Task 25. `vocabulary-types.adoc` — `std::pair`/`std::tuple`, `std::optional` and its monadic operations,
+  - [x] Task 24.1. Add a mermaid diagram of a lazy view pipeline.
+- [x] Task 25. `vocabulary-types.adoc` — `std::pair`/`std::tuple`, `std::optional` and its monadic operations,
       `std::variant` and `std::visit`, `std::any`, `std::expected`, `std::reference_wrapper`.
-- [ ] Task 26. `dates-times-and-chrono.adoc` — `chrono::duration`, clocks and `time_point`, measuring execution
+- [x] Task 26. `dates-times-and-chrono.adoc` — `chrono::duration`, clocks and `time_point`, measuring execution
       time, calendars (`year_month_day`), time zones, formatting/parsing times.
-- [ ] Task 27. `input-output-and-streams.adoc` — the iostreams hierarchy, formatted vs. unformatted I/O,
+- [x] Task 27. `input-output-and-streams.adoc` — the iostreams hierarchy, formatted vs. unformatted I/O,
       manipulators and `<iomanip>`, string streams, binary file I/O, `std::span` buffers (`<spanstream>`),
       locales, `std::osyncstream`, `std::print` vs. streams.
-  - [ ] Task 27.1. Add an SVG (`modules/ROOT/images/cpp-stream-class-hierarchy.svg`) of the stream class
+  - [x] Task 27.1. Add an SVG (`modules/ROOT/images/cpp-stream-class-hierarchy.svg`) of the stream class
         hierarchy.
-  - [ ] Task 27.2. Per Choice 4: give the `std::print` comparison the same one-sentence toolchain note as Task
+  - [x] Task 27.2. Per Choice 4: give the `std::print` comparison the same one-sentence toolchain note as Task
         2.2; the iostreams examples themselves compile locally.
-- [ ] Task 28. `filesystem.adoc` — `std::filesystem::path`, creating/copying/removing files and directories,
+- [x] Task 28. `filesystem.adoc` — `std::filesystem::path`, creating/copying/removing files and directories,
       file properties, directory iteration, finding files, error handling with `error_code`.
 
 #### Error handling and robustness
 
-- [ ] Task 29. `error-handling.adoc` — exceptions and the standard hierarchy, `throw`/`try`/`catch`, exception
+- [x] Task 29. `error-handling.adoc` — exceptions and the standard hierarchy, `throw`/`try`/`catch`, exception
       safety guarantees, `noexcept`, `std::exception_ptr`, `std::error_code`/`system_error`, `std::expected` as
       an alternative, `assert`, `std::source_location`, `<stacktrace>`, `std::terminate`.
-  - [ ] Task 29.1. Add a mermaid diagram of exception propagation and stack unwinding.
+  - [x] Task 29.1. Add a mermaid diagram of exception propagation and stack unwinding.
 
 #### Concurrency
 
-- [ ] Task 30. `threads-and-synchronization.adoc` — `std::thread`/`std::jthread`, `stop_token` cancellation,
+- [x] Task 30. `threads-and-synchronization.adoc` — `std::thread`/`std::jthread`, `stop_token` cancellation,
       mutexes and lock helpers (`lock_guard`, `scoped_lock`, `unique_lock`, `shared_mutex`), condition
       variables, `latch`, `barrier`, `counting_semaphore`, `thread_local`, exceptions from threads,
       `osyncstream`.
-  - [ ] Task 30.1. Add an SVG (`modules/ROOT/images/cpp-synchronization-primitives.svg`) of the synchronization
+  - [x] Task 30.1. Add an SVG (`modules/ROOT/images/cpp-synchronization-primitives.svg`) of the synchronization
         primitives at a glance.
-- [ ] Task 31. `async-futures-and-atomics.adoc` — `std::promise`/`std::future`/`shared_future`, `std::async` and
+- [x] Task 31. `async-futures-and-atomics.adoc` — `std::promise`/`std::future`/`shared_future`, `std::async` and
       launch policies, `std::packaged_task`, `std::atomic` and memory orders, `atomic_ref`,
       `atomic<shared_ptr>`, parallel algorithms with execution policies, parallel map/fold.
-- [ ] Task 32. `coroutines.adoc` — `co_await`/`co_yield`/`co_return`, promise types and awaitables, a `task`
+- [x] Task 32. `coroutines.adoc` — `co_await`/`co_yield`/`co_return`, promise types and awaitables, a `task`
       type, a `generator` type, `std::generator` (C++23).
-  - [ ] Task 32.1. Add a mermaid state-machine diagram of a coroutine's suspend/resume states.
-  - [ ] Task 32.2. Per Choice 4: `<generator>`/`std::generator` isn't in this environment's libstdc++ — the
+  - [x] Task 32.1. Add a mermaid state-machine diagram of a coroutine's suspend/resume states.
+  - [x] Task 32.2. Per Choice 4: `<generator>`/`std::generator` isn't in this environment's libstdc++ — the
         hand-written `task`/`generator` awaitable types compile locally (verify them); give `std::generator`
         itself the same one-sentence toolchain note as Task 2.2.
 
 #### Design, performance and tooling
 
-- [ ] Task 33. `patterns-and-idioms.adoc` — RAII, pimpl, NVI, CRTP and static polymorphism (with `deducing
+- [x] Task 33. `patterns-and-idioms.adoc` — RAII, pimpl, NVI, CRTP and static polymorphism (with `deducing
       this`), mixins, type erasure, the named-parameter idiom, attorney–client, factories without `if`/`else`,
       thread-safe singleton.
-- [ ] Task 34. `performance.adoc` — the zero-overhead principle, measuring before optimizing, avoiding copies
+- [x] Task 34. `performance.adoc` — the zero-overhead principle, measuring before optimizing, avoiding copies
       (moves, `string_view`, `span`), reserving and contiguous containers, `constexpr` evaluation, inlining and
       `[[likely]]`, allocation strategies, undefined behavior and the optimizer, profiling and sanitizers.
-- [ ] Task 35. `build-and-tooling.adoc` — compilers and flags, CMake (targets, `CMakePresets`), package
+- [x] Task 35. `build-and-tooling.adoc` — compilers and flags, CMake (targets, `CMakePresets`), package
       managers (vcpkg, Conan), `clang-format`, `clang-tidy`, sanitizers (ASan/UBSan/TSan),
       `compile_commands.json`, Compiler Explorer.
-- [ ] Task 36. `testing.adoc` — GoogleTest (assertions, fixtures, parameterized tests, GoogleMock), Catch2
+- [x] Task 36. `testing.adoc` — GoogleTest (assertions, fixtures, parameterized tests, GoogleMock), Catch2
       (sections, matchers, generators), Boost.Test, CTest integration, testing constexpr code with
       `static_assert`.
-- [ ] Task 37. `cpp-standards-and-cpp26.adoc` — the editions from C++98 to C++23 and their headline features,
+- [x] Task 37. `cpp-standards-and-cpp26.adoc` — the editions from C++98 to C++23 and their headline features,
       feature-test macros, compiler support pages, and C++26 (reflection, contracts, `std::execution`,
       erroneous behaviour, hardened library) with links to N5046 and cppreference.
-  - [ ] Task 37.1. Add a mermaid timeline of the C++ standards.
+  - [x] Task 37.1. Add a mermaid timeline of the C++ standards.
 
 ### Group 3 — Cheat sheet _(untagged)_
 
 **Parallelizable: yes** (single task, but depends on Group 2's final page list/titles to cross-reference
 accurately — so it lands after Group 2).
 
-- [ ] Task 38. C++ cheat sheet
-  - [ ] Task 38.1. Build a print-ready, single-page HTML/CSS layout (dense multi-column, colour-coded boxed
+- [x] Task 38. C++ cheat sheet
+  - [x] Task 38.1. Build a print-ready, single-page HTML/CSS layout (dense multi-column, colour-coded boxed
         sections, a header line "Irurueta Docs — C++ Reference" and a breadcrumb footer "Guides & References /
         Programming Languages / C++ Reference") covering, at minimum, one box per Group 2 subsection: getting
         started; language fundamentals (types, operators, control flow, functions/lambdas); OOP (classes,
@@ -334,11 +334,11 @@ accurately — so it lands after Group 2).
         ranges, vocabulary types, chrono, I/O, filesystem); error handling; concurrency (threads, futures/atomics,
         coroutines); and design/performance/tooling — visually consistent with `kotlin-cheat-sheet.pdf` /
         `java-cheat-sheet.pdf`.
-  - [ ] Task 38.2. Render it to PDF via headless Chrome (`--headless --print-to-pdf --no-pdf-header-footer`,
+  - [x] Task 38.2. Render it to PDF via headless Chrome (`--headless --print-to-pdf --no-pdf-header-footer`,
         e.g. using `/opt/pw-browsers/chromium`), verify it is **exactly one A4 page** with no clipping (page
         count via PDF page-object inspection, plus a rendered preview screenshot), save to
         `modules/ROOT/attachments/cpp-cheat-sheet.pdf`. Discard the HTML source (not checked in).
-  - [ ] Task 38.3. Create `modules/ROOT/pages/programming-languages/cpp/cheat-sheet.adoc` — `:description:`/
+  - [x] Task 38.3. Create `modules/ROOT/pages/programming-languages/cpp/cheat-sheet.adoc` — `:description:`/
         `:keywords:`, `include::partial$cpp-disclaimer.adoc[]`, one summary paragraph, then every topic page
         from Group 2 cross-referenced grouped by subsection (same grouping as Task 39.2 below), ending with
         `xref:attachment$cpp-cheat-sheet.pdf[Download the C++ Cheat Sheet (PDF)]`.
@@ -349,17 +349,17 @@ accurately — so it lands after Group 2).
 list from Groups 2–3, `nav.adoc`/`programming-languages/index.adoc`/root `index.adoc` are single shared files
 edited once each, and build verification must run last, against everything already in place.
 
-- [ ] Task 39. Create `modules/ROOT/pages/programming-languages/cpp/index.adoc` — "C++ Reference" landing page:
-  - [ ] Task 39.1. `= C++ Reference`, `:description:`, `:keywords:` (C++, C++23, C++26, WG21, cppreference,
+- [x] Task 39. Create `modules/ROOT/pages/programming-languages/cpp/index.adoc` — "C++ Reference" landing page:
+  - [x] Task 39.1. `= C++ Reference`, `:description:`, `:keywords:` (C++, C++23, C++26, WG21, cppreference,
         RAII, templates, concepts, ranges, coroutines, smart pointers, move semantics, …),
         `include::partial$cpp-disclaimer.adoc[]`, one intro paragraph on what C++ is and that this section
         targets C++23, a "New here? read in this order" pointer (Task 2 → Task 3 → *Language fundamentals* in
         order → the rest as needed).
-  - [ ] Task 39.2. `== What's covered` — full bulleted list of Tasks 2–37 + Task 38 (cheat sheet), grouped
+  - [x] Task 39.2. `== What's covered` — full bulleted list of Tasks 2–37 + Task 38 (cheat sheet), grouped
         exactly as Group 2's subsections above (Getting started; Language fundamentals; Object-oriented
         programming; Generic and compile-time programming; Standard library; Error handling and robustness;
         Concurrency; Design, performance and tooling; Reference).
-  - [ ] Task 39.3. `== Bibliography` section, anchor `_bibliography`, reproducing the issue's own bibliography
+  - [x] Task 39.3. `== Bibliography` section, anchor `_bibliography`, reproducing the issue's own bibliography
         list verbatim (all linked): the Standard C++ Foundation's "The Standard"/status pages, WG21 + the N5046
         working draft + eel.is/c++draft, cppreference.com (with its C++20/23/26 feature pages), the C++ Core
         Guidelines, GCC/Clang/MSVC documentation and conformance pages, CMake/vcpkg/Conan/GoogleTest/Catch2/
@@ -367,22 +367,22 @@ edited once each, and build verification must run last, against everything alrea
         Bancila's *Modern C++ Programming Cookbook, 3rd ed.*, each marked "Consulted reference" and linked to
         their publisher/author pages per the issue's own citation text) — closing with the same "on any
         discrepancy, the standard and cppreference win" sentence the Kotlin/Java landing pages use.
-- [ ] Task 40. Create `modules/ROOT/partials/nav-cpp.adoc` — flat `*`/`**` xref list: `programming-languages/cpp/index.adoc`
+- [x] Task 40. Create `modules/ROOT/partials/nav-cpp.adoc` — flat `*`/`**` xref list: `programming-languages/cpp/index.adoc`
       as `*`, every page from Tasks 2–37 as `**` in the same order as Task 39.2, `cheat-sheet.adoc` (Task 38.3)
       last — written exactly like `nav-kotlin.adoc`'s depth-agnostic technique.
-- [ ] Task 41. Update `modules/ROOT/nav.adoc`: insert `include::partial$nav-cpp.adoc[]` as a new line between
+- [x] Task 41. Update `modules/ROOT/nav.adoc`: insert `include::partial$nav-cpp.adoc[]` as a new line between
       the existing `include::partial$nav-kotlin.adoc[]` (line 23) and the closing `--` (line 24) of that open
       block — see Choice 2 above for why this is the correct insertion point (right after the last sibling that
       actually exists) rather than "after `nav-c.adoc`."
-- [ ] Task 42. Update `modules/ROOT/pages/programming-languages/index.adoc`:
-  - [ ] Task 42.1. Add a sixth `== Sections` bullet, after the Kotlin bullet: `xref:programming-languages/cpp/index.adoc[C++
+- [x] Task 42. Update `modules/ROOT/pages/programming-languages/index.adoc`:
+  - [x] Task 42.1. Add a sixth `== Sections` bullet, after the Kotlin bullet: `xref:programming-languages/cpp/index.adoc[C++
         Reference] -- ...` (one-line summary in the same style as the other five, covering language
         fundamentals, OOP, generics/compile-time programming, the standard library, concurrency, and tooling,
         plus a downloadable cheat sheet).
-  - [ ] Task 42.2. Refresh the page's `:description:`/`:keywords:` to mention C++/C++23.
-- [ ] Task 43. Update `modules/ROOT/pages/index.adoc`: append `C++, C++23, C++26` to the end of the existing
+  - [x] Task 42.2. Refresh the page's `:description:`/`:keywords:` to mention C++/C++23.
+- [x] Task 43. Update `modules/ROOT/pages/index.adoc`: append `C++, C++23, C++26` to the end of the existing
       `:keywords:` line (line 3) — no other change to this page is required by the issue.
-- [ ] Task 44. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
+- [x] Task 44. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
       context window:
       ```
       Agent({
