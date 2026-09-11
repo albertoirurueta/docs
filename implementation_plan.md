@@ -382,7 +382,7 @@ Every page in this group, without exception:
       code and cancellation, code coverage with coverlet, and integration-test pointers to the ASP.NET Core
       reference (`xref:web/aspnet/core/…`). This is the **only** page whose `== References` may link xunit.net /
       nunit.org alongside official Microsoft documentation.
-- [ ] Task 39. `csharp-versions-and-whats-new.adoc` — a version table (C# 1.0 → 14 with year, paired
+- [x] Task 39. `csharp-versions-and-whats-new.adoc` — a version table (C# 1.0 → 14 with year, paired
       .NET/Visual Studio release and headline features), the C# 13 / 14 features in one place with links to the
       pages above, the **C# 15 preview** feature list with its .NET 11 timeline, how to opt into preview
       features (`<LangVersion>preview</LangVersion>`), breaking changes and warning waves, and the
