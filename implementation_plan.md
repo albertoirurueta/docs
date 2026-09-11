@@ -394,8 +394,8 @@ Every page in this group, without exception:
 **Parallelizable: yes** (single task, but it must follow Group 2 — the cheat sheet's content and its
 cross-references depend on every concept page's final heading structure).
 
-- [ ] Task 40. C# cheat sheet
-  - [ ] Task 40.1. Build a print-ready, single-page HTML/CSS layout — dense multi-column, colour-coded boxed
+- [x] Task 40. C# cheat sheet
+  - [x] Task 40.1. Build a print-ready, single-page HTML/CSS layout — dense multi-column, colour-coded boxed
         sections covering: built-in types and literals; `var`/`const`/`readonly`; string interpolation and raw
         literals; operators (`??`, `?.`, `^`, `..`, `is`/`as`, `switch`); control-flow one-liners; method
         parameters (`ref`/`out`/`in`/`params`); class/struct/record/interface/enum skeletons; properties
@@ -406,11 +406,11 @@ cross-references depend on every concept page's final heading structure).
         reflection one-liners; and `dotnet` CLI commands. Header line "C# Cheat Sheet — C# 14 / .NET 10",
         breadcrumb footer "Irurueta Docs · Guides & References / Programming Languages / C# Reference" —
         visually consistent with `kotlin-cheat-sheet.pdf` / `java-cheat-sheet.pdf` / `c-cheat-sheet.pdf`.
-  - [ ] Task 40.2. Render it to PDF with headless Chromium (`--headless --print-to-pdf
+  - [x] Task 40.2. Render it to PDF with headless Chromium (`--headless --print-to-pdf
         --no-pdf-header-footer`, binary at `/opt/pw-browsers/chromium`), verify it is **exactly one A4 page**
         with no clipping (page-object inspection plus a rendered preview screenshot), and save as
         `modules/ROOT/attachments/csharp-cheat-sheet.pdf`. Discard the HTML source — it is not checked in.
-  - [ ] Task 40.3. Create `modules/ROOT/pages/programming-languages/csharp/cheat-sheet.adoc` — `= C# Cheat
+  - [x] Task 40.3. Create `modules/ROOT/pages/programming-languages/csharp/cheat-sheet.adoc` — `= C# Cheat
         Sheet`, `:description:`, `:keywords:`, `include::partial$csharp-disclaimer.adoc[]`, a short paragraph
         listing what the sheet covers, cross-references to every concept page (Tasks 3–39) grouped under the
         same seven headings used in Group 2 and in the "What's covered" list (Task 41.2), ending with
