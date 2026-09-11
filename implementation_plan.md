@@ -302,7 +302,7 @@ Every page in this group, without exception:
       `finally` and `using` for cleanup, `TryParse`-style and result-object alternatives, unhandled-exception
       handlers, and best practices from the framework design guidelines. 📊 **mermaid** — exception propagation
       through the call stack with filters and `finally`.
-- [ ] Task 28. `memory-management-and-disposal.adoc` — the generational garbage collector (gen 0/1/2, LOH,
+- [x] Task 28. `memory-management-and-disposal.adoc` — the generational garbage collector (gen 0/1/2, LOH,
       server vs. workstation, concurrent GC), what allocates and what does not, `IDisposable` and the dispose
       pattern, `using` statements and **`using` declarations**, `IAsyncDisposable`/`await using`, finalizers and
       `SafeHandle`, `GC.SuppressFinalize`, weak references, `GC.Collect` and when not to call it, memory
@@ -311,7 +311,7 @@ Every page in this group, without exception:
 
 #### Concurrency and asynchrony
 
-- [ ] Task 29. `async-and-await.adoc` — the task-based asynchronous pattern, `async`/`await`,
+- [x] Task 29. `async-and-await.adoc` — the task-based asynchronous pattern, `async`/`await`,
       `Task`/`Task<T>`/`ValueTask<T>`, async return types (including `void` for event handlers and custom
       task-like types), how the compiler builds the state machine, synchronization contexts and
       `ConfigureAwait(false)`, composing tasks (`Task.WhenAll`/`WhenAny`/`WhenEach`), cancellation
@@ -319,7 +319,7 @@ Every page in this group, without exception:
       **async streams** (`IAsyncEnumerable<T>`, `await foreach`, `yield` in async iterators), `async Main`, and
       common pitfalls (sync-over-async deadlocks, `async void`, forgotten `await`). 📊 **mermaid sequence
       diagram** — an `await` yielding to the caller and resuming.
-- [ ] Task 30. `threads-and-synchronization.adoc` — `Thread` and `ThreadPool`, `Task.Run`, the `lock` statement
+- [x] Task 30. `threads-and-synchronization.adoc` — `Thread` and `ThreadPool`, `Task.Run`, the `lock` statement
       and **`System.Threading.Lock` (.NET 9+)**, `Monitor`, `Mutex`/`Semaphore`/`SemaphoreSlim`, `Interlocked`,
       `volatile` and memory ordering, `ReaderWriterLockSlim`, thread-local storage, `Lazy<T>`,
       `ConcurrentDictionary`/`ConcurrentQueue`/`BlockingCollection`, `Channel<T>`, the Task Parallel Library
