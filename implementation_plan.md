@@ -358,14 +358,14 @@ Every page in this group, without exception:
 
 #### Code organisation and tooling
 
-- [ ] Task 35. `namespaces-assemblies-and-projects.adoc` — namespaces vs. assemblies, `internal` and
+- [x] Task 35. `namespaces-assemblies-and-projects.adoc` — namespaces vs. assemblies, `internal` and
       `[InternalsVisibleTo]`, `extern alias`, the SDK-style `.csproj` (target frameworks, multi-targeting,
       `PackageReference`, properties), solutions (`.sln`/`.slnx`), `global.json`, NuGet packages (consuming,
       authoring, `dotnet pack`), assembly versioning and strong names, deployment models (framework-dependent,
       self-contained, single-file, ReadyToRun, **trimming and Native AOT**), and how this relates to the ASP.NET
       Reference's project layouts (`xref:web/aspnet/…`). 📊 **mermaid** — from source files to assemblies to a
       published app.
-- [ ] Task 36. `coding-conventions-and-documentation.adoc` — Microsoft's C# coding conventions and identifier
+- [x] Task 36. `coding-conventions-and-documentation.adoc` — Microsoft's C# coding conventions and identifier
       naming rules, the framework design guidelines (naming, member design), `.editorconfig` and code-style
       rules (IDE0xxx), analyzers and `dotnet format`, XML documentation comments (`<summary>`, `<param>`,
       `<returns>`, `<exception>`, `<see cref>`, `<inheritdoc/>`), generating docs with DocFX and
