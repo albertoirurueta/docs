@@ -328,14 +328,14 @@ Every page in this group, without exception:
 
 #### Advanced language features
 
-- [ ] Task 31. `attributes-and-reflection.adoc` — applying attributes (targets, positional/named parameters,
+- [x] Task 31. `attributes-and-reflection.adoc` — applying attributes (targets, positional/named parameters,
       generic attributes), the compiler-recognised attributes (`[Obsolete]`, `[Conditional]`,
       caller-information attributes, `[ModuleInitializer]`, `[SkipLocalsInit]`, nullable-analysis attributes,
       `[InlineArray]`), writing custom attributes, reading attributes with reflection, the reflection API
       (`Type`, `MemberInfo`, `MethodInfo.Invoke`, `Activator.CreateInstance`, generics and reflection, `typeof`
       vs. `GetType`), `Assembly` loading, `System.Reflection.Emit` in brief, reflection's cost and its
       trimming/AOT-unfriendly nature, and **source generators / interceptors** as the modern alternative.
-- [ ] Task 32. `unsafe-code-spans-and-performance.adoc` — `Span<T>`/`ReadOnlySpan<T>`/`Memory<T>` and the
+- [x] Task 32. `unsafe-code-spans-and-performance.adoc` — `Span<T>`/`ReadOnlySpan<T>`/`Memory<T>` and the
       **implicit span conversions (C# 14)**, `stackalloc`, `ref` locals/returns and `ref` fields in `ref
       struct`s, `scoped`, `unsafe` contexts and pointers (`*`, `&`, `->`, pointer arithmetic), `fixed`
       statements and fixed-size buffers, function pointers (`delegate*`), `sizeof`, `Unsafe`/`MemoryMarshal`
