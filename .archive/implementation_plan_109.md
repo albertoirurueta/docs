@@ -402,6 +402,9 @@ Depends on Groups 2–9: the nav partial lists every page, and the index bullet 
         `nav-kotlin.adoc`**, after it. Re-check at this point whether `nav-c.adoc`/`nav-cpp.adoc` are present
         in the branch (PRs #108/#107 may have merged by then) and, if so, place the include **after** those,
         per issue #109's append-order instruction.
+        **Placed after `nav-kotlin.adoc` initially** (neither C partial existed then); once #108/#107 merged
+        and `origin/main` was merged in, the include was moved to sit **after `nav-c.adoc` and
+        `nav-cpp.adoc`**, per the append-order instruction.
 - [x] Task 32. Add the "Objective-C Reference" bullet to
       `modules/ROOT/pages/programming-languages/index.adoc`
   - [x] Task 32.1. Append a bullet to the `== Sections` list in the same style as the existing five (an
@@ -421,18 +424,25 @@ Depends on Groups 2–9: the nav partial lists every page, and the index bullet 
         `xref:programming-languages/c/<page>.adoc[…]` cross-references to the matching C Reference pages,
         trimming each summary to the Objective-C-specific angle, exactly as issue #109's fourth acceptance
         criterion asks. Do the same for any other page that summarises plain-C material.
-        **NOT APPLICABLE this run** — `modules/ROOT/pages/programming-languages/c/` was absent at
-        implementation time (PR #108 still unmerged), so the 34.3 branch was taken instead.
+        **APPLIED, after the fact.** At implementation time `programming-languages/c/` was absent (PR #108
+        still unmerged) so 34.3 was taken first; PRs #108 and #107 then both merged into `main` while this
+        branch was being finished. `origin/main` was merged into `feature/109` and this branch was applied:
+        18 `xref:` cross-references now point into the C Reference from
+        `basic-syntax-and-types.adoc` (lexical structure, basic types, arrays and strings, structures/unions,
+        pointers, constants and initialization, storage duration) and
+        `operators-control-flow-and-functions.adoc` (operators and expressions, control flow, advanced control
+        flow, functions, pointers, structures/unions, the memory model, the preprocessor), plus C and {cpp}
+        Reference links from `objective-c-plus-plus-and-c-interop.adoc`. Every target was verified to exist.
+        **Issue #109's fourth acceptance criterion is therefore MET, not deferred.**
   - [x] Task 34.3. **If it does not exist**: leave the pages self-contained, add **no** `xref:` to a
         non-existent `programming-languages/c/` page (it would emit "target of xref not found" and render a
         broken link), and record in the run's summary that the cross-referencing acceptance criterion is
         deferred pending #108 — so it can be raised as a follow-up issue.
-        **BRANCH TAKEN.** Verified absent: no `programming-languages/c/` or `cpp/` directory, and no
-        `nav-c.adoc`/`nav-cpp.adoc`. `basic-syntax-and-types.adoc` and
-        `operators-control-flow-and-functions.adoc` therefore remain self-contained, with the C material
-        summarised and the Objective-C angle primary. Zero `xref:programming-languages/c/` links were
-        authored (verified by grep). **Issue #109's C-cross-reference acceptance criterion is DEFERRED
-        pending #108** and should be raised as a follow-up issue.
+        **TAKEN INITIALLY, THEN SUPERSEDED.** During implementation this was correct: no
+        `programming-languages/c/` or `cpp/` directory and no `nav-c.adoc`/`nav-cpp.adoc` existed, so both
+        pages were written self-contained with zero `xref:programming-languages/c/` links. #108 and #107 then
+        merged into `main` before this branch's PR was finalized, so 34.2 was applied on top (see above) and
+        the deferral no longer stands. No follow-up issue is needed.
 - [x] Task 35. Build and verify the site
   - [x] Task 35.1. Delegate the build to the `iru-gate-runner` agent so its output doesn't consume the main
         context, e.g.
