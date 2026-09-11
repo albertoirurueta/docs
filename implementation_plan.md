@@ -246,7 +246,7 @@ Every page in this group, without exception:
       operators (`+`, `==`/`!=` pairs, `<`/`>`, `true`/`false`, unary, `checked` operators), **user-defined
       compound assignment operators (C# 14)**, user-defined `implicit`/`explicit` conversions, and operators via
       static abstract interface members.
-- [ ] Task 21. `extension-members.adoc` — classic extension methods (`this` parameter, discovery via `using`,
+- [x] Task 21. `extension-members.adoc` — classic extension methods (`this` parameter, discovery via `using`,
       LINQ as the canonical example, extension methods on `null` receivers, guidelines), **extension blocks
       (C# 14 — `extension(T receiver) { … }` with extension properties, static extension members and extension
       operators)**, **extension indexers (C# 15 preview)**, and how the compiler resolves extension members vs.
@@ -254,7 +254,7 @@ Every page in this group, without exception:
 
 #### Functional programming
 
-- [ ] Task 22. `delegates-lambdas-and-events.adoc` — `delegate` types, `Func<>`/`Action<>`/`Predicate<>`, method
+- [x] Task 22. `delegates-lambdas-and-events.adoc` — `delegate` types, `Func<>`/`Action<>`/`Predicate<>`, method
       group conversions, multicast delegates and invocation lists, lambda expressions (expression vs. statement
       bodies, implicitly typed parameters, **modifiers on simple lambda parameters — C# 14**, `static` lambdas,
       default parameter values, natural type, attributes on lambdas), closures and captured variables (including
@@ -263,13 +263,13 @@ Every page in this group, without exception:
       accessors, **partial events — C# 14**, unsubscribing and memory leaks), and delegates vs. interfaces.
       📊 **SVG `modules/ROOT/images/csharp-closure-capture.svg`** — a closure capturing a local variable across
       calls.
-- [ ] Task 23. `pattern-matching.adoc` — `is` patterns, `switch` statements and expressions,
+- [x] Task 23. `pattern-matching.adoc` — `is` patterns, `switch` statements and expressions,
       declaration/type, constant, relational, logical (`and`/`or`/`not`), property, positional
       (deconstruction), tuple, `var`, discard and **list/slice** patterns, nested patterns, case guards,
       exhaustiveness and the compiler's "not exhaustive" warnings, **union types** and **closed hierarchies**
       (both C# 15 preview) as the way to get exhaustive matching over a fixed set of cases, and the
       "data-driven algorithms" tutorial. 📊 **mermaid** — how a `switch` expression is evaluated top to bottom.
-- [ ] Task 24. `collections-and-iterators.adoc` — arrays (single-, multi-dimensional, jagged, `Array` methods,
+- [x] Task 24. `collections-and-iterators.adoc` — arrays (single-, multi-dimensional, jagged, `Array` methods,
       array covariance), **collection expressions** `[a, b, .. rest]` (and **collection-expression arguments
       `with(...)` — C# 15 preview**), `List<T>`, `Dictionary<TKey,TValue>`, `HashSet<T>`, `Queue<T>`/`Stack<T>`,
       `LinkedList<T>`, `SortedDictionary`/`SortedSet`, `PriorityQueue<T,P>`, the
