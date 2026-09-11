@@ -371,12 +371,12 @@ Every page in this group, without exception:
       `<returns>`, `<exception>`, `<see cref>`, `<inheritdoc/>`), generating docs with DocFX and
       `GenerateDocumentationFile`, and common idioms (guard clauses, expression-bodied members, `var` guidance,
       `is null` vs. `== null`).
-- [ ] Task 37. `build-and-tooling.adoc` — the `dotnet` CLI in depth (`new`, `build`, `run`, `watch`, `test`,
+- [x] Task 37. `build-and-tooling.adoc` — the `dotnet` CLI in depth (`new`, `build`, `run`, `watch`, `test`,
       `publish`, `pack`, `tool`, templates), MSBuild basics and `Directory.Build.props`, Visual Studio 2026 /
       VS Code C# Dev Kit / Rider, debugging (breakpoints, conditional breakpoints, hot reload), diagnostics
       tools (`dotnet-counters`, `dotnet-trace`, `dotnet-dump`), Roslyn analyzers and source generators, LINQPad
       and `dotnet run file.cs` as scratchpads, and CI with GitHub Actions (`actions/setup-dotnet`).
-- [ ] Task 38. `testing.adoc` — test projects and `dotnet test`, **xUnit** (facts, theories with
+- [x] Task 38. `testing.adoc` — test projects and `dotnet test`, **xUnit** (facts, theories with
       `InlineData`/`MemberData`, fixtures, `IAsyncLifetime`), NUnit and MSTest equivalents in brief, the
       Microsoft Testing Platform, assertions, mocking with NSubstitute/Moq, test data builders, testing async
       code and cancellation, code coverage with coverlet, and integration-test pointers to the ASP.NET Core
