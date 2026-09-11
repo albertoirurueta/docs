@@ -278,7 +278,7 @@ Every page in this group, without exception:
       collections, indices and ranges on arrays/lists/spans, `Span<T>` as a collection view,
       `Comparer<T>`/`EqualityComparer<T>` in collections, and a thread-safe collections pointer (Task 30).
       📊 **mermaid** — the collection interface hierarchy.
-- [ ] Task 25. `linq.adoc` — what LINQ is, query syntax vs. method syntax and how query expressions are
+- [x] Task 25. `linq.adoc` — what LINQ is, query syntax vs. method syntax and how query expressions are
       translated (`from`/`where`/`select`/`orderby`/`group … by`/`join`/`let`/`into`), deferred vs. immediate
       execution, the standard query operators by family (filtering, projection incl. `SelectMany`, ordering,
       grouping, joining, set operations, partitioning, quantifiers, aggregation, element operators, conversion —
@@ -287,7 +287,7 @@ Every page in this group, without exception:
       pointer (Task 30), writing your own operators (extension methods + iterators), and performance tips
       (`Span`-based alternatives, avoiding multiple enumeration). 📊 **mermaid** — a query pipeline with deferred
       execution.
-- [ ] Task 26. `expression-trees-and-dynamic.adoc` — `Expression<TDelegate>` vs. delegates, building trees by
+- [x] Task 26. `expression-trees-and-dynamic.adoc` — `Expression<TDelegate>` vs. delegates, building trees by
       hand (`Expression.Lambda`, `Parameter`, `Call`), compiling and executing, interpreting and translating
       trees (`ExpressionVisitor`), how `IQueryable` providers use them, restrictions on expression-tree lambdas;
       the `dynamic` type and the DLR (late binding, `ExpandoObject`, `DynamicObject`,
@@ -295,7 +295,7 @@ Every page in this group, without exception:
 
 #### Error handling and resources
 
-- [ ] Task 27. `exceptions-and-error-handling.adoc` — `try`/`catch`/`finally`, exception filters (`when`),
+- [x] Task 27. `exceptions-and-error-handling.adoc` — `try`/`catch`/`finally`, exception filters (`when`),
       `throw` vs. `throw;` (rethrow) vs. `ExceptionDispatchInfo`, throw expressions, the `System.Exception`
       hierarchy and the common exception types, designing custom exceptions,
       `ArgumentException.ThrowIfNullOrEmpty`-style guard helpers, `AggregateException` and async exceptions,
