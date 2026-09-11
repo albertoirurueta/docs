@@ -470,7 +470,7 @@ exist, and the build-verification task must run last against the fully-wired tre
   - [x] Task 43.2. Refresh the page's `:description:`/`:keywords:` to mention C# / C# 14 / .NET 10.
 - [x] Task 44. Update `modules/ROOT/pages/index.adoc`'s `:keywords:` line to add `C#, C# 14, .NET 10, LINQ,
       async/await` (the issue's explicit instruction) — no other change to this file.
-- [ ] Task 45. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
+- [x] Task 45. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
       context window:
       ```
       Agent({
