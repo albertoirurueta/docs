@@ -422,21 +422,21 @@ cross-references depend on every concept page's final heading structure).
 2–3, `nav-csharp.adoc` / `nav.adoc` / `programming-languages/index.adoc` must reference files that already
 exist, and the build-verification task must run last against the fully-wired tree.
 
-- [ ] Task 41. Create `modules/ROOT/pages/programming-languages/csharp/index.adoc` — the "C# Reference" landing
+- [x] Task 41. Create `modules/ROOT/pages/programming-languages/csharp/index.adoc` — the "C# Reference" landing
       page, mirroring `programming-languages/kotlin/index.adoc` and `programming-languages/c/index.adoc`:
-  - [ ] Task 41.1. `= C# Reference`, `:description:`, `:keywords:` (including `C#, C# 14, .NET 10, LINQ,
+  - [x] Task 41.1. `= C# Reference`, `:description:`, `:keywords:` (including `C#, C# 14, .NET 10, LINQ,
         async/await`), `include::partial$csharp-disclaimer.adoc[]`, one intro paragraph on what C# is and that
         the section targets C# 14 on .NET 10, and a "New here? read in this order" pointer (Getting Started →
         C# and .NET → the Getting started pages in order → Types and object-oriented programming, then the
         remaining groups as needed). Point server-side/web readers at the ASP.NET Reference
         (`xref:web/aspnet/index.adoc[…]`) and Java readers at the Java Reference for the "C# for Java
         developers" comparison.
-  - [ ] Task 41.2. `== What's covered` — the full bulleted list of Tasks 3–39 plus Task 40 (cheat sheet),
+  - [x] Task 41.2. `== What's covered` — the full bulleted list of Tasks 3–39 plus Task 40 (cheat sheet),
         grouped under the same seven headings used in Group 2: Getting started; Types and object-oriented
         programming; Functional programming; Error handling and resources; Concurrency and asynchrony; Advanced
         language features; Code organisation and tooling. One line per page, each a short summary in the same
         style/length as the Kotlin and C landing pages.
-  - [ ] Task 41.3. `== Bibliography` section (anchor `_bibliography`), listing **every** source from the issue,
+  - [x] Task 41.3. `== Bibliography` section (anchor `_bibliography`), listing **every** source from the issue,
         each linked: Microsoft's *C# documentation* hub (with its Tour of C#, Fundamentals, Programming guide,
         LINQ, Asynchronous programming and Advanced topics sections); the *C# language reference*; *What's new
         in C#* (C# 14, C# 15 preview, and the version history); the *C# language specification* (the draft
@@ -450,25 +450,25 @@ exist, and the build-verification task must run last against the fully-wired tre
         (Manning, 2008, ISBN 1-933988-36-3), linked to the publisher's page (now listing the 4th edition) and
         csharpindepth.com, each marked as a consulted reference. Close with the house note (matching the Kotlin
         and C bibliographies) that the official documentation and the ECMA standard win on any discrepancy.
-- [ ] Task 42. Wire navigation:
-  - [ ] Task 42.1. Create `modules/ROOT/partials/nav-csharp.adoc`, written exactly like `nav-kotlin.adoc` /
+- [x] Task 42. Wire navigation:
+  - [x] Task 42.1. Create `modules/ROOT/partials/nav-csharp.adoc`, written exactly like `nav-kotlin.adoc` /
         `nav-c.adoc` (its own `*`/`**` bullet depth, nesting via the open-block continuation at its include
         site): `* xref:programming-languages/csharp/index.adoc[C# Reference]`, then one `**` entry per page from
         Tasks 3–39 in the same grouped order as Task 41.2, then
         `** xref:programming-languages/csharp/cheat-sheet.adoc[Cheat Sheet (PDF)]`.
-  - [ ] Task 42.2. In `modules/ROOT/nav.adoc`, add `include::partial$nav-csharp.adoc[]` on its own line
+  - [x] Task 42.2. In `modules/ROOT/nav.adoc`, add `include::partial$nav-csharp.adoc[]` on its own line
         immediately **after** the existing `include::partial$nav-c.adoc[]` line inside the **same open block**
         under `Guides & References > Programming Languages` (the block at lines ~21–25, before
         `nav-javascript.adoc`) — the issue's append-order convention. Do **not** add a second include at the
         other `nav-kotlin.adoc` site (the `Apps > Android` block, line ~604) — that site is Kotlin/Android
         specific (see "Choices made").
-- [ ] Task 43. Update `modules/ROOT/pages/programming-languages/index.adoc`:
-  - [ ] Task 43.1. Add a seventh `== Sections` bullet,
+- [x] Task 43. Update `modules/ROOT/pages/programming-languages/index.adoc`:
+  - [x] Task 43.1. Add a seventh `== Sections` bullet,
         `xref:programming-languages/csharp/index.adoc[C# Reference]`, after the C bullet, in the same
         style/length as the other six (one-sentence summary of what the section covers — the C# language and the
         .NET BCL, targeting C# 14 on .NET 10 — ending "plus a downloadable cheat sheet").
-  - [ ] Task 43.2. Refresh the page's `:description:`/`:keywords:` to mention C# / C# 14 / .NET 10.
-- [ ] Task 44. Update `modules/ROOT/pages/index.adoc`'s `:keywords:` line to add `C#, C# 14, .NET 10, LINQ,
+  - [x] Task 43.2. Refresh the page's `:description:`/`:keywords:` to mention C# / C# 14 / .NET 10.
+- [x] Task 44. Update `modules/ROOT/pages/index.adoc`'s `:keywords:` line to add `C#, C# 14, .NET 10, LINQ,
       async/await` (the issue's explicit instruction) — no other change to this file.
 - [ ] Task 45. Build verification — delegate to a sub-agent so Antora's build output doesn't consume the main
       context window:
