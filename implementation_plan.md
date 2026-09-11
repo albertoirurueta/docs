@@ -95,20 +95,20 @@ decision):
 **Parallelizable: yes** — the two tasks are independent (one installs an SDK, the other writes a partial), and
 both must land before Group 2, whose every page includes the disclaimer and whose every example is compile-checked.
 
-- [ ] Task 1. Install and smoke-test the .NET 10 SDK used to verify every example
-  - [ ] Task 1.1. `sudo apt-get update && sudo apt-get install -y dotnet-sdk-10.0` (candidate 10.0.104 from
+- [x] Task 1. Install and smoke-test the .NET 10 SDK used to verify every example
+  - [x] Task 1.1. `sudo apt-get update && sudo apt-get install -y dotnet-sdk-10.0` (candidate 10.0.104 from
         `noble-updates/universe`); confirm with `dotnet --version` and `dotnet --list-sdks`.
-  - [ ] Task 1.2. Create a scratch verification project **outside the repository** (e.g. under the session
+  - [x] Task 1.2. Create a scratch verification project **outside the repository** (e.g. under the session
         scratchpad, never committed): a `net10.0` console project with `<Nullable>enable</Nullable>`,
         `<TreatWarningsAsErrors>true</TreatWarningsAsErrors>` and `<AllowUnsafeBlocks>true</AllowUnsafeBlocks>`
         (needed by the unsafe/spans page). Smoke-test it with a C# 14 feature (e.g. the `field` keyword or a
         `extension` block) to confirm the SDK really defaults to C# 14.
-  - [ ] Task 1.3. Record the verification recipe in the plan run notes so every page task in Group 2 uses the
+  - [x] Task 1.3. Record the verification recipe in the plan run notes so every page task in Group 2 uses the
         same harness: paste each snippet into the scratch project (or a `dotnet run file.cs` file-based app) and
         require a clean build with no warnings. **C# 15 preview snippets are exempt** — no .NET 11 SDK is
         obtainable (see "Choices made"); they are checked against the official feature specs instead and must be
         wrapped in a labelled preview admonition.
-- [ ] Task 2. Create `modules/ROOT/partials/csharp-disclaimer.adoc`, modelled exactly on
+- [x] Task 2. Create `modules/ROOT/partials/csharp-disclaimer.adoc`, modelled exactly on
       `modules/ROOT/partials/kotlin-disclaimer.adoc`: an `[IMPORTANT]` block whose first sentence scopes the
       section to **C# 14 on .NET 10 (LTS)** as published at https://learn.microsoft.com/dotnet/csharp/ and states
       that C# 15 / .NET 11 features are flagged as preview, followed by the house AI-assistance disclosure
@@ -139,7 +139,7 @@ Every page in this group, without exception:
 
 #### Getting started
 
-- [ ] Task 3. `getting-started.adoc` — "Getting Started": what C# is (general-purpose, type-safe,
+- [x] Task 3. `getting-started.adoc` — "Getting Started": what C# is (general-purpose, type-safe,
       object-oriented *and* functional, designed by Anders Hejlsberg); short history (C# 1.0 in 2002 →
       generics/LINQ → `async` → .NET Core → C# 14 / .NET 10, with C# 15 / .NET 11 on the horizon); where C# is
       used (ASP.NET Core, Blazor, MAUI, WPF/WinForms, Unity/Godot, Azure Functions, ML.NET); installing the
@@ -148,40 +148,40 @@ Every page in this group, without exception:
       (`dotnet run hello.cs`, `#:package`/`#:sdk`/`#:property` directives); C# for Java developers pointers.
       📊 **SVG `modules/ROOT/images/csharp-compilation-pipeline.svg`** — C# source → Roslyn → IL + metadata in an
       assembly → JIT / ReadyToRun / Native AOT → native code.
-- [ ] Task 4. `csharp-and-dotnet.adoc` — "C# and .NET": the CLR (managed code, IL, JIT, tiered compilation,
+- [x] Task 4. `csharp-and-dotnet.adoc` — "C# and .NET": the CLR (managed code, IL, JIT, tiered compilation,
       Native AOT), assemblies and metadata, the BCL, the runtimes (.NET 10, .NET Framework 4.8, Mono/MAUI,
       Blazor WebAssembly), the support policy (LTS vs. STS), target framework monikers and language versioning
       (`LangVersion`, default language version per TFM), the `dotnet` CLI at a glance, the .NET Standard legacy,
       and C# ↔ F# / VB interoperability. 📊 **mermaid** — runtime architecture (application layer / BCL / CLR / OS).
-- [ ] Task 5. `lexical-structure-and-style.adoc` — identifiers, keywords and contextual keywords, `@` verbatim
+- [x] Task 5. `lexical-structure-and-style.adoc` — identifiers, keywords and contextual keywords, `@` verbatim
       identifiers, literals, comments and XML doc comments, statements vs. expressions, blocks and scope,
       `namespace` (block and file-scoped), `using` directives (plain, `static`, alias, `global`, implicit global
       usings), `Main` vs. top-level statements, and the naming/layout conventions from Microsoft's C# coding
       conventions.
-- [ ] Task 6. `basic-types-and-variables.adoc` — value vs. reference types, the built-in types table
+- [x] Task 6. `basic-types-and-variables.adoc` — value vs. reference types, the built-in types table
       (`sbyte`…`ulong`, `nint`/`nuint`, `float`/`double`/`decimal`, `bool`, `char`, `object`, `string`), numeric
       literals and suffixes, `var` and implicit typing, `const` vs. `readonly`, default values and `default`,
       implicit/explicit numeric conversions, `checked`/`unchecked` overflow, `Convert`/`Parse`/`TryParse`,
       boxing and unboxing, `typeof` and `sizeof`. 📊 **SVG `modules/ROOT/images/csharp-stack-vs-heap.svg`** —
       stack vs. heap, value copy vs. reference copy.
-- [ ] Task 7. `strings-and-text.adoc` — `string` immutability and interning, concatenation vs. `StringBuilder`,
+- [x] Task 7. `strings-and-text.adoc` — `string` immutability and interning, concatenation vs. `StringBuilder`,
       interpolation `$"…"` (alignment, format specifiers, `FormattableString`, interpolated string handlers),
       verbatim `@"…"` and raw `"""…"""` literals, UTF-8 literals `"…"u8`, `nameof`, comparison and culture
       (`StringComparison`, `CultureInfo`), searching/splitting/trimming, `Span<char>`/`ReadOnlySpan<char>`,
       `char` vs. `Rune`, composite formatting and `IFormattable`.
-- [ ] Task 8. `operators-and-expressions.adoc` — arithmetic, comparison, boolean logical and bitwise/shift
+- [x] Task 8. `operators-and-expressions.adoc` — arithmetic, comparison, boolean logical and bitwise/shift
       operators, assignment and compound assignment, `++`/`--`, the conditional operator, null-coalescing
       `??`/`??=`, null-conditional `?.`/`?[]` (including **null-conditional assignment**, C# 14), the
       null-forgiving `!`, `is`/`as`/`typeof`/casts, index `^` and range `..` operators, `default`, `new`
       (including target-typed `new()`), `with`, `switch` expressions (pointing to Task 24), `await`,
       `stackalloc`, `checked`/`unchecked` expressions, `nameof` (including unbound generics, C# 14), and an
       operator precedence/associativity table.
-- [ ] Task 9. `control-flow.adoc` — `if`/`else`, the `switch` statement (case guards with `when`, fall-through
+- [x] Task 9. `control-flow.adoc` — `if`/`else`, the `switch` statement (case guards with `when`, fall-through
       rules) vs. the `switch` expression, `while`/`do`/`for`/`foreach` (including `foreach` over spans, tuples
       and a custom `GetEnumerator`), `break`/`continue`/`goto`/`return`, **labeled `break` and `continue`
       (C# 15 preview)**, `throw` as statement and expression, `yield` (pointer to Task 25). 📊 **mermaid** —
       `switch` statement vs. `switch` expression decision.
-- [ ] Task 10. `methods-and-parameters.adoc` — declaration and expression-bodied members, overloading and
+- [x] Task 10. `methods-and-parameters.adoc` — declaration and expression-bodied members, overloading and
       overload resolution, optional and named arguments, `params` arrays and **`params` collections (C# 13)**,
       pass-by-value vs. `ref`/`out`/`in`/`ref readonly` parameters, `ref` locals and `ref` returns, `scoped`,
       local functions (static local functions, attributes on local functions), recursion, method groups,
@@ -189,7 +189,7 @@ Every page in this group, without exception:
 
 #### Types and object-oriented programming
 
-- [ ] Task 11. `classes-and-objects.adoc` — `class` declaration, fields and constants, instance and static
+- [x] Task 11. `classes-and-objects.adoc` — `class` declaration, fields and constants, instance and static
       members, `static` classes, constructors (instance, static, private, **primary constructors** for classes
       and structs, **partial constructors — C# 14**, chaining with `this(...)`/`base(...)`), object and
       collection initializers, `required` members, properties (auto-implemented, `init`-only, expression-bodied,
@@ -198,49 +198,49 @@ Every page in this group, without exception:
       `private protected`/`file`), finalizers, the `object` base type. 📊 **SVG
       `modules/ROOT/images/csharp-class-anatomy.svg`** — anatomy of a class (members, accessibility, static vs.
       instance).
-- [ ] Task 12. `structs-and-value-types.adoc` — `struct` semantics (copying, `default`, parameterless
+- [x] Task 12. `structs-and-value-types.adoc` — `struct` semantics (copying, `default`, parameterless
       constructors, field initializers), `readonly struct` and `readonly` members, `ref struct` (and
       `allows ref struct` constraints), `record struct`, `in` parameters and defensive copies, `with`
       expressions on structs, **inline arrays**, `Nullable<T>` as a struct, struct layout and `StructLayout`,
       and when to choose a struct over a class. 📊 **mermaid** — choosing between class, struct, record and tuple.
-- [ ] Task 13. `inheritance-and-polymorphism.adoc` — base and derived classes, `virtual`/`override`/`new`
+- [x] Task 13. `inheritance-and-polymorphism.adoc` — base and derived classes, `virtual`/`override`/`new`
       (hiding), `abstract` classes and members, `sealed` classes and members, **`closed` hierarchies (C# 15
       preview)**, `base` access, constructors and inheritance, upcasting/downcasting, covariant return types,
       the `object` members (`Equals`, `GetHashCode`, `ToString`, `GetType`), `is`/`as` with hierarchies,
       composition over inheritance. 📊 **mermaid class diagram** of a small hierarchy with a `closed` root.
-- [ ] Task 14. `interfaces.adoc` — declaring and implementing interfaces, interface
+- [x] Task 14. `interfaces.adoc` — declaring and implementing interfaces, interface
       properties/events/indexers, explicit interface implementation (including implementing members of two
       interfaces), interface inheritance, **default interface members** (versioning, mixins), **static abstract
       and static virtual members** and generic math (`INumber<T>`, `IAdditionOperators<TSelf, TOther, TResult>`),
       the everyday BCL interfaces (`IDisposable`, `IEquatable<T>`, `IComparable<T>`, `IEnumerable<T>`,
       `IFormattable`, `IParsable<T>`), and interfaces vs. abstract classes vs. delegates.
-- [ ] Task 15. `records.adoc` — `record class` and `record struct`, positional records and primary constructors,
+- [x] Task 15. `records.adoc` — `record class` and `record struct`, positional records and primary constructors,
       synthesized value equality, `ToString`, `with` expressions and non-destructive mutation, `Deconstruct`,
       `init`-only properties, record inheritance and `EqualityContract`, records vs. classes vs. structs vs.
       tuples (the official "choosing" tutorial). 📊 **SVG `modules/ROOT/images/csharp-record-synthesis.svg`** —
       what the compiler synthesizes for a positional record.
-- [ ] Task 16. `enums.adoc` — declaring enums and underlying types, explicit values, `[Flags]` and bitwise
+- [x] Task 16. `enums.adoc` — declaring enums and underlying types, explicit values, `[Flags]` and bitwise
       combination, conversions to/from integers and strings (`Enum.Parse`, `Enum.TryParse`,
       `Enum.GetValues<T>`), `switch` over enums and exhaustiveness, enum constraints in generics
       (`where T : struct, Enum`), and enum best practices.
-- [ ] Task 17. `generics.adoc` — generic classes, structs, interfaces, methods and delegates; type parameters
+- [x] Task 17. `generics.adoc` — generic classes, structs, interfaces, methods and delegates; type parameters
       and type inference; constraints (`where T : class/struct/notnull/unmanaged/new()/BaseType/IInterface/
       default`, `allows ref struct`); `default(T)`; static members and static constructors in generic types;
       generics at run time (reification vs. Java erasure, JIT sharing for reference types); **covariance and
       contravariance** (`out`/`in` on interfaces and delegates, array covariance); generic math via static
       abstract members; open vs. closed types and `typeof(List<>)`. 📊 **mermaid** — variance
       (`IEnumerable<out T>` vs. `IComparer<in T>`).
-- [ ] Task 18. `tuples-deconstruction-and-anonymous-types.adoc` — `ValueTuple` syntax, named elements and
+- [x] Task 18. `tuples-deconstruction-and-anonymous-types.adoc` — `ValueTuple` syntax, named elements and
       inference, tuple equality, returning multiple values, deconstruction of tuples/records/user types
       (`Deconstruct`), discards `_`, anonymous types (projection initializers, `with` on anonymous types), the
       `System.Tuple` legacy, and when to promote a tuple to a record.
-- [ ] Task 19. `nullable-types-and-null-safety.adoc` — `Nullable<T>` and `T?` for value types (lifted operators,
+- [x] Task 19. `nullable-types-and-null-safety.adoc` — `Nullable<T>` and `T?` for value types (lifted operators,
       `HasValue`/`Value`/`GetValueOrDefault`, boxing), **nullable reference types** (`#nullable enable`,
       `<Nullable>`, `?`/`!`, nullable warnings, flow analysis, null-state), the nullable static-analysis
       attributes (`[NotNull]`, `[MaybeNull]`, `[NotNullWhen]`, `[MemberNotNull]`…),
       `ArgumentNullException.ThrowIfNull`, `required` as an alternative to constructors, and migration
       strategies for existing code. 📊 **mermaid** — how the compiler tracks null-state through a method.
-- [ ] Task 20. `equality-and-operator-overloading.adoc` — reference vs. value equality, `==` on
+- [x] Task 20. `equality-and-operator-overloading.adoc` — reference vs. value equality, `==` on
       strings/records/structs, overriding `Equals`/`GetHashCode` correctly, `IEquatable<T>`,
       `IEqualityComparer<T>` and `IComparer<T>`/`IComparable<T>`, `EqualityComparer<T>.Default`, overloading
       operators (`+`, `==`/`!=` pairs, `<`/`>`, `true`/`false`, unary, `checked` operators), **user-defined
