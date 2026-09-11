@@ -344,12 +344,12 @@ Every page in this group, without exception:
       allocations, custom interpolated string handlers), and a BenchmarkDotNet pointer. 📊 **SVG
       `modules/ROOT/images/csharp-span-slicing.svg`** — a `Span<T>` slicing a stack buffer and a heap array
       without copying. (Requires `<AllowUnsafeBlocks>` in the Task 1.2 verification project.)
-- [ ] Task 33. `native-interop.adoc` — P/Invoke with `[DllImport]` and the source-generated `[LibraryImport]`,
+- [x] Task 33. `native-interop.adoc` — P/Invoke with `[DllImport]` and the source-generated `[LibraryImport]`,
       marshalling rules (strings, structs, arrays, callbacks via delegates and `[UnmanagedCallersOnly]`),
       `Marshal` and `SafeHandle`, `NativeLibrary`, COM interop (`[ComImport]`, RCW/CCW, `dynamic` with Office),
       C++/CLI in brief, calling C# from native code (Native AOT exports), cross-platform library probing, and
       interop with the **C reference on this site** (`xref:programming-languages/c/…`).
-- [ ] Task 34. `preprocessor-directives-and-compilation.adoc` — `#if`/`#elif`/`#else`/`#endif`,
+- [x] Task 34. `preprocessor-directives-and-compilation.adoc` — `#if`/`#elif`/`#else`/`#endif`,
       `#define`/`#undef` and `DefineConstants`, `#region`, `#nullable`, `#pragma warning`/`checksum`, `#line`,
       `#warning`/`#error`, the **file-based app directives (`#:package`, `#:sdk`, `#:property`, `#!` shebang —
       C# 14)**, the `[Conditional]` attribute, the compiler options that matter day to day (`LangVersion`,
