@@ -1,0 +1,359 @@
+= Near-Far Caches
+:description: The two-level (L1/L2) near-far caching pattern -- a local Caffeine "near" cache layered in front of a distributed Redis "far" cache -- pros and cons versus pure local and pure distributed caching, consistency and invalidation trade-offs, and blocking and non-blocking (Project Reactor) Spring Boot implementation options.
+:keywords: near-far cache, near cache, far cache, two-level cache, multi-level cache, L1 cache, L2 cache, cache coherence, cache invalidation, TTL, Redis Pub/Sub, Redis keyspace notifications, staleness window, Caffeine, Redis, CompositeCacheManager, custom CacheManager, Redisson, RLocalCachedMap, LocalCachedMapOptions, sync strategy, spring-boot-starter-cache, spring-boot-starter-data-redis, redisson-spring-boot-starter, Project Reactor, Mono, Flux, non-blocking, WebFlux, ReactiveRedisTemplate, spring-boot-starter-data-redis-reactive, AsyncCache, async cache mode
+
+include::partial$springboot-disclaimer.adoc[]
+
+xref:backend/springboot/caching.adoc[Caching] covers Caffeine and Redis as two independent, single-tier cache
+providers. This page covers combining them into one **near-far cache**: a small, fast local tier layered in
+front of a larger, shared distributed tier, so most reads never leave the JVM while the bulk of the data still
+lives in one consistent place. It focuses on the composition itself -- the read path, the consistency trade-offs
+it introduces, and how to wire it up in Spring Boot -- and cross-links back to `caching.adoc` for the
+single-tier configuration knobs (`maximumSize`, `expireAfterWrite`, `time-to-live`, and so on) rather than
+repeating them.
+
+== What is a near-far cache?
+
+A **near cache** is local and in-process -- typically Caffeine -- and sits closest to the calling code: nanosecond
+reads, but private to one JVM. A **far cache** is distributed and network-accessible -- typically Redis -- shared
+by every application instance, itself sitting in front of the source of truth (a database, an external service,
+an expensive computation).
+
+The read path checks the tiers in order, populating each tier it passes through on the way back up:
+
+1. Check the near cache. A hit returns immediately -- no network hop.
+2. On a near-cache miss, check the far cache. A hit populates the near cache and returns.
+3. On a far-cache miss too, fall through to the source of truth, then populate *both* tiers before returning.
+
+[mermaid]
+....
+flowchart TD
+    Start(["Read request for key K"]) --> NearCheck{"Near cache\n(Caffeine)\ncontains K?"}
+    NearCheck -- "hit" --> NearReturn["Return value\n(no network hop)"]
+    NearCheck -- "miss" --> FarCheck{"Far cache\n(Redis)\ncontains K?"}
+    FarCheck -- "hit" --> PopulateNear["Populate near cache\nwith value from Redis"]
+    PopulateNear --> FarReturn["Return value"]
+    FarCheck -- "miss" --> SourceLoad["Load from source of truth"]
+    SourceLoad --> PopulateBoth["Populate far cache (Redis)\nand near cache (Caffeine)"]
+    PopulateBoth --> SourceReturn["Return value"]
+....
+
+Every write still goes through the same `@CachePut`/`@CacheEvict`-style path described in `caching.adoc`; a
+near-far cache only changes what happens on a *read* miss, by adding the extra local tier in front.
+
+== Pure local vs. pure distributed vs. near-far
+
+xref:backend/springboot/caching.adoc[Caching]'s "Choosing between Caffeine and Redis" section already compares
+the two single-tier options: pure local (Caffeine only) gives nanosecond, no-network-hop reads but lets
+instances diverge and lose their cache on restart, while pure distributed (Redis only) gives one consistent
+shared source across every instance at the cost of a network round trip plus (de)serialization on every read.
+A near-far cache is a third option that combines both:
+
+* **Near-far (both)** -- absorbs hot keys locally so they skip the network hop entirely, while the far tier still
+  shares the bulk of the data consistently across instances, and can even keep serving the hottest keys locally
+  through a brief Redis outage. The cost is the coherence and complexity trade-offs covered next.
+
+== Consistency and invalidation
+
+Layering a local tier in front of a shared one reopens a problem the pure-distributed case avoided: a write on
+one instance updates Redis, but every *other* instance's near cache keeps serving its old, now-stale, in-memory
+copy until that entry expires or is explicitly told to go away. This gap is the **staleness window**, and how
+wide it is depends entirely on which of the two strategies below is chosen.
+
+=== TTL-only invalidation
+
+The simplest option: give the near cache a short `expireAfterWrite` and accept that any instance may serve a
+stale value for up to that duration after a write elsewhere. No extra moving parts, no additional
+infrastructure dependency -- just a bound on staleness rather than an elimination of it. This is the right
+default whenever the workload can tolerate a few seconds (or less) of cross-instance inconsistency.
+
+=== Active invalidation
+
+Redis https://redis.io/docs/latest/develop/interact/pubsub/[Pub/Sub] or
+https://redis.io/docs/latest/develop/use/keyspace-notifications/[keyspace notifications] can broadcast a key
+change to every instance the moment it happens, so each one evicts its own near-cache entry immediately instead
+of waiting out a TTL. This shrinks the staleness window dramatically, at the cost of real added complexity: a
+message bus to wire up, and an **at-most-once** delivery caveat -- an instance that is disconnected when the
+notification fires simply never sees it. A short TTL should still be kept as a backstop underneath active
+invalidation, not replaced by it, so a missed message self-heals instead of lasting indefinitely.
+
+== When it's worth it
+
+A near-far cache earns its complexity for read-heavy workloads with a skewed, hot-key access pattern -- a
+product catalog, reference or configuration data -- where a handful of keys account for most reads and a brief
+window of cross-instance inconsistency is acceptable. It is *not* worth it for strict read-your-writes
+requirements (where any staleness at all is unacceptable) or for a fairly uniform key access pattern, where no
+small set of keys is hot enough for a local tier to meaningfully offload the far tier. There is also an ongoing
+operational cost even when it does pay off: two eviction policies to reason about instead of one, and, per
+`caching.adoc`, the fact that Spring Boot's auto-configuration only ever wires up a single `CacheManager`
+automatically -- combining two tiers means building that composition by hand, as shown next.
+
+== Spring Boot implementation options
+
+The three options below get progressively more "off the shelf": from fully manual code, to a custom but
+reusable `CacheManager`, to a library that provides the whole pattern out of the box. All three use **blocking**
+I/O throughout -- a blocking JPA repository call, and either a synchronous Caffeine `Cache`/`RedisCache` or the
+classic (synchronous) Redisson client -- which is the right default for a traditional Spring MVC (servlet)
+application. For a WebFlux application, see "Non-blocking implementations with Project Reactor" below instead:
+a blocking cache or repository call still parks the thread even inside a reactive pipeline, defeating WebFlux's
+non-blocking execution model.
+
+=== Manual two-tier lookup in application code
+
+The most direct option: a service method checks an injected Caffeine `Cache` bean first, then falls back to
+Redis (via `RedisTemplate` or a `RedisCache` instance directly), populating both tiers on a miss. It is the
+simplest approach to understand and debug, but it bypasses the `@Cacheable` declarative model entirely --
+every call site that needs near-far behavior has to repeat this logic.
+
+[source,java]
+----
+public Product findById(Long id) {
+    Product cached = nearCache.get(id, Product.class);
+    if (cached != null) {
+        return cached;
+    }
+    Cache.ValueWrapper wrapper = farCache.get(id.toString());
+    Product fromFar = wrapper != null ? (Product) wrapper.get() : null;
+    if (fromFar != null) {
+        nearCache.put(id, fromFar);
+        return fromFar;
+    }
+    Product fromSource = productRepository.findById(id)
+            .orElseThrow(() -> new ProductNotFoundException(id));
+    farCache.put(id.toString(), fromSource);
+    nearCache.put(id, fromSource);
+    return fromSource;
+}
+----
+
+=== A custom composite CacheManager
+
+Spring itself ships `org.springframework.cache.support.CompositeCacheManager`, but it does **not** implement
+near-far semantics: for a given cache *name*, it resolves once to whichever configured `CacheManager` reports a
+non-null `Cache` for that name first, and every subsequent `get`/`put`/`evict` for that name goes exclusively to
+that single delegate -- it never re-consults the other delegates on a runtime miss, let alone backfills one
+cache from another. Getting correct near-cache backfill on a far-cache hit requires a custom `CacheManager`/
+`Cache` pair instead:
+
+[source,java]
+----
+public class NearFarCache implements Cache {
+
+    private final CaffeineCache caffeineCache;
+    private final RedisCache redisCache;
+
+    public NearFarCache(CaffeineCache caffeineCache, RedisCache redisCache) {
+        this.caffeineCache = caffeineCache;
+        this.redisCache = redisCache;
+    }
+
+    @Override
+    public ValueWrapper get(Object key) {
+        ValueWrapper value = caffeineCache.get(key);
+        if (value != null) {
+            return value;
+        }
+        ValueWrapper fromRedis = redisCache.get(key);
+        if (fromRedis != null) {
+            caffeineCache.put(key, fromRedis.get());
+        }
+        return fromRedis;
+    }
+
+    @Override
+    public void put(Object key, Object value) {
+        caffeineCache.put(key, value);
+        redisCache.put(key, value);
+    }
+
+    @Override
+    public void evict(Object key) {
+        caffeineCache.evict(key);
+        redisCache.evict(key);
+    }
+
+    // getName(), getNativeCache(), get(key, type/callable), evict variants and clear() omitted for brevity
+}
+
+@Configuration
+@EnableCaching
+public class NearFarCacheConfig {
+
+    @Bean
+    public CacheManager cacheManager(CaffeineCacheManager caffeineCacheManager,
+                                      RedisCacheManager redisCacheManager) {
+        return new CacheManager() {
+            @Override
+            public Cache getCache(String name) {
+                return new NearFarCache(
+                        (CaffeineCache) caffeineCacheManager.getCache(name),
+                        (RedisCache) redisCacheManager.getCache(name));
+            }
+
+            @Override
+            public Collection<String> getCacheNames() {
+                return caffeineCacheManager.getCacheNames();
+            }
+        };
+    }
+}
+----
+
+Once wired up as the primary `CacheManager`, this transparently supports `@Cacheable`, `@CachePut`, and
+`@CacheEvict` exactly as documented in `caching.adoc` -- every call site keeps using the same annotations, with
+no awareness that two tiers exist underneath.
+
+=== Redisson's RLocalCachedMap
+
+The most off-the-shelf option: add `org.redisson:redisson-spring-boot-starter`.
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.redisson</groupId>
+    <artifactId>redisson-spring-boot-starter</artifactId>
+</dependency>
+----
+
+Redisson's `RLocalCachedMap` keeps a local near cache in front of a Redis-backed map, and uses Redis Pub/Sub
+internally to invalidate or update entries on every other instance automatically -- active invalidation, built
+in, with no message bus to wire up by hand:
+
+[source,java]
+----
+@Bean
+public RLocalCachedMap<Long, Product> productLocalCachedMap(RedissonClient redissonClient) {
+    LocalCachedMapOptions<Long, Product> options = LocalCachedMapOptions.<Long, Product>defaults()
+            .cacheSize(10_000)
+            .timeToLive(10, TimeUnit.MINUTES)
+            .syncStrategy(LocalCachedMapOptions.SyncStrategy.INVALIDATE);
+    return redissonClient.getLocalCachedMap("products", options);
+}
+----
+
+`SyncStrategy.INVALIDATE` evicts an instance's local copy of a changed entry, so the next read repopulates it
+from Redis; `SyncStrategy.UPDATE` instead pushes the new value to every instance directly, trading a larger
+Pub/Sub payload for one fewer round trip on the next read. Note that `RLocalCachedMap` is a `Map`-style API, not
+a drop-in `@Cacheable` `CacheManager` -- call sites use `get`/`put`/`fastPut` directly rather than annotations.
+Reach for the custom `CacheManager` from the previous subsection instead when declarative caching through
+`@Cacheable`/`@CachePut`/`@CacheEvict` is a hard requirement. The snippet above uses Redisson's classic
+`org.redisson.api.LocalCachedMapOptions` builder; recent Redisson releases also offer a newer, fluent options
+API under `org.redisson.api.options` -- check the current Redisson wiki for the exact builder in use before
+copying either verbatim.
+
+=== Non-blocking implementations with Project Reactor
+
+The same near-far read path from "What is a near-far cache?" applies unchanged in a non-blocking pipeline --
+only the mechanism for expressing it moves from blocking calls to a chain of
+https://projectreactor.io/[Project Reactor] operators.
+
+**Near tier -- Caffeine's `AsyncCache`.** Caffeine's `AsyncCache` computes and stores values as
+`CompletableFuture`s instead of blocking, and adapts directly to `Mono` with `Mono.fromFuture(...)`:
+
+[source,java]
+----
+AsyncCache<Long, Product> nearCache = Caffeine.newBuilder()
+        .maximumSize(10_000)
+        .expireAfterWrite(Duration.ofMinutes(10))
+        .buildAsync();
+----
+
+**Far tier -- Spring Data Redis Reactive.** Add `spring-boot-starter-data-redis-reactive` instead of the
+blocking `spring-boot-starter-data-redis` starter -- it brings the same Lettuce driver but exposes it through a
+`ReactiveRedisConnectionFactory`, auto-configured the same way `RedisConnectionFactory` is for the blocking case:
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+</dependency>
+----
+
+A `ReactiveRedisTemplate` needs an explicit value serializer, the same way `caching.adoc`'s blocking
+`RedisCacheManager` did:
+
+[source,java]
+----
+@Bean
+public ReactiveRedisTemplate<String, Product> reactiveRedisTemplate(
+        ReactiveRedisConnectionFactory connectionFactory) {
+    Jackson2JsonRedisSerializer<Product> serializer =
+            new Jackson2JsonRedisSerializer<>(new ObjectMapper(), Product.class);
+    RedisSerializationContext<String, Product> context = RedisSerializationContext
+            .<String, Product>newSerializationContext(new StringRedisSerializer())
+            .value(serializer)
+            .build();
+    return new ReactiveRedisTemplate<>(connectionFactory, context);
+}
+----
+
+**Composing the two tiers.** Passing the far-tier lookup as `AsyncCache.get`'s loader function chains the whole
+near-far-source path into one non-blocking pipeline that never parks a thread:
+
+[source,java]
+----
+public Mono<Product> findById(Long id) {
+    return Mono.fromFuture(() -> nearCache.get(id, (key, executor) -> findInFarCache(key).toFuture()));
+}
+
+private Mono<Product> findInFarCache(Long id) {
+    return reactiveRedisTemplate.opsForValue().get(id.toString())
+            .switchIfEmpty(loadFromSourceAndCacheFar(id));
+}
+
+private Mono<Product> loadFromSourceAndCacheFar(Long id) {
+    return reactiveProductRepository.findById(id)
+            .switchIfEmpty(Mono.error(() -> new ProductNotFoundException(id)))
+            .flatMap(product -> reactiveRedisTemplate.opsForValue()
+                    .set(id.toString(), product, Duration.ofMinutes(10))
+                    .thenReturn(product));
+}
+----
+
+`reactiveProductRepository` here is a reactive repository (`ReactiveCrudRepository`, backed by R2DBC or a
+reactive Spring Data module) -- reactive caching only pays off end to end when the source of truth is reactive
+too. Wrapping a blocking JPA call in `Mono.fromCallable(...).subscribeOn(Schedulers.boundedElastic())` still
+parks a thread, just on a different pool, and defeats the point of going non-blocking in the first place.
+
+**The declarative options, reactively.** Spring Framework 6.1+ lets `@Cacheable` cache a `Mono`/`Flux`-returning
+method directly, provided every `CacheManager` in play completes asynchronously -- `CaffeineCacheManager`
+supports this via its async cache mode, built on the same `AsyncCache` used above. Extending the custom
+composite `CacheManager` from the previous subsection to support this means overriding its `Cache#retrieve`
+method to return a `CompletableFuture` instead of blocking inside `get`. Redisson also ships a reactive client
+(`RedissonReactiveClient`, obtained via `redissonClient.reactive()`) alongside its synchronous and asynchronous
+ones -- see the https://github.com/redisson/redisson/wiki[Redisson wiki] for its current reactive local-cache
+support before relying on it.
+
+== Reference implementations
+
+Two open-source projects implement this same pattern end to end and are worth a look for further reading or
+comparison, though neither is adopted as a dependency here: Gaetano Piazzolla's
+https://github.com/GaetanoPiazzolla/spring-boot-multi-layer-cache[`spring-boot-multi-layer-cache`] layers a
+Caffeine L1 in front of a Redis L2 behind a small abstraction layer, and
+https://github.com/FlyInWind1/spring-boot-multilevel-cache-starter[`spring-boot-multilevel-cache-starter`]
+extends the same idea with a circuit breaker around the L2/Redis calls, so a struggling Redis instance degrades
+to L1-only reads instead of failing them.
+
+== Choosing an approach
+
+* **Manual two-tier lookup** -- a single call site that needs full control over the exact read/populate
+  sequence, and doesn't need `@Cacheable`'s declarative model elsewhere.
+* **A custom composite `CacheManager`** -- to keep `@Cacheable`/`@CachePut`/`@CacheEvict` working transparently
+  across both tiers, with no call site aware that two caches exist.
+* **Redisson's `RLocalCachedMap`** -- when the project already depends on Redisson, or when built-in Pub/Sub
+  invalidation matters more than staying inside the Spring Cache abstraction.
+* **Non-blocking (Project Reactor)** -- for a WebFlux application end to end (reactive controller, reactive
+  repository); mixing this with a blocking call anywhere in the chain (a blocking JPA repository, the classic
+  Redisson client) defeats the point.
+
+== References
+
+* https://docs.spring.io/spring-boot/reference/io/caching.html[Spring Boot caching reference]
+* https://github.com/ben-manes/caffeine/wiki[Caffeine wiki]
+* https://redis.io/docs/latest/develop/interact/pubsub/[Redis Pub/Sub]
+* https://redis.io/docs/latest/develop/use/keyspace-notifications/[Redis keyspace notifications]
+* https://github.com/redisson/redisson/wiki/7.-distributed-collections/#732-local-cache[Redisson wiki -- Local Cache]
+* https://projectreactor.io/docs/core/release/reference/[Project Reactor reference documentation]
+* https://docs.spring.io/spring-data/redis/reference/[Spring Data Redis reference] -- includes the reactive
+  `ReactiveRedisTemplate` support used above
