@@ -1,0 +1,185 @@
+= Clustering & Storage
+:description: How Qdrant scales out as a multi-node cluster -- sharding and replication of collection data, Raft-based consensus for cluster metadata, on-disk vs. in-memory storage trade-offs, and snapshots.
+:keywords: qdrant, distributed deployment, sharding, shard_number, replication, replication_factor, raft, consensus, cluster, on-disk storage, memory-mapped, mmap, snapshots, backup, restore
+
+include::partial$qdrant-disclaimer.adoc[]
+
+A single Qdrant instance can be grown into a multi-node cluster, at which point a collection's points are
+sharded and replicated across nodes and a Raft group keeps every node's view of the cluster consistent. This
+page covers that distributed deployment model, the on-disk/in-memory storage trade-off available whether or
+not a cluster is in play, and snapshots for backup and node bootstrapping.
+
+== Distributed deployment
+
+Qdrant runs as a single binary either standalone or as one *peer* in a cluster: each node runs the same
+Qdrant process, is started with `--uri` pointing at itself and, for every node after the first,
+`--bootstrap` pointing at an existing cluster member so it can join. Once joined, a peer participates in
+Raft consensus (below) and can host shards for any collection, regardless of which node the client happens
+to talk to -- Qdrant forwards a request internally to whichever peer holds the relevant shard.
+
+The full node lifecycle -- starting a cluster, adding and removing peers, and the command-line flags
+involved -- is described in
+https://qdrant.tech/documentation/guides/distributed_deployment/[Distributed Deployment].
+
+== Sharding
+
+A collection's points are split into a fixed number of *shards*, set at collection-creation time via
+`shard_number` and never changed afterwards (growing shard count later means creating a new collection and
+migrating data, or using resharding where supported). Qdrant distributes those shards across the cluster's
+peers, so a collection with more shards than the cluster has nodes spreads storage and query load more
+evenly, while a `shard_number` of `1` keeps a collection entirely on one node's worth of data (still
+replicable, just not partitioned).
+
+[source,json]
+----
+// PUT /collections/documents
+{
+  "vectors": {
+    "size": 768,
+    "distance": "Cosine"
+  },
+  "shard_number": 6,
+  "replication_factor": 2
+}
+----
+
+By default, points are assigned to shards by hashing their id, spreading them evenly; a collection can
+instead define a *custom sharding key* so that points sharing a key (e.g. a tenant id) always land on the
+same shard, which is useful for scoping a query to one tenant's data. See
+https://qdrant.tech/documentation/guides/distributed_deployment/[Distributed Deployment] for the sharding
+methods and how a query can be routed to a specific shard.
+
+== Replication
+
+`replication_factor` (shown above alongside `shard_number`) sets how many copies of each shard Qdrant
+keeps, placed on different peers whenever the cluster has enough nodes to do so. A read can be served by
+any in-sync replica and a write must reach a quorum of a shard's replicas (governed by `write_consistency_
+factor`) before it is acknowledged, so the collection keeps serving both reads and writes through the loss
+of a minority of a shard's replicas. A replica that falls behind or drops out is marked `Dead` and later
+brought back in sync automatically, or can be recovered from a snapshot (below) rather than a full resync.
+
+[source,python]
+----
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
+
+client = QdrantClient(url="http://localhost:6333")
+
+client.create_collection(
+    collection_name="documents",
+    vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE),
+    shard_number=6,
+    replication_factor=2,
+    write_consistency_factor=1,
+)
+
+# inspect current shard/replica placement across the cluster
+info = client.get_collection_cluster_info(collection_name="documents")
+print(info)
+----
+
+== Raft-based consensus
+
+Every peer runs the *Raft* consensus algorithm, but Raft in Qdrant governs *cluster metadata* -- collection
+configurations, which shard replicas live on which peer, and cluster peer membership itself -- not the
+point data inside a collection. One peer is elected Raft leader for that metadata log; a change such as
+creating a collection or moving a shard replica is proposed through Raft and only takes effect once a
+majority of peers have committed it, which is what keeps every node's view of the cluster's topology
+consistent even as peers join, leave, or fail. The actual vectors and payloads inside a shard are kept in
+sync by the shard replication mechanism described above, entirely separate from the Raft log -- a design
+that mirrors the general pattern (also seen in
+xref:database/neo4j/clustering-and-multi-database.adoc[Neo4j's own Raft-based clustering]) of using Raft
+for metadata/topology consensus while replicating the bulk data through a different path.
+
+[source,shell]
+----
+# cluster-wide status: peers, this node's Raft role, and pending Raft operations
+curl http://localhost:6333/cluster
+----
+
+[mermaid]
+....
+flowchart TD
+    subgraph Raft["Raft consensus group (cluster metadata)"]
+        P1["peer 1 (leader)"]
+        P2["peer 2 (follower)"]
+        P3["peer 3 (follower)"]
+    end
+    P1 -->|propose: create collection / move shard| P2
+    P1 -->|propose: create collection / move shard| P3
+    P2 -.->|majority ack to commit| P1
+    P3 -.->|majority ack to commit| P1
+    P1 -->|shard replica data| P2
+    P1 -->|shard replica data| P3
+....
+
+See https://qdrant.tech/documentation/guides/distributed_deployment/[Distributed Deployment] for how peers
+join and leave the Raft group and how consensus operations are exposed through the `/cluster` API.
+
+== On-disk vs. in-memory storage
+
+Independent of clustering, each collection chooses where its vectors and payload live. By default vectors
+are kept fully in RAM for the lowest query latency; setting `on_disk: true` on the vector configuration
+instead memory-maps the vector data from disk, letting a collection far larger than available RAM be
+served at the cost of some latency (mmap pages are faulted in on access, and cold data is slower than a
+warm in-memory read). Payload storage has an analogous choice: an on-disk payload store trades a small
+latency cost for keeping structured payload out of RAM entirely.
+
+[source,json]
+----
+// PUT /collections/documents
+{
+  "vectors": {
+    "size": 768,
+    "distance": "Cosine",
+    "on_disk": true
+  },
+  "hnsw_config": {
+    "on_disk": true
+  }
+}
+----
+
+Because this is a per-collection (and per named vector) setting rather than a cluster-wide one, a
+deployment can keep a small, latency-sensitive collection fully in memory while a much larger archival
+collection runs mostly from disk on the same cluster.
+
+== Snapshots
+
+A *snapshot* is a point-in-time copy of a collection (or, taken across every collection, of the whole
+node/cluster) that Qdrant can create on demand and later restore from. Snapshots serve two purposes:
+backup/restore, and bootstrapping a new replica for a shard without a full resync -- Qdrant can recover a
+`Dead` replica directly from a peer's snapshot instead of re-streaming every point.
+
+[source,shell]
+----
+# create a snapshot of one collection
+curl -X POST http://localhost:6333/collections/documents/snapshots
+
+# list existing snapshots for that collection
+curl http://localhost:6333/collections/documents/snapshots
+
+# download a snapshot by name (from the list above) to a local file
+curl -o documents.snapshot \
+  http://localhost:6333/collections/documents/snapshots/documents-2026-09-15-10-00-00.snapshot
+----
+
+[source,python]
+----
+client.create_snapshot(collection_name="documents")
+
+snapshots = client.list_snapshots(collection_name="documents")
+for snapshot in snapshots:
+    print(snapshot.name, snapshot.creation_time, snapshot.size)
+----
+
+Restoring uploads a snapshot file to a (typically empty) collection, or a node can be started with a
+`--snapshot` recovery flag pointing at one; the full set of snapshot, recovery, and shard-snapshot
+endpoints is documented in https://qdrant.tech/documentation/concepts/snapshots/[Snapshots].
+
+== Where to go next
+
+* xref:database/qdrant/crud-and-batch-operations.adoc[] -- the point-level writes whose durability and
+  availability this page's sharding, replication, and snapshots protect.
+* xref:database/qdrant/security-and-administration.adoc[] -- securing and administering the cluster
+  described here (API keys, TLS, RBAC, and cluster-level administration).
