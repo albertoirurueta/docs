@@ -29,10 +29,9 @@ Base branch: main
     itself is not a password."
   - Line 66 (immediately following, no blank line): the `image::oauth-authentication-factors.svg[...]` macro —
     currently merged into the preceding paragraph's text instead of being recognized as a block.
-  - Line 67 (immediately following the image line, no blank line): `== Passwords as the baseline primary
-    factor` — the next section heading also has no blank line separating it from the image macro, which is
-    likewise inconsistent with the convention seen elsewhere in this repo (a blank line both before and after
-    an `image::` block).
+  - Line 67 (immediately following the image line): `== Passwords as the baseline primary factor` — a blank
+    line already separated the image macro from this heading, so only the missing blank line *before* the
+    macro needs fixing.
   - The image target `modules/ROOT/images/oauth-authentication-factors.svg` exists and is correctly named —
     no change needed there.
 - No other file, nav entry, or image reference is affected — this is a single-page, single-line content fix.
@@ -44,11 +43,12 @@ Base branch: main
 - [x] Task 1. Insert blank lines around the `image::oauth-authentication-factors.svg[...]` macro in
       `modules/ROOT/pages/backend/oauth/authentication-methods-2fa-and-passwordless.adoc`
   - [x] Task 1.1. Add a blank line between the end of the paragraph ("...is not a password.") and the
-        `image::oauth-authentication-factors.svg[...]` line, and a blank line between that `image::` line and
-        the following `== Passwords as the baseline primary factor` heading, so the macro becomes its own
-        AsciiDoc block (matching the convention used by every other `image::` usage in this repository, e.g.
-        `modules/ROOT/pages/database/prometheus/alertmanager.adoc`). Do not change the macro's target, alt
-        text, or attributes (`width=700,role=text-center`) — only the surrounding blank lines.
+        `image::oauth-authentication-factors.svg[...]` line, so the macro becomes its own AsciiDoc block
+        (matching the convention used by every other `image::` usage in this repository, e.g.
+        `modules/ROOT/pages/database/prometheus/alertmanager.adoc`). A blank line already followed the macro,
+        before the `== Passwords as the baseline primary factor` heading, so only this one line was missing.
+        Do not change the macro's target, alt text, or attributes (`width=700,role=text-center`) — only the
+        blank line before it.
   - [x] Task 1.2. Verify the fix by building the site and confirming the section renders as an image, not as
         literal text. Delegate this to the `iru-build-docs` skill (invoked directly in-context is fine here —
         it's a single, fast Antora build with plain text output, not a large test suite — but if an
