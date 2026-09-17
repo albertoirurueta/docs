@@ -49,7 +49,7 @@ Base branch: main
         AsciiDoc block (matching the convention used by every other `image::` usage in this repository, e.g.
         `modules/ROOT/pages/database/prometheus/alertmanager.adoc`). Do not change the macro's target, alt
         text, or attributes (`width=700,role=text-center`) — only the surrounding blank lines.
-  - [ ] Task 1.2. Verify the fix by building the site and confirming the section renders as an image, not as
+  - [x] Task 1.2. Verify the fix by building the site and confirming the section renders as an image, not as
         literal text. Delegate this to the `iru-build-docs` skill (invoked directly in-context is fine here —
         it's a single, fast Antora build with plain text output, not a large test suite — but if an
         `iru-gate-runner`-style agent is preferred to keep output out of the main context, that's equally
