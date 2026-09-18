@@ -1,0 +1,330 @@
+= Kafka Producers
+:description: Walks the Kafka producer's internal pipeline -- serialization, partitioning, batching, and the sender thread -- and the configuration knobs that govern durability, throughput, and ordering, with a plain-Java kafka-clients example.
+:keywords: Kafka producer, ProducerRecord, KafkaProducer, serializer, partitioner, sticky partitioner, record accumulator, batch.size, linger.ms, acks, min.insync.replicas, delivery.timeout.ms, idempotent producer, enable.idempotence, max.in.flight.requests.per.connection, compression.type, gzip, snappy, lz4, zstd, Callback, RecordMetadata, headers, kafka-clients
+
+include::partial$messaging-disclaimer.adoc[]
+
+A `KafkaProducer` does far more between the moment application code calls `send()` and the moment a record is
+actually on the wire than the one-line call suggests: the record is serialized, routed to a partition, appended
+to an in-memory batch that may sit and grow for a few milliseconds, and only then handed to a background thread
+that talks to the broker. This page walks that pipeline stage by stage, then the configuration knobs that shape
+what each stage does -- `acks` and idempotence for durability, `compression.type` for wire efficiency, and the
+callback/`Future` pair the application gets back once a batch is actually acknowledged. The topic/partition/
+broker/replication concepts the partitioner and `acks` lean on are covered in full on
+xref:backend/messaging/kafka-architecture.adoc[Apache Kafka Architecture]; the at-least-once/exactly-once
+semantics `acks` and idempotence combine into are covered in full on
+xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees] rather than re-derived here.
+
+== The producer pipeline
+
+Every record passed to `send()` moves through four stages inside the client, entirely on the calling thread up
+to the point it is handed off, before a separate background thread ever touches the network:
+
+[cols="1,3",options="header"]
+|===
+| Stage | What happens
+
+| *Serializer*
+| The record's key and value -- ordinary Java objects as far as application code is concerned -- are converted to
+  `byte[]` by the configured `key.serializer` and `value.serializer`. Kafka never inspects the bytes it stores;
+  serialization is entirely the producer's (and, symmetrically, the consumer's deserializer's) concern.
+
+| *Partitioner*
+| The serialized record is assigned to one of the topic's partitions, deciding which broker (that partition's
+  leader) it will eventually be sent to. Key hashing, the sticky partitioner, and custom partitioners are covered
+  below.
+
+| *Record accumulator*
+| The record is appended to an in-memory batch dedicated to its destination partition, rather than sent
+  immediately. Batches accumulate until either `batch.size` bytes are reached or `linger.ms` has elapsed, covered
+  below.
+
+| *Sender thread*
+| A single background I/O thread, separate from every thread calling `send()`, drains ready batches and turns
+  each one into a `Produce` request sent to the relevant partition leader, receiving the broker's response and
+  completing the corresponding callbacks/`Future`s asynchronously.
+|===
+
+The figure below draws this same pipeline as a left-to-right flow, with the broker's asynchronous reply feeding
+back into the callback/`Future` the application registered when it called `send()`.
+
+image::messaging-kafka-producer-internals.svg[Kafka producer internals as a five-stage pipeline: the application calls send() with a ProducerRecord and a Callback; the Serializer converts the key and value to bytes; the Partitioner assigns a partition by key hash; sticky assignment for records with no key; or a custom Partitioner implementation; the Record Accumulator batches records per partition governed by batch.size and linger.ms and applies compression.type; the Sender thread drains batches into Produce requests sent to the broker's partition leader; and the broker's response flows back asynchronously to complete the application's Callback with a RecordMetadata or Future,width=700,role=text-center]
+
+`send()` itself never blocks on the broker -- it returns as soon as the record has been serialized, partitioned,
+and appended to its batch, which is what lets a producer sustain high throughput without one slow broker
+round-trip stalling every subsequent call.
+
+== `ProducerRecord` and serializers
+
+A `ProducerRecord<K, V>` is the unit of data passed to `send()`: a topic, an optional partition, an optional key,
+a value, an optional timestamp, and optional headers. Only the topic and value are strictly required --
+everything else can be left to the producer's own defaults (partition chosen by the partitioner, timestamp set to
+"now", no headers).
+
+[source,java]
+----
+ProducerRecord<String, String> record =
+        new ProducerRecord<>("orders", "order-42", "{\"status\":\"created\"}");
+----
+
+The `key.serializer` and `value.serializer` configuration entries name the classes that turn the record's typed
+key and value into the `byte[]` Kafka actually stores; `org.apache.kafka.common.serialization.StringSerializer`
+is the common case for JSON-as-text payloads, with `ByteArraySerializer`, `IntegerSerializer`, and a handful of
+others available for other payload shapes, plus the `Serializer<T>` interface for a custom one.
+See https://kafka.apache.org/43/generated/producer_config.html[Apache Kafka -- Producer Configuration Reference]
+for `key.serializer`/`value.serializer` and every other configuration entry named on this page.
+
+== Batching: the record accumulator, `batch.size`, and `linger.ms`
+
+The record accumulator exists because sending one record per network request would be enormously wasteful --
+every request carries fixed framing and round-trip overhead regardless of how much data it contains, so batching
+several records that are headed to the same partition into one request amortizes that overhead across all of
+them. Two configuration entries govern when a batch stops accumulating and becomes eligible to send:
+
+* *`batch.size`* (default `16384` bytes) caps how large a single batch for one partition is allowed to grow. Once
+  a batch reaches this size, it is sent as soon as the sender thread can get to it, without waiting any longer.
+* *`linger.ms`* adds a deliberate, bounded wait: even a batch that is not yet full is sent once it has been
+  accumulating for `linger.ms` milliseconds, so a low-traffic partition does not leave a small batch sitting
+  indefinitely. The default changed from `0` to `5` milliseconds in Apache Kafka 4.0 (KIP-1030) -- previously a
+  producer would send a partially-filled batch essentially immediately once the sender thread was free, which
+  favored latency over batching efficiency; the new 5&#160;ms default trades a small, usually imperceptible
+  amount of added latency for materially better batching (and, indirectly, compression) on the same traffic,
+  without needing the application to opt in explicitly.
+
+A batch is therefore sent at whichever of the two happens first: it fills up to `batch.size`, or `linger.ms`
+elapses since the first record was added to it. Raising `linger.ms` further trades additional per-record latency
+for larger, more efficient batches under sustained load; raising `batch.size` alone, without also raising
+`linger.ms`, mostly matters for producers that are already sending fast enough to fill batches on their own.
+See https://kafka.apache.org/43/generated/producer_config.html[Apache Kafka -- Producer Configuration Reference]
+for `batch.size` and `linger.ms`.
+
+== The partitioner
+
+Every record needs a partition before it can be batched, and the partitioner decides that assignment using one
+of three strategies, in order of how a given `send()` call is shaped:
+
+* *Key hashing.* When a record carries a non-null key, the default partitioner hashes it (murmur2) and maps the
+  hash onto one of the topic's partitions. Every record with the same key is therefore always routed to the same
+  partition, which is what makes per-key ordering possible in the first place -- see
+  xref:backend/messaging/kafka-architecture.adoc[Apache Kafka Architecture] for how partitions and their ordering
+  guarantee actually work.
+* *Sticky partitioning for null/no-key records.* When a record has no key, hashing has nothing to hash, so
+  spreading records evenly by picking a partition at random for every single record would defeat batching --
+  each record would likely land in a different, mostly-empty batch. Instead, the default partitioner *sticks* to
+  one partition for an entire batch's worth of null-key records, switching to a new partition only once the
+  current batch is sent (or `linger.ms` elapses), which lets same-destination records accumulate into full
+  batches while still spreading load across partitions over time.
+* *Custom partitioners.* Application code that needs different routing logic entirely -- geographic sharding, a
+  fixed partition per tenant regardless of key hash, and so on -- implements the `Partitioner` interface and
+  configures it via `partitioner.class`; the interface's `partition()` method receives the topic, key, serialized
+  key, value, serialized value, and cluster metadata, and returns the partition index to use.
+
+[source,java]
+----
+package com.example.orders;
+
+import java.util.List;
+import java.util.Map;
+
+import org.apache.kafka.clients.producer.Partitioner;
+import org.apache.kafka.common.Cluster;
+import org.apache.kafka.common.PartitionInfo;
+
+public class PriorityAwarePartitioner implements Partitioner {
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes, Object value, byte[] valueBytes,
+            Cluster cluster) {
+        List<PartitionInfo> partitions = cluster.partitionsForTopic(topic);
+        // route "priority" orders to a dedicated partition (index 0), everything else spreads over the rest
+        if (key != null && key.toString().startsWith("priority-")) {
+            return 0;
+        }
+        int remaining = partitions.size() - 1;
+        return 1 + (Math.abs(key == null ? 0 : key.hashCode()) % remaining);
+    }
+
+    @Override
+    public void close() {
+        // no resources to release
+    }
+
+    @Override
+    public void configure(Map<String, ?> configs) {
+        // no configuration needed for this partitioner
+    }
+}
+----
+
+`Partitioner` and the sticky-partitioning default are documented in the client Javadoc; see
+https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/Partitioner.html[Apache Kafka Javadoc --
+`Partitioner`] and `partitioner.class` in the
+https://kafka.apache.org/43/generated/producer_config.html[Apache Kafka -- Producer Configuration Reference].
+
+== Durability: `acks`, `min.insync.replicas`, retries, and `delivery.timeout.ms`
+
+`acks` controls how many replicas must have the record before the broker responds to the producer, and is one
+of the two configuration entries -- together with `enable.idempotence` below -- most directly responsible for
+what a Kafka producer actually guarantees about a message's fate. The three values, and how `min.insync.replicas`
+interacts with the strongest of them, are covered in full, alongside the rest of Kafka's delivery-semantics
+picture, on xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees]; in short, from the producer
+configuration's own point of view:
+
+[cols="1,3",options="header"]
+|===
+| `acks` value | What the producer waits for
+
+| `0`
+| Nothing -- the record is considered sent the instant it leaves the client, with no acknowledgement and no
+  retry on failure. Highest throughput, weakest guarantee: a lost record is never even detected by the producer.
+
+| `1`
+| The partition leader has appended the record to its own log, but replication to follower replicas has not yet
+  necessarily happened. A leader that crashes immediately after acknowledging, before followers replicate, can
+  still lose the record.
+
+| `all` (or `-1`)
+| Every in-sync replica (the partition's current ISR) has appended the record. `min.insync.replicas` sets the
+  minimum ISR size the broker will accept a write against at all -- with `acks=all` and
+  `min.insync.replicas=2` on a three-replica topic, a write is rejected outright (rather than silently
+  under-replicated) if fewer than two replicas are currently in sync.
+|===
+
+Retries and the ambiguous-failure handling that goes with them (a request that times out without the producer
+knowing whether it landed) are governed by `delivery.timeout.ms` as an overall upper bound: the producer keeps
+retrying a failed send internally -- governed by `retries`, which defaults to effectively unlimited
+(`Integer.MAX_VALUE`) -- until either the send succeeds or `delivery.timeout.ms` (default 120 seconds) has
+elapsed since the record was originally handed to `send()`, at which point the send is finally reported as
+failed to the application. This makes `delivery.timeout.ms` the single knob that bounds how long `send()`'s
+returned `Future` (or its callback) can remain unresolved, regardless of how many individual retry attempts
+happen underneath it.
+
+=== The idempotent producer and `max.in.flight.requests.per.connection`
+
+`enable.idempotence` (default `true`) prevents a producer's own retries from creating duplicate records at the
+broker: the broker assigns each producer session a producer ID and tracks a per-partition sequence number, and
+silently discards a retried write whose sequence number it has already seen, rather than appending a second copy.
+This is what makes retrying on an ambiguous send failure safe rather than a duplication risk in its own right --
+the full at-least-once-versus-exactly-once discussion this enables is on
+xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees]. Idempotence requires `acks=all` and caps
+`max.in.flight.requests.per.connection` at 5 (still allowing pipelining, unlike capping it at 1), both of which
+the client enforces automatically when idempotence is enabled rather than leaving them for the application to
+get wrong.
+
+== Compression
+
+`compression.type` (default `none`) compresses an entire batch as one unit before it is sent, rather than
+compressing individual records -- which is another reason larger batches (via `linger.ms`/`batch.size`) matter:
+a bigger batch compresses more effectively than several small ones sent separately. Four algorithms are built in:
+
+[cols="1,3",options="header"]
+|===
+| Value | Trade-off
+
+| `gzip`
+| Highest compression ratio of the four, at the highest CPU cost -- favors producers that are bandwidth- or
+  storage-constrained over ones that are CPU-constrained.
+
+| `snappy`
+| Low CPU cost, moderate compression ratio -- favors throughput and low producer-side latency over squeezing the
+  most bytes out of the payload.
+
+| `lz4`
+| Similar profile to `snappy` -- low CPU cost -- with a generally better compression ratio in practice on typical
+  workloads, which is why it is a common default choice for latency-sensitive, high-throughput producers.
+
+| `zstd`
+| Configurable compression level, generally the best ratio-for-CPU-cost trade-off of the four across a wide level
+  range, at the cost of being the newest and least universally battle-tested of the four in older client/broker
+  combinations.
+|===
+
+Compressed batches are stored compressed on the broker and decompressed only by the consumer (or never, if the
+consumer only needs to relay the batch onward), so choosing a compression algorithm is a producer-and-consumer
+CPU trade-off, not just a producer one. See `compression.type` in the
+https://kafka.apache.org/43/generated/producer_config.html[Apache Kafka -- Producer Configuration Reference].
+
+== Send callbacks, the returned `Future`, and headers
+
+`send()` returns a `Future<RecordMetadata>` immediately and, optionally, invokes a `Callback` once the broker
+has actually responded -- the two are two ways of observing the same asynchronous outcome, and an application
+typically uses one or the other rather than both. The callback fires on the sender thread, not the thread that
+called `send()`, so it must not block; `RecordMetadata` reports the partition, offset, and timestamp the record
+was actually written at once the send succeeds, and the callback's `Exception` argument is non-null exactly when
+it fails.
+
+Headers are optional key/value metadata carried alongside a record -- a `Headers` instance on `ProducerRecord`,
+holding an ordered list of string keys mapped to raw `byte[]` values -- commonly used for cross-cutting concerns
+such as a trace id or a schema-registry content-type hint that do not belong in the business payload itself.
+
+== A complete producer example
+
+[source,java]
+----
+package com.example.orders;
+
+import java.util.Properties;
+import java.util.concurrent.ExecutionException;
+
+import org.apache.kafka.clients.producer.Callback;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.header.internals.RecordHeader;
+import org.apache.kafka.common.serialization.StringSerializer;
+
+public class OrderEventProducer {
+
+    private static final String TOPIC = "orders";
+
+    public static void main(String[] args) throws InterruptedException, ExecutionException {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.ACKS_CONFIG, "all"); // wait for every in-sync replica
+        props.put(ProducerConfig.COMPRESSION_TYPE_CONFIG, "lz4"); // low CPU cost, good ratio for JSON payloads
+        props.put(ProducerConfig.LINGER_MS_CONFIG, 10); // batch slightly harder than the 5 ms default
+        // enable.idempotence defaults to true already; set explicitly here for clarity at the call site
+        props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+
+        try (Producer<String, String> producer = new KafkaProducer<>(props)) {
+            ProducerRecord<String, String> record =
+                    new ProducerRecord<>(TOPIC, "order-42", "{\"status\":\"created\"}");
+            // a trace id header travels with the record without polluting the JSON payload
+            record.headers().add(new RecordHeader("trace-id", "a1b2c3d4".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+
+            Callback callback = (RecordMetadata metadata, Exception exception) -> {
+                if (exception != null) {
+                    // a genuinely failed send after delivery.timeout.ms and all internal retries are exhausted
+                    System.err.println("send failed: " + exception.getMessage());
+                } else {
+                    System.out.printf("sent to partition %d at offset %d%n", metadata.partition(), metadata.offset());
+                }
+            };
+
+            // fire the send asynchronously with a callback, then also demonstrate blocking on the returned Future
+            producer.send(record, callback).get();
+        }
+    }
+}
+----
+
+This example builds directly on the `KafkaProducer`/`ProducerConfig`/`ProducerRecord`/`Callback`/`RecordMetadata`
+API surface documented in the client Javadoc; see
+https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html[Apache Kafka Javadoc --
+`KafkaProducer`] and https://kafka.apache.org/43/generated/producer_config.html[Apache Kafka -- Producer
+Configuration Reference] for the full configuration surface `ProducerConfig`'s constants name. For the initial,
+simpler send/receive example this page builds on, see
+xref:backend/messaging/getting-started.adoc[Getting Started with Messaging].
+
+== References
+
+* https://kafka.apache.org/43/generated/producer_config.html[Apache Kafka -- Producer Configuration Reference]
+* https://kafka.apache.org/43/design/design/#theproducer[Apache Kafka Documentation -- Design: The Producer]
+* https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/KafkaProducer.html[Apache Kafka Javadoc
+  -- `KafkaProducer`]
+* https://kafka.apache.org/43/javadoc/org/apache/kafka/clients/producer/Partitioner.html[Apache Kafka Javadoc --
+  `Partitioner`]
