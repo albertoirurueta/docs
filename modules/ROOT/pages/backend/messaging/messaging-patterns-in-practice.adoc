@@ -1,0 +1,314 @@
+= Messaging Patterns in Practice
+:description: Synthesizes recurring messaging design patterns across Kafka and RabbitMQ -- the transactional outbox, idempotent consumers, retry and dead-letter strategies, hot-partition mitigation, backpressure, trace-context propagation, schema evolution, saga choreography and orchestration, event sourcing with CQRS, and the claim-check pattern -- with a concrete Kafka and RabbitMQ realization for every pattern.
+:keywords: transactional outbox, dual writes, idempotent consumer, dedup key, INSERT ON CONFLICT, retry topic, delay ladder, TTL DLX, poison message, hot partition, partition skew, salting keys, backpressure, consumer lag, correlation id, W3C Trace Context, traceparent, tracestate, schema evolution, saga choreography, saga orchestration, event sourcing, CQRS, log compaction, claim-check pattern
+
+include::partial$messaging-disclaimer.adoc[]
+
+The preceding pages each cover one broker in depth: how Kafka's log and consumer groups work, how RabbitMQ's
+exchanges and queues route and hold messages, and what reliability guarantees each one actually makes. This page
+sits a level above that -- it is about **patterns**: recurring problems that show up in almost any
+messaging-based system, regardless of which broker carries the traffic, and the concrete shape each pattern takes
+once it meets Kafka's partitioned log or RabbitMQ's routed queues. Where a pattern's mechanics are already covered
+in full on a broker-specific page, this page links to it rather than repeating it -- the goal here is the
+synthesis: naming the pattern, explaining why it exists, and showing its Kafka realization side by side with its
+RabbitMQ realization.
+
+== Transactional outbox and why dual writes fail
+
+A service that writes to its own database and also needs to tell the rest of the system about that write is
+tempted by the simplest possible approach: commit the database transaction, then call the broker client to
+publish an event, as two separate steps. This is the **dual-write problem**, and it fails in a very concrete way.
+Because the database commit and the publish call are not atomic with each other, a crash (or a network partition,
+or an out-of-memory kill) landing between the two steps produces a **torn write**: either the database transaction
+commits and the process dies before the publish call goes out, silently losing the event -- other services never
+learn a state change actually happened -- or the publish call is attempted before the database transaction is
+known to have committed, and a retry after a perceived failure double-publishes an event for a write that, from
+the database's point of view, might not have happened at all. There is no ordering of "write to the database" and
+"publish to the broker" as two independent steps that closes this gap; one of the two operations is always at risk
+of running, or not running, independently of the other.
+
+The **transactional outbox pattern** solves this by turning the event into an ordinary row, written to an
+`outbox` table in the *same* local database transaction as the business change -- so the business write and the
+event record are atomic by construction, guaranteed by the database's own transaction, not by anything
+messaging-related -- and then relying on a separate process to relay that row onward to the broker, independently
+of whether the original request that created it is still running.
+xref:backend/messaging/kafka-connect.adoc[Kafka Connect] already works through this pattern end to end, using
+change data capture (Debezium tailing the database's write-ahead log) and Debezium's outbox event router SMT to
+turn each inserted `outbox` row into a clean domain event on a Kafka topic, including the tradeoffs of that
+approach versus a direct producer call -- that treatment is not repeated here. The same shape applies with
+RabbitMQ as the destination: a relay process (a small poller reading unpublished `outbox` rows, or a CDC connector
+writing to an AMQP endpoint instead of a Kafka topic) publishes each row's payload to the appropriate exchange and
+only then marks or deletes the row, so a crash before that publish simply leaves the row for the next relay pass
+to pick up, and a crash after a confirmed publish (paired with
+xref:backend/messaging/rabbitmq-publishing.adoc[RabbitMQ Publishing]'s publisher confirms) never re-publishes a
+duplicate as long as the row is marked in the same step that observes the confirm. Either way, the relay's own
+delivery to the broker is only ever **at-least-once** -- a crash between publishing and marking the row can
+re-publish it -- which is exactly why the next pattern, the idempotent consumer, has to sit on the receiving end.
+
+== Idempotent consumers: dedup keys and `INSERT ... ON CONFLICT`
+
+xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees] already introduces the idempotent-consumer
+idea in general terms: deduplicate by an application-assigned id, or rely on the operation's natural idempotency.
+The concrete mechanism worth spelling out is the dedup table itself, because a naive "check if the id exists,
+then insert" does not actually close the race between two concurrent deliveries of the same message id -- both
+can pass the check before either has inserted. A single atomic upsert closes it instead. On Postgres:
+
+[source,sql]
+----
+INSERT INTO processed_events (event_id, processed_at)
+VALUES ($1, now())
+ON CONFLICT (event_id) DO NOTHING
+RETURNING event_id;
+----
+
+`event_id` carries a unique constraint, so a concurrent duplicate insert (from a redelivered Kafka record with the
+same key, or a requeued RabbitMQ message) collides on that constraint instead of silently landing twice; `ON
+CONFLICT (event_id) DO NOTHING` makes the collision a no-op rather than an error, and the `RETURNING` clause comes
+back empty exactly when the row already existed -- which is what the application checks to decide whether to
+apply the message's side effect at all. This is broker-agnostic by construction: nothing about the query cares
+whether `event_id` arrived as a Kafka record's key (or a header, if the key is used for partitioning instead) or a
+RabbitMQ message's `message-id`/correlation-id property, which is exactly why the same dedup table pattern works
+identically on either broker's consuming side, wiring into
+xref:backend/messaging/kafka-consumers.adoc[Kafka Consumers]' manual offset commits or
+xref:backend/messaging/rabbitmq-consuming.adoc[RabbitMQ Consuming]'s manual acknowledgements the same way in
+either case: apply the effect and record the dedup row inside one local transaction, then acknowledge/commit only
+after that transaction succeeds.
+
+== Retry with backoff and dead-letter handling
+
+Both brokers need a way to give a failed message another chance, on a delay, before giving up on it entirely --
+but they build that behavior out of structurally different primitives, and the shapes are worth contrasting
+directly rather than treating "retry with backoff" as one universal mechanism.
+
+**Kafka** has no built-in per-record delay or scheduling, so a delayed retry is built out of ordinary topics: a
+failed record is produced onward to a **retry topic** instead of being reprocessed immediately, and a consumer of
+that retry topic sleeps (or otherwise waits) for the desired backoff before processing it and, on failure,
+forwards it again. The common refinement is a **delay ladder**: several retry topics
+(`orders-retry-1`, `orders-retry-2`, `orders-retry-3`, ...), each with a longer configured delay than the last, so
+early attempts retry quickly and later attempts back off further, with a final **DLQ topic** at the end of the
+ladder for records that exhaust every retry level. xref:backend/messaging/kafka-connect.adoc[Kafka Connect]'s
+`errors.deadletterqueue.topic.name` is the same DLQ idea applied specifically to a sink connector's converter and
+transform failures, not a general application-level retry ladder -- it is the terminal topic a retry ladder like
+this one would also feed into, not a substitute for the ladder itself.
+
+**RabbitMQ** builds the equivalent delay out of TTL and dead-lettering instead of a chain of topics --
+xref:backend/messaging/rabbitmq-reliability-dead-lettering-and-ttl.adoc[RabbitMQ Reliability, Dead-Lettering and
+TTL] already covers that wait-queue-with-TTL-back-to-the-work-queue mechanism in full, including the exact queue
+arguments, and is not repeated here. The structural difference is what matters for comparing the two: Kafka's
+retry ladder is a *sequence of distinct topics*, each processed by its own consumer loop, so "which attempt number
+is this" is implicit in which topic the record currently sits on; RabbitMQ's TTL+DLX approach is a *loop* through
+the same one or two queues, where "which attempt number is this" has to be tracked explicitly (typically from the
+`x-death` header's count, as that page describes), because the same wait queue is reused for every retry level
+rather than each level getting its own queue. Both converge on the same terminal state -- a message that keeps
+failing eventually lands in a true dead-letter topic or queue for manual inspection -- but Kafka's version scales
+retry levels by adding topics, while RabbitMQ's scales them by adding TTL/hop configuration to a loop that stays
+structurally the same shape regardless of how many levels it represents.
+
+**Poison messages** -- a message that fails every attempt and would otherwise retry forever -- are handled by a
+built-in delivery-count cap on both brokers rather than needing to be detected by application logic.
+xref:backend/messaging/kafka-share-groups.adoc[Kafka Share Groups] covers Kafka's version: a share group's
+`group.share.delivery.count.limit` archives a record once it has been delivered that many times without an
+`ACCEPT`, functioning as an automatic poison-message guard without a hand-built dead-letter topic. RabbitMQ's
+equivalent is a quorum queue's `delivery_limit`, covered on
+xref:backend/messaging/rabbitmq-queue-types.adoc[RabbitMQ Queue Types] together with how exceeding it dead-letters
+the message with reason `delivery_limit`, as
+xref:backend/messaging/rabbitmq-reliability-dead-lettering-and-ttl.adoc[RabbitMQ Reliability, Dead-Lettering and
+TTL] lists among its four dead-lettering reasons. Neither mechanism is a replacement for the retry ladder or the
+TTL+DLX loop above -- it is the safety net underneath either one, bounding how many times a message can cycle
+through that loop before the broker itself stops offering it for redelivery.
+
+== Ordering keys and hot partitions
+
+Choosing how a message is keyed controls two things at once: whether related messages stay in order, and how
+evenly work spreads across consumers -- and those two goals can pull in opposite directions. On **Kafka**, every
+record with the same key lands on the same partition (per
+xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees]'s ordering coverage), so a key that is
+supposed to guarantee ordering for, say, "all events for this customer" also concentrates every one of that
+customer's events onto a single partition -- if a handful of keys (a large customer, a popular product id) account
+for a disproportionate share of traffic, their partition becomes a **hot partition**: one consumer instance
+absorbs far more work than its peers while the rest of the consumer group sits comparatively idle, even though the
+topic overall is well provisioned. On **RabbitMQ**, the analogous skew shows up as a hot queue: a routing key (or
+binding pattern) that funnels a disproportionate share of messages into one queue overloads whichever consumer or
+consumers are attached to it, the same imbalance, one level up in the routing rather than the partitioning.
+
+The practical mitigations are the same shape on both brokers. **Better key selection** -- keying by something with
+naturally higher cardinality and a flatter distribution (an order id instead of a customer id, if per-order rather
+than per-customer ordering is actually what the consumer needs) -- removes the skew at the source when the
+domain allows it. Where ordering genuinely must be scoped coarser than the traffic distribution allows, **salting
+keys** spreads a hot key across several partitions or queues on purpose: appending a bounded random or
+round-robined suffix (`customer-42#0`, `customer-42#1`, ... `customer-42#7`) turns one hot partition/queue into
+several cooler ones, at the cost of only guaranteeing ordering within each salted sub-key rather than across the
+whole original key -- a tradeoff that is only acceptable when the consumer does not actually need strict ordering
+across every event for that original key, only within a narrower grouping it can still reconstruct downstream.
+
+== Backpressure and consumer lag
+
+Both brokers need a way to stop a fast producer from overwhelming a slow consumer, and both expose it as a
+bounded window of outstanding, unprocessed work rather than an unbounded queue. On **Kafka**, that window is not
+enforced by the broker at all -- a consumer simply falls behind, and how far behind is measured as **consumer
+lag**, the gap between a partition's log-end offset and the group's committed offset;
+xref:backend/messaging/kafka-operations-and-monitoring.adoc[Kafka Operations and Monitoring] covers `lag` in
+detail, including the `records-lag-max` client metric and the operational alerting built around it. Lag is purely
+observational on Kafka's side -- nothing stops a producer from continuing to publish while a consumer group falls
+arbitrarily far behind, short of retention deleting data the group has not yet read. **RabbitMQ**, by contrast,
+enforces backpressure directly at the broker: xref:backend/messaging/rabbitmq-consuming.adoc[RabbitMQ Consuming]'s
+prefetch (QoS) setting caps how many unacknowledged deliveries the broker will push to a given consumer before
+pausing, and xref:backend/messaging/rabbitmq-publishing.adoc[RabbitMQ Publishing]'s connection-level flow control
+can block a publisher outright when the broker itself is under memory or disk pressure -- both mechanisms actively
+throttle one side of the pipeline rather than merely reporting how far it has fallen behind.
+
+== Correlation IDs and W3C Trace Context propagation
+
+A **correlation id** ties together every message and service call that resulted from one originating request, so
+logs and traces from different services can be joined back into a single end-to-end story -- the correlation
+identifier already appears in the Enterprise Integration Patterns catalogue on
+xref:backend/messaging/messaging-models-and-patterns.adoc[Messaging Models and Patterns] as a general messaging
+concept. The interoperable, standardized way to carry that context is the
+https://www.w3.org/TR/trace-context/[W3C Trace Context] specification's two fields: **`traceparent`**, which
+carries a version, a 16-byte trace id, an 8-byte parent (span) id, and an 8-bit trace-flags byte as
+dash-separated hex (for example `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`), and **`tracestate`**,
+an optional, vendor-extensible list of additional key-value trace state. Both are defined as HTTP headers in the
+specification, but the same two field names and formats are what a tracing system propagates through any
+transport, messaging included -- the question for each broker is simply where those two values are attached to a
+message.
+
+On **Kafka**, `traceparent` and `tracestate` are carried as ordinary **record headers** -- Kafka's per-record
+header list (already used elsewhere for metadata, as
+xref:backend/messaging/kafka-serialization-and-schemas.adoc[Kafka Serialization and Schemas] notes) is exactly
+where an instrumented producer writes them before sending, and an instrumented consumer reads them back to
+continue the same trace rather than starting a new one. On **RabbitMQ**, there is no reserved property for trace
+context, so the same two values travel as entries in the message's `headers` table (`AMQP.BasicProperties.headers`),
+the general-purpose header map already used for routing metadata such as `x-death` -- an instrumented publisher
+sets `traceparent`/`tracestate` there, and an instrumented consumer reads them from the delivered message's
+properties. In both cases the propagation is manual unless a tracing/instrumentation library wires it in
+automatically; the header names and value formats themselves are exactly what the W3C specification defines,
+regardless of which broker's header mechanism carries them.
+
+== Schema evolution across brokers
+
+xref:backend/messaging/kafka-serialization-and-schemas.adoc[Kafka Serialization and Schemas] already covers
+schema registries and compatibility modes (`BACKWARD`, `FORWARD`, `FULL`) in depth for Kafka, where a schema
+registry sits in front of the broker and can reject an incompatible schema change before a producer is even
+allowed to publish it. The same compatibility-mode thinking applies just as well when RabbitMQ carries the
+payload instead of Kafka -- a message body is still Avro, Protobuf, or JSON Schema-encoded bytes, and adding an
+optional field, never removing or repurposing a required one, and never changing a field's type in place remain
+exactly the same rules for keeping old and new consumers interoperable. What changes is only the enforcement
+point: nothing in RabbitMQ itself validates a message body's schema or blocks an incompatible publish the way a
+schema-registry-backed Kafka producer can be configured to, so a schema registry used alongside RabbitMQ enforces
+compatibility as an external, opt-in check the publisher and consumer both choose to call, rather than a
+broker-enforced gate.
+
+== Saga choreography vs. orchestration
+
+A **saga** coordinates a business transaction that spans several services, each committing its own local
+transaction, without a single distributed transaction across all of them -- and there are two structurally
+different ways to sequence the steps.
+
+**Choreography** has no central coordinator at all: each service publishes an event when it completes its own
+step, and every other service that needs to react is simply subscribed to the events it cares about, deciding on
+its own what to do next. On **Kafka**, this maps directly onto topics as an event bus -- an `order-created` topic,
+a `payment-authorized` topic, a `shipment-scheduled` topic, each published by the service that owns that step and
+consumed by whichever downstream services react to it, with no service aware of the saga as a whole. On
+**RabbitMQ**, the same shape is built from a topic exchange (or several) with each participating service both
+publishing its own completion events and binding a queue to the events it reacts to -- routing keys such as
+`order.created`, `payment.authorized` standing in for Kafka's topic names, per the routing patterns already
+covered on xref:backend/messaging/rabbitmq-routing-patterns.adoc[RabbitMQ Routing Patterns].
+
+**Orchestration** puts a central saga orchestrator in charge instead: it holds the saga's state machine, issues
+explicit commands to each participant in turn, and reacts to each participant's response by issuing the next
+command or triggering a compensating action if a step fails. On **Kafka**, the orchestrator is a service that
+consumes participants' reply/event topics and produces command records onto per-participant command topics,
+tracking saga state itself (often in a compacted topic, per the next section) rather than relying on any
+broker-side workflow feature. On **RabbitMQ**, the orchestrator instead publishes commands to per-participant
+command queues (typically via direct exchanges, since a command has exactly one intended recipient rather than
+many interested subscribers) and consumes each participant's reply queue to decide the next step, using
+xref:backend/messaging/messaging-models-and-patterns.adoc[Messaging Models and Patterns]'s request/reply shape
+between the orchestrator and each participant rather than choreography's fan-out of events. Choreography scales
+better with participant count, since adding a new reactive service costs nothing on the existing services, but
+makes the overall saga flow harder to see in one place; orchestration keeps the flow and its compensation logic
+centralized and easy to reason about, at the cost of the orchestrator becoming a coordination bottleneck and a
+single service that every participant now depends on.
+
+== Event sourcing, CQRS, and why log compaction matters
+
+**Event sourcing** stores every state change as an immutable event rather than overwriting a row in place, so a
+given entity's current state is always derivable by replaying its events from the beginning; **CQRS** (Command
+Query Responsibility Segregation) pairs naturally with it by keeping the write side (append events) and the read
+side (one or more query-optimized projections built from those events) as separate models entirely, each scaled
+and shaped independently. On **Kafka**, the event log for a given entity is a natural fit for a topic keyed by
+entity id, and this is exactly where
+xref:backend/messaging/kafka-architecture.adoc[Kafka Architecture]'s log compaction coverage becomes relevant
+beyond its original changelog-topic use case: a compacted topic guarantees to retain at least the last known
+record for every key forever, which matters for event-sourced state specifically because an event-sourced topic
+is not really "the last value per key" the way a changelog topic is -- it is the *entire history* of an entity
+that needs replaying to reconstruct current state. What compaction actually buys an event-sourced system is
+bounding *storage*, not replay semantics: without compaction, an infinitely append-only topic would need
+unbounded retention to preserve every entity's full history, while with compaction, superseding a compactable
+"snapshot" event (or a per-entity tombstone, when the entity is deleted) lets Kafka reclaim space for entities that
+are no longer relevant without ever losing the ability to replay any entity's still-relevant history. On
+**RabbitMQ**, there is no equivalent log-retention model to reach for -- RabbitMQ's queues are not durable logs
+with a replay/compaction story the way a Kafka topic is (streams come closest, but are still primarily consumed
+in delivery order rather than replayed from an arbitrary offset the way compaction assumes) -- so an
+event-sourced system built on RabbitMQ instead persists its event log in a purpose-built event store (or an
+append-only database table) and uses RabbitMQ purely to *notify* interested projections that new events exist,
+rather than as the event log's system of record.
+
+== The claim-check pattern for large payloads
+
+A message carrying a large payload -- a multi-megabyte document, an image, a bulk export -- strains both brokers'
+assumptions: Kafka's default `message.max.bytes`/`max.request.size` and RabbitMQ's practical throughput both
+degrade well before a payload reaches tens of megabytes. The **claim-check pattern** sidesteps this by never
+putting the large payload on the broker at all: the producer uploads it to out-of-band storage (typically object
+storage such as S3 or an equivalent), then publishes a small message that carries only a **claim check** -- a
+reference (object key/URL, plus enough metadata to validate it) the consumer uses to fetch the payload separately,
+by the time it actually needs it. On **Kafka**, this is a normal record whose value is a small JSON or Avro
+envelope holding the object storage key rather than the payload itself, produced and consumed exactly like any
+other record covered on xref:backend/messaging/kafka-producers.adoc[Kafka Producers] and
+xref:backend/messaging/kafka-consumers.adoc[Kafka Consumers]. On **RabbitMQ**, the same envelope travels as an
+ordinary message body through whichever exchange and queue would otherwise have carried the full payload,
+unchanged in every other respect -- the pattern's implementation is essentially identical on both brokers, since
+its whole point is to keep the broker out of the large-payload business entirely, regardless of which broker is in
+use.
+
+== The outbox pattern end to end
+
+The sequence below ties the transactional-outbox section above together as one flow: the application writes its
+business row and its outbox row in a single local transaction, a relay process (a CDC connector, or a polling
+publisher) reads the outbox table independently of that request, publishes the event to the broker, and only then
+marks the outbox row as sent.
+
+[mermaid]
+....
+sequenceDiagram
+    participant App as Application
+    participant DB as Local database
+    participant Relay as Relay process (CDC or poller)
+    participant Broker as Kafka or RabbitMQ
+
+    App->>DB: begin transaction
+    App->>DB: insert business row
+    App->>DB: insert outbox row (same transaction)
+    App->>DB: commit
+    Note over App,DB: business write and event are atomic -- no dual write
+
+    Relay->>DB: read unpublished outbox row
+    Relay->>Broker: publish event
+    Broker-->>Relay: acknowledge or confirm
+
+    Relay->>DB: mark outbox row as sent (or delete it)
+    Note over Relay,DB: at-least-once handoff -- a crash here can republish, which is why downstream consumers must be idempotent
+....
+
+The figure below contrasts the two brokers' retry structures side by side: Kafka's retry-topic ladder, a sequence
+of distinct topics with growing delay, versus RabbitMQ's TTL+DLX loop, the same wait queue reused across every
+retry attempt.
+
+image::messaging-retry-patterns.svg[Side-by-side comparison of retry patterns: on the left; a Kafka retry-topic ladder where a failed record flows from the main topic through retry-topic-1 with a short delay: retry-topic-2 with a longer delay: and retry-topic-3 with a longer delay still before reaching a DLQ topic -- a straight ladder of distinct topics -- on the right; a RabbitMQ TTL+DLX loop where a rejected message from the work queue enters a wait queue with a per-message TTL: and once that TTL expires the dead-letter exchange routes it back to the work queue: looping until a delivery-count limit sends it to a true dead-letter queue instead,width=760,role=text-center]
+
+== References
+
+* https://microservices.io/patterns/data/transactional-outbox.html[microservices.io -- Pattern: Transactional
+  Outbox]
+* https://debezium.io/documentation/reference/3.6/transformations/outbox-event-router.html[Debezium
+  Documentation -- Outbox Event Router]
+* https://www.w3.org/TR/trace-context/[W3C Recommendation -- Trace Context]
