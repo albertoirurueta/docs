@@ -137,177 +137,186 @@ Must land first: every page includes it.
 
 Filenames are fixed here so sibling xrefs can be written up front.
 
-- [ ] Task 2. `getting-started.adoc` — "Getting Started with Git and GitHub"
-  - [ ] Task 2.1. Version control and why distributed; Git vs. GitHub (tool vs. hosting/collaboration platform);
+- [x] Task 2. `getting-started.adoc` — "Getting Started with Git and GitHub"
+  - [x] Task 2.1. Version control and why distributed; Git vs. GitHub (tool vs. hosting/collaboration platform);
         Mermaid flowchart: local repository ↔ remote repository on GitHub.
-  - [ ] Task 2.2. Installing Git 2.55 (macOS, Windows, Linux) and `git --version`; first-time setup:
+  - [x] Task 2.2. Installing Git 2.55 (macOS, Windows, Linux) and `git --version`; first-time setup:
         `git config --global user.name`, `user.email`, `init.defaultBranch main`, `core.editor`, `pull.rebase`
         (mention, detailed on the fetch/pull/push page); `git config --list --show-origin`; getting help
         (`git help <cmd>`, `git <cmd> -h`).
-  - [ ] Task 2.3. Creating a GitHub account (link only); authenticating: HTTPS with Git Credential Manager or
+  - [x] Task 2.3. Creating a GitHub account (link only); authenticating: HTTPS with Git Credential Manager or
         `gh auth login`, SSH keys (`ssh-keygen -t ed25519`, adding the key on GitHub, `ssh -T git@github.com`);
         personal access tokens mentioned as the fallback.
-  - [ ] Task 2.4. IDE setup: IntelliJ IDEA (Settings › Version Control › Git, Settings › Version Control › GitHub
+  - [x] Task 2.4. IDE setup: IntelliJ IDEA (Settings › Version Control › Git, Settings › Version Control › GitHub
         › add account); VS Code (built-in Git, sign in with GitHub, install the *GitHub Pull Requests and Issues*
         extension).
-  - [ ] Task 2.5. `== References`: git-scm.com book ch. 1 (1.5 Installing, 1.6 First-Time Setup, 1.7 Getting Help),
+  - [x] Task 2.5. `== References`: git-scm.com book ch. 1 (1.5 Installing, 1.6 First-Time Setup, 1.7 Getting Help),
         git-scm.com/install, docs.github.com "Set up Git", "Authenticating with GitHub from Git", "Connecting to
         GitHub with SSH", cli.github.com/manual/gh_auth_login, IntelliJ "Set up a Git repository" / GitHub
         account pages, VS Code "Source control overview" and "Working with GitHub".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/getting-started.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 3. `repositories-and-cloning.adoc` — "Repositories and Cloning"
-  - [ ] Task 3.1. What a repository is (`.git` directory, history, refs); the three states and three areas —
+- [x] Task 3. `repositories-and-cloning.adoc` — "Repositories and Cloning"
+  - [x] Task 3.1. What a repository is (`.git` directory, history, refs); the three states and three areas —
         working tree, staging area (index), repository — with a Mermaid flowchart (`git add` → `git commit`,
         `git restore` back); file lifecycle (untracked / unmodified / modified / staged); `git status`.
-  - [ ] Task 3.2. `git init` vs. `git clone <url>` (HTTPS vs. SSH URLs); `.gitignore` (patterns, global ignore,
+  - [x] Task 3.2. `git init` vs. `git clone <url>` (HTTPS vs. SSH URLs); `.gitignore` (patterns, global ignore,
         github/gitignore templates); remotes (`origin`, `git remote -v`, `git remote add`).
-  - [ ] Task 3.3. GitHub.com: creating a repository (README, .gitignore template, license), copying the clone URL,
+  - [x] Task 3.3. GitHub.com: creating a repository (README, .gitignore template, license), copying the clone URL,
         forking vs. cloning; `gh repo create`, `gh repo clone`, `gh repo fork --clone`.
-  - [ ] Task 3.4. IntelliJ: *Get from VCS* (clone), *Share Project on GitHub*; VS Code: *Git: Clone*, *Publish to
+  - [x] Task 3.4. IntelliJ: *Get from VCS* (clone), *Share Project on GitHub*; VS Code: *Git: Clone*, *Publish to
         GitHub*, initializing a repository from the Source Control view.
-  - [ ] Task 3.5. `== References`: book 2.1, 2.2 (three states), 2.5; git-init, git-clone, gitignore, git-remote
+  - [x] Task 3.5. `== References`: book 2.1, 2.2 (three states), 2.5; git-init, git-clone, gitignore, git-remote
         docs; docs.github.com "Creating a new repository", "Cloning a repository", "Fork a repo"; IntelliJ "Check out
         a project" / "Share a project on GitHub"; VS Code "Repositories and remotes".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/repositories-and-cloning.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 4. `commits.adoc` — "Commits"
-  - [ ] Task 4.1. What a commit is: a snapshot (not a diff), SHA-1/SHA-256 id, tree, parent(s), author vs.
+- [x] Task 4. `commits.adoc` — "Commits"
+  - [x] Task 4.1. What a commit is: a snapshot (not a diff), SHA-1/SHA-256 id, tree, parent(s), author vs.
         committer, message; Mermaid `gitGraph` of a linear history; `HEAD` introduced.
-  - [ ] Task 4.2. Staging and committing: `git add <file>`, `git add -p`, `git commit -m`, `git commit -a`;
+  - [x] Task 4.2. Staging and committing: `git add <file>`, `git add -p`, `git commit -m`, `git commit -a`;
         writing good messages (50/72 rule, imperative mood, `Closes #123` on GitHub); inspecting: `git log`
         (`--oneline --graph --all`), `git show`, `git diff` vs. `git diff --staged`.
-  - [ ] Task 4.3. Changing and undoing: `git commit --amend` (only before pushing); `git restore <file>`,
+  - [x] Task 4.3. Changing and undoing: `git commit --amend` (only before pushing); `git restore <file>`,
         `git restore --staged <file>`; `git revert <sha>` (safe for shared history) vs. `git reset --soft|--mixed|--hard`
         (rewrites history — bold warning); a table "I want to… → command".
-  - [ ] Task 4.4. GitHub.com: editing/creating a file in the web editor and committing directly vs. to a new branch;
+  - [x] Task 4.4. GitHub.com: editing/creating a file in the web editor and committing directly vs. to a new branch;
         viewing commit history and a commit's diff.
-  - [ ] Task 4.5. IntelliJ: Commit tool window (Ctrl+K / ⌘K), partial commits (chunk checkboxes), amend, Git log
+  - [x] Task 4.5. IntelliJ: Commit tool window (Ctrl+K / ⌘K), partial commits (chunk checkboxes), amend, Git log
         (Alt+9 / ⌘9), *Revert Commit*, *Reset Current Branch to Here*; VS Code: Source Control view
         (Ctrl+Shift+G / ⌃⇧G), stage/unstage, commit message box, *Commit (Amend)*, *Undo Last Commit*, timeline /
         history.
-  - [ ] Task 4.6. `== References`: book 2.2, 2.3, 2.4; git-add, git-commit, git-log, git-diff, git-restore,
+  - [x] Task 4.6. `== References`: book 2.2, 2.3, 2.4; git-add, git-commit, git-log, git-diff, git-restore,
         git-revert, git-reset docs; docs.github.com "About commits", "Editing files"; IntelliJ "Commit and push
         changes", "Undo changes"; VS Code "Staging and committing changes".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/commits.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 5. `branches.adoc` — "Branches"
-  - [ ] Task 5.1. A branch is a movable pointer to a commit; `HEAD` points to the current branch; creating a branch is
+- [x] Task 5. `branches.adoc` — "Branches"
+  - [x] Task 5.1. A branch is a movable pointer to a commit; `HEAD` points to the current branch; creating a branch is
         cheap; Mermaid `gitGraph` with `main` and a `feature` branch diverging.
-  - [ ] Task 5.2. Commands: `git branch`, `git branch -a`, `git switch -c <name>`, `git branch -m`,
+  - [x] Task 5.2. Commands: `git branch`, `git branch -a`, `git switch -c <name>`, `git branch -m`,
         `git branch -d` / `-D`; local vs. remote-tracking branches (`origin/main`) and upstreams
         (`git branch -u`, `git branch -vv`) — details deferred to the fetch/pull/push page via xref.
-  - [ ] Task 5.3. Branching workflows: GitHub flow (short-lived branches off `main` + pull requests) and a
+  - [x] Task 5.3. Branching workflows: GitHub flow (short-lived branches off `main` + pull requests) and a
         Git-flow-style model; worked example: this account's convention (`develop` integration branch,
         `feature/<issue>` and `hotfix/<issue>` branches, `release_x.y.z` release branches); Mermaid `gitGraph`
         illustrating it; branch naming tips.
-  - [ ] Task 5.4. GitHub.com: creating a branch from the branch dropdown and from an issue (*Create a branch*),
+  - [x] Task 5.4. GitHub.com: creating a branch from the branch dropdown and from an issue (*Create a branch*),
         viewing/deleting branches, default branch, branch protection rules and rulesets (overview + link only).
-  - [ ] Task 5.5. IntelliJ: branches popup (status-bar widget / *Git › Branches*), *New Branch*, *Rename*, *Delete*,
+  - [x] Task 5.5. IntelliJ: branches popup (status-bar widget / *Git › Branches*), *New Branch*, *Rename*, *Delete*,
         *Compare with Current*; VS Code: status-bar branch picker, *Git: Create Branch…*, *Git: Delete Branch…*,
         *Git: Rename Branch…*.
-  - [ ] Task 5.6. `== References`: book 3.1, 3.3, 3.4, 3.5; git-branch docs; docs.github.com "About branches",
+  - [x] Task 5.6. `== References`: book 3.1, 3.3, 3.4, 3.5; git-branch docs; docs.github.com "About branches",
         "Creating and deleting branches within your repository", "About protected branches", "About rulesets",
         "GitHub flow"; IntelliJ "Manage Git branches"; VS Code "Branches and worktrees".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/branches.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 6. `checkout-switch-and-restore.adoc` — "Checkout, Switch and Restore"
-  - [ ] Task 6.1. What `git checkout` does (switch branches **and** restore files — two jobs in one command) and why
+- [x] Task 6. `checkout-switch-and-restore.adoc` — "Checkout, Switch and Restore"
+  - [x] Task 6.1. What `git checkout` does (switch branches **and** restore files — two jobs in one command) and why
         Git 2.23 introduced `git switch` and `git restore`; equivalence table (`checkout <branch>` ↔ `switch <branch>`,
         `checkout -b` ↔ `switch -c`, `checkout -- <file>` ↔ `restore <file>`, `checkout <sha> -- <file>` ↔
         `restore --source <sha> <file>`).
-  - [ ] Task 6.2. Detached `HEAD`: checking out a tag or commit (`git switch --detach v1.2.0`), what happens to new
+  - [x] Task 6.2. Detached `HEAD`: checking out a tag or commit (`git switch --detach v1.2.0`), what happens to new
         commits there, getting back (`git switch -`, `git switch main`), keeping work (`git switch -c`); Mermaid
         `gitGraph` showing HEAD detached on a tag.
-  - [ ] Task 6.3. Checking out a remote branch (`git switch <name>` auto-tracking `origin/<name>`); switching with
+  - [x] Task 6.3. Checking out a remote branch (`git switch <name>` auto-tracking `origin/<name>`); switching with
         uncommitted changes: what Git refuses, `git stash` / `git stash pop` / `git stash list`, `git switch -m`;
         checking out a pull request locally (`gh pr checkout <n>`).
-  - [ ] Task 6.4. GitHub.com: switching the viewed branch/tag in the repository UI; browsing a repository at a commit.
-  - [ ] Task 6.5. IntelliJ: branches popup › *Checkout*, *Checkout Tag or Revision…*, smart checkout, shelve vs.
+  - [x] Task 6.4. GitHub.com: switching the viewed branch/tag in the repository UI; browsing a repository at a commit.
+  - [x] Task 6.5. IntelliJ: branches popup › *Checkout*, *Checkout Tag or Revision…*, smart checkout, shelve vs.
         stash; VS Code: *Git: Checkout to…* (branch picker), stash commands (*Git: Stash*, *Git: Pop Stash…*),
         checking out a PR from the *GitHub Pull Requests* view.
-  - [ ] Task 6.6. `== References`: git-checkout, git-switch, git-restore, git-stash docs; book 3.2, 7.3 (Stashing);
+  - [x] Task 6.6. `== References`: git-checkout, git-switch, git-restore, git-stash docs; book 3.2, 7.3 (Stashing);
         cli.github.com/manual/gh_pr_checkout; IntelliJ "Manage Git branches" (checkout), "Shelve or stash changes";
         VS Code "Branches and worktrees".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/checkout-switch-and-restore.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 7. `tags-and-releases.adoc` — "Tags and Releases"
-  - [ ] Task 7.1. What a tag is (a fixed pointer, unlike a branch); lightweight vs. annotated tags; semantic
+- [x] Task 7. `tags-and-releases.adoc` — "Tags and Releases"
+  - [x] Task 7.1. What a tag is (a fixed pointer, unlike a branch); lightweight vs. annotated tags; semantic
         versioning (`v1.4.0`); Mermaid `gitGraph` with tags on `main`.
-  - [ ] Task 7.2. Commands: `git tag`, `git tag -l "v1.*"`, `git tag -a v1.4.0 -m "…"`, tagging an older commit,
+  - [x] Task 7.2. Commands: `git tag`, `git tag -l "v1.*"`, `git tag -a v1.4.0 -m "…"`, tagging an older commit,
         `git show v1.4.0`, `git tag -d`, **tags are not pushed by default** (`git push origin v1.4.0`,
         `git push --tags`, `git push origin --delete v1.4.0`), signed tags mentioned.
-  - [ ] Task 7.3. GitHub releases built on tags: creating a release on github.com (choose/create tag, target,
+  - [x] Task 7.3. GitHub releases built on tags: creating a release on github.com (choose/create tag, target,
         generate release notes, assets, pre-release, latest) and with `gh release create v1.4.0 --generate-notes`;
         tag rulesets (overview); tags triggering GitHub Actions — xref
         `backend/docker/ci-cd-with-github-actions.adoc`.
-  - [ ] Task 7.4. IntelliJ: Git log › right-click commit › *New Tag…*, pushing tags from the Push dialog
+  - [x] Task 7.4. IntelliJ: Git log › right-click commit › *New Tag…*, pushing tags from the Push dialog
         (*Push Tags*); VS Code: *Git: Create Tag*, *Git: Delete Tag*, *Git: Push Tags*.
-  - [ ] Task 7.5. `== References`: book 2.6; git-tag docs; docs.github.com "About releases", "Managing releases in a
+  - [x] Task 7.5. `== References`: book 2.6; git-tag docs; docs.github.com "About releases", "Managing releases in a
         repository", "Automatically generated release notes"; cli.github.com/manual/gh_release_create; IntelliJ
         "Tags"; VS Code "Source control overview" (commands).
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/tags-and-releases.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 8. `fetch-pull-and-push.adoc` — "Fetch, Pull and Push"
-  - [ ] Task 8.1. Remotes and remote-tracking branches recap; Mermaid `sequenceDiagram` local ↔ `origin` for
+- [x] Task 8. `fetch-pull-and-push.adoc` — "Fetch, Pull and Push"
+  - [x] Task 8.1. Remotes and remote-tracking branches recap; Mermaid `sequenceDiagram` local ↔ `origin` for
         fetch, pull and push; the difference between `git fetch` (download only) and `git pull` (fetch + integrate).
-  - [ ] Task 8.2. `git fetch` (`--prune`, `--all`); `git pull` (merge by default, `--rebase`, `pull.rebase` /
+  - [x] Task 8.2. `git fetch` (`--prune`, `--all`); `git pull` (merge by default, `--rebase`, `pull.rebase` /
         `pull.ff` configuration and the "divergent branches" hint); `git push`, `git push -u origin <branch>`,
         `push.autoSetupRemote`; rejected non-fast-forward pushes and how to recover (pull, resolve, push again);
         `--force-with-lease` vs. `--force` (bold warning, never on shared branches); deleting a remote branch.
-  - [ ] Task 8.3. GitHub.com: nothing to push/pull in the browser — instead: *Sync fork* for forks, *Update branch*
+  - [x] Task 8.3. GitHub.com: nothing to push/pull in the browser — instead: *Sync fork* for forks, *Update branch*
         on a pull request, and what a push looks like (branch appears, *Compare & pull request* banner); pushes
         triggering GitHub Actions — xref the CI/CD pages.
-  - [ ] Task 8.4. IntelliJ: *Git › Fetch*, *Update Project* (Ctrl+T / ⌘T, merge vs. rebase choice), Push dialog
+  - [x] Task 8.4. IntelliJ: *Git › Fetch*, *Update Project* (Ctrl+T / ⌘T, merge vs. rebase choice), Push dialog
         (Ctrl+Shift+K / ⌘⇧K, force push uses `--force-with-lease`); VS Code: *Sync Changes* (pull then push),
         status-bar sync indicator, *Git: Fetch*, *Git: Pull*, *Git: Push*, *Publish Branch*, `git.autofetch`.
-  - [ ] Task 8.5. `== References`: book 2.5, 3.5; git-fetch, git-pull, git-push, git-remote docs; docs.github.com
+  - [x] Task 8.5. `== References`: book 2.5, 3.5; git-fetch, git-pull, git-push, git-remote docs; docs.github.com
         "Pushing commits to a remote repository", "Getting changes from a remote repository", "Syncing a fork",
         "Dealing with non-fast-forward errors"; IntelliJ "Commit and push changes", "Sync with a remote Git
         repository"; VS Code "Repositories and remotes".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/fetch-pull-and-push.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 9. `merging-rebasing-and-conflicts.adoc` — "Merging, Rebasing and Conflicts"
-  - [ ] Task 9.1. `git merge`: fast-forward vs. three-way merge (merge commit with two parents), `--no-ff`,
+- [x] Task 9. `merging-rebasing-and-conflicts.adoc` — "Merging, Rebasing and Conflicts"
+  - [x] Task 9.1. `git merge`: fast-forward vs. three-way merge (merge commit with two parents), `--no-ff`,
         `--ff-only`, `--squash`; Mermaid `gitGraph` for each.
-  - [ ] Task 9.2. Merge conflicts: why they happen, conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), resolving,
+  - [x] Task 9.2. Merge conflicts: why they happen, conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`), resolving,
         `git add` + `git commit` (or `git merge --continue`), `git merge --abort`; a worked example with the exact
         terminal output.
-  - [ ] Task 9.3. `git rebase` introduction: replaying commits onto a new base, Mermaid before/after `gitGraph`,
+  - [x] Task 9.3. `git rebase` introduction: replaying commits onto a new base, Mermaid before/after `gitGraph`,
         `git rebase --continue|--abort`, the golden rule (never rebase commits others have), merge vs. rebase
         trade-offs table; interactive rebase named with a link only (out of scope for basics).
-  - [ ] Task 9.4. GitHub.com: resolving simple conflicts in the web conflict editor on a pull request; *Update
+  - [x] Task 9.4. GitHub.com: resolving simple conflicts in the web conflict editor on a pull request; *Update
         branch* (merge or rebase); merge methods are covered on the pull-requests page (xref).
-  - [ ] Task 9.5. IntelliJ: branches popup › *Merge into Current* / *Rebase Current onto Selected*, the Conflicts
+  - [x] Task 9.5. IntelliJ: branches popup › *Merge into Current* / *Rebase Current onto Selected*, the Conflicts
         dialog and three-pane merge window (*Accept Left/Right*, *Merge…*); VS Code: *Git: Merge Branch…*,
         *Git: Rebase Branch…*, inline conflict CodeLens (*Accept Current / Incoming / Both*), the 3-way merge editor,
         *Complete Merge*.
-  - [ ] Task 9.6. `== References`: book 3.2, 3.6; git-merge, git-rebase docs; docs.github.com "About merge
+  - [x] Task 9.6. `== References`: book 3.2, 3.6; git-merge, git-rebase docs; docs.github.com "About merge
         conflicts", "Resolving a merge conflict on GitHub", "Resolving a merge conflict using the command line";
         IntelliJ "Merge, rebase, or cherry-pick", "Resolve conflicts"; VS Code "Merge conflicts".
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/merging-rebasing-and-conflicts.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
-- [ ] Task 10. `pull-requests.adoc` — "Pull Requests"
-  - [ ] Task 10.1. What a pull request is (a proposal to merge a head/compare branch into a base branch, with
+- [x] Task 10. `pull-requests.adoc` — "Pull Requests"
+  - [x] Task 10.1. What a pull request is (a proposal to merge a head/compare branch into a base branch, with
         discussion, review and checks); GitHub flow end to end in six steps with a Mermaid flowchart; draft PRs;
         PR templates (`.github/pull_request_template.md`); linking issues (`Closes #123`); PRs from forks.
-  - [ ] Task 10.2. **Create a PR on github.com**: push the branch → *Compare & pull request* banner (or *Pull
+  - [x] Task 10.2. **Create a PR on github.com**: push the branch → *Compare & pull request* banner (or *Pull
         requests › New pull request*) → pick base and compare → title and description → reviewers, assignees,
         labels → *Create pull request* or *Create draft pull request*.
-  - [ ] Task 10.3. **With the GitHub CLI**: `gh pr create` (interactive), `--base`, `--head`, `--title`, `--body`,
+  - [x] Task 10.3. **With the GitHub CLI**: `gh pr create` (interactive), `--base`, `--head`, `--title`, `--body`,
         `--draft`, `--reviewer`, `--web`; `gh pr list`, `gh pr view`, `gh pr checkout`, `gh pr review`,
         `gh pr merge --squash --delete-branch`.
-  - [ ] Task 10.4. **In IntelliJ IDEA 2026.2**: *Git › GitHub › Create Pull Request* (or the **+** in the Pull
+  - [x] Task 10.4. **In IntelliJ IDEA 2026.2**: *Git › GitHub › Create Pull Request* (or the **+** in the Pull
         Requests tool window, or the post-push notification) → base repository/branch (left) and head (right) →
         review the diff → title, description, reviewers, assignees, labels → *Create Pull Request* or
         *Create Draft Pull Request*; reviewing (*Git › GitHub › View Pull Requests*, gutter comments, *Submit*:
         approve / request changes / comment) and merging (Merge / Squash and Merge / Rebase).
-  - [ ] Task 10.5. **In VS Code**: install *GitHub Pull Requests and Issues*, sign in; *GitHub Pull Requests: Create
+  - [x] Task 10.5. **In VS Code**: install *GitHub Pull Requests and Issues*, sign in; *GitHub Pull Requests: Create
         Pull Request* from the Command Palette (or *Create Pull Request* in the Pull Requests view) → target branch
         → title/description (template auto-filled) → *Create* / *Create Draft* → choose the remote to publish to;
         review mode, comments, checking out a PR, merging.
-  - [ ] Task 10.6. Reviewing and merging on github.com: *Files changed*, comments and suggestions, approve /
+  - [x] Task 10.6. Reviewing and merging on github.com: *Files changed*, comments and suggestions, approve /
         request changes, required status checks, the three merge methods (merge commit, squash and merge, rebase and
         merge) with a Mermaid `gitGraph` for each outcome, auto-merge and merge queue named, deleting the branch
         afterwards and pulling `main` locally.
-  - [ ] Task 10.7. `== References`: docs.github.com "About pull requests", "Creating a pull request", "Creating a
+  - [x] Task 10.7. `== References`: docs.github.com "About pull requests", "Creating a pull request", "Creating a
         pull request from a fork", "Reviewing proposed changes in a pull request", "About pull request merges",
         "Merging a pull request", "Linking a pull request to an issue", "GitHub flow";
         cli.github.com/manual/gh_pr_create (and `gh_pr_*` pages used); IntelliJ "Create and merge GitHub pull
         requests", "Review incoming GitHub pull requests"; VS Code "Working with GitHub"; the extension's
         Marketplace page.
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/pull-requests.adoc` created per the plan's row in issue #180's Proposed pages table; Mermaid diagrams validated (`validate-mermaid.mjs`); `== References` links only git-scm.com/docs.github.com/cli.github.com/jetbrains.com/help/idea/code.visualstudio.com/docs pages, verified live via WebFetch/WebSearch where feasible; no admonitions other than the disclaimer include; Antora build clean aside from the expected not-yet-resolved `_bibliography` xref (Group 3 not yet landed).
 
 ### Group 3 — Landing pages and cheat-sheet page (Parallelizable: yes — three distinct files; all need every Group 2 page's final title/path)
 
