@@ -607,24 +607,26 @@ One sentence or clause per link; no restructuring; no admonitions added.
 
 ### Group 12 — Validation, build and acceptance audit (Parallelizable: no — verifies the output of every prior group)
 
-- [ ] Task 40. Mermaid validation — `npm i --no-save mermaid@11 jsdom` then `npm run validate:mermaid`; fix every
+> Done: Task 40 -- `npm run validate:mermaid`: all 375 Mermaid diagrams in the repository parse (22 new ones in `backend/docker/`). Task 41 -- clean `npx antora antora-playbook.yml` (fresh `build/`): exit 0, zero log lines (no errors or warnings); `build/site/backend/docker/` has 24 HTML pages (22 topic pages + index + cheat sheet -- the plan's "23" assumed 21 topic pages); all 24 are in `search-index.js`; the Docker block renders in the nav under Backend Development. Task 42 -- 42.1: no admonition besides the disclaimer include; every page has `:description:`, `:keywords:` and the disclaimer; every topic page ends with `== References` (index keeps `== Bibliography` like the Messaging precedent; a short `== References` was added to `cheat-sheet.adoc`). 42.2: all 22 `docker-*.svg` exist and are referenced; no alt text contains a comma. 42.3: the only 1.x Testcontainers names are in the "1.x (historical)" column of the 2.0 migration table; no `version:` key; superseded terms appear only as historical (`COPY --link` hits are the current Dockerfile flag). 42.4: PDF is one A4 page; `cheat-sheet.html` links `../../_attachments/docker-cheat-sheet.pdf`, which exists. 42.5: clean build; additionally all 35 `xref:...#fragment` links touching the section were checked against the generated HTML IDs.
+
+- [x] Task 40. Mermaid validation — `npm i --no-save mermaid@11 jsdom` then `npm run validate:mermaid`; fix every
       failing block.
-- [ ] Task 41. Antora build — `npx antora antora-playbook.yml` completes with zero `xref`/AsciiDoc errors and
+- [x] Task 41. Antora build — `npx antora antora-playbook.yml` completes with zero `xref`/AsciiDoc errors and
       warnings; `build/site/backend/docker/*.html` has 23 pages; the section appears in the nav under Backend
       Development and in `build/site/search-index.js`.
-- [ ] Task 42. Acceptance audit against the issue's criteria
-  - [ ] Task 42.1. `grep -rnE '^\[(NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]|^(NOTE|TIP|WARNING|CAUTION|IMPORTANT):'
+- [x] Task 42. Acceptance audit against the issue's criteria
+  - [x] Task 42.1. `grep -rnE '^\[(NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]|^(NOTE|TIP|WARNING|CAUTION|IMPORTANT):'
         modules/ROOT/pages/backend/docker/` returns nothing; every page has `:description:`, `:keywords:`, the
         disclaimer include and `== References`.
-  - [ ] Task 42.2. Every `image::docker-*.svg` resolves to a file and every `modules/ROOT/images/docker-*.svg` is
+  - [x] Task 42.2. Every `image::docker-*.svg` resolves to a file and every `modules/ROOT/images/docker-*.svg` is
         referenced; no alt text contains a comma.
-  - [ ] Task 42.3. `grep -rn 'org.testcontainers:\(postgresql\|kafka\|junit-jupiter\|mongodb\)\b\|org.testcontainers.containers.\(PostgreSQL\|Kafka\)'
+  - [x] Task 42.3. `grep -rn 'org.testcontainers:\(postgresql\|kafka\|junit-jupiter\|mongodb\)\b\|org.testcontainers.containers.\(PostgreSQL\|Kafka\)'
         modules/ROOT/pages/backend/docker/` finds no 1.x names; `grep -rn '^version:'` inside Compose snippets finds
         nothing; superseded terms (`MAINTAINER`, `--link`, `--volumes-from`, `docker-compose `, `nsenter`,
         `Content Trust`) appear only in historical context.
-  - [ ] Task 42.4. `docker-cheat-sheet.pdf` is one A4 page and `cheat-sheet.html`'s download link resolves to
+  - [x] Task 42.4. `docker-cheat-sheet.pdf` is one A4 page and `cheat-sheet.html`'s download link resolves to
         `_attachments/docker-cheat-sheet.pdf`.
-  - [ ] Task 42.5. All reciprocal links from Group 11 resolve (covered by a clean build).
+  - [x] Task 42.5. All reciprocal links from Group 11 resolve (covered by a clean build).
 
 Delegate Tasks 40-41 to the `iru-gate-runner` agent so build output stays out of the main context:
 
