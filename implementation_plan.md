@@ -322,8 +322,8 @@ Per-page checklist:
   - [x] Task 8.2. Figures:
         - Mermaid `stateDiagram-v2` of scene phases;
         - Mermaid `sequenceDiagram` of UIKit launch.
-- [ ] Task 9. `apps/apple/app-architecture.adoc`: *App Architecture the Apple Way*
-  - [ ] Task 9.1. Content:
+- [x] Task 9. `apps/apple/app-architecture.adoc`: *App Architecture the Apple Way*
+  - [x] Task 9.1. Content:
         - the model-driven SwiftUI app with `NoteStore` (`@Observable`), view-local `@State` and `@Bindable`;
         - `.environment(store)` / `@Environment(NoteStore.self)`;
         - an `@Entry` custom environment value for `SummaryGenerating`;
@@ -334,11 +334,11 @@ Per-page checklist:
         - the Swift API Design Guidelines with before/after naming examples;
         - Apple's samples as references.
         - Link `backend/architecture/architectural-patterns/index.adoc`.
-  - [ ] Task 9.2. Figures:
+  - [x] Task 9.2. Figures:
         - Mermaid `classDiagram`: App → NoteStore → environment → views → services;
         - Mermaid side-by-side: MV with Observation vs MVVM.
-- [ ] Task 10. `apps/apple/concurrency-in-apps.adoc`: *Swift Concurrency in Apps*
-  - [ ] Task 10.1. Content:
+- [x] Task 10. `apps/apple/concurrency-in-apps.adoc`: *Swift Concurrency in Apps*
+  - [x] Task 10.1. Content:
         - the approachable-concurrency build settings and MainActor default isolation, citing the build-settings
           reference;
         - leaving the main actor with `@concurrent` / `nonisolated`;
@@ -351,7 +351,7 @@ Per-page checklist:
         - migrating to Swift 6 mode;
         - Combine's status.
         - Link the Swift concurrency pages for language semantics.
-  - [ ] Task 10.2. Figures:
+  - [x] Task 10.2. Figures:
         - Mermaid `sequenceDiagram`: MainActor → `@concurrent` → resume;
         - `apple-isolation-domains.svg`;
         - Mermaid task tree showing cancellation.
