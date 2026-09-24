@@ -213,58 +213,60 @@ Must land first: every page includes it.
 
 ### Group 3 — Building images (Parallelizable: yes — four distinct pages; later pages link earlier ones by path only, which does not require the target to exist until the build check)
 
-- [ ] Task 5. `dockerfile-fundamentals.adoc` — "Dockerfile Fundamentals"
-  - [ ] Task 5.1. Parser directives (`# syntax=docker/dockerfile:1`, `escape`, `check`); `FROM` (`ARG` before `FROM`,
+> Done: `dockerfile-fundamentals.adoc`, `build-cache-and-multi-stage-builds.adoc`, `buildkit-and-buildx.adoc`, `image-best-practices-and-security.adoc`; figures `docker-cmd-entrypoint-matrix.svg`, `docker-multi-stage-build.svg`, `docker-buildx-drivers.svg`, `docker-image-supply-chain.svg` + 4 Mermaid blocks (all 7 so far parse). Build: 0 messages besides forward xrefs; every docs.docker.com link resolves against the docker/docs source; ad hoc detect-secrets scan clean. Verified against the Dockerfile reference (moby/buildkit), build docs and DHI Java example; the build-policies page lives at `build/policies/` (experimental), not `build/policies/intro/`.
+
+- [x] Task 5. `dockerfile-fundamentals.adoc` — "Dockerfile Fundamentals"
+  - [x] Task 5.1. Parser directives (`# syntax=docker/dockerfile:1`, `escape`, `check`); `FROM` (`ARG` before `FROM`,
         `--platform`, `AS`); `RUN` shell vs. exec form, `--mount`, `--network`, `--security`.
-  - [ ] Task 5.2. `CMD` vs. `ENTRYPOINT` with the interaction matrix; `COPY` vs. `ADD` (`--chown`, `--chmod`,
+  - [x] Task 5.2. `CMD` vs. `ENTRYPOINT` with the interaction matrix; `COPY` vs. `ADD` (`--chown`, `--chmod`,
         `--link`, `--parents`, `--exclude`, `ADD --checksum`); `WORKDIR`; `ENV` vs. `ARG` (scope, predefined args,
         cache impact); `EXPOSE`; `USER`; `VOLUME`; `LABEL` (`MAINTAINER` historical); `HEALTHCHECK`; `STOPSIGNAL`;
         `SHELL`; `ONBUILD`; here-documents.
-  - [ ] Task 5.3. Build context and `.dockerignore`; `docker build` with `--target`, `--build-arg`, `--no-cache`,
+  - [x] Task 5.3. Build context and `.dockerignore`; `docker build` with `--target`, `--build-arg`, `--no-cache`,
         `--progress=plain`; the _Learning Docker_ ch. 3 survey brought up to date.
-  - [ ] Task 5.4. 📊 `docker-cmd-entrypoint-matrix.svg`; 📊 mermaid build context → BuildKit → layers.
-  - [ ] Task 5.5. `== References`: `reference/dockerfile/`, `build/concepts/context/`, `build/concepts/dockerfile/`,
+  - [x] Task 5.4. 📊 `docker-cmd-entrypoint-matrix.svg`; 📊 mermaid build context → BuildKit → layers.
+  - [x] Task 5.5. `== References`: `reference/dockerfile/`, `build/concepts/context/`, `build/concepts/dockerfile/`,
         `reference/cli/docker/buildx/build/`.
 
-- [ ] Task 6. `build-cache-and-multi-stage-builds.adoc` — "Build Cache and Multi-Stage Builds"
-  - [ ] Task 6.1. How the layer cache works and what invalidates it (instruction order, `COPY` checksums, `ARG`
+- [x] Task 6. `build-cache-and-multi-stage-builds.adoc` — "Build Cache and Multi-Stage Builds"
+  - [x] Task 6.1. How the layer cache works and what invalidates it (instruction order, `COPY` checksums, `ARG`
         changes); ordering for cache hits (dependencies before sources).
-  - [ ] Task 6.2. `RUN --mount=type=cache` (Maven/Gradle/npm), `bind`, `secret`, `ssh`, `tmpfs` mounts.
-  - [ ] Task 6.3. Multi-stage builds: named stages, `COPY --from`, `--target`, external images as stages, build vs.
+  - [x] Task 6.2. `RUN --mount=type=cache` (Maven/Gradle/npm), `bind`, `secret`, `ssh`, `tmpfs` mounts.
+  - [x] Task 6.3. Multi-stage builds: named stages, `COPY --from`, `--target`, external images as stages, build vs.
         runtime images, a test stage; base-image choice (Official Images, Debian slim vs. Alpine vs. Ubuntu vs.
         distroless vs. Docker Hardened Images, glibc vs. musl).
-  - [ ] Task 6.4. Java example: `eclipse-temurin:25-jdk` build stage caching `/root/.m2`, `eclipse-temurin:25-jre`
+  - [x] Task 6.4. Java example: `eclipse-temurin:25-jdk` build stage caching `/root/.m2`, `eclipse-temurin:25-jre`
         runtime stage — kept generic here, with an `xref:` to `java-and-spring-boot-images.adoc` for the Spring Boot
         layered-jar version.
-  - [ ] Task 6.5. 📊 `docker-multi-stage-build.svg` (deps → build → runtime, what is copied forward); 📊 mermaid of
+  - [x] Task 6.5. 📊 `docker-multi-stage-build.svg` (deps → build → runtime, what is copied forward); 📊 mermaid of
         cache hit/miss propagation.
-  - [ ] Task 6.6. `== References`: `build/cache/`, `build/cache/invalidation/`, `build/cache/optimize/`,
+  - [x] Task 6.6. `== References`: `build/cache/`, `build/cache/invalidation/`, `build/cache/optimize/`,
         `build/building/multi-stage/`, `build/building/base-images/`, `reference/dockerfile/#run---mount`.
 
-- [ ] Task 7. `buildkit-and-buildx.adoc` — "BuildKit and Buildx"
-  - [ ] Task 7.1. BuildKit as default builder (parallel/skipped stages, frontends); `docker buildx` builders and
+- [x] Task 7. `buildkit-and-buildx.adoc` — "BuildKit and Buildx"
+  - [x] Task 7.1. BuildKit as default builder (parallel/skipped stages, frontends); `docker buildx` builders and
         drivers (`docker`, `docker-container`, `kubernetes`, `remote`, `cloud`).
-  - [ ] Task 7.2. Multi-platform builds (`--platform`, QEMU vs. cross-compilation with `$BUILDPLATFORM`/`TARGETARCH`);
+  - [x] Task 7.2. Multi-platform builds (`--platform`, QEMU vs. cross-compilation with `$BUILDPLATFORM`/`TARGETARCH`);
         exporters; remote cache backends (`registry`, `gha`, `local`, `inline`, `s3`).
-  - [ ] Task 7.3. Build checks (`docker build --check`); attestations (SBOM, SLSA provenance,
+  - [x] Task 7.3. Build checks (`docker build --check`); attestations (SBOM, SLSA provenance,
         `docker buildx imagetools inspect`); annotations; Bake (targets, matrices, variables, Compose-file input);
         build policies (introduced only); Build Cloud and the GitHub Builder named.
-  - [ ] Task 7.4. 📊 `docker-buildx-drivers.svg`; 📊 mermaid of a multi-platform build fanning out per platform into
+  - [x] Task 7.4. 📊 `docker-buildx-drivers.svg`; 📊 mermaid of a multi-platform build fanning out per platform into
         a manifest list.
-  - [ ] Task 7.5. `== References`: `build/buildkit/`, `build/builders/`, `build/builders/drivers/`,
+  - [x] Task 7.5. `== References`: `build/buildkit/`, `build/builders/`, `build/builders/drivers/`,
         `build/building/multi-platform/`, `build/exporters/`, `build/cache/backends/`, `build/checks/`,
         `build/metadata/attestations/`, `build/bake/`, `build/policies/intro/`, docker/buildx repo.
 
-- [ ] Task 8. `image-best-practices-and-security.adoc` — "Image Best Practices and Supply-Chain Security"
-  - [ ] Task 8.1. The official "building best practices", each with its reason: minimal pinned bases, one concern per
+- [x] Task 8. `image-best-practices-and-security.adoc` — "Image Best Practices and Supply-Chain Security"
+  - [x] Task 8.1. The official "building best practices", each with its reason: minimal pinned bases, one concern per
         image, ephemeral containers, `.dockerignore`, multi-stage, non-root `USER`, no secrets in layers/`ENV`
         (`--mount=type=secret`), `HEALTHCHECK`, reproducible builds (`SOURCE_DATE_EPOCH`, pinned digests), OCI labels.
-  - [ ] Task 8.2. Linting (build checks, hadolint); Docker Scout (`quickview`, `cves`, `recommendations`, policies);
+  - [x] Task 8.2. Linting (build checks, hadolint); Docker Scout (`quickview`, `cves`, `recommendations`, policies);
         Docker Hardened Images incl. the Java migration example; attestations + Sigstore signing now that Content
         Trust is removed from the CLI in 29 (_Learning Docker_ ch. 11 flagged historical).
-  - [ ] Task 8.3. 📊 mermaid base-image decision flow; 📊 `docker-image-supply-chain.svg` (source → build →
+  - [x] Task 8.3. 📊 mermaid base-image decision flow; 📊 `docker-image-supply-chain.svg` (source → build →
         attestations → registry → scan → deploy).
-  - [ ] Task 8.4. `== References`: `build/building/best-practices/`, `build/building/secrets/`, `scout/`,
+  - [x] Task 8.4. `== References`: `build/building/best-practices/`, `build/building/secrets/`, `scout/`,
         `scout/quickstart/`, `scout/policy/`, `dhi/`, `dhi/migration/examples/java/`, `build/metadata/attestations/`,
         hadolint, slsa.dev, sigstore.dev.
 
