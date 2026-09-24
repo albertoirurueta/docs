@@ -361,7 +361,7 @@ them must be covered.
 Parallelizable: yes. Each task edits a different file. This group runs after Group 2, because the bibliography
 collects the URLs the pages actually use.
 
-- [ ] Task 17. `apps/apple/index.adoc` § `== Bibliography`: add every official URL used by pages 21–35 that isn't
+- [x] Task 17. `apps/apple/index.adoc` § `== Bibliography`: add every official URL used by pages 21–35 that isn't
   already listed.
   - Merge them into the existing groups: Apple Developer Documentation (one bullet per framework, with subpages
     inline), Apple tutorials, sample code and release notes, and WWDC sessions by year.
@@ -399,20 +399,20 @@ Parallelizable: no. Each task depends on the one before it.
     - 27-only APIs are behind `#available`.
   - [ ] Task 22.5. Check that every `Package.swift` starts with `// swift-tools-version: 6.4`.
   - [ ] Task 22.6. Fix everything found.
-- [ ] Task 23. Validation:
-  - [ ] Task 23.1. No admonitions under `apps/apple` except the disclaimer include.
-  - [ ] Task 23.2. Every new page has `:description:`, `:keywords:`, the disclaimer, a `=== Platform availability`
+- [x] Task 23. Validation:
+  - [x] Task 23.1. No admonitions under `apps/apple` except the disclaimer include.
+  - [x] Task 23.2. Every new page has `:description:`, `:keywords:`, the disclaimer, a `=== Platform availability`
     table and `== References`.
-  - [ ] Task 23.3. Every example block is followed by an official link. Use the same script as #172; any exception
+  - [x] Task 23.3. Every example block is followed by an official link. Use the same script as #172; any exception
     must be a deliberate one (the first half of a two-block example, a directory tree, a "don't do this" example).
-  - [ ] Task 23.4. `npm run validate:mermaid` passes, then restore `node_modules/.package-lock.json`.
-  - [ ] Task 23.5. Every new `apple-*.svg` is well-formed XML.
-  - [ ] Task 23.6. Antora build:
+  - [x] Task 23.4. `npm run validate:mermaid` passes, then restore `node_modules/.package-lock.json`.
+  - [x] Task 23.5. Every new `apple-*.svg` is well-formed XML.
+  - [x] Task 23.6. Antora build:
     - 0 warnings;
     - every remaining `xref` error targets a page from 36–48 or `cheat-sheet.adoc`;
     - no error targets pages 1–35;
     - record the count.
-  - [ ] Task 23.7. Run `detect-secrets` over the changed files and triage any finding.
+  - [x] Task 23.7. Run `detect-secrets` over the changed files and triage any finding.
 - [ ] Task 24. Post a comment on #170 listing the unverified claims and API shapes the page writers reported,
   grouped by page, plus the final forward-link count.
 - [ ] Task 25. Commit on `feature/173` with a message starting `Apple Platforms part 2:`, reviewing `git status` and
