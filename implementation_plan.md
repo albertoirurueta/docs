@@ -396,60 +396,62 @@ Must land first: every page includes it.
 
 ### Group 6 — Java/Spring Boot I: images, Compose for local dev, Testcontainers fundamentals (Parallelizable: yes — three distinct pages)
 
+> Done: `java-and-spring-boot-images.adoc`, `compose-for-local-development.adoc`, `testcontainers-fundamentals.adoc`; figures `docker-spring-boot-layered-jar.svg`, `docker-local-dev-laptop.svg`, `docker-testcontainers-ryuk.svg` + 3 Mermaid blocks (20 total, all parse). Build clean apart from forward xrefs. Verified against the Spring Boot 4.1.x sources (`extract --layers --destination`, `DockerComposeProperties` defaults incl. `skip.in-tests=true`, the service-connection tables -- Kafka has no Docker Compose service connection, so the local profile sets `spring.kafka.bootstrap-servers`), the Testcontainers 2.0.5 source (module packages, `ComposeContainer` constructors -- `withLocalCompose` no longer exists, no JUnit 4 in core; Testcontainers does not read Docker contexts, `getting-started.adoc` corrected accordingly) and the Temurin JRE Dockerfile (no curl/wget, so the HEALTHCHECK example installs curl).
+
 Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus sections already cover — `xref:` it.
 
-- [ ] Task 19. `java-and-spring-boot-images.adoc` — "Java and Spring Boot Images"
-  - [ ] Task 19.1. Path 1, multi-stage Dockerfile: `eclipse-temurin:25-jdk` + Maven wrapper +
+- [x] Task 19. `java-and-spring-boot-images.adoc` — "Java and Spring Boot Images"
+  - [x] Task 19.1. Path 1, multi-stage Dockerfile: `eclipse-temurin:25-jdk` + Maven wrapper +
         `RUN --mount=type=cache,target=/root/.m2`; `java -Djarmode=tools -jar app.jar extract --layers --launcher`
         (verify the exact 4.1 flags against `reference/packaging/container-images/efficient-images.html`) into
         dependencies / spring-boot-loader / snapshot-dependencies / application layers; `eclipse-temurin:25-jre` (or
         DHI) runtime; non-root `USER`; `EXPOSE 8080`; `HEALTHCHECK` against `/actuator/health/readiness`;
         `ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", …]`; graceful shutdown; `STOPSIGNAL`.
-  - [ ] Task 19.2. Path 2, Cloud Native Buildpacks via `./mvnw spring-boot:build-image` (Paketo, `image.name`,
+  - [x] Task 19.2. Path 2, Cloud Native Buildpacks via `./mvnw spring-boot:build-image` (Paketo, `image.name`,
         `builder`, `env` for JVM options, `publish`) — the house `deploy.yml` option.
-  - [ ] Task 19.3. Path 3, Jib (daemonless, reproducible), cross-referenced to `xref:backend/quarkus/container-images.adoc`
+  - [x] Task 19.3. Path 3, Jib (daemonless, reproducible), cross-referenced to `xref:backend/quarkus/container-images.adoc`
         rather than repeated; `docker init` for Java; `.dockerignore` for Maven; native images pointer only.
-  - [ ] Task 19.4. 📊 `docker-spring-boot-layered-jar.svg` (layered vs. fat-jar single layer); 📊 mermaid comparing
+  - [x] Task 19.4. 📊 `docker-spring-boot-layered-jar.svg` (layered vs. fat-jar single layer); 📊 mermaid comparing
         the three build paths.
-  - [ ] Task 19.5. `== References`: Spring Boot `reference/packaging/container-images/*`,
+  - [x] Task 19.5. `== References`: Spring Boot `reference/packaging/container-images/*`,
         `maven-plugin/build-image.html`, buildpacks.io, paketo.io, the Jib repo, `guides/java/containerize/`,
         `reference/cli/docker/init/`, `dhi/migration/examples/java/`, hub.docker.com/_/eclipse-temurin.
 
-- [ ] Task 20. `compose-for-local-development.adoc` — "Compose for Local Development"
-  - [ ] Task 20.1. The house root `compose.yaml` for a Spring Boot service (one pinned service per backing technology,
+- [x] Task 20. `compose-for-local-development.adoc` — "Compose for Local Development"
+  - [x] Task 20.1. The house root `compose.yaml` for a Spring Boot service (one pinned service per backing technology,
         each with `healthcheck`, named volumes, an `observability` profile for Prometheus/Grafana, a WireMock mock),
         matching `iru-setup-java-springboot-testcontainers` Step 1; credentials labelled development-only.
-  - [ ] Task 20.2. App on the host vs. inside Compose (a `develop.watch` service built from the Dockerfile's build
+  - [x] Task 20.2. App on the host vs. inside Compose (a `develop.watch` service built from the Dockerfile's build
         stage, JDWP 5005).
-  - [ ] Task 20.3. Spring Boot's Docker Compose support in full — the **single** place `spring.docker.compose.*` is
+  - [x] Task 20.3. Spring Boot's Docker Compose support in full — the **single** place `spring.docker.compose.*` is
         documented: `spring-boot-docker-compose` as `optional`; `enabled`, `file`, `lifecycle-management`,
         `start.command`, `stop.command`, `skip.in-tests` (verify its 4.1 default), `readiness.*`, `profiles.active`,
         `arguments`; service connections for supported images; `org.springframework.boot.service-connection`,
         `.ignore`, `.readiness-check.*` labels; SSL bundles via labels; this stack is the one the ITs start.
-  - [ ] Task 20.4. From the intro, `xref:backend/messaging/spring-boot-testing-messaging.adoc` for broker-specific
+  - [x] Task 20.4. From the intro, `xref:backend/messaging/spring-boot-testing-messaging.adoc` for broker-specific
         Compose usage — do not repeat it.
-  - [ ] Task 20.5. 📊 `docker-local-dev-laptop.svg`; 📊 mermaid `SpringApplication.run` → Compose up → readiness →
+  - [x] Task 20.5. 📊 `docker-local-dev-laptop.svg`; 📊 mermaid `SpringApplication.run` → Compose up → readiness →
         service connections → app ready.
-  - [ ] Task 20.6. `== References`: Spring Boot `reference/features/dev-services.html`, `how-to/docker-compose.html`,
+  - [x] Task 20.6. `== References`: Spring Boot `reference/features/dev-services.html`, `how-to/docker-compose.html`,
         `guides/java/develop/`, `compose/how-tos/file-watch/`.
 
-- [ ] Task 21. `testcontainers-fundamentals.adoc` — "Testcontainers Fundamentals"
-  - [ ] Task 21.1. How Testcontainers uses Docker: environment discovery (`DOCKER_HOST`, socket, Desktop, contexts,
+- [x] Task 21. `testcontainers-fundamentals.adoc` — "Testcontainers Fundamentals"
+  - [x] Task 21.1. How Testcontainers uses Docker: environment discovery (`DOCKER_HOST`, socket, Desktop, contexts,
         `~/.testcontainers.properties`, `TESTCONTAINERS_*`), Ryuk.
-  - [ ] Task 21.2. The 2.0 artifact/package model (`org.testcontainers:testcontainers`, `testcontainers-junit-jupiter`,
+  - [x] Task 21.2. The 2.0 artifact/package model (`org.testcontainers:testcontainers`, `testcontainers-junit-jupiter`,
         `testcontainers-<module>` with `org.testcontainers.<module>` classes, JUnit 4 removed) — verified against the
         2.0 release notes.
-  - [ ] Task 21.3. `GenericContainer` (`withExposedPorts`, `getHost()`/`getMappedPort()`, `withEnv`, `withCommand`,
+  - [x] Task 21.3. `GenericContainer` (`withExposedPorts`, `getHost()`/`getMappedPort()`, `withEnv`, `withCommand`,
         `withCopyFileToContainer`, `withNetwork` + aliases, `withLogConsumer`, `execInContainer`); wait strategies;
         `@Testcontainers`/`@Container`, static vs. instance, singleton pattern, manual lifecycle; `ComposeContainer`
         (`withExposedService`, `withLocalCompose`, `waitingFor`, `getServiceHost/Port`).
-  - [ ] Task 21.4. Module table (databases, Kafka, RabbitMQ, MongoDB, Elasticsearch, LocalStack, MinIO, Keycloak,
+  - [x] Task 21.4. Module table (databases, Kafka, RabbitMQ, MongoDB, Elasticsearch, LocalStack, MinIO, Keycloak,
         WireMock, MockServer, Redis), each linked to the repository page already using it; reuse mode (local only);
         pull policies and rate limits; supported environments (Desktop, Engine, remote, Colima/Podman/Rancher caveats);
         Testcontainers Desktop/Cloud named.
-  - [ ] Task 21.5. 📊 `docker-testcontainers-ryuk.svg` (test JVM → Docker API → containers + Ryuk); 📊 mermaid test
+  - [x] Task 21.5. 📊 `docker-testcontainers-ryuk.svg` (test JVM → Docker API → containers + Ryuk); 📊 mermaid test
         class lifecycle with a static container.
-  - [ ] Task 21.6. `== References`: java.testcontainers.org `quickstart/junit_5_quickstart/`, `features/*`,
+  - [x] Task 21.6. `== References`: java.testcontainers.org `quickstart/junit_5_quickstart/`, `features/*`,
         `test_framework_integration/junit_5/`, `modules/docker_compose/`, `supported_docker_environment/`, the 2.0
         release notes, `testcontainers/` on docs.docker.com.
 
