@@ -468,8 +468,8 @@ name, not to content, so they can be written in any order. The per-page checklis
         - SF Symbols rendering modes, variable values and `symbolEffect`;
         - Dynamic Type.
   - [x] Task 18.2. Figure: a table of how the same `Form` renders on iOS, macOS and watchOS.
-- [ ] Task 19. `apps/apple/swiftui-drawing-animation-and-gestures.adoc`: *Drawing, Animation and Gestures*
-  - [ ] Task 19.1. Content:
+- [x] Task 19. `apps/apple/swiftui-drawing-animation-and-gestures.adoc`: *Drawing, Animation and Gestures*
+  - [x] Task 19.1. Content:
         - `Shape`/`Path` (a note-card corner shape), `Canvas` and `TimelineView`;
         - a Metal `Shader` effect;
         - implicit vs explicit animation, springs, transitions and `matchedGeometryEffect`;
@@ -479,11 +479,11 @@ name, not to content, so they can be written in any order. The per-page checklis
         - `@GestureState`;
         - `simultaneously`, `sequenced`, `exclusively`;
         - gesture input sources (2026).
-  - [ ] Task 19.2. Figures:
+  - [x] Task 19.2. Figures:
         - `apple-animation-curves.svg`;
         - Mermaid `stateDiagram-v2` of gesture states.
-- [ ] Task 20. `apps/apple/liquid-glass-and-the-design-system.adoc`: *Liquid Glass, Materials and Icons*
-  - [ ] Task 20.1. Content:
+- [x] Task 20. `apps/apple/liquid-glass-and-the-design-system.adoc`: *Liquid Glass, Materials and Icons*
+  - [x] Task 20.1. Content:
         - the functional layer vs the content layer;
         - automatic adoption, and removing custom bar backgrounds;
         - `glassEffect(_:in:)`, `GlassEffectContainer` and `glassEffectID` with the FieldNotes `CaptureButton`;
@@ -492,7 +492,7 @@ name, not to content, so they can be written in any order. The per-page checklis
         - `UIGlassEffect` and `NSGlassEffectView`;
         - how Reduce Transparency and Reduce Motion change rendering;
         - Icon Composer layered icons with Xcode 27 refraction, and a forward xref to page 45.
-  - [ ] Task 20.2. Figure: `apple-liquid-glass-layers.svg`.
+  - [x] Task 20.2. Figure: `apple-liquid-glass-layers.svg`.
 - [x] Task 21. `apps/apple/uikit-and-appkit-interop.adoc`: *UIKit and AppKit Essentials, and Mixing Them with SwiftUI*
   - [x] Task 21.1. Content:
         - UIKit essentials: view controllers, `UINavigationController`, diffable collection views, traits;
