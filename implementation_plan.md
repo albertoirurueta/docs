@@ -307,7 +307,7 @@ them must be covered.
       `CLBackgroundActivitySession`), writing `NoteLocation`;
     - `NotesMapView` (`Map`, `Marker`, camera, `MKMapItem`, Look Around, `MKGeocodingRequest` 26).
   - Figure: 📊 Mermaid permission flow.
-- [ ] Task 12. `apps/apple/camera-media-and-photos.adoc`: *Camera, Media and Photos*
+- [x] Task 12. `apps/apple/camera-media-and-photos.adoc`: *Camera, Media and Photos*
   - Content:
     - `NotePhotoPicker` with `PhotosPicker` and no permission needed, saving `PhotoAttachment`/`PhotoRecord`;
     - PhotoKit full access;
@@ -316,7 +316,7 @@ them must be covered.
     - Now Playing (27);
     - an iOS ARKit pointer to page 35.
   - Figure: 📊 Mermaid capture pipeline.
-- [ ] Task 13. `apps/apple/health-motion-and-accessories.adoc`: *Health, Motion and Accessories*
+- [x] Task 13. `apps/apple/health-motion-and-accessories.adoc`: *Health, Motion and Accessories*
   - Content:
     - HealthKit authorization and `FieldTripWorkoutSession` (iPhone since 26, zones in 27), with a forward link
       to page 38;
