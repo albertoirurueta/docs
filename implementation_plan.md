@@ -264,8 +264,8 @@ Per-page checklist:
 - `xref:`s to the Swift/Objective-C reference instead of re-explaining the language;
 - `== References` last.
 
-- [ ] Task 5. `apps/apple/getting-started.adoc`: *Getting Started with Apple Platforms*
-  - [ ] Task 5.1. Sections:
+- [x] Task 5. `apps/apple/getting-started.adoc`: *Getting Started with Apple Platforms*
+  - [x] Task 5.1. Sections:
         - *The five platforms (and tvOS)*;
         - *Year-based versions and the 27 baseline*;
         - *One UI framework everywhere, three by platform*: SwiftUI vs UIKit vs AppKit, WatchKit remnants,
@@ -277,11 +277,11 @@ Per-page checklist:
         - *Running on a simulator and a device*: Developer Mode;
         - *A learning path through Apple's tutorials*;
         - *References*.
-  - [ ] Task 5.2. Figures:
+  - [x] Task 5.2. Figures:
         - Mermaid `graph LR`: each platform → its UI framework and key system frameworks;
         - `apple-toolchain.svg`: Xcode → Simulator/Device Hub → Instruments → App Store Connect.
-- [ ] Task 6. `apps/apple/xcode-projects-and-previews.adoc`: *Xcode Projects, Targets, Schemes and Previews*
-  - [ ] Task 6.1. Content:
+- [x] Task 6. `apps/apple/xcode-projects-and-previews.adoc`: *Xcode Projects, Targets, Schemes and Previews*
+  - [x] Task 6.1. Content:
         - workspace, project, target and product;
         - scheme actions;
         - Debug and Release configurations;
@@ -294,7 +294,7 @@ Per-page checklist:
         - `#Playground`;
         - Device Hub;
         - an Xcode 27 coding-intelligence sidebar as a plain subsection.
-  - [ ] Task 6.2. Figures:
+  - [x] Task 6.2. Figures:
         - Mermaid `classDiagram`: Workspace → Project → Target; Scheme → Actions → Configurations;
         - Mermaid build pipeline: compile → link → copy resources → sign.
 - [ ] Task 7. `apps/apple/swift-packages-and-modularization.adoc`: *Swift Packages and Modularizing an App*
