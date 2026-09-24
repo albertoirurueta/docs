@@ -382,7 +382,7 @@ collects the URLs the pages actually use.
 
 Parallelizable: no. Each task depends on the one before it.
 
-- [ ] Task 22. Consistency pass over pages 21–35, and any part 1 page they touch:
+- [x] Task 22. Consistency pass over pages 21–35, and any part 1 page they touch:
   - [ ] Task 22.1. Grep every canonical name from the sheet (`NoteRecord`, `NotePersisting`, `NoteEntity`,
     `KeychainStore`, `StoreManager`, `LocationService`, `FieldTripAttributes`, and so on) for conflicting
     definitions. There must be exactly one `struct`/`class`/`enum`/`actor`/`protocol` definition per name, or
