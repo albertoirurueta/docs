@@ -191,7 +191,7 @@ and the rendering rules.
     Observation tracking); App Sandbox with `ExportFolderBookmark`; Apple silicon only and Rosetta's end; choosing
     native SwiftUI vs Mac Catalyst vs Designed for iPad vs AppKit, linking page 7.
   - Figures: 📊 Mermaid Mac scene graph; 📊 Mermaid approach decision flowchart.
-- [ ] Task 4. `apps/apple/watchos.adoc`: *watchOS: App Structure, Connectivity, Workouts and the Smart Stack*
+- [x] Task 4. `apps/apple/watchos.adoc`: *watchOS: App Structure, Connectivity, Workouts and the Smart Stack*
   - Content: single-target app, dependent vs independent, `WKApplicationDelegateAdaptor`/`WatchAppDelegate`
     (ClockKit/`WKExtensionDelegate` deprecation); vertical-page `TabView`, `NavigationStack`, Digital Crown,
     `handGestureShortcut`, Always On, watch sizes; `WatchConnectivityBridge` with the four transfer types;
@@ -200,7 +200,7 @@ and the rendering rules.
     controls, Live Activities in the Smart Stack, ClockKit migration; watchOS 27 (Foundation Models, Vision).
   - Figures: 📊 Mermaid four WatchConnectivity transfer types; 📊 Mermaid watch app + widget extension App Group →
     complication/Smart Stack.
-- [ ] Task 5. `apps/apple/visionos.adoc`: *visionOS: Windows, Volumes, Immersive Spaces and RealityKit*
+- [x] Task 5. `apps/apple/visionos.adoc`: *visionOS: Windows, Volumes, Immersive Spaces and RealityKit*
   - Content: Shared vs Full Space; windows and `NoteOrnament`; `FieldSiteVolume` volume; `ImmersiveSpace` immersion
     styles and `openImmersiveSpace`/`dismissImmersiveSpace`; look-and-tap with private gaze, hover effects,
     `targetedToAnyEntity`; `RealityView` attachments and `Model3D` (link page 35); porting iPad/iPhone apps; visionOS
