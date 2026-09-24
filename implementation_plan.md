@@ -365,20 +365,31 @@ Filenames are fixed here so sibling xrefs can be written up front.
 
 ### Group 4 — Cheat-sheet PDF (Parallelizable: yes)
 
-- [ ] Task 14. Produce `modules/ROOT/attachments/git-cheat-sheet.pdf`
-  - [ ] Task 14.1. Inspect `docker-cheat-sheet.pdf` (PyMuPDF or `pdftotext -layout`) to match palette, fonts,
+- [x] Task 14. Produce `modules/ROOT/attachments/git-cheat-sheet.pdf`
+  - [x] Task 14.1. Inspect `docker-cheat-sheet.pdf` (PyMuPDF or `pdftotext -layout`) to match palette, fonts,
         colour-coded bordered boxes, header version line and breadcrumb footer
         ("Guides & References › Git Repositories › Git & GitHub").
-  - [ ] Task 14.2. Write a scratch HTML/CSS layout **in the session scratchpad, not the repository**, with boxes for:
+  - [x] Task 14.2. Write a scratch HTML/CSS layout **in the session scratchpad, not the repository**, with boxes for:
         the three areas (working tree → staging → repository → remote) mini-diagram; setup & config; create/clone;
         stage & commit; inspect (`status`/`log`/`diff`/`show`); undo (`restore`/`revert`/`reset`/`--amend`);
         branches; checkout vs. switch vs. restore; stash; tags & releases; remotes (`fetch`/`pull`/`push`,
         `-u`, `--force-with-lease`); merge/rebase and the conflict-resolution steps; GitHub flow in six steps; pull
         requests (`gh pr create/checkout/merge`, the three merge methods); IDE strip (IntelliJ and VS Code
         shortcuts/commands). Content drawn from the pages written in Group 2 for consistency.
-  - [ ] Task 14.3. Render with headless Chromium (Playwright or `--headless --print-to-pdf`), A4 portrait; verify
+  - [x] Task 14.3. Render with headless Chromium (Playwright or `--headless --print-to-pdf`), A4 portrait; verify
         exactly one page of ~595×842 pt; fix overflow by layout (columns, tighter type), never by silently dropping
         content. Commit only the PDF.
+  > Done: `modules/ROOT/attachments/git-cheat-sheet.pdf` -- exactly one page, 594.96 x 841.92 pt (A4), rendered with
+  headless Google Chrome (`--headless --print-to-pdf`) from a scratch HTML/CSS layout kept in the session scratchpad
+  (not committed). Palette (six accent colours matched by RGB sampling), bordered colour-coded boxes, monospace code
+  blocks, header version line ("Git 2.55.x · GitHub CLI 2.101.x · IntelliJ IDEA 2026.2 · VS Code (current stable) ·
+  github.com · default branch main") and breadcrumb footer ("Irurueta Docs · Guides & References → Git Repositories
+  → Git & GitHub · albertoirurueta.github.io/docs") matched to `docker-cheat-sheet.pdf` (inspected with PyMuPDF: page
+  rect, fonts, text/stroke/fill colours). 15 boxes covering all Task 14.2 topics in a 5-column CSS-column layout; no
+  overflow (verified by rendering the PDF page to PNG and visually inspecting it -- no clipped or overlapping
+  content); no realistic credentials/tokens. `npx antora antora-playbook.yml` exits 0 with no errors/warnings;
+  `build/site/git-repositories/git-and-github/cheat-sheet.html` links `../../_attachments/git-cheat-sheet.pdf`,
+  which exists in `build/site/_attachments/`. Only the PDF was added to the repository.
 
 ### Group 5 — Site wiring and cross-links (Parallelizable: yes — every task edits a distinct file)
 
