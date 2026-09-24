@@ -297,8 +297,8 @@ Per-page checklist:
   - [x] Task 6.2. Figures:
         - Mermaid `classDiagram`: Workspace → Project → Target; Scheme → Actions → Configurations;
         - Mermaid build pipeline: compile → link → copy resources → sign.
-- [ ] Task 7. `apps/apple/swift-packages-and-modularization.adoc`: *Swift Packages and Modularizing an App*
-  - [ ] Task 7.1. Content:
+- [x] Task 7. `apps/apple/swift-packages-and-modularization.adoc`: *Swift Packages and Modularizing an App*
+  - [x] Task 7.1. Content:
         - adding a remote dependency;
         - the full `Packages/FieldNotesKit/Package.swift`: `FieldNotesModel` and `FieldNotesServices` targets, a
           test target, platforms `.iOS(.v26)`, `.macOS(.v26)`, `.watchOS(.v26)`, `.visionOS(.v26)`, and
@@ -308,10 +308,10 @@ Per-page checklist:
         - explicit modules and mergeable libraries;
         - Swift Build as the default engine in 6.4.
         - Link `swift/swift-package-manager.adoc` for the tool itself.
-  - [ ] Task 7.2. Figure: Mermaid graph of the `FieldNotes` target → `FieldNotesUI` → `FieldNotesKit`
+  - [x] Task 7.2. Figure: Mermaid graph of the `FieldNotes` target → `FieldNotesUI` → `FieldNotesKit`
         (Model/Services) → remote packages.
-- [ ] Task 8. `apps/apple/app-structure-and-lifecycle.adoc`: *App Structure and Life Cycle (SwiftUI, UIKit, AppKit)*
-  - [ ] Task 8.1. Content:
+- [x] Task 8. `apps/apple/app-structure-and-lifecycle.adoc`: *App Structure and Life Cycle (SwiftUI, UIKit, AppKit)*
+  - [x] Task 8.1. Content:
         - `FieldNotesApp`: `@main`, the scene list per platform, `ScenePhase` handling (save on `.background`);
         - `UIApplicationDelegateAdaptor`, `NSApplicationDelegateAdaptor`, `WKApplicationDelegateAdaptor`;
         - UIKit: `UIApplicationDelegate` plus `UIWindowSceneDelegate` with the `UIApplicationSceneManifest`
@@ -319,7 +319,7 @@ Per-page checklist:
         - AppKit: `NSApplicationDelegate`;
         - migrating to the SwiftUI life cycle;
         - `@SceneStorage` restoration, with a forward xref to page 23.
-  - [ ] Task 8.2. Figures:
+  - [x] Task 8.2. Figures:
         - Mermaid `stateDiagram-v2` of scene phases;
         - Mermaid `sequenceDiagram` of UIKit launch.
 - [ ] Task 9. `apps/apple/app-architecture.adoc`: *App Architecture the Apple Way*
