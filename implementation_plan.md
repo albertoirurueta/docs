@@ -289,7 +289,7 @@ them must be covered.
     - universal links: an AASA JSON for `fieldnotes.example.com`, `onOpenURL` and `NSUserActivity`;
     - App Groups and `FieldNotesShareExtension` with `ShareLink`.
   - Figures: 📊 Mermaid intent-to-surfaces diagram and link-resolution sequence.
-- [ ] Task 10. `apps/apple/apple-intelligence-and-machine-learning.adoc`: *Apple Intelligence and Machine Learning*
+- [x] Task 10. `apps/apple/apple-intelligence-and-machine-learning.adoc`: *Apple Intelligence and Machine Learning*
   - Content:
     - `FoundationModelSummaryGenerator` (availability check, session, streaming, `NoteSummary` guided generation,
       `TagSuggestionTool`, context window, guardrails);
@@ -300,7 +300,7 @@ them must be covered.
     - Writing Tools and Image Playground;
     - prompt-injection risks.
   - Figures: 📊 Mermaid approach chooser and tool-calling sequence.
-- [ ] Task 11. `apps/apple/location-and-maps.adoc`: *Location and Maps*
+- [x] Task 11. `apps/apple/location-and-maps.adoc`: *Location and Maps*
   - Content:
     - usage strings and the permission flow;
     - `LocationService` (`CLServiceSession`, `liveUpdates`, `CLMonitor` geofence per notebook,
