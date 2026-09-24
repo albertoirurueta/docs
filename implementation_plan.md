@@ -320,36 +320,48 @@ Filenames are fixed here so sibling xrefs can be written up front.
 
 ### Group 3 — Landing pages and cheat-sheet page (Parallelizable: yes — three distinct files; all need every Group 2 page's final title/path)
 
-- [ ] Task 11. `modules/ROOT/pages/git-repositories/git-and-github/index.adoc` — "Git & GitHub"
-  - [ ] Task 11.1. `include::partial$git-disclaimer.adoc[]` after `:keywords:`; one paragraph on what Git and GitHub
+- [x] Task 11. `modules/ROOT/pages/git-repositories/git-and-github/index.adoc` — "Git & GitHub"
+  - [x] Task 11.1. `include::partial$git-disclaimer.adoc[]` after `:keywords:`; one paragraph on what Git and GitHub
         are and how they relate; the version baseline in prose.
-  - [ ] Task 11.2. "New here? Read in this order": getting started → repositories and cloning → commits → branches →
+  - [x] Task 11.2. "New here? Read in this order": getting started → repositories and cloning → commits → branches →
         checkout/switch/restore → fetch/pull/push → merging/rebasing/conflicts → pull requests → tags and releases.
-  - [ ] Task 11.3. `== What's covered` — one `xref:` + one-line description per page, grouped *Foundations*
+  - [x] Task 11.3. `== What's covered` — one `xref:` + one-line description per page, grouped *Foundations*
         (getting started, repositories), *Everyday work* (commits, branches, checkout, tags),
         *Collaborating* (fetch/pull/push, merging, pull requests), *Reference* (cheat sheet). Verify filenames with
         `ls` before writing xrefs.
-  - [ ] Task 11.4. One short paragraph linking the GitHub Actions pages
+  - [x] Task 11.4. One short paragraph linking the GitHub Actions pages
         (`backend/docker/ci-cd-with-github-actions.adoc`, `apps/react-native/ci-cd-and-over-the-air-updates.adoc`)
         as "what happens after you push".
-  - [ ] Task 11.5. `[[_bibliography]]` `== Bibliography`: Pro Git 2nd ed. (Scott Chacon and Ben Straub, Apress,
+  - [x] Task 11.5. `[[_bibliography]]` `== Bibliography`: Pro Git 2nd ed. (Scott Chacon and Ben Straub, Apress,
         free at git-scm.com/book), the Git reference manual, git-scm.com/learn, GitHub Docs (Get started, Pull
         requests, Repositories), GitHub CLI manual, IntelliJ IDEA Version control docs, VS Code Source Control docs —
         every item linked; closing sentence that official docs win on any discrepancy. No physical line starting
         with a bare `<number>.`.
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/index.adoc` created — filenames of all nine concept
+  pages verified with `ls` before writing xrefs; reading order and grouped "What's covered" sections match the
+  nine pages' actual titles; one-sentence link to both GitHub Actions pages; `[[_bibliography]]` anchor present
+  with only official sources (Pro Git 2nd ed., git-scm.com, docs.github.com, cli.github.com, JetBrains, VS Code
+  Docs) plus a closing sentence that official docs win on any discrepancy. No admonition beyond the disclaimer
+  include; no bare `<number>.` lines.
 
-- [ ] Task 12. `modules/ROOT/pages/git-repositories/index.adoc` — "Git Repositories" category page
-  - [ ] Task 12.1. Mirror `apps/index.adoc`: title, `:description:`, `:keywords:`, one intro paragraph (version
+- [x] Task 12. `modules/ROOT/pages/git-repositories/index.adoc` — "Git Repositories" category page
+  - [x] Task 12.1. Mirror `apps/index.adoc`: title, `:description:`, `:keywords:`, one intro paragraph (version
         control and hosting platforms), `== Sections` with a single bullet
         `xref:git-repositories/git-and-github/index.adoc[Git & GitHub] -- …` summarising the section, ending
         "plus a downloadable cheat sheet". No disclaimer include (matches `apps/index.adoc`).
+  > Done: `modules/ROOT/pages/git-repositories/index.adoc` created, mirroring `apps/index.adoc`'s structure exactly
+  (title, `:description:`, `:keywords:`, intro paragraph, `== Sections` with one bullet, no disclaimer include).
 
-- [ ] Task 13. `modules/ROOT/pages/git-repositories/git-and-github/cheat-sheet.adoc` — "Git & GitHub Cheat Sheet"
-  - [ ] Task 13.1. Mirror `backend/docker/cheat-sheet.adoc`: description of what the sheet covers, grouped xrefs to
+- [x] Task 13. `modules/ROOT/pages/git-repositories/git-and-github/cheat-sheet.adoc` — "Git & GitHub Cheat Sheet"
+  - [x] Task 13.1. Mirror `backend/docker/cheat-sheet.adoc`: description of what the sheet covers, grouped xrefs to
         all nine concept pages, `== Download` with
         `xref:attachment$git-cheat-sheet.pdf[Download the Git & GitHub Cheat Sheet (PDF)]`, `== References`
         (git-scm.com/docs, git-scm.com/book, docs.github.com, cli.github.com/manual, IntelliJ and VS Code docs).
         The attachment xref fails the build until Group 4 lands — expected.
+  > Done: `modules/ROOT/pages/git-repositories/git-and-github/cheat-sheet.adoc` created, mirroring
+  `backend/docker/cheat-sheet.adoc`'s structure — intro paragraph naming every topic, grouped xrefs to all nine
+  concept pages, `== Download` with the `attachment$git-cheat-sheet.pdf` xref, `== References` limited to official
+  docs. Confirmed via the Group 3 build that this xref is the only remaining error (PDF lands in Group 4).
 
 ### Group 4 — Cheat-sheet PDF (Parallelizable: yes)
 
