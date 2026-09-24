@@ -493,8 +493,8 @@ name, not to content, so they can be written in any order. The per-page checklis
         - how Reduce Transparency and Reduce Motion change rendering;
         - Icon Composer layered icons with Xcode 27 refraction, and a forward xref to page 45.
   - [ ] Task 20.2. Figure: `apple-liquid-glass-layers.svg`.
-- [ ] Task 21. `apps/apple/uikit-and-appkit-interop.adoc`: *UIKit and AppKit Essentials, and Mixing Them with SwiftUI*
-  - [ ] Task 21.1. Content:
+- [x] Task 21. `apps/apple/uikit-and-appkit-interop.adoc`: *UIKit and AppKit Essentials, and Mixing Them with SwiftUI*
+  - [x] Task 21.1. Content:
         - UIKit essentials: view controllers, `UINavigationController`, diffable collection views, traits;
         - AppKit essentials: `NSWindow`/`NSWindowController`, `NSMenu`;
         - `UIHostingController` and `UIHostingConfiguration` cells;
@@ -503,9 +503,9 @@ name, not to content, so they can be written in any order. The per-page checklis
         - `UITraitBridgedEnvironmentKey`;
         - unified animations;
         - `UIArrangementViewController`.
-  - [ ] Task 21.2. Figure: Mermaid of the representable life cycle.
-- [ ] Task 22. `apps/apple/human-interface-guidelines.adoc`: *Human Interface Guidelines in Practice*
-  - [ ] Task 22.1. Content:
+  - [x] Task 21.2. Figure: Mermaid of the representable life cycle.
+- [x] Task 22. `apps/apple/human-interface-guidelines.adoc`: *Human Interface Guidelines in Practice*
+  - [x] Task 22.1. Content:
         - the HIG structure;
         - the design principles;
         - key foundations (layout, color, typography, Dark Mode, materials, SF Symbols, motion, writing,
@@ -513,7 +513,7 @@ name, not to content, so they can be written in any order. The per-page checklis
         - one subsection per platform (iOS, iPadOS, macOS, watchOS, visionOS, iPhone Duo), each forward-linking
           its part-3 page (36–39).
         - Summarize and link only; never copy the HIG.
-  - [ ] Task 22.2. Figure: Mermaid `mindmap` of the HIG.
+  - [x] Task 22.2. Figure: Mermaid `mindmap` of the HIG.
 - [x] Task 23. `apps/apple/accessibility.adoc`: *Accessibility*
   - [x] Task 23.1. Content:
         - VoiceOver label, value, hint and traits on `NoteRow`;
