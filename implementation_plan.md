@@ -355,8 +355,8 @@ Per-page checklist:
         - Mermaid `sequenceDiagram`: MainActor → `@concurrent` → resume;
         - `apple-isolation-domains.svg`;
         - Mermaid task tree showing cancellation.
-- [ ] Task 11. `apps/apple/multiplatform-projects.adoc`: *One Codebase for iOS, iPadOS, macOS, watchOS and visionOS*
-  - [ ] Task 11.1. Content:
+- [x] Task 11. `apps/apple/multiplatform-projects.adoc`: *One Codebase for iOS, iPadOS, macOS, watchOS and visionOS*
+  - [x] Task 11.1. Content:
         - the FieldNotes multiplatform target and Supported Destinations;
         - the separate `FieldNotesWatch` target;
         - per-SDK build settings;
@@ -367,11 +367,11 @@ Per-page checklist:
         - iPad/iPhone apps on visionOS and Apple silicon Macs;
         - an `ArrangementView` sidebar (new in iOS 27.1).
         - Forward xrefs to pages 36–39.
-  - [ ] Task 11.2. Figures:
+  - [x] Task 11.2. Figures:
         - Mermaid: shared packages → multiplatform target plus watchOS target;
         - an availability-pattern table.
-- [ ] Task 12. `apps/apple/language-interoperability.adoc`: *Mixing Swift, Objective-C and C++ in an App*
-  - [ ] Task 12.1. Content:
+- [x] Task 12. `apps/apple/language-interoperability.adoc`: *Mixing Swift, Objective-C and C++ in an App*
+  - [x] Task 12.1. Content:
         - bridging header vs module map;
         - the generated `FieldNotes-Swift.h`;
         - `@objc` / `@objcMembers`;
@@ -381,7 +381,7 @@ Per-page checklist:
         - enabling C++ interop in Xcode and with `.interoperabilityMode(.Cxx)`;
         - step-by-step migration.
         - Link the Swift interop and Objective-C `swift-interoperability.adoc` pages for language rules.
-  - [ ] Task 12.2. Figure: Mermaid Swift ↔ Objective-C ↔ C++ bridging graph.
+  - [x] Task 12.2. Figure: Mermaid Swift ↔ Objective-C ↔ C++ bridging graph.
 
 ### Group 3: SwiftUI, UI & design pages (9–20)
 
