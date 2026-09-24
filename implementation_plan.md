@@ -539,11 +539,13 @@ Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus s
 
 ### Group 9 — Cheat-sheet PDF (Parallelizable: yes)
 
-- [ ] Task 26. Produce `modules/ROOT/attachments/docker-cheat-sheet.pdf`
-  - [ ] Task 26.1. Inspect `messaging-cheat-sheet.pdf` / `springboot-cheat-sheet.pdf` (PyMuPDF or `pdftotext`) to match
+> Done: `modules/ROOT/attachments/docker-cheat-sheet.pdf` -- exactly one page, 595.9 x 842.9 pt (A4), rendered with Playwright Chromium from a scratch HTML/CSS layout kept in the session scratchpad (not committed); palette, bordered colour-coded boxes, header version line and breadcrumb footer matched to `messaging-cheat-sheet.pdf` (inspected with PyMuPDF). Overflow was fixed by layout (balanced 5-column flow, tighter type) and verified programmatically (no overflow column); no content dropped. Build: zero errors/warnings; `cheat-sheet.html` links to `_attachments/docker-cheat-sheet.pdf`.
+
+- [x] Task 26. Produce `modules/ROOT/attachments/docker-cheat-sheet.pdf`
+  - [x] Task 26.1. Inspect `messaging-cheat-sheet.pdf` / `springboot-cheat-sheet.pdf` (PyMuPDF or `pdftotext`) to match
         palette, fonts, colour-coded bordered boxes, header line and breadcrumb footer
         ("Guides & References › Backend Development › Docker").
-  - [ ] Task 26.2. Write a scratch HTML/CSS layout **in the session scratchpad, not the repository**: architecture
+  - [x] Task 26.2. Write a scratch HTML/CSS layout **in the session scratchpad, not the repository**: architecture
         one-liners; image commands; Dockerfile instruction table (`CMD`/`ENTRYPOINT` forms, `RUN --mount` types);
         multi-stage skeleton; `docker run` option groups; lifecycle commands; volume/bind/tmpfs syntax; networking
         one-liners; Compose skeleton + CLI; Buildx essentials (`--platform`, `--cache-to type=gha`,
@@ -552,7 +554,7 @@ Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus s
         `spring-boot-testcontainers` + `@ServiceConnection`, `ComposeContainer`, Surefire `*Test` vs. Failsafe `*IT`);
         GitHub Actions skeleton (`setup-buildx` → `login` → `metadata` → `build-push`). Content drawn from the actual
         pages written in Groups 2-7 for consistency.
-  - [ ] Task 26.3. Render with headless Chromium (`/opt/pw-browsers` Playwright Chromium, or `--headless
+  - [x] Task 26.3. Render with headless Chromium (`/opt/pw-browsers` Playwright Chromium, or `--headless
         --print-to-pdf`), A4 portrait; verify exactly one page of ~595×842 pt; fix overflow by layout (flex columns,
         `table-layout:fixed`, `<wbr>`), never by dropping content silently. Commit only the PDF.
 
