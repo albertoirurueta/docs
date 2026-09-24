@@ -206,14 +206,14 @@ and the rendering rules.
     `targetedToAnyEntity`; `RealityView` attachments and `Model3D` (link page 35); porting iPad/iPhone apps; visionOS
     27 highlights.
   - Figures: 📊 `apple-visionos-immersion-spectrum.svg`; 📊 Mermaid FieldNotes visionOS scene graph.
-- [ ] Task 6. `apps/apple/testing-with-swift-testing.adoc`: *Unit Testing with Swift Testing*
+- [x] Task 6. `apps/apple/testing-with-swift-testing.adoc`: *Unit Testing with Swift Testing*
   - Content (app-focused, linking Swift `testing.adoc` for basics): `@Test`/`@Suite`, `#expect`/`try #require`,
     `#expect(throws:)`, `confirmation`, `withKnownIssue`; `@Test(arguments:)`; traits (`.tags`, `.enabled(if:)`,
     `.timeLimit`, `.serialized`, custom `TestScoping`); attachments and exit tests (not on iOS); testing SwiftData
     and `@Observable` models (`NoteStoreTests`, `PersistenceTests`), App Intents via AppIntentsTesting
     (`FieldNotesShortcutsTests`); Xcode 27 XCTest interop modes `limited`/`complete`/`strict`/`none`.
   - Figure: 📊 Mermaid Swift Testing vs XCTest decision.
-- [ ] Task 7. `apps/apple/ui-tests-test-plans-and-coverage.adoc`: *UI Tests, Test Plans, Performance Tests and Coverage*
+- [x] Task 7. `apps/apple/ui-tests-test-plans-and-coverage.adoc`: *UI Tests, Test Plans, Performance Tests and Coverage*
   - Content: `XCUIApplication`, identifier queries, `--uitesting` launch argument (with the `AppServices` revision),
     recording, `performAccessibilityAudit()`, video/screenshot attachments; `measure(metrics:)` with `XCTClockMetric`
     and `XCTApplicationLaunchMetric`; `FieldNotes.xctestplan` configurations, tags, repetitions, parallelization;
