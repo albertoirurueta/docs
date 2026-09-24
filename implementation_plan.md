@@ -415,8 +415,8 @@ name, not to content, so they can be written in any order. The per-page checklis
   - [x] Task 14.2. Figures:
         - Mermaid `sequenceDiagram` of layout negotiation;
         - `apple-layout-comparison.svg`.
-- [ ] Task 15. `apps/apple/swiftui-state-and-data-flow.adoc`: *State and Data Flow with Observation*
-  - [ ] Task 15.1. Content:
+- [x] Task 15. `apps/apple/swiftui-state-and-data-flow.adoc`: *State and Data Flow with Observation*
+  - [x] Task 15.1. Content:
         - source of truth;
         - `@State` as a macro in Xcode 27, and its initializer pitfalls;
         - `@Binding`;
@@ -428,11 +428,11 @@ name, not to content, so they can be written in any order. The per-page checklis
         - migrating from `ObservableObject`, `@StateObject` and `@Published`;
         - Observation tracking in UIKit and AppKit.
         - Link `swift/properties.adoc`.
-  - [ ] Task 15.2. Figures:
+  - [x] Task 15.2. Figures:
         - Mermaid flowchart: source of truth → bindings → views;
         - a "which property wrapper?" decision table.
-- [ ] Task 16. `apps/apple/swiftui-lists-tables-and-collections.adoc`: *Lists, Tables and Collections*
-  - [ ] Task 16.1. Content:
+- [x] Task 16. `apps/apple/swiftui-lists-tables-and-collections.adoc`: *Lists, Tables and Collections*
+  - [x] Task 16.1. Content:
         - `NoteList` with `List`, `ForEach` and `Section` (pinned vs others);
         - selection and edit mode;
         - `.swipeActions` (pin, delete), now available on any container;
@@ -441,7 +441,7 @@ name, not to content, so they can be written in any order. The per-page checklis
         - `ScrollView` with `LazyVGrid`;
         - `.searchable`, `.refreshable`;
         - a custom container view.
-  - [ ] Task 16.2. Figure: `apple-list-anatomy.svg`.
+  - [x] Task 16.2. Figure: `apple-list-anatomy.svg`.
 - [x] Task 17. `apps/apple/swiftui-navigation-and-presentation.adoc`: *Navigation and Presentation*
   - [x] Task 17.1. Content:
         - `ContentView` as a three-column `NavigationSplitView`;
