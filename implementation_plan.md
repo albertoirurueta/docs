@@ -513,26 +513,28 @@ Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus s
 
 ### Group 8 — Landing page and cheat-sheet page (Parallelizable: yes — two distinct files; both need every earlier page's final title/path)
 
-- [ ] Task 24. `index.adoc` — "Docker" landing page
-  - [ ] Task 24.1. One paragraph on what Docker is; the version baseline in prose (not an admonition); "new here? read
+> Done: `index.adoc` (reading order, "What's covered" for all 22 topic pages -- Tasks 2-23 are 22 pages, so the issue's "22 concept pages" count is right and the "21" in this plan's summary was a miscount; no extra page was invented -- relationships to SpringBoot/Hibernate/Messaging/Quarkus/Prometheus, `[[_bibliography]]` with all seven groups linked, both books with ISBN, publisher link and superseded material; no physical line starts with a bare `<number>.`) and `cheat-sheet.adoc` (`== Download` to `xref:attachment$docker-cheat-sheet.pdf[...]`). Build: every forward xref now resolves; the only remaining error is the attachment, which Group 9 adds.
+
+- [x] Task 24. `index.adoc` — "Docker" landing page
+  - [x] Task 24.1. One paragraph on what Docker is; the version baseline in prose (not an admonition); "new here? read
         in this order" (getting started → architecture → images → Dockerfile → running containers → storage and
         networking → Compose → the Java/Spring Boot pages).
-  - [ ] Task 24.2. "What's covered" grouped as the issue's outline (Foundations; Building images; Running containers;
+  - [x] Task 24.2. "What's covered" grouped as the issue's outline (Foundations; Building images; Running containers;
         Compose; Registries and distribution; Security; Orchestration and beyond; Docker in the Java and Spring Boot
         development loop; Other framework bindings — the three Quarkus xrefs; Reference — the cheat sheet), each bullet
         a one-line `xref:` + description. Verify all 21 filenames with `ls` before writing xrefs.
-  - [ ] Task 24.3. Relationship to the SpringBoot, Hibernate, Messaging, Quarkus and Prometheus references (one short
+  - [x] Task 24.3. Relationship to the SpringBoot, Hibernate, Messaging, Quarkus and Prometheus references (one short
         paragraph each, like `messaging/index.adoc`).
-  - [ ] Task 24.4. `== Bibliography` (anchor `_bibliography`) with the seven groups from the issue's "Bibliography"
+  - [x] Task 24.4. `== Bibliography` (anchor `_bibliography`) with the seven groups from the issue's "Bibliography"
         section, every source linked; both 2015 books with full citation, ISBN, publisher link and superseded-material
         call-out; closing note that official docs win on any discrepancy. Re-wrap so no physical line starts with a
         bare `<number>.` token.
-  - [ ] Task 24.5. `include::partial$docker-disclaimer.adoc[]` right after `:keywords:`.
+  - [x] Task 24.5. `include::partial$docker-disclaimer.adoc[]` right after `:keywords:`.
 
-- [ ] Task 25. `cheat-sheet.adoc` — "Docker Cheat Sheet"
-  - [ ] Task 25.1. Short page listing what the sheet covers, cross-referencing all 21 topic pages grouped like
+- [x] Task 25. `cheat-sheet.adoc` — "Docker Cheat Sheet"
+  - [x] Task 25.1. Short page listing what the sheet covers, cross-referencing all 21 topic pages grouped like
         `index.adoc`.
-  - [ ] Task 25.2. `== Download` with `xref:attachment$docker-cheat-sheet.pdf[Download the Docker Cheat Sheet (PDF)]`,
+  - [x] Task 25.2. `== Download` with `xref:attachment$docker-cheat-sheet.pdf[Download the Docker Cheat Sheet (PDF)]`,
         matching `messaging/cheat-sheet.adoc`'s structure (the PDF lands in Group 9).
 
 ### Group 9 — Cheat-sheet PDF (Parallelizable: yes)
