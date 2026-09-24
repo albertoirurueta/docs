@@ -270,7 +270,7 @@ them must be covered.
     - Live Activities: `FieldTripAttributes`, the Dynamic Island and Lock Screen, push updates, broadcast,
       `LiveActivityIntent`, `isDynamicIslandLimitedInWidth` (27) and the `.small` family.
   - Figures: 📊 Mermaid APNs sequence and `apple-live-activity-surfaces.svg`.
-- [ ] Task 8. `apps/apple/widgets-and-controls.adoc`: *Widgets, Complications and Controls (WidgetKit)*
+- [x] Task 8. `apps/apple/widgets-and-controls.adoc`: *Widgets, Complications and Controls (WidgetKit)*
   - Content:
     - `FieldNotesWidgetBundle`, `PinnedNotesWidget` with its provider, reload budget, families and interactivity
       through `TogglePinIntent`;
@@ -280,7 +280,7 @@ them must be covered.
       and 39;
     - App Group data and previews.
   - Figures: 📊 Mermaid timeline flow and a family × surface × OS table.
-- [ ] Task 9. `apps/apple/app-intents-and-system-integration.adoc`: *App Intents, Siri, Shortcuts, Spotlight, Deep Links and Extensions*
+- [x] Task 9. `apps/apple/app-intents-and-system-integration.adoc`: *App Intents, Siri, Shortcuts, Spotlight, Deep Links and Extensions*
   - Content:
     - `NoteEntity`/`NoteEntityQuery`, `OpenNoteIntent`/`CreateNoteIntent`/`TogglePinIntent` and
       `FieldNotesShortcuts`;
