@@ -388,8 +388,8 @@ Per-page checklist:
 Parallelizable: yes. Each page is an independent new file. Pages link to one another only by `xref:` to a file
 name, not to content, so they can be written in any order. The per-page checklist from Group 2 applies.
 
-- [ ] Task 13. `apps/apple/swiftui-views-and-modifiers.adoc`: *SwiftUI Views and Modifiers*
-  - [ ] Task 13.1. Content:
+- [x] Task 13. `apps/apple/swiftui-views-and-modifiers.adoc`: *SwiftUI Views and Modifiers*
+  - [x] Task 13.1. Content:
         - `View` and `body` with `NoteRow`;
         - composition;
         - modifier order (`padding` before or after `background`);
@@ -398,9 +398,9 @@ name, not to content, so they can be written in any order. The per-page checklis
         - conditional content and view identity (structural vs `.id`);
         - `@Entry` environment values and the Xcode 27 warning.
         - Link `swift/result-builders.adoc`.
-  - [ ] Task 13.2. Figure: `apple-modifier-chain.svg`.
-- [ ] Task 14. `apps/apple/swiftui-layout.adoc`: *SwiftUI Layout*
-  - [ ] Task 14.1. Content:
+  - [x] Task 13.2. Figure: `apple-modifier-chain.svg`.
+- [x] Task 14. `apps/apple/swiftui-layout.adoc`: *SwiftUI Layout*
+  - [x] Task 14.1. Content:
         - the propose/choose/place protocol;
         - stacks and lazy stacks;
         - `Grid` and lazy grids (a notebook grid);
@@ -412,7 +412,7 @@ name, not to content, so they can be written in any order. The per-page checklis
         - size classes;
         - `scrollPosition` / `onScrollGeometryChange`;
         - `ArrangementView` / `ReservedRegion` (new in iOS 27.1).
-  - [ ] Task 14.2. Figures:
+  - [x] Task 14.2. Figures:
         - Mermaid `sequenceDiagram` of layout negotiation;
         - `apple-layout-comparison.svg`.
 - [ ] Task 15. `apps/apple/swiftui-state-and-data-flow.adoc`: *State and Data Flow with Observation*
