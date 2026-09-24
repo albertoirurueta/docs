@@ -315,7 +315,7 @@ Parallelizable: no. Each task depends on the one before it.
     URLs, no raw `xref:` text.
   - [x] Task 20.8. `detect-secrets` over the changed files; triage findings (the known placeholder checksum is a
     confirmed false positive).
-- [ ] Task 21. Post a comment on #170 listing the unverified claims and API shapes per page, how the #174 "facts to
+- [x] Task 21. Post a comment on #170 listing the unverified claims and API shapes per page, how the #174 "facts to
   verify" were resolved, and the final forward-link count.
-- [ ] Task 22. Commit on `feature/174` with messages starting `Apple Platforms part 3:`, reviewing `git status` and
+- [x] Task 22. Commit on `feature/174` with messages starting `Apple Platforms part 3:`, reviewing `git status` and
   excluding `build/` and `node_modules/`, then push.
