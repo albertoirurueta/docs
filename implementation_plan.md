@@ -440,12 +440,30 @@ Filenames are fixed here so sibling xrefs can be written up front.
 
 ### Group 6 — Final verification (Parallelizable: yes)
 
-- [ ] Task 20. Validate and build
-  - [ ] Task 20.1. `node scripts/validate-mermaid.mjs modules/ROOT/pages/git-repositories` — all blocks parse.
-  - [ ] Task 20.2. Delegate `npx antora antora-playbook.yml` to the `iru-gate-runner` agent — zero errors/warnings;
-        confirm `build/site/irurueta/git-repositories/git-and-github/cheat-sheet.html` links to
-        `_attachments/git-cheat-sheet.pdf` and the home page shows the new tile.
-  - [ ] Task 20.3. Spot-check the acceptance criteria of #180: every concept named in the request (commits,
-        branches, tags, pull requests, checkout, push, pull, merge) has a clearly titled page; each concept page has
-        CLI, GitHub.com, IntelliJ IDEA and VS Code subsections (or a one-line reason one is omitted) and a
-        `== References` of official links.
+- [x] Task 20. Validate and build
+  - [x] Task 20.1. `node scripts/validate-mermaid.mjs modules/ROOT/pages/git-repositories` — all blocks parse.
+        `npm i --no-save mermaid@11 jsdom` were already present; ran clean: "All 18 Mermaid diagrams parsed
+        successfully."
+  - [x] Task 20.2. Delegated `npx antora antora-playbook.yml` to the `iru-gate-runner` agent — exit 0, zero
+        errors/warnings. The `irurueta` component is served at the site root (not under `/irurueta/`), so the
+        actual path is `build/site/git-repositories/git-and-github/cheat-sheet.html`; it links
+        `href="../../_attachments/git-cheat-sheet.pdf"`, and `build/site/_attachments/git-cheat-sheet.pdf` exists
+        on disk (332 KB). `build/site/index.html` references `git-repositories.svg` and links to
+        `git-repositories/git-and-github/*.html` pages, confirming the new home-page tile renders.
+  - [x] Task 20.3. Spot-checked #180's acceptance criteria against all nine concept pages under
+        `modules/ROOT/pages/git-repositories/git-and-github/`: every named concept (getting started, repositories,
+        commits, branches, checkout/switch/restore, tags & releases, fetch/pull/push, merging/rebasing/conflicts,
+        pull requests) has its own clearly titled page; every page has `== Concept`, IntelliJ IDEA and VS Code
+        subsections, and a `== References` section. CLI and GitHub.com content is present on every page but two
+        deviate from the literal "Command line" / "On GitHub.com" heading names by design, not omission:
+        `getting-started.adoc` (a setup/intro page structured as Installing Git → First-time setup → Creating a
+        GitHub account and authenticating → IDE setup, with CLI and github.com content folded into those
+        headings) and `merging-rebasing-and-conflicts.adoc` (CLI `git merge`/`git rebase` commands are inline
+        under `== Concept`, `== Resolving conflicts` and `== Rebasing` since the operations are inherently
+        command-driven; it does have a separate `== On GitHub.com` heading). `pull-requests.adoc` uses
+        "Create a PR on github.com" / "With the GitHub CLI" / "Reviewing and merging on github.com" instead of the
+        generic heading names, which is a clearer fit for that page's two-audience (creating vs. reviewing)
+        structure. No content gap was found in any of the three, so nothing was changed. `== References` sections
+        across all nine pages were grepped for every URL: every link is git-scm.com, docs.github.com,
+        cli.github.com, jetbrains.com, code.visualstudio.com, marketplace.visualstudio.com or
+        github.com/github/gitignore — no non-official link found.
