@@ -442,8 +442,8 @@ name, not to content, so they can be written in any order. The per-page checklis
         - `.searchable`, `.refreshable`;
         - a custom container view.
   - [ ] Task 16.2. Figure: `apple-list-anatomy.svg`.
-- [ ] Task 17. `apps/apple/swiftui-navigation-and-presentation.adoc`: *Navigation and Presentation*
-  - [ ] Task 17.1. Content:
+- [x] Task 17. `apps/apple/swiftui-navigation-and-presentation.adoc`: *Navigation and Presentation*
+  - [x] Task 17.1. Content:
         - `ContentView` as a three-column `NavigationSplitView`;
         - `NavigationStack` with `navigationDestination(for: Note.self)` and `NavigationPath`;
         - deep-link navigation, with a forward xref to page 28;
@@ -453,11 +453,11 @@ name, not to content, so they can be written in any order. The per-page checklis
         - zoom transitions;
         - toolbars (`ToolbarSpacer`, `ToolbarOverflowMenu`, `visibilityPriority`);
         - search placement.
-  - [ ] Task 17.2. Figures:
+  - [x] Task 17.2. Figures:
         - Mermaid of `NavigationPath` push and pop;
         - `apple-split-view-columns.svg`.
-- [ ] Task 18. `apps/apple/swiftui-controls-forms-text-and-images.adoc`: *Controls, Forms, Text, Images and SF Symbols*
-  - [ ] Task 18.1. Content:
+- [x] Task 18. `apps/apple/swiftui-controls-forms-text-and-images.adoc`: *Controls, Forms, Text, Images and SF Symbols*
+  - [x] Task 18.1. Content:
         - `SettingsView` as a `Form`;
         - `Button` styles including `.glass`;
         - `Toggle`, `Picker`, `Slider`, `Stepper`, `DatePicker`, `Menu`, `LabeledContent`;
@@ -467,7 +467,7 @@ name, not to content, so they can be written in any order. The per-page checklis
         - `Image` and `AsyncImage` caching;
         - SF Symbols rendering modes, variable values and `symbolEffect`;
         - Dynamic Type.
-  - [ ] Task 18.2. Figure: a table of how the same `Form` renders on iOS, macOS and watchOS.
+  - [x] Task 18.2. Figure: a table of how the same `Form` renders on iOS, macOS and watchOS.
 - [ ] Task 19. `apps/apple/swiftui-drawing-animation-and-gestures.adoc`: *Drawing, Animation and Gestures*
   - [ ] Task 19.1. Content:
         - `Shape`/`Path` (a note-card corner shape), `Canvas` and `TimelineView`;
