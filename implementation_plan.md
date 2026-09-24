@@ -252,12 +252,12 @@ and the rendering rules.
     Nutrition Labels; age-rating questionnaire (date); App Review Guidelines sections 1–5 (revision date); phased
     release; upcoming SDK requirements with dates; EU alternative distribution and MarketplaceKit.
   - Figure: 📊 Mermaid sequence archive → … → phased release.
-- [ ] Task 13. `apps/apple/macos-distribution-outside-the-app-store.adoc`: *Distributing Mac Apps with Developer ID and Notarization*
+- [x] Task 13. `apps/apple/macos-distribution-outside-the-app-store.adoc`: *Distributing Mac Apps with Developer ID and Notarization*
   - Content: Developer ID Application/Installer certificates (Account Holder); hardened runtime;
     `xcrun notarytool submit --wait` with the `fieldnotes-notary` profile, `xcrun stapler staple`, `altool` retired;
     Gatekeeper; DMG, `pkgbuild`/`productbuild`, ZIP; common notarization issues.
   - Figure: 📊 Mermaid build → sign → notarize → staple → distribute → Gatekeeper.
-- [ ] Task 14. `apps/apple/ci-cd-xcode-cloud-and-command-line.adoc`: *CI/CD with Xcode Cloud and the Command Line*
+- [x] Task 14. `apps/apple/ci-cd-xcode-cloud-and-command-line.adoc`: *CI/CD with Xcode Cloud and the Command Line*
   - Content: Xcode Cloud workflows (start conditions, actions, post-actions to TestFlight), `ci_scripts/`,
     environment variables, webhooks and simpler TestFlight workflows (27), included compute hours (dated), the
     membership question from #174 resolved or both sources stated; `xcodebuild` build/`test -testPlan`/archive/
