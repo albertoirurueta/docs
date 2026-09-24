@@ -325,7 +325,7 @@ them must be covered.
     - `FieldSensorScanner` (Core Bluetooth) and AccessorySetupKit;
     - `NFCNoteTagReader`.
   - Figure: 📊 framework × platform table.
-- [ ] Task 14. `apps/apple/security-and-privacy.adoc`: *Security and Privacy*
+- [x] Task 14. `apps/apple/security-and-privacy.adoc`: *Security and Privacy*
   - Content:
     - `KeychainStore` (add, query, update, delete; accessibility classes; access group for the App Group apps);
     - `BiometricLock` (LocalAuthentication, Keychain access control);
@@ -338,7 +338,7 @@ them must be covered.
     - App Attest;
     - Trust Insights (27).
   - Figures: 📊 Mermaid passkey sequence and protection-class flowchart.
-- [ ] Task 15. `apps/apple/storekit-in-app-purchases.adoc`: *In-App Purchases and Subscriptions with StoreKit 2*
+- [x] Task 15. `apps/apple/storekit-in-app-purchases.adoc`: *In-App Purchases and Subscriptions with StoreKit 2*
   - Content:
     - `StoreManager` (products, purchase, verification, the `Transaction.updates` listener started at launch,
       entitlements, `AppStore.sync()`);
@@ -347,7 +347,7 @@ them must be covered.
     - the 2026 commitment plans;
     - a forward link to page 46 for review rules.
   - Figure: 📊 Mermaid purchase sequence.
-- [ ] Task 16. `apps/apple/augmented-reality.adoc`: *Augmented Reality with ARKit and RealityKit*
+- [x] Task 16. `apps/apple/augmented-reality.adoc`: *Augmented Reality with ARKit and RealityKit*
   - Content:
     - RealityKit's ECS with `NotePinComponent`/`NotePinSystem`;
     - `FieldNotesARView` on iOS (world tracking, planes, anchors);
