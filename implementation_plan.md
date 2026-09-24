@@ -270,10 +270,10 @@ and the rendering rules.
 Parallelizable: yes. Each task edits different files. Runs after Group 2, because the bibliography and link texts
 depend on the finished pages.
 
-- [ ] Task 15. `apps/apple/index.adoc` § `== Bibliography`: add every official URL used by pages 36–48 that isn't
+- [x] Task 15. `apps/apple/index.adoc` § `== Bibliography`: add every official URL used by pages 36–48 that isn't
   listed, merged into the existing groups, using the `link:++…++[+…+]` form where needed; keep the closing
   paragraph about #175.
-- [ ] Task 16. `apps/apple/index.adoc` § *The FieldNotes app*: one sentence on what part 3 adds (iPad windows and
+- [x] Task 16. `apps/apple/index.adoc` § *The FieldNotes app*: one sentence on what part 3 adds (iPad windows and
   commands, the Mac utility window and menu bar extra, the watch bridge and complication, the visionOS volume,
   the test targets and test plan, and the release pipeline).
 - [x] Task 17. Normalize the link text of every existing `xref:` to pages 36–48 across `apps/apple/*.adoc` to the
@@ -291,29 +291,29 @@ depend on the finished pages.
 
 Parallelizable: no. Each task depends on the one before it.
 
-- [ ] Task 19. Consistency pass over pages 36–48 and any page they touch:
-  - [ ] Task 19.1. Exactly one definition per canonical name (the duplicate-definition scan from #173), and no
+- [x] Task 19. Consistency pass over pages 36–48 and any page they touch:
+  - [x] Task 19.1. Exactly one definition per canonical name (the duplicate-definition scan from #173), and no
     redefinition of part 1–2 types.
-  - [ ] Task 19.2. Part 1–2 signatures used unchanged (`NoteStore(...)`, `NoteEditor(noteID:)`,
+  - [x] Task 19.2. Part 1–2 signatures used unchanged (`NoteStore(...)`, `NoteEditor(noteID:)`,
     `NoteList(notebookID:selection:)`, `TagChip(_:isSelected:)`, `CaptureButton(action:)`, `AppServices.shared`,
     `SharedNoteAccess.persistence()`).
-  - [ ] Task 19.3. Store injection wherever `@Environment(NoteStore.self)` is read; new scenes (`NoteWindow`,
+  - [x] Task 19.3. Store injection wherever `@Environment(NoteStore.self)` is read; new scenes (`NoteWindow`,
     `TagInspector`, `FieldSiteVolume`) get `.environment(store)`.
-  - [ ] Task 19.4. Platform guards (`#if os(...)`, `canImport`, `#available` for 27-only APIs).
-  - [ ] Task 19.5. Every dated rule has a date and an official link.
-  - [ ] Task 19.6. Fix everything found.
-- [ ] Task 20. Validation:
-  - [ ] Task 20.1. No admonitions under `apps/apple` except the disclaimer include.
-  - [ ] Task 20.2. Every new page has `:description:`, `:keywords:`, the disclaimer, a `=== Platform availability`
+  - [x] Task 19.4. Platform guards (`#if os(...)`, `canImport`, `#available` for 27-only APIs).
+  - [x] Task 19.5. Every dated rule has a date and an official link.
+  - [x] Task 19.6. Fix everything found.
+- [x] Task 20. Validation:
+  - [x] Task 20.1. No admonitions under `apps/apple` except the disclaimer include.
+  - [x] Task 20.2. Every new page has `:description:`, `:keywords:`, the disclaimer, a `=== Platform availability`
     table and `== References`.
-  - [ ] Task 20.3. Every example block is followed by an official link (deliberate exceptions only).
-  - [ ] Task 20.4. `npm run validate:mermaid` passes; restore `node_modules/.package-lock.json`.
-  - [ ] Task 20.5. Every new `apple-*.svg` is well-formed XML.
-  - [ ] Task 20.6. Antora build: 0 warnings; the only remaining `xref` errors target `cheat-sheet.adoc`; record the
+  - [x] Task 20.3. Every example block is followed by an official link (deliberate exceptions only).
+  - [x] Task 20.4. `npm run validate:mermaid` passes; restore `node_modules/.package-lock.json`.
+  - [x] Task 20.5. Every new `apple-*.svg` is well-formed XML.
+  - [x] Task 20.6. Antora build: 0 warnings; the only remaining `xref` errors target `cheat-sheet.adoc`; record the
     count.
-  - [ ] Task 20.7. Rendering check on the built HTML: no literal backticks outside code, no `<em>` inside Apple link
+  - [x] Task 20.7. Rendering check on the built HTML: no literal backticks outside code, no `<em>` inside Apple link
     URLs, no raw `xref:` text.
-  - [ ] Task 20.8. `detect-secrets` over the changed files; triage findings (the known placeholder checksum is a
+  - [x] Task 20.8. `detect-secrets` over the changed files; triage findings (the known placeholder checksum is a
     confirmed false positive).
 - [ ] Task 21. Post a comment on #170 listing the unverified claims and API shapes per page, how the #174 "facts to
   verify" were resolved, and the final forward-link count.
