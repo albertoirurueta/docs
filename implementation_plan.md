@@ -366,16 +366,16 @@ collects the URLs the pages actually use.
   - Merge them into the existing groups: Apple Developer Documentation (one bullet per framework, with subpages
     inline), Apple tutorials, sample code and release notes, and WWDC sessions by year.
   - Keep the closing plain paragraph saying #175 completes the books and the remaining groups.
-- [ ] Task 18. `apps/apple/index.adoc` § *The FieldNotes app*: add one sentence on what part 2 adds: persistence
+- [x] Task 18. `apps/apple/index.adoc` § *The FieldNotes app*: add one sentence on what part 2 adds: persistence
   and sync, widgets and a Live Activity, App Intents, on-device summaries, location and photos, Keychain/passkey
   sign-in, and FieldNotes Pro.
-- [ ] Task 19. `database/couchbase/sdks-and-mobile.adoc` § `== Couchbase Mobile`: add one sentence linking
+- [x] Task 19. `database/couchbase/sdks-and-mobile.adoc` § `== Couchbase Mobile`: add one sentence linking
   `xref:apps/apple/core-data-cloudkit-and-icloud.adoc[…]` and `xref:apps/apple/swiftdata.adoc[…]` as Apple's
   first-party alternatives on Apple platforms.
-- [ ] Task 20. `apps/react-native/storage-and-offline.adoc` § *Choosing a Storage Mechanism* and
+- [x] Task 20. `apps/react-native/storage-and-offline.adoc` § *Choosing a Storage Mechanism* and
   `apps/react-native/security.adoc` § *Secure Storage*: add one sentence each pointing to the native pages
   (`swiftdata`, `preferences-files-and-documents` and `security-and-privacy`).
-- [ ] Task 21. `backend/messaging/index.adoc`: add one sentence in its related or overview section linking
+- [x] Task 21. `backend/messaging/index.adoc`: add one sentence in its related or overview section linking
   `xref:apps/apple/notifications-and-live-activities.adoc[…]`, for delivering push to Apple devices through APNs.
 
 ### Group 4: Consistency pass, validation, #170 comment and commit
