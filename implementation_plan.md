@@ -332,64 +332,66 @@ Must land first: every page includes it.
 
 ### Group 5 — Compose, registries, security and orchestration (Parallelizable: yes — five distinct pages)
 
-- [ ] Task 14. `compose-fundamentals.adoc` — "Docker Compose Fundamentals"
-  - [ ] Task 14.1. Compose and the Compose Specification: the `docker compose` plugin (v2; v5 = v2 + Go SDK) vs. the
+> Done: `compose-fundamentals.adoc`, `compose-in-practice.adoc`, `registries-and-docker-hub.adoc`, `security.adoc`, `orchestration-swarm-and-kubernetes.adoc`; figures `docker-compose-application-model.svg`, `docker-compose-merge.svg`, `docker-registry-push-pull.svg`, `docker-isolation-layers.svg`, `docker-swarm-routing-mesh.svg` + 5 Mermaid blocks (17 total, all parse). Build: 0 messages besides forward xrefs (inline `${VAR}` escaped as passthrough to avoid attribute warnings). Verified against docker/docs (Compose history/precedence/hooks/watch incl. `sync+exec`, Hub pull limits 100/200 per 6 h, automated builds removal 2027-04-01) and the CNCF Distribution docs. The Docker Java guide sub-pages are now one page (`guides/java/`), linked directly.
+
+- [x] Task 14. `compose-fundamentals.adoc` — "Docker Compose Fundamentals"
+  - [x] Task 14.1. Compose and the Compose Specification: the `docker compose` plugin (v2; v5 = v2 + Go SDK) vs. the
         retired Python `docker-compose` v1; file formats 1/2.x/3.x merged into the Specification; `compose.yaml` naming
         and lookup order; `version:` ignored.
-  - [ ] Task 14.2. Application model (project, services, networks, volumes, configs, secrets); service essentials
+  - [x] Task 14.2. Application model (project, services, networks, volumes, configs, secrets); service essentials
         (`image`/`build`, `ports`, `environment`/`env_file`, `volumes`, `networks`, `depends_on` with
         `condition: service_healthy`, `healthcheck`, `restart`, `command`/`entrypoint`, `deploy.resources`,
         `profiles`).
-  - [ ] Task 14.3. CLI (`up -d --build`, `down -v`, `ps`, `logs -f`, `exec`, `run --rm`, `config`, `watch`); project
+  - [x] Task 14.3. CLI (`up -d --build`, `down -v`, `ps`, `logs -f`, `exec`, `run --rm`, `config`, `watch`); project
         names; interpolation (`.env`, precedence, `${VAR:-default}`); startup order and readiness; a first
         `compose.yaml` (web app + PostgreSQL); _Learning Docker_ ch. 8 file rewritten to the Specification.
-  - [ ] Task 14.4. 📊 `docker-compose-application-model.svg`; 📊 mermaid `up` ordering with `depends_on` conditions.
-  - [ ] Task 14.5. `== References`: `compose/intro/`, `compose/intro/history/`, `compose/gettingstarted/`,
+  - [x] Task 14.4. 📊 `docker-compose-application-model.svg`; 📊 mermaid `up` ordering with `depends_on` conditions.
+  - [x] Task 14.5. `== References`: `compose/intro/`, `compose/intro/history/`, `compose/gettingstarted/`,
         `compose/how-tos/startup-order/`, `compose/how-tos/environment-variables/`, `reference/compose-file/`,
         `reference/cli/docker/compose/`, the compose-spec repo.
 
-- [ ] Task 15. `compose-in-practice.adoc` — "Compose in Practice"
-  - [ ] Task 15.1. Multiple files (`-f` merge rules, `extends`, `include`), profiles, Compose Watch (`develop.watch`:
+- [x] Task 15. `compose-in-practice.adoc` — "Compose in Practice"
+  - [x] Task 15.1. Multiple files (`-f` merge rules, `extends`, `include`), profiles, Compose Watch (`develop.watch`:
         `sync`, `rebuild`, `sync+restart`), lifecycle hooks, init containers.
-  - [ ] Task 15.2. Secrets (file-based, why not `environment:`), configs, provider services, GPU, `models:` and Compose
+  - [x] Task 15.2. Secrets (file-based, why not `environment:`), configs, provider services, GPU, `models:` and Compose
         Bridge with one example each; Compose apps as OCI artifacts; Compose in production; the trust model.
-  - [ ] Task 15.3. 📊 mermaid Watch sync/rebuild decision; 📊 `docker-compose-merge.svg` (base + override + profile).
-  - [ ] Task 15.4. `== References`: every `compose/how-tos/*` page used, `compose/bridge/`, `compose/trust-model/`.
+  - [x] Task 15.3. 📊 mermaid Watch sync/rebuild decision; 📊 `docker-compose-merge.svg` (base + override + profile).
+  - [x] Task 15.4. `== References`: every `compose/how-tos/*` page used, `compose/bridge/`, `compose/trust-model/`.
 
-- [ ] Task 16. `registries-and-docker-hub.adoc` — "Registries and Docker Hub"
-  - [ ] Task 16.1. OCI distribution API (blobs, manifests, pull by tag vs. digest); Docker Hub (repositories, tags,
+- [x] Task 16. `registries-and-docker-hub.adoc` — "Registries and Docker Hub"
+  - [x] Task 16.1. OCI distribution API (blobs, manifests, pull by tag vs. digest); Docker Hub (repositories, tags,
         immutable tags, Official Images, Verified Publishers, access tokens, `docker login`, pull usage/rate limits and
         avoiding them in CI — authenticated pulls, mirrors, GHCR).
-  - [ ] Task 16.2. Pushing (`tag` + `push`, multi-platform via Buildx); GHCR, ECR, Artifact Registry, ACR (OIDC named);
+  - [x] Task 16.2. Pushing (`tag` + `push`, multi-platform via Buildx); GHCR, ECR, Artifact Registry, ACR (OIDC named);
         a private registry with CNCF Distribution (TLS, auth, pull-through cache); OCI artifacts; webhooks; autobuilds
         legacy; Python `docker-registry` historical.
-  - [ ] Task 16.3. 📊 `docker-registry-push-pull.svg`; 📊 mermaid CI pulling via a mirror.
-  - [ ] Task 16.4. `== References`: `docker-hub/quickstart/`, `docker-hub/repos/`, `docker-hub/usage/pulls/`,
+  - [x] Task 16.3. 📊 `docker-registry-push-pull.svg`; 📊 mermaid CI pulling via a mirror.
+  - [x] Task 16.4. `== References`: `docker-hub/quickstart/`, `docker-hub/repos/`, `docker-hub/usage/pulls/`,
         `security/access-tokens/`, `docker-hub/repos/manage/builds/migrate/`, distribution.github.io/distribution/,
         OCI distribution-spec, docs.github.com "Working with the Container registry".
 
-- [ ] Task 17. `security.adoc` — "Docker Security"
-  - [ ] Task 17.1. Threat model (daemon root, socket root, images are code); protecting the socket and remote access
+- [x] Task 17. `security.adoc` — "Docker Security"
+  - [x] Task 17.1. Threat model (daemon root, socket root, images are code); protecting the socket and remote access
         (TLS, SSH contexts); rootless mode; `userns-remap`; non-root inside the container.
-  - [ ] Task 17.2. Capabilities (`--cap-drop=ALL --cap-add`), seccomp, AppArmor/SELinux, `--read-only`/`--tmpfs`,
+  - [x] Task 17.2. Capabilities (`--cap-drop=ALL --cap-add`), seccomp, AppArmor/SELinux, `--read-only`/`--tmpfs`,
         `no-new-privileges`, `--privileged` and devices, resource limits as DoS guard, build/run-time secrets, image
         hygiene (`xref:` Task 8), Enhanced Container Isolation named, CIS Docker Benchmark, "security non-events".
-  - [ ] Task 17.3. The two books' checklists consolidated into one table with the official page per row; Content Trust
+  - [x] Task 17.3. The two books' checklists consolidated into one table with the official page per row; Content Trust
         historical.
-  - [ ] Task 17.4. 📊 `docker-isolation-layers.svg`; 📊 mermaid build-time vs. run-time secret paths.
-  - [ ] Task 17.5. `== References`: `engine/security/`, `engine/security/rootless/`, `engine/security/userns-remap/`,
+  - [x] Task 17.4. 📊 `docker-isolation-layers.svg`; 📊 mermaid build-time vs. run-time secret paths.
+  - [x] Task 17.5. `== References`: `engine/security/`, `engine/security/rootless/`, `engine/security/userns-remap/`,
         `engine/security/seccomp/`, `engine/security/apparmor/`, `engine/security/protect-access/`,
         `engine/security/non-events/`, `compose/how-tos/use-secrets/`.
 
-- [ ] Task 18. `orchestration-swarm-and-kubernetes.adoc` — "Orchestration: Swarm Mode and Kubernetes"
-  - [ ] Task 18.1. When one host is not enough; Swarm mode summary (nodes, managers/Raft, services/tasks,
+- [x] Task 18. `orchestration-swarm-and-kubernetes.adoc` — "Orchestration: Swarm Mode and Kubernetes"
+  - [x] Task 18.1. When one host is not enough; Swarm mode summary (nodes, managers/Raft, services/tasks,
         `docker stack deploy`, rolling updates, routing mesh, secrets/configs, overlay networks) with an honest note on
         its position today.
-  - [ ] Task 18.2. Kubernetes as the default (Desktop's cluster, Compose Bridge, what changes) pointing to
+  - [x] Task 18.2. Kubernetes as the default (Desktop's cluster, Compose Bridge, what changes) pointing to
         `xref:backend/quarkus/kubernetes-and-openshift.adoc`; Twelve-Factor recap linking
         `xref:backend/architecture/decisions-and-migrations/index.adoc`; 2015 Swarm/Centurion/ECS historical.
-  - [ ] Task 18.3. 📊 `docker-swarm-routing-mesh.svg`; 📊 mermaid single host → Compose → Swarm/Kubernetes decision.
-  - [ ] Task 18.4. `== References`: `engine/swarm/`, `engine/swarm/key-concepts/`, `engine/swarm/ingress/`,
+  - [x] Task 18.3. 📊 `docker-swarm-routing-mesh.svg`; 📊 mermaid single host → Compose → Swarm/Kubernetes decision.
+  - [x] Task 18.4. `== References`: `engine/swarm/`, `engine/swarm/key-concepts/`, `engine/swarm/ingress/`,
         `engine/swarm/stack-deploy/`, `desktop/features/kubernetes/`, `compose/bridge/`, 12factor.net.
 
 ### Group 6 — Java/Spring Boot I: images, Compose for local dev, Testcontainers fundamentals (Parallelizable: yes — three distinct pages)
