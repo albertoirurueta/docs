@@ -208,7 +208,7 @@ The scope, sub-concepts, 📊 figures and links for each page are in `sub2.md` u
 them must be covered.
 
 - [x] Task 2. `apps/apple/swiftdata.adoc`: *Persisting Models with SwiftData*
-  - [ ] Task 2.1. Content:
+  - [x] Task 2.1. Content:
     - the `NoteRecord`/`NotebookRecord`/`PhotoRecord` models, attributes and relationships, `#Unique`/`#Index`,
       and inheritance;
     - `ModelContainer.fieldNotes(inMemory:)` in the App Group with CloudKit, `ModelContext`, and undo;
@@ -219,7 +219,7 @@ them must be covered.
     - the "`@Model` in views" alternative for small apps;
     - persistent history, and `ResultsObserver`/`HistoryObserver` (27);
     - the rule that only the main app migrates.
-  - [ ] Task 2.2. Figures:
+  - [x] Task 2.2. Figures:
     - Mermaid class diagram: container → context → records → `@Query`, and the `NotePersisting` layer;
     - Mermaid migration stages;
     - `apple-swiftdata-app-group.svg`.
@@ -383,22 +383,22 @@ collects the URLs the pages actually use.
 Parallelizable: no. Each task depends on the one before it.
 
 - [x] Task 22. Consistency pass over pages 21–35, and any part 1 page they touch:
-  - [ ] Task 22.1. Grep every canonical name from the sheet (`NoteRecord`, `NotePersisting`, `NoteEntity`,
+  - [x] Task 22.1. Grep every canonical name from the sheet (`NoteRecord`, `NotePersisting`, `NoteEntity`,
     `KeychainStore`, `StoreManager`, `LocationService`, `FieldTripAttributes`, and so on) for conflicting
     definitions. There must be exactly one `struct`/`class`/`enum`/`actor`/`protocol` definition per name, or
     explicitly labelled revisions of it.
-  - [ ] Task 22.2. Check that part 1 types are only used, never redefined, with part 1's signatures:
+  - [x] Task 22.2. Check that part 1 types are only used, never redefined, with part 1's signatures:
     - `NoteStore(...)`, including the new `persistence:` parameter where used;
     - `NoteEditor(noteID:)`, `NoteList(notebookID:selection:)`, `TagChip(_:)`, `CaptureButton(action:)`;
     - `NoteSortOrder`.
-  - [ ] Task 22.3. Check that views reading `@Environment(NoteStore.self)` get it injected in scene or preview
+  - [x] Task 22.3. Check that views reading `@Environment(NoteStore.self)` get it injected in scene or preview
     code.
-  - [ ] Task 22.4. Check platform guards:
+  - [x] Task 22.4. Check platform guards:
     - `ActivityKit`, `BackgroundTasks`, `HealthKit`, `NFC`, `ARKit` and `VisionKit` usages sit behind `#if os(...)`
       or `canImport` where the page's target includes platforms without them;
     - 27-only APIs are behind `#available`.
-  - [ ] Task 22.5. Check that every `Package.swift` starts with `// swift-tools-version: 6.4`.
-  - [ ] Task 22.6. Fix everything found.
+  - [x] Task 22.5. Check that every `Package.swift` starts with `// swift-tools-version: 6.4`.
+  - [x] Task 22.6. Fix everything found.
 - [x] Task 23. Validation:
   - [x] Task 23.1. No admonitions under `apps/apple` except the disclaimer include.
   - [x] Task 23.2. Every new page has `:description:`, `:keywords:`, the disclaimer, a `=== Platform availability`
@@ -413,7 +413,7 @@ Parallelizable: no. Each task depends on the one before it.
     - no error targets pages 1–35;
     - record the count.
   - [x] Task 23.7. Run `detect-secrets` over the changed files and triage any finding.
-- [ ] Task 24. Post a comment on #170 listing the unverified claims and API shapes the page writers reported,
+- [x] Task 24. Post a comment on #170 listing the unverified claims and API shapes the page writers reported,
   grouped by page, plus the final forward-link count.
-- [ ] Task 25. Commit on `feature/173` with a message starting `Apple Platforms part 2:`, reviewing `git status` and
+- [x] Task 25. Commit on `feature/173` with a message starting `Apple Platforms part 2:`, reviewing `git status` and
   excluding `build/` and `node_modules/`, then push.
