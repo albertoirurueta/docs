@@ -272,60 +272,62 @@ Must land first: every page includes it.
 
 ### Group 4 — Running containers (Parallelizable: yes — five distinct pages)
 
-- [ ] Task 9. `running-containers.adoc` — "Running Containers"
-  - [ ] Task 9.1. Lifecycle (`create` → `start` → running → `stop`/`kill` → exited → `rm`; `pause`; `restart`).
-  - [ ] Task 9.2. `docker run` options: `-d`, `-it`, `--rm`, `--name`, `-e`/`--env-file`, `-p`/`-P`, `-v`/`--mount`,
+> Done: `running-containers.adoc`, `storage-volumes-and-bind-mounts.adoc`, `networking.adoc`, `resources-logging-and-monitoring.adoc`, `debugging-containers.adoc`; figures `docker-run-option-groups.svg`, `docker-storage-mounts.svg`, `docker-networking-bridges.svg`, `docker-cgroup-limits.svg`, `docker-debug-sidecar.svg` + 5 Mermaid blocks (12 total, all parse). Build: 0 messages besides forward xrefs; docs.docker.com links and xref anchors verified; every image tag checked against Docker Hub; ad hoc detect-secrets scan clean.
+
+- [x] Task 9. `running-containers.adoc` — "Running Containers"
+  - [x] Task 9.1. Lifecycle (`create` → `start` → running → `stop`/`kill` → exited → `rm`; `pause`; `restart`).
+  - [x] Task 9.2. `docker run` options: `-d`, `-it`, `--rm`, `--name`, `-e`/`--env-file`, `-p`/`-P`, `-v`/`--mount`,
         `--network`, `-w`, `-u`, `--entrypoint`, `--init`, `--restart`, `--stop-timeout`, `--label`, `--platform`;
         overriding image defaults.
-  - [ ] Task 9.3. `exec`, `logs`, `ps`, `inspect`, `top`, `stats`, `cp`, `attach`, `port`, `update`, `wait`; signals
+  - [x] Task 9.3. `exec`, `logs`, `ps`, `inspect`, `top`, `stats`, `cp`, `attach`, `port`, `update`, `wait`; signals
         and exit codes (PID 1, `SIGTERM` → `SIGKILL`, `--init`/tini, graceful shutdown); restart policies vs. process
         managers; one process per container; pruning.
-  - [ ] Task 9.4. 📊 mermaid `stateDiagram-v2` of the lifecycle; 📊 `docker-run-option-groups.svg`.
-  - [ ] Task 9.5. `== References`: `engine/containers/run/`, `engine/containers/start-containers-automatically/`,
+  - [x] Task 9.4. 📊 mermaid `stateDiagram-v2` of the lifecycle; 📊 `docker-run-option-groups.svg`.
+  - [x] Task 9.5. `== References`: `engine/containers/run/`, `engine/containers/start-containers-automatically/`,
         `engine/containers/multi-service_container/`, `reference/cli/docker/container/`.
 
-- [ ] Task 10. `storage-volumes-and-bind-mounts.adoc` — "Storage: Volumes, Bind Mounts and tmpfs"
-  - [ ] Task 10.1. Ephemeral writable layer; named/anonymous volumes and `docker volume`; bind mounts (UID mapping,
+- [x] Task 10. `storage-volumes-and-bind-mounts.adoc` — "Storage: Volumes, Bind Mounts and tmpfs"
+  - [x] Task 10.1. Ephemeral writable layer; named/anonymous volumes and `docker volume`; bind mounts (UID mapping,
         read-only, `:z`/`:Z`); tmpfs; `--mount` vs. `-v`; image mounts.
-  - [ ] Task 10.2. Backup/restore a volume with a throwaway container; Desktop file sharing and synchronized file
+  - [x] Task 10.2. Backup/restore a volume with a throwaway container; Desktop file sharing and synchronized file
         shares; overlay2 vs. containerd image store (link Task 3); `--volumes-from` flagged historical.
-  - [ ] Task 10.3. 📊 `docker-storage-mounts.svg`; 📊 mermaid backup/restore round trip.
-  - [ ] Task 10.4. `== References`: `engine/storage/`, `engine/storage/volumes/`, `engine/storage/bind-mounts/`,
+  - [x] Task 10.3. 📊 `docker-storage-mounts.svg`; 📊 mermaid backup/restore round trip.
+  - [x] Task 10.4. `== References`: `engine/storage/`, `engine/storage/volumes/`, `engine/storage/bind-mounts/`,
         `engine/storage/tmpfs/`, `desktop/features/synchronized-file-sharing/`.
 
-- [ ] Task 11. `networking.adoc` — "Networking"
-  - [ ] Task 11.1. Drivers: default `bridge` vs. user-defined bridge (embedded DNS, discovery by name), `host`,
+- [x] Task 11. `networking.adoc` — "Networking"
+  - [x] Task 11.1. Drivers: default `bridge` vs. user-defined bridge (embedded DNS, discovery by name), `host`,
         `none`, `overlay`, `macvlan`, `ipvlan`; `docker network` commands.
-  - [ ] Task 11.2. Port publishing (`-p host:container/proto`, interface binding, `-P`, `EXPOSE` as documentation);
+  - [x] Task 11.2. Port publishing (`-p host:container/proto`, interface binding, `-P`, `EXPOSE` as documentation);
         `host.docker.internal`, `--add-host host-gateway`; DNS; IPv6.
-  - [ ] Task 11.3. iptables/nftables (`DOCKER-USER`, the 29 nftables backend, published ports bypass host
+  - [x] Task 11.3. iptables/nftables (`DOCKER-USER`, the 29 nftables backend, published ports bypass host
         firewalls); proxies; `--link` historical (no env vars injected in 29); the `docker0`/NAT explanation modernised.
-  - [ ] Task 11.4. 📊 `docker-networking-bridges.svg`; 📊 mermaid request through the published-port NAT.
-  - [ ] Task 11.5. `== References`: `engine/network/`, `engine/network/drivers/bridge/` (and siblings),
+  - [x] Task 11.4. 📊 `docker-networking-bridges.svg`; 📊 mermaid request through the published-port NAT.
+  - [x] Task 11.5. `== References`: `engine/network/`, `engine/network/drivers/bridge/` (and siblings),
         `engine/network/port-publishing/`, `engine/network/packet-filtering-firewalls/`, `engine/network/links/`.
 
-- [ ] Task 12. `resources-logging-and-monitoring.adoc` — "Resources, Logging and Monitoring"
-  - [ ] Task 12.1. cgroup limits (`--memory`, `--memory-swap`, `--cpus`, `--cpuset-cpus`, `--pids-limit`,
+- [x] Task 12. `resources-logging-and-monitoring.adoc` — "Resources, Logging and Monitoring"
+  - [x] Task 12.1. cgroup limits (`--memory`, `--memory-swap`, `--cpus`, `--cpuset-cpus`, `--pids-limit`,
         `--ulimit`, `--gpus`); OOM; what the JVM sees (container awareness, `-XX:MaxRAMPercentage`,
         `-XX:ActiveProcessorCount`).
-  - [ ] Task 12.2. Logging drivers (`json-file`/`local` with rotation, `journald`, `fluentd`, `gelf`, `awslogs`,
+  - [x] Task 12.2. Logging drivers (`json-file`/`local` with rotation, `journald`, `fluentd`, `gelf`, `awslogs`,
         `syslog`), dual logging, stdout/stderr as the contract.
-  - [ ] Task 12.3. `docker stats`, `events`, `system df`, health states, daemon Prometheus metrics (`xref:` to the
+  - [x] Task 12.3. `docker stats`, `events`, `system df`, health states, daemon Prometheus metrics (`xref:` to the
         Prometheus reference incl. `database/prometheus/containers-and-kubernetes-monitoring.adoc`), cAdvisor named;
         pruning and labels.
-  - [ ] Task 12.4. 📊 `docker-cgroup-limits.svg`; 📊 mermaid logging pipeline.
-  - [ ] Task 12.5. `== References`: `engine/containers/resource_constraints/`, `engine/containers/runmetrics/`,
+  - [x] Task 12.4. 📊 `docker-cgroup-limits.svg`; 📊 mermaid logging pipeline.
+  - [x] Task 12.5. `== References`: `engine/containers/resource_constraints/`, `engine/containers/runmetrics/`,
         `engine/logging/`, `engine/logging/configure/`, `engine/daemon/prometheus/`, the Java 25 `java` man page.
 
-- [ ] Task 13. `debugging-containers.adoc` — "Debugging Containers"
-  - [ ] Task 13.1. The toolbox in order: `logs`, `ps -a` and exit codes, `inspect --format` Go templates,
+- [x] Task 13. `debugging-containers.adoc` — "Debugging Containers"
+  - [x] Task 13.1. The toolbox in order: `logs`, `ps -a` and exit codes, `inspect --format` Go templates,
         `exec -it … sh`, `docker debug` for shell-less images, `top`, `diff`, `cp`, `image history`, `events`;
         namespace-sharing sidecars (`--pid=container:`, `--network=container:`); `nsenter` historical; daemon logs and
         `dockerd --debug`.
-  - [ ] Task 13.2. Common-failures table (port already allocated, `docker.sock` permission denied, no space left, DNS
+  - [x] Task 13.2. Common-failures table (port already allocated, `docker.sock` permission denied, no space left, DNS
         in containers, `exec format error`, OOM-killed, healthcheck never healthy, bind-mount changes not visible).
-  - [ ] Task 13.3. 📊 mermaid troubleshooting flowchart; 📊 `docker-debug-sidecar.svg`.
-  - [ ] Task 13.4. `== References`: `reference/cli/docker/debug/`, `reference/cli/docker/container/inspect/`,
+  - [x] Task 13.3. 📊 mermaid troubleshooting flowchart; 📊 `docker-debug-sidecar.svg`.
+  - [x] Task 13.4. `== References`: `reference/cli/docker/debug/`, `reference/cli/docker/container/inspect/`,
         `engine/cli/formatting/`, `engine/daemon/troubleshoot/`, `engine/daemon/logs/`.
 
 ### Group 5 — Compose, registries, security and orchestration (Parallelizable: yes — five distinct pages)
