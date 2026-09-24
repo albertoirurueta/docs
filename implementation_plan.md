@@ -158,8 +158,8 @@ Parallelizable: yes. Each task edits a different file, and none needs another's 
   - [x] Task 1.1. Copy the text verbatim from #170, following `react-native-disclaimer.adoc`: an `[IMPORTANT]`
         block with the AI-assistance sentence and
         `xref:apps/apple/index.adoc#_bibliography[the section bibliography]`, and nothing else.
-- [ ] Task 2. Create the landing page `modules/ROOT/pages/apps/apple/index.adoc`
-  - [ ] Task 2.1. Header:
+- [x] Task 2. Create the landing page `modules/ROOT/pages/apps/apple/index.adoc`
+  - [x] Task 2.1. Header:
         - `= Apple Platforms`;
         - `:description:`;
         - `:keywords:` with the terms #170 lists: the version baseline, SwiftUI, UIKit, AppKit, SwiftData,
@@ -168,7 +168,7 @@ Parallelizable: yes. Each task edits a different file, and none needs another's 
         - `include::partial$apple-disclaimer.adoc[]`;
         - an intro paragraph stating the baseline in prose: 27 releases, Xcode 27, Swift 6.4, deployment
           minimum 26.
-  - [ ] Task 2.2. `== How Apple app development got here`: a `[cols="1,4",options="header"]` milestones table:
+  - [x] Task 2.2. `== How Apple app development got here`: a `[cols="1,4",options="header"]` milestones table:
         - Objective-C/Cocoa and UIKit (2008);
         - Swift (2014);
         - SwiftUI (2019);
@@ -176,10 +176,10 @@ Parallelizable: yes. Each task edits a different file, and none needs another's 
         - Observation and SwiftData, visionOS announced (2023);
         - year-based versions 26 with Liquid Glass and Foundation Models (2025);
         - the 27 releases: `@State` macro, `ContentBuilder`, mandatory UIKit scene life cycle, Swift 6.4 (2026).
-  - [ ] Task 2.3. `== New here? Read in this order`: an xref chain through pages 1 → 4 → 9 → 10 → 11 → 13 → 5.
-  - [ ] Task 2.4. `== The FieldNotes app`: one or two paragraphs introducing the running app (the canonical
+  - [x] Task 2.3. `== New here? Read in this order`: an xref chain through pages 1 → 4 → 9 → 10 → 11 → 13 → 5.
+  - [x] Task 2.4. `== The FieldNotes app`: one or two paragraphs introducing the running app (the canonical
         reference above, in reader-facing prose).
-  - [ ] Task 2.5. `== What's covered`:
+  - [x] Task 2.5. `== What's covered`:
         - `===` groups for all **48** pages plus the cheat sheet, in #170's order:
           - Foundations & tooling;
           - SwiftUI, UI & design;
@@ -193,7 +193,7 @@ Parallelizable: yes. Each task edits a different file, and none needs another's 
           - Reference.
         - Each entry is `* xref:apps/apple/<slug>.adoc[<Title>] -- <one-line summary>`.
         - Titles come from #172, #173 and #174. Pages 21–48 and the cheat sheet are forward links (decision 2).
-  - [ ] Task 2.6. `== Related sections`: prose linking every "What already exists" row of #170:
+  - [x] Task 2.6. `== Related sections`: prose linking every "What already exists" row of #170:
         - the Swift and Objective-C references;
         - Android;
         - React Native;
@@ -202,7 +202,7 @@ Parallelizable: yes. Each task edits a different file, and none needs another's 
         - `web/accessibility.adoc`;
         - `web/e2e-testing-real-browsers.adoc`;
         - the architectural-patterns section.
-  - [ ] Task 2.7. `[[_bibliography]]` then `== Bibliography`:
+  - [x] Task 2.7. `[[_bibliography]]` then `== Bibliography`:
         - Seed it with the sources used by pages 1–20, grouped as #175 specifies:
           - `=== Apple Developer Documentation`: SwiftUI, UIKit, AppKit, Observation, Xcode, Swift/concurrency,
             PackageDescription, Accessibility, localization;
