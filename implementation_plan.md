@@ -514,8 +514,8 @@ name, not to content, so they can be written in any order. The per-page checklis
           its part-3 page (36–39).
         - Summarize and link only; never copy the HIG.
   - [ ] Task 22.2. Figure: Mermaid `mindmap` of the HIG.
-- [ ] Task 23. `apps/apple/accessibility.adoc`: *Accessibility*
-  - [ ] Task 23.1. Content:
+- [x] Task 23. `apps/apple/accessibility.adoc`: *Accessibility*
+  - [x] Task 23.1. Content:
         - VoiceOver label, value, hint and traits on `NoteRow`;
         - `accessibilityElement(children: .combine)`;
         - `accessibilityRepresentation`;
@@ -528,11 +528,11 @@ name, not to content, so they can be written in any order. The per-page checklis
         - Accessibility Nutrition Labels, with a forward xref to page 46;
         - Assistive Access.
         - Link `web/accessibility.adoc`.
-  - [ ] Task 23.2. Figures:
+  - [x] Task 23.2. Figures:
         - Mermaid: view tree → accessibility tree;
         - a table mapping each nutrition label to its APIs and a test.
-- [ ] Task 24. `apps/apple/localization.adoc`: *Localization with String Catalogs*
-  - [ ] Task 24.1. Content:
+- [x] Task 24. `apps/apple/localization.adoc`: *Localization with String Catalogs*
+  - [x] Task 24.1. Content:
         - `Localizable.xcstrings`, including a JSON excerpt;
         - `LocalizedStringKey` vs `LocalizedStringResource` vs `String(localized:comment:)`;
         - plural and device variations;
@@ -545,7 +545,7 @@ name, not to content, so they can be written in any order. The per-page checklis
         - package resources;
         - testing with scheme/test-plan languages and preview variants;
         - Xcode 27 localization with agents.
-  - [ ] Task 24.2. Figures:
+  - [x] Task 24.2. Figures:
         - Mermaid localization pipeline;
         - `apple-ltr-rtl.svg`.
 
