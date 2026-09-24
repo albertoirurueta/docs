@@ -219,7 +219,7 @@ Parallelizable: yes. Each task edits a different file, and none needs another's 
         (iOS, iPadOS, macOS, watchOS, visionOS)]` and 49 `****` entries:
         - pages 1–48 in #170's order, titled as in #172, #173 and #174;
         - `apps/apple/cheat-sheet.adoc[Cheat Sheets (PDF)]`.
-  - [ ] Task 3.2. Embed the Swift reference, the way Android embeds `nav-kotlin`: a `+` / `--` open block with
+  - [x] Task 3.2. Embed the Swift reference, the way Android embeds `nav-kotlin`: a `+` / `--` open block with
         `include::partial$nav-swift.adoc[]`, placed right after the Apple `***` line and before its `****`
         children, as #170 specifies.
         - `nav-swift.adoc` starts at `*` and would nest wrongly here. If it can't be embedded cleanly, don't
@@ -581,29 +581,29 @@ link names a page that now exists, or a forward target (pages 23–48) that #173
 
 Parallelizable: no. Task 31 depends on Task 30's results, and Task 32 commits only after both.
 
-- [ ] Task 30. Static checks, delegated to the `iru-gate-runner` agent (or a generic sub-agent) so output stays out
-      of the main context
-  - [ ] Task 30.1. Admonitions: `grep -rnE '^\[(NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]|^(NOTE|TIP|WARNING|CAUTION|IMPORTANT):' modules/ROOT/pages/apps/apple`
+- [x] Task 30. Static checks, delegated to the `iru-gate-runner` agent (or a generic sub-agent) so output stays out
+      of the main context — done (run directly by the coordinator, outputs summarized): 0 admonitions; all 21 pages have header, disclaimer and References; all 373 Mermaid diagrams parse; 9 `apple-*.svg` well-formed; Antora: 0 warnings, 147 xref errors, all forward links to the 29 targets from #173/#174/#175 (pages 21–48 + cheat-sheet)
+  - [x] Task 30.1. Admonitions: `grep -rnE '^\[(NOTE|TIP|WARNING|CAUTION|IMPORTANT)\]|^(NOTE|TIP|WARNING|CAUTION|IMPORTANT):' modules/ROOT/pages/apps/apple`
         must return nothing. The disclaimer's only `[IMPORTANT]` lives in the partial, not the pages.
-  - [ ] Task 30.2. Structure: every `apps/apple/*.adoc` from this plan has `:description:`, `:keywords:`,
+  - [x] Task 30.2. Structure: every `apps/apple/*.adoc` from this plan has `:description:`, `:keywords:`,
         `include::partial$apple-disclaimer.adoc[]` and `== References`.
-  - [ ] Task 30.3. Mermaid: `npm i --no-save mermaid@11 jsdom && npm run validate:mermaid` must pass (exit 0).
-  - [ ] Task 30.4. SVGs: each new `modules/ROOT/images/apple-*.svg` is well-formed XML
+  - [x] Task 30.3. Mermaid: `npm i --no-save mermaid@11 jsdom && npm run validate:mermaid` must pass (exit 0).
+  - [x] Task 30.4. SVGs: each new `modules/ROOT/images/apple-*.svg` is well-formed XML
         (`python3 -c "import xml.dom.minidom,sys; xml.dom.minidom.parse(sys.argv[1])" <file>`).
-  - [ ] Task 30.5. Antora build: `npm install` (if needed) then `npx antora antora-playbook.yml`.
+  - [x] Task 30.5. Antora build: `npm install` (if needed) then `npx antora antora-playbook.yml`.
         - Collect every reported `xref` error.
         - Every error must point to a **forward target**: an `apps/apple/` page from 21–48, `cheat-sheet.adoc`,
           or a `_bibliography` anchor that #175 extends.
         - Any error pointing anywhere else (a typo, a wrong Swift/Objective-C page name, a broken anchor inside
           pages 1–20) must be fixed.
         - Record the remaining forward-link errors in the checkbox note (decision 2).
-- [ ] Task 31. Fix every non-forward error found in Task 30, then re-run the failing check until only forward-link
-      `xref` errors remain.
-- [ ] Task 32. Commit on `feature/172`
-  - [ ] Task 32.1. Stage the new pages, partial and images, plus the modified `nav.adoc`, `apps/index.adoc`,
+- [x] Task 31. Fix every non-forward error found in Task 30, then re-run the failing check until only forward-link
+      `xref` errors remain. — done: fixed one section-level warning (`swiftui-lists-tables-and-collections.adoc`); consistency pass standardized `NoteEditor(noteID:)` and guarded `CaptureButton` for visionOS
+- [x] Task 32. Commit on `feature/172`
+  - [x] Task 32.1. Stage the new pages, partial and images, plus the modified `nav.adoc`, `apps/index.adoc`,
         `apps/android/index.adoc`, `pages/index.adoc` and the Group 4 files.
         - Review `git status` and the diff.
         - Do not stage `build/` or `node_modules/`.
-  - [ ] Task 32.2. Commit with the message
+  - [x] Task 32.2. Commit with the message
         `Apple Platforms part 1: foundations, tooling, SwiftUI and design pages + section scaffolding (#172, #170)`,
         ending with the session's attribution trailer lines.
