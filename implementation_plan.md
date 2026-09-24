@@ -251,7 +251,7 @@ them must be covered.
     - pinning, linked to page 33;
     - a gRPC pointer.
   - Figure: 📊 Mermaid background-download sequence.
-- [ ] Task 6. `apps/apple/background-execution.adoc`: *Background Execution*
+- [x] Task 6. `apps/apple/background-execution.adoc`: *Background Execution*
   - Content:
     - the suspension model;
     - the `BGTaskScheduler` identifiers above, `BGAppRefreshTask`/`BGProcessingTask`/`BGContinuedProcessingTask`
@@ -261,7 +261,7 @@ them must be covered.
     - a watchOS `WKExtendedRuntimeSession` note with a forward link to page 38;
     - debugging with `_simulateLaunchForTaskWithIdentifier`.
   - Figures: 📊 Mermaid decision tree and state diagram.
-- [ ] Task 7. `apps/apple/notifications-and-live-activities.adoc`: *Notifications, APNs and Live Activities*
+- [x] Task 7. `apps/apple/notifications-and-live-activities.adoc`: *Notifications, APNs and Live Activities*
   - Content:
     - `NoteReminderScheduler` (permission, triggers, categories and actions, delegate);
     - APNs registration and payload JSON, token auth, and a link to `backend/messaging` for the provider side;
