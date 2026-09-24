@@ -231,7 +231,7 @@ them must be covered.
     - `NSUbiquitousKeyValueStore`, capabilities, and migrating Core Data to SwiftData;
     - a link to Couchbase Lite.
   - Figures: 📊 a Mermaid sync-flow diagram and a decision tree.
-- [ ] Task 4. `apps/apple/preferences-files-and-documents.adoc`: *Preferences, Files and Document-Based Apps*
+- [x] Task 4. `apps/apple/preferences-files-and-documents.adoc`: *Preferences, Files and Document-Based Apps*
   - Content:
     - `UserDefaults.fieldNotesShared`, `@AppStorage("noteSortOrder")` and `@SceneStorage`;
     - the sandbox layout, App Group containers and backup exclusion;
@@ -240,7 +240,7 @@ them must be covered.
     - `NotebookExportDocument` with `DocumentGroup`/`ReadableDocument`/`WritableDocument` (27) and a 26 fallback;
     - `fileImporter`/`fileExporter` and the UTType declaration.
   - Figure: 📊 `apple-sandbox-containers.svg`.
-- [ ] Task 5. `apps/apple/networking.adoc`: *Networking: URLSession, Network Framework and ATS*
+- [x] Task 5. `apps/apple/networking.adoc`: *Networking: URLSession, Network Framework and ATS*
   - Content:
     - `NotesAPIClient` with the async `data`/`bytes`, `RemoteNote` decoding, and errors and retries with
       cancellation;
