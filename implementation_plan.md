@@ -207,7 +207,7 @@ topic so related pages share a writer: 21–22, 23–24, 25–26, 27–28, 29–
 The scope, sub-concepts, 📊 figures and links for each page are in `sub2.md` under the same page number, and all of
 them must be covered.
 
-- [ ] Task 2. `apps/apple/swiftdata.adoc`: *Persisting Models with SwiftData*
+- [x] Task 2. `apps/apple/swiftdata.adoc`: *Persisting Models with SwiftData*
   - [ ] Task 2.1. Content:
     - the `NoteRecord`/`NotebookRecord`/`PhotoRecord` models, attributes and relationships, `#Unique`/`#Index`,
       and inheritance;
@@ -223,7 +223,7 @@ them must be covered.
     - Mermaid class diagram: container → context → records → `@Query`, and the `NotePersisting` layer;
     - Mermaid migration stages;
     - `apple-swiftdata-app-group.svg`.
-- [ ] Task 3. `apps/apple/core-data-cloudkit-and-icloud.adoc`: *Core Data, CloudKit and iCloud*
+- [x] Task 3. `apps/apple/core-data-cloudkit-and-icloud.adoc`: *Core Data, CloudKit and iCloud*
   - Content:
     - the Core Data stack (for a legacy "FieldNotes 1.x" store);
     - `NSPersistentCloudKitContainer` with private/shared/public databases and `CKShare` sharing of a notebook;
