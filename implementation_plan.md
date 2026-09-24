@@ -560,21 +560,23 @@ Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus s
 
 ### Group 10 — Site wiring (Parallelizable: yes — four distinct files)
 
-- [ ] Task 27. `modules/ROOT/nav.adoc` — insert `*** xref:backend/docker/index.adoc[Docker]` after line 800 (the
+> Done (committed in the Group 10 commit; boxes checked afterwards): `nav.adoc` (Docker block after the Architecture cheat sheet, before Apps: index + 22 topic pages + cheat sheet, in "What's covered" order, no Quarkus duplicates); `backend/index.adoc` (Docker bullet after Architecture, Docker in `:description:`, 10 keywords appended); `backend/springboot/index.adoc` (pointer paragraph to the Docker reference; `Docker`, `Docker Compose` keywords added -- `Testcontainers` was already present); root `pages/index.adoc` (8 keywords appended, none previously present). Build: zero errors/warnings; the built `backend/index.html` and root `index.html` link to `backend/docker/index.html`.
+
+- [x] Task 27. `modules/ROOT/nav.adoc` — insert `*** xref:backend/docker/index.adoc[Docker]` after line 800 (the
       Architecture cheat-sheet entry) and before `** xref:apps/index.adoc[Apps]`, with `****` children for all 21 topic
       pages + `cheat-sheet.adoc` (`[Cheat Sheet (PDF)]`), in `index.adoc`'s "What's covered" order. Do not duplicate
       the Quarkus pages.
-- [ ] Task 28. `modules/ROOT/pages/backend/index.adoc`
-  - [ ] Task 28.1. Add a `* xref:backend/docker/index.adoc[Docker] -- …` bullet after the Architecture bullet and its
+- [x] Task 28. `modules/ROOT/pages/backend/index.adoc`
+  - [x] Task 28.1. Add a `* xref:backend/docker/index.adoc[Docker] -- …` bullet after the Architecture bullet and its
         sub-bullets, styled like the Messaging bullet (one clause per sub-area: platform and architecture, images and
         builds, running containers, Compose, security, Spring Boot/Testcontainers/GitHub Actions, cheat sheet).
-  - [ ] Task 28.2. Add "Docker" to `:description:`'s section list and append
+  - [x] Task 28.2. Add "Docker" to `:description:`'s section list and append
         `Docker, containers, Dockerfile, Docker Compose, BuildKit, Buildx, OCI, Testcontainers, container images,
         GitHub Actions` to `:keywords:`.
-- [ ] Task 29. `modules/ROOT/pages/backend/springboot/index.adoc` — add one sentence/bullet pointing to
+- [x] Task 29. `modules/ROOT/pages/backend/springboot/index.adoc` — add one sentence/bullet pointing to
       `xref:backend/docker/index.adoc[Docker]` (images, local Compose, Testcontainers integration tests) and add
       `Docker, Testcontainers, Docker Compose` to `:keywords:` where missing.
-- [ ] Task 30. `modules/ROOT/pages/index.adoc` — append
+- [x] Task 30. `modules/ROOT/pages/index.adoc` — append
       `Docker, containers, Dockerfile, Docker Compose, BuildKit, OCI, Testcontainers, container images` to the root
       `:keywords:` (skip any term already present).
 
