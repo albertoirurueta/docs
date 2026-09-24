@@ -457,56 +457,58 @@ Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus s
 
 ### Group 7 — Java/Spring Boot II: integration tests and CI/CD (Parallelizable: yes — two distinct pages; both depend on Group 6's pages existing to link into)
 
-- [ ] Task 22. `spring-boot-integration-tests-with-testcontainers.adoc` — "Spring Boot Integration Tests with
+> Done: `spring-boot-integration-tests-with-testcontainers.adoc` (worked example: `compose.yaml` with PostgreSQL + Kafka + WireMock, `AbstractIT` with a `ComposeContainer` singleton, `OrderIT`, the Failsafe block, `build.yml` -- same service names, ports and properties throughout) and `ci-cd-with-github-actions.adoc`; figures `docker-one-compose-two-stacks.svg`, `docker-github-actions-pipeline.svg` + 3 Mermaid blocks (22 total, all parse). Build: 0 messages besides forward xrefs to `index.adoc`. Verified: action inputs/outputs against each action README (majors confirmed via tags: checkout v7, setup-java v6, upload-artifact v7, configure-aws-credentials v6), Spring Boot starter-parent already binds Failsafe goals and `classesDirectory`, runner sizes (public 4 vCPU/16 GB, private 2 vCPU/8 GB), `KafkaTestUtils.getOneRecord` signature. Anchor to the Buildpacks section made explicit (`#buildpacks-build-image`) because Asciidoctor drops the colon of `spring-boot:build-image` from generated IDs.
+
+- [x] Task 22. `spring-boot-integration-tests-with-testcontainers.adoc` — "Spring Boot Integration Tests with
       Testcontainers (Locally and in GitHub Actions)" — **the page the request singles out**
-  - [ ] Task 22.1. The split: Surefire `*Test` (no Docker) vs. Failsafe `*IT` (Docker), linking
+  - [x] Task 22.1. The split: Surefire `*Test` (no Docker) vs. Failsafe `*IT` (Docker), linking
         `xref:backend/springboot/maven-quality-plugins.adoc`; dependencies (`spring-boot-starter-test`,
         `spring-boot-testcontainers`, `testcontainers-junit-jupiter`, modules — versions managed by Spring Boot 4.1,
         Testcontainers 2.0.5).
-  - [ ] Task 22.2. The three wiring options: `@Container @ServiceConnection` static fields (link
+  - [x] Task 22.2. The three wiring options: `@Container @ServiceConnection` static fields (link
         `xref:backend/springboot/unit-and-integration-testing.adoc`, not repeated); containers as `@Bean`s in a
         `@TestConfiguration` (recommended — context caching reuses containers); `@DynamicPropertySource` /
         `DynamicPropertyRegistrar`; the connection-details table; `@ImportTestcontainers`.
-  - [ ] Task 22.3. The house shared-`compose.yaml` harness exactly as in `iru-setup-java-springboot-testcontainers`:
+  - [x] Task 22.3. The house shared-`compose.yaml` harness exactly as in `iru-setup-java-springboot-testcontainers`:
         `AbstractIT` with `ComposeContainer` started once, `withExposedService(...)` + real wait strategies, mapped
         ports via `@DynamicPropertySource`, `spring.docker.compose.skip.in-tests=true`, the module-relative
         `compose.yaml` path pitfall; WireMock/Microcks for downstream APIs; Testcontainers at development time
         (`SpringApplication.from(...).with(...)`, `@RestartScope`, `spring-boot:test-run`).
-  - [ ] Task 22.4. **Running locally**: Docker running, `mvn verify` vs. `mvn test`, `-DskipITs`, reuse mode,
+  - [x] Task 22.4. **Running locally**: Docker running, `mvn verify` vs. `mvn test`, `-DskipITs`, reuse mode,
         troubleshooting (Ryuk on restricted sockets, Colima/Podman `DOCKER_HOST` / `TESTCONTAINERS_HOST_OVERRIDE`,
         Apple silicon and `linux/amd64`-only images).
-  - [ ] Task 22.5. **Running in GitHub Actions**: the house `build.yml` shape (`ubuntu-latest` ships Docker and
+  - [x] Task 22.5. **Running in GitHub Actions**: the house `build.yml` shape (`ubuntu-latest` ships Docker and
         Compose, `actions/checkout@v7`, `actions/setup-java@v6` with `distribution: temurin`, `java-version: 25`,
         `cache: maven`, `mvn -B -ntp clean verify`, upload `**/target/failsafe-reports/**` on failure); Docker Hub rate
         limits (`docker/login-action@v4` with a PAT, or GHCR/a mirror); `services:` job containers and why they are
         worse here (fixed ports, no wait strategies, no Compose parity); `container:` jobs and DinD caveats;
         Testcontainers Cloud / larger runners; timeouts and parallelism (`-T`, Failsafe `forkCount`); brokers via
         `xref:backend/messaging/spring-boot-testing-messaging.adoc`.
-  - [ ] Task 22.6. A complete worked example: `compose.yaml` (PostgreSQL + Kafka + WireMock), `AbstractIT`, `OrderIT`,
+  - [x] Task 22.6. A complete worked example: `compose.yaml` (PostgreSQL + Kafka + WireMock), `AbstractIT`, `OrderIT`,
         the Failsafe `pom.xml` block, `.github/workflows/build.yml` — internally consistent (same service names, ports,
         property names across all five snippets).
-  - [ ] Task 22.7. 📊 `docker-one-compose-two-stacks.svg` (local via `spring-boot-docker-compose` vs. Failsafe via
+  - [x] Task 22.7. 📊 `docker-one-compose-two-stacks.svg` (local via `spring-boot-docker-compose` vs. Failsafe via
         `ComposeContainer`, one `compose.yaml`); 📊 mermaid GitHub Actions job: checkout → setup-java → mvn verify →
         Testcontainers pulls/starts → tests → reports.
-  - [ ] Task 22.8. `== References`: Spring Boot `reference/testing/testcontainers.html`,
+  - [x] Task 22.8. `== References`: Spring Boot `reference/testing/testcontainers.html`,
         `reference/features/dev-services.html`, java.testcontainers.org `modules/docker_compose/` and
         `supported_docker_environment/continuous_integration/`, `image_registry_rate_limiting/`, `guides/java/run-tests/`,
         `guides/testcontainers-java-*` used, docs.github.com "About service containers", actions/runner-images,
         actions/checkout, actions/setup-java, docker/login-action.
 
-- [ ] Task 23. `ci-cd-with-github-actions.adoc` — "Docker CI/CD with GitHub Actions"
-  - [ ] Task 23.1. `setup-qemu-action@v4` + `setup-buildx-action@v4`; `login-action@v4` (GHCR with `GITHUB_TOKEN` +
+- [x] Task 23. `ci-cd-with-github-actions.adoc` — "Docker CI/CD with GitHub Actions"
+  - [x] Task 23.1. `setup-qemu-action@v4` + `setup-buildx-action@v4`; `login-action@v4` (GHCR with `GITHUB_TOKEN` +
         `packages: write`, Hub PAT, cloud OIDC); `metadata-action@v6` (branch/tag/semver/sha tags, OCI labels);
         `build-push-action@v7` (`context`, `file`, `platforms`, `push`, `load`, `tags`, `labels`,
         `cache-from`/`cache-to: type=gha`, `secrets`, `provenance`/`sbom`) — inputs verified against each action's
         README.
-  - [ ] Task 23.2. Test-before-push, sharing an image between jobs, multi-platform, `bake-action@v7`,
+  - [x] Task 23.2. Test-before-push, sharing an image between jobs, multi-platform, `bake-action@v7`,
         `scout-action@v1` CVE gate, `setup-docker-action@v5` / `setup-compose-action@v2`, GitHub Builder named.
-  - [ ] Task 23.3. The house `deploy.yml` variant (`spring-boot:build-image` + `docker.publishRegistry.*`, OIDC) as in
+  - [x] Task 23.3. The house `deploy.yml` variant (`spring-boot:build-image` + `docker.publishRegistry.*`, OIDC) as in
         `iru-setup-java-springboot-github-workflows` Step 2; immutable tags and `latest`; a full workflow example.
-  - [ ] Task 23.4. 📊 `docker-github-actions-pipeline.svg`; 📊 mermaid of the tags `metadata-action` produces for a
+  - [x] Task 23.4. 📊 `docker-github-actions-pipeline.svg`; 📊 mermaid of the tags `metadata-action` produces for a
         push, a release tag and a PR.
-  - [ ] Task 23.5. `== References`: `build/ci/github-actions/` and sub-pages used, each `docker/*` action repo,
+  - [x] Task 23.5. `== References`: `build/ci/github-actions/` and sub-pages used, each `docker/*` action repo,
         docs.github.com "Publishing Docker images", "Working with the Container registry", `scout/integrations/ci/gha/`.
 
 ### Group 8 — Landing page and cheat-sheet page (Parallelizable: yes — two distinct files; both need every earlier page's final title/path)
