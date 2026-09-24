@@ -580,25 +580,27 @@ Deliberately thin on anything the SpringBoot, Hibernate, Messaging and Quarkus s
 
 ### Group 11 — Reciprocal cross-links in existing pages (Parallelizable: yes — every task edits a distinct file)
 
+> Done: one sentence/clause each in `backend/springboot/unit-and-integration-testing.adoc`, `backend/springboot/maven-quality-plugins.adoc`, `backend/messaging/spring-boot-testing-messaging.adoc`, `backend/hibernate/integration-testing.adoc`, `backend/hibernate/hibernate-search-integration-testing.adoc`, `backend/quarkus/container-images.adoc`, `backend/quarkus/developer-experience.adoc`, `database/prometheus/containers-and-kubernetes-monitoring.adoc`; Task 39 optional links added to the couchbase, elasticsearch, neo4j, prometheus, qdrant and solr getting-started pages and `backend/messaging/getting-started.adoc` (MongoDB skipped: its getting-started page has no `docker run`/Compose snippet). No restructuring, no admonitions. Build: zero errors/warnings. Noted for follow-up (out of scope here): `spring-boot-testing-messaging.adoc`'s Docker Compose subsection says Compose support creates `KafkaConnectionDetails` and starts in a plain `@SpringBootTest`, but Spring Boot 4.1 has no Kafka Docker Compose connection factory and `spring.docker.compose.skip.in-tests` defaults to `true`.
+
 One sentence or clause per link; no restructuring; no admonitions added.
 
-- [ ] Task 31. `backend/springboot/unit-and-integration-testing.adoc` — from its Testcontainers section, link
+- [x] Task 31. `backend/springboot/unit-and-integration-testing.adoc` — from its Testcontainers section, link
       `xref:backend/docker/testcontainers-fundamentals.adoc` and
       `xref:backend/docker/spring-boot-integration-tests-with-testcontainers.adoc`.
-- [ ] Task 32. `backend/springboot/maven-quality-plugins.adoc` — from its Failsafe section, the same two links.
-- [ ] Task 33. `backend/messaging/spring-boot-testing-messaging.adoc` — from the Docker Compose support subsection
+- [x] Task 32. `backend/springboot/maven-quality-plugins.adoc` — from its Failsafe section, the same two links.
+- [x] Task 33. `backend/messaging/spring-boot-testing-messaging.adoc` — from the Docker Compose support subsection
       (~line 122), link `xref:backend/docker/compose-for-local-development.adoc`.
-- [ ] Task 34. `backend/hibernate/integration-testing.adoc` — from the intro, link
+- [x] Task 34. `backend/hibernate/integration-testing.adoc` — from the intro, link
       `xref:backend/docker/testcontainers-fundamentals.adoc`.
-- [ ] Task 35. `backend/hibernate/hibernate-search-integration-testing.adoc` — from the intro, the same link.
-- [ ] Task 36. `backend/quarkus/container-images.adoc` — from the intro, link
+- [x] Task 35. `backend/hibernate/hibernate-search-integration-testing.adoc` — from the intro, the same link.
+- [x] Task 36. `backend/quarkus/container-images.adoc` — from the intro, link
       `xref:backend/docker/java-and-spring-boot-images.adoc` and
       `xref:backend/docker/build-cache-and-multi-stage-builds.adoc`.
-- [ ] Task 37. `backend/quarkus/developer-experience.adoc` — from the Dev Services section, link
+- [x] Task 37. `backend/quarkus/developer-experience.adoc` — from the Dev Services section, link
       `xref:backend/docker/testcontainers-fundamentals.adoc`.
-- [ ] Task 38. `database/prometheus/containers-and-kubernetes-monitoring.adoc` — link
+- [x] Task 38. `database/prometheus/containers-and-kubernetes-monitoring.adoc` — link
       `xref:backend/docker/resources-logging-and-monitoring.adoc`.
-- [ ] Task 39. Optional inbound links (issue: "optional") — one clause beside the existing `docker run` / Compose
+- [x] Task 39. Optional inbound links (issue: "optional") — one clause beside the existing `docker run` / Compose
       one-liner in `database/{couchbase,elasticsearch,mongodb,neo4j,prometheus,qdrant,solr}/getting-started.adoc` and
       `backend/messaging/getting-started.adoc`, linking `xref:backend/docker/running-containers.adoc` (or
       `compose-fundamentals.adoc` where the snippet is Compose). Skip a page if it has no such snippet.
