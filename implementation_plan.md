@@ -276,10 +276,10 @@ depend on the finished pages.
 - [ ] Task 16. `apps/apple/index.adoc` § *The FieldNotes app*: one sentence on what part 3 adds (iPad windows and
   commands, the Mac utility window and menu bar extra, the watch bridge and complication, the visionOS volume,
   the test targets and test plan, and the release pipeline).
-- [ ] Task 17. Normalize the link text of every existing `xref:` to pages 36–48 across `apps/apple/*.adoc` to the
+- [x] Task 17. Normalize the link text of every existing `xref:` to pages 36–48 across `apps/apple/*.adoc` to the
   page's real title from `nav.adoc` (e.g. "Signing, Capabilities and Configuration" → "Membership, Signing,
   Capabilities and Info.plist").
-- [ ] Task 18. Reciprocal links:
+- [x] Task 18. Reciprocal links:
   - `apps/react-native/ci-cd-and-over-the-air-updates.adoc`: one sentence in its iOS/TestFlight part linking pages
     46 and 48;
   - `apps/react-native/building-and-publishing.adoc` § *Certificates, Identifiers, and Provisioning Profiles*: one
