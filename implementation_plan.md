@@ -220,20 +220,20 @@ and the rendering rules.
     coverage reports; snapshot testing (none from Apple; previews, screenshots, attachments; one line on third-party
     libraries).
   - Figures: 📊 Mermaid test pyramid; 📊 Mermaid test plan × destinations → report.
-- [ ] Task 8. `apps/apple/debugging-with-xcode-and-lldb.adoc`: *Debugging with Xcode and LLDB*
+- [x] Task 8. `apps/apple/debugging-with-xcode-and-lldb.adoc`: *Debugging with Xcode and LLDB*
   - Content: breakpoints (line, symbolic, Swift error, exception, runtime issue; conditions, actions,
     log-and-continue); LLDB `p`/`po`/`v`/`expr`/`bt`, `@DebugDescription`; stepping across `await`; view debugger,
     environment overrides, memory graph with malloc stack logging; Address/Thread/UB sanitizers and Main Thread
     Checker; crashes from missing privacy keys; Device Hub (27). Link Swift `build-and-tooling.adoc` for LLDB basics.
   - Figures: 📊 Mermaid state run → break → inspect/step → continue; 📊 `apple-retain-cycle.svg` (an `@Observable`
     model and a closure).
-- [ ] Task 9. `apps/apple/logging-metrics-and-crash-reports.adoc`: *Logging, MetricKit, Crash Reports and Organizer*
+- [x] Task 9. `apps/apple/logging-metrics-and-crash-reports.adoc`: *Logging, MetricKit, Crash Reports and Organizer*
   - Content: `Logger` (levels, privacy interpolation, Xcode console filtering, Console.app, `log stream`),
     `OSLogStore`; `OSSignposter`; MetricKit `MetricManager` (27) replacing `MXMetricManager`, StateReporting;
     crash report anatomy, symbolication and dSYMs; Xcode Organizer 27 (insights, metric goals, hitches, storage). Link
     the Prometheus section for server-side metrics.
   - Figure: 📊 Mermaid device → MetricKit/crash logs/TestFlight feedback → App Store Connect/Organizer → developer.
-- [ ] Task 10. `apps/apple/performance-and-instruments.adoc`: *Performance and Instruments*
+- [x] Task 10. `apps/apple/performance-and-instruments.adoc`: *Performance and Instruments*
   - Content: profiling Release builds (⌘I) in a measure → identify → fix → verify loop; Time Profiler (Call Tree,
     Flame Graph, Top Functions 27), Run Comparison (27); hangs and Animation Hitches; the SwiftUI instrument; Swift
     Concurrency template and Swift Executors instrument (27); System Trace; Allocations and Leaks; Power Profiler;
