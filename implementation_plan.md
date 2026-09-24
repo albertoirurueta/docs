@@ -393,7 +393,7 @@ Filenames are fixed here so sibling xrefs can be written up front.
 
 ### Group 5 — Site wiring and cross-links (Parallelizable: yes — every task edits a distinct file)
 
-- [ ] Task 15. `modules/ROOT/nav.adoc` — append after the last line (the React Native cheat-sheet entry):
+- [x] Task 15. `modules/ROOT/nav.adoc` — append after the last line (the React Native cheat-sheet entry):
       ```
       ** xref:git-repositories/index.adoc[Git Repositories]
       *** xref:git-repositories/git-and-github/index.adoc[Git & GitHub]
@@ -401,20 +401,42 @@ Filenames are fixed here so sibling xrefs can be written up front.
       ... (the nine concept pages in the index's reading order)
       **** xref:git-repositories/git-and-github/cheat-sheet.adoc[Cheat Sheet (PDF)]
       ```
-- [ ] Task 16. `modules/ROOT/images/git-repositories.svg` — new 600×600 tile copied from `apps.svg`'s structure:
+  > Done: appended the `** Git Repositories` block to `modules/ROOT/nav.adoc` (now 872 lines); the nine concept-page
+  entries use the reading order and short titles from the "New here? Read in this order" line of
+  `git-repositories/git-and-github/index.adoc` (Getting Started → Repositories and Cloning → Commits → Branches →
+  Checkout, Switch and Restore → Fetch, Pull and Push → Merging, Rebasing and Conflicts → Pull Requests → Tags and
+  Releases), followed by the Cheat Sheet (PDF) entry; all ten target filenames verified with `ls` before writing.
+- [x] Task 16. `modules/ROOT/images/git-repositories.svg` — new 600×600 tile copied from `apps.svg`'s structure:
       gradient `#FCA3AF` → `#7873f5`, a white branch/merge icon (three circles joined by a forked line) at
       (300,170), title "Git" or "Git Repositories" (shrink font to fit ≤ 500px width), subtitle
       "Version control &amp; GitHub", "Explore" pill.
-- [ ] Task 17. `modules/ROOT/pages/index.adoc`
-  - [ ] Task 17.1. Put `image::git-repositories.svg[xref="git-repositories/index.adoc"]` in the empty sixth `a|` cell
+  > Done: `modules/ROOT/images/git-repositories.svg` created, mirroring `apps.svg`'s viewBox/gradient/clip-path/
+  translucent-icon-circle/title/divider/subtitle/Explore-pill structure exactly, with the `#FCA3AF` → `#7873f5`
+  gradient and a white three-circles-joined-by-a-forked-line branch/merge icon. `xmllint --noout` confirms
+  well-formed XML; rendered to PNG with headless Google Chrome (`--headless --screenshot`) and visually inspected --
+  "Git Repositories" at 40px fits comfortably within the card width and the branch icon is legible against the
+  translucent circle.
+- [x] Task 17. `modules/ROOT/pages/index.adoc`
+  - [x] Task 17.1. Put `image::git-repositories.svg[xref="git-repositories/index.adoc"]` in the empty sixth `a|` cell
         of the `== Guides & References` table.
-  - [ ] Task 17.2. Append `Git, GitHub, version control, commits, branches, tags, pull requests, git merge, git
+  - [x] Task 17.2. Append `Git, GitHub, version control, commits, branches, tags, pull requests, git merge, git
         rebase, GitHub CLI, Git cheat sheet` to `:keywords:` (skip any term already present); add "Git and GitHub"
         to `:description:` if it enumerates the guide areas.
-- [ ] Task 18. `backend/docker/ci-cd-with-github-actions.adoc` — one sentence in the intro linking
+  > Done: the previously-empty sixth `a|` cell of the `== Guides & References` table now holds
+  `image::git-repositories.svg[xref="git-repositories/index.adoc"]`; `:keywords:` (verified none of the new terms
+  were already present) gained `, Git, GitHub, version control, commits, branches, tags, pull requests, git merge,
+  git rebase, GitHub CLI, Git cheat sheet` appended after `container images`; `:description:` (which enumerates
+  "standalone database, web-development, backend, and apps references") now reads "...backend, apps, and Git and
+  GitHub references."
+- [x] Task 18. `backend/docker/ci-cd-with-github-actions.adoc` — one sentence in the intro linking
       `xref:git-repositories/git-and-github/index.adoc[Git & GitHub]` for readers new to branches, tags and pull
       requests.
-- [ ] Task 19. `apps/react-native/ci-cd-and-over-the-air-updates.adoc` — the same one-sentence link.
+  > Done: added "If branches, tags and pull requests that trigger these workflows are new territory, see
+  xref:git-repositories/git-and-github/index.adoc[Git & GitHub] first." to the end of the intro paragraph.
+- [x] Task 19. `apps/react-native/ci-cd-and-over-the-air-updates.adoc` — the same one-sentence link.
+  > Done: added the same sentence ("If branches, tags and pull requests that trigger these workflows are new
+  territory, see xref:git-repositories/git-and-github/index.adoc[Git & GitHub] first.") to the end of the page's
+  first intro paragraph.
 
 ### Group 6 — Final verification (Parallelizable: yes)
 
