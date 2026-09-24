@@ -176,7 +176,7 @@ platform-availability table, "needs" sentences, `== References`), every 📊 fig
 #174 (`xcuiautomation/recording-ui-automation-for-testing`, `xcode/diagnosing-memory-thread-and-crash-issues-early`),
 and the rendering rules.
 
-- [ ] Task 2. `apps/apple/ipados.adoc`: *iPadOS: Windows, Multitasking, Pointer and Apple Pencil*
+- [x] Task 2. `apps/apple/ipados.adoc`: *iPadOS: Windows, Multitasking, Pointer and Apple Pencil*
   - Content: multiple scenes and resizable windows (`UIApplicationSupportsMultipleScenes`, `openWindow`,
     `UISceneSizeRestrictions`, effective geometry); the iPad menu bar with `FieldNotesCommands` and keyboard
     shortcuts; `.sidebarAdaptable`; pointer (`hoverEffect`, `pointerStyle`, `UIPointerInteraction`); Apple Pencil
@@ -184,7 +184,7 @@ and the rendering rules.
     inspector on iPad.
   - Figures: 📊 Mermaid process → `UIWindowScene`s/sessions; 📊 `apple-ipad-window-sizes.svg` (compact vs regular vs
     resized window).
-- [ ] Task 3. `apps/apple/macos.adoc`: *macOS: Windows, Menus, Commands, Settings and Menu Bar Extras*
+- [x] Task 3. `apps/apple/macos.adoc`: *macOS: Windows, Menus, Commands, Settings and Menu Bar Extras*
   - Content: `WindowGroup`/`Window`/`UtilityWindow`, sizing, placement, styles, restoration, `openWindow`/
     `dismissWindow`; `.commands` with `CommandMenu`/`CommandGroup`/`keyboardShortcut`/`FocusedValue`; `Settings` +
     `SettingsLink`; `MenuBarExtra` in `.menu` and `.window` styles; AppKit modernization in 27 (`NSControl` events,
