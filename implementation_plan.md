@@ -239,14 +239,14 @@ and the rendering rules.
     Concurrency template and Swift Executors instrument (27); System Trace; Allocations and Leaks; Power Profiler;
     launch time; app size and thinning.
   - Figures: 📊 Mermaid loop; 📊 Mermaid decision tree high CPU vs blocked main thread.
-- [ ] Task 11. `apps/apple/signing-capabilities-and-configuration.adoc`: *Membership, Signing, Capabilities and Info.plist*
+- [x] Task 11. `apps/apple/signing-capabilities-and-configuration.adoc`: *Membership, Signing, Capabilities and Info.plist*
   - Content: Program membership (individual, organization, Enterprise); certificate types; App IDs and bundle IDs;
     devices; provisioning profiles; automatic vs manual signing; `FieldNotes.entitlements`; Info.plist identity
     keys, usage descriptions, launch screen; privacy manifest (link page 33); Icon Composer layered icons; Developer
     Mode.
   - Figure: 📊 `apple-signing-pieces.svg` (Team → Certificate; App ID + Entitlements + Devices + Certificate →
     Provisioning Profile → signed build), cross-linked with the React Native figure.
-- [ ] Task 12. `apps/apple/app-store-connect-testflight-and-review.adoc`: *App Store Connect, TestFlight and App Review*
+- [x] Task 12. `apps/apple/app-store-connect-testflight-and-review.adoc`: *App Store Connect, TestFlight and App Review*
   - Content: app record; archive → Organizer → Distribute, `xcodebuild -exportArchive`, App Store Connect API;
     TestFlight internal vs external, beta review, public links, feedback; App Privacy details; Accessibility
     Nutrition Labels; age-rating questionnaire (date); App Review Guidelines sections 1–5 (revision date); phased
