@@ -162,50 +162,52 @@ Must land first: every page includes it.
 
 ### Group 2 — Foundations (Parallelizable: yes — three distinct pages, each with its own SVGs)
 
-- [ ] Task 2. `getting-started.adoc` — "Getting Started with Docker"
-  - [ ] Task 2.1. The problem Docker solves; what Docker is not (not a VM, not configuration management, not an
+> Done: `getting-started.adoc`, `architecture-and-the-oci.adoc`, `images-layers-and-tags.adoc`; figures `docker-platform-map.svg`, `docker-architecture-stack.svg`, `docker-image-layers.svg` + 3 Mermaid blocks (all parse). Build: no errors other than forward xrefs to later-group pages. Verified live against docker/docs sources (docs.docker.com is blocked by the session egress policy; the same content was read from the github.com/docker/docs repository): Engine 29.2 lowered the minimum API to v1.40 and 29.8 serves v1.56 (the issue text says 1.44/1.52 — pages state the verified history); nftables is opt-in via `firewall-backend`.
+
+- [x] Task 2. `getting-started.adoc` — "Getting Started with Docker"
+  - [x] Task 2.1. The problem Docker solves; what Docker is not (not a VM, not configuration management, not an
         orchestrator — the _Up & Running_ ch. 1 narrative restated against `get-started/docker-overview/`); containers
         vs. virtual machines.
-  - [ ] Task 2.2. The platform map: Engine, CLI, Desktop, Hub, Build/Buildx, Compose, Scout, Hardened Images,
+  - [x] Task 2.2. The platform map: Engine, CLI, Desktop, Hub, Build/Buildx, Compose, Scout, Hardened Images,
         Testcontainers; Sandboxes, Model Runner, Offload, Build Cloud **named only** (out of scope).
-  - [ ] Task 2.3. Installing Docker Desktop vs. Docker Engine on Linux; post-install (`docker` group and why it is
+  - [x] Task 2.3. Installing Docker Desktop vs. Docker Engine on Linux; post-install (`docker` group and why it is
         root-equivalent); `docker version`, `docker info`, `docker run hello-world`, `docker context ls/use`.
-  - [ ] Task 2.4. The version history explaining the books' numbers: 1.x → 17.03 (CalVer, CE/EE) → 20.10 → 23.0
+  - [x] Task 2.4. The version history explaining the books' numbers: 1.x → 17.03 (CalVer, CE/EE) → 20.10 → 23.0
         (BuildKit default) → 29 (containerd image store default on fresh installs); Boot2Docker/Machine flagged
         historical → Desktop.
-  - [ ] Task 2.5. 📊 `docker-platform-map.svg` (laptop, CI, registry, runtime); 📊 mermaid contrasting a VM stack
+  - [x] Task 2.5. 📊 `docker-platform-map.svg` (laptop, CI, registry, runtime); 📊 mermaid contrasting a VM stack
         and a container stack.
-  - [ ] Task 2.6. `== References`: `get-started/docker-overview/`, `get-started/get-docker/`, `engine/install/`,
+  - [x] Task 2.6. `== References`: `get-started/docker-overview/`, `get-started/get-docker/`, `engine/install/`,
         `engine/install/linux-postinstall/`, `desktop/`, `engine/manage-resources/contexts/`, `engine/release-notes/29/`.
 
-- [ ] Task 3. `architecture-and-the-oci.adoc` — "Docker Architecture and the OCI"
-  - [ ] Task 3.1. Client/daemon: `docker` CLI → Engine API (Unix socket / TCP / SSH) → `dockerd` → containerd →
+- [x] Task 3. `architecture-and-the-oci.adoc` — "Docker Architecture and the OCI"
+  - [x] Task 3.1. Client/daemon: `docker` CLI → Engine API (Unix socket / TCP / SSH) → `dockerd` → containerd →
         shim → runc → kernel; why the socket is root-equivalent; API versioning (Engine 29 minimum 1.44, current 1.52
         — verify against `engine/release-notes/29/` and `reference/api/engine/version-history/`).
-  - [ ] Task 3.2. BuildKit as the build engine; the OCI image, runtime and distribution specifications and what
+  - [x] Task 3.2. BuildKit as the build engine; the OCI image, runtime and distribution specifications and what
         "OCI-compatible" means.
-  - [ ] Task 3.3. Linux primitives: namespaces, cgroups v2 (v1 deprecated in 29), capabilities, seccomp; storage:
+  - [x] Task 3.3. Linux primitives: namespaces, cgroups v2 (v1 deprecated in 29), capabilities, seccomp; storage:
         overlay2 vs. the containerd image store and snapshotters; execution drivers and AUFS/devicemapper flagged
         historical.
-  - [ ] Task 3.4. Docker Desktop's Linux VM (VMM, WSL 2) and what it implies for file sharing and networking;
+  - [x] Task 3.4. Docker Desktop's Linux VM (VMM, WSL 2) and what it implies for file sharing and networking;
         alternative runtimes (`--runtime`, gVisor/Kata named).
-  - [ ] Task 3.5. 📊 `docker-architecture-stack.svg` (CLI → API → dockerd → containerd → shim → runc → kernel);
+  - [x] Task 3.5. 📊 `docker-architecture-stack.svg` (CLI → API → dockerd → containerd → shim → runc → kernel);
         📊 mermaid `sequenceDiagram` of `docker run` end to end (pull if missing → create → start).
-  - [ ] Task 3.6. `== References`: `get-started/docker-overview/`, `engine/`, `engine/storage/containerd/`,
+  - [x] Task 3.6. `== References`: `get-started/docker-overview/`, `engine/`, `engine/storage/containerd/`,
         `engine/storage/drivers/`, `engine/security/`, `engine/daemon/alternative-runtimes/`, the three OCI spec repos,
         runc, containerd.io, moby/buildkit.
 
-- [ ] Task 4. `images-layers-and-tags.adoc` — "Images, Layers and Tags"
-  - [ ] Task 4.1. An image = read-only layers + config, addressed by content digest; layer sharing and copy-on-write;
+- [x] Task 4. `images-layers-and-tags.adoc` — "Images, Layers and Tags"
+  - [x] Task 4.1. An image = read-only layers + config, addressed by content digest; layer sharing and copy-on-write;
         the writable container layer; the books' image-vs-container explanation reused.
-  - [ ] Task 4.2. References `registry/namespace/repository:tag`; tags vs. `@sha256:` digests; why `latest` is a trap;
+  - [x] Task 4.2. References `registry/namespace/repository:tag`; tags vs. `@sha256:` digests; why `latest` is a trap;
         manifests and manifest lists / OCI image indexes (multi-platform).
-  - [ ] Task 4.3. Commands: `pull`, `image ls` (29 tree view, `--all`), `image inspect`, `image history`, `tag`,
+  - [x] Task 4.3. Commands: `pull`, `image ls` (29 tree view, `--all`), `image inspect`, `image history`, `tag`,
         `rmi`, `save`/`load` (air-gapped), `export`/`import` and `commit` (and why not), `image prune`; labels vs.
         annotations.
-  - [ ] Task 4.4. 📊 `docker-image-layers.svg` (two containers sharing one image's layers); 📊 mermaid of a
+  - [x] Task 4.4. 📊 `docker-image-layers.svg` (two containers sharing one image's layers); 📊 mermaid of a
         reference resolving index → platform manifest → config + layers.
-  - [ ] Task 4.5. `== References`: `get-started/docker-concepts/the-basics/what-is-an-image/`,
+  - [x] Task 4.5. `== References`: `get-started/docker-concepts/the-basics/what-is-an-image/`,
         `get-started/docker-concepts/building-images/understanding-image-layers/`, `reference/cli/docker/image/`,
         OCI image-spec.
 
