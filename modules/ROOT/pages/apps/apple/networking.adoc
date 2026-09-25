@@ -1,0 +1,1152 @@
+= Networking: URLSession, Network Framework and ATS
+:description: How an Apple-platforms app talks to servers: the async URLSession APIs (data, bytes as an AsyncSequence, upload and download), decoding JSON into models, errors, retries and cancellation, background sessions and relaunch with SwiftUI's urlSession background task, NWPathMonitor with the expensive and constrained flags, the Network framework's structured-concurrency NetworkConnection and NetworkListener (26) with NWConnection as the legacy API, App Transport Security and its exceptions, certificate pinning, and a pointer to gRPC Swift.
+:keywords: URLSession, URL Loading System, data(for:delegate:), data(from:delegate:), bytes(from:delegate:), AsyncBytes, upload(for:from:delegate:), download(from:delegate:), JSONDecoder, URLError, retry, exponential backoff, cancellation, URLSessionConfiguration.background, sessionSendsLaunchEvents, URLSessionDownloadDelegate, backgroundTask, urlSession, nsurlsessiond, NWPathMonitor, isExpensive, isConstrained, Low Data Mode, Network framework, NetworkConnection, NetworkListener, Coder, TLS, NWConnection, App Transport Security, NSAppTransportSecurity, NSExceptionDomains, NSPinnedDomains, certificate pinning, gRPC Swift, FieldNotes
+
+include::partial$apple-disclaimer.adoc[]
+
+*FieldNotes* keeps its notes on the device, but it also syncs them with a small REST service, streams changes from
+it, and downloads photo attachments in the background. This page builds that networking layer. It targets the
+section's baseline: **iOS, iPadOS, macOS, watchOS and visionOS 27**, built with **Xcode 27** and **Swift 6.4**, with
+a **deployment minimum of 26** for every *FieldNotes* target. Everything shown here is available on 26: the
+Network framework's structured-concurrency API, `NetworkConnection` and `NetworkListener`, arrived in the 26
+releases, and the URL Loading System APIs are older.
+
+Three types are added to the `FieldNotesServices` module of the `FieldNotesKit` package:
+
+* `NotesAPIClient`, an actor that talks to `https://api.fieldnotes.example.com` and exchanges `RemoteNote` values;
+* `AttachmentDownloader`, which owns the background `URLSession` with the identifier
+  `com.example.fieldnotes.attachments`;
+* `ConnectivityMonitor`, an `@Observable` wrapper around `NWPathMonitor`.
+
+The language features they rely on, `async`/`await`, actors, `Sendable` and `Codable`, are explained in the Swift
+reference: xref:programming-languages/swift/async-await-and-tasks.adoc[Async/Await and Tasks],
+xref:programming-languages/swift/actors-isolation-and-sendable.adoc[Actors, Isolation and Sendable] and
+xref:programming-languages/swift/codable-and-serialization.adoc[Codable and Serialization]. The basics of `URL` and a
+first `URLSession` call are on xref:programming-languages/swift/foundation-essentials.adoc[Foundation Essentials].
+How the app's concurrency is organized, including which code runs on the main actor, is on
+xref:apps/apple/concurrency-in-apps.adoc[Swift Concurrency in Apps]. The same problems from React Native are covered
+on xref:apps/react-native/networking-and-data-fetching.adoc[Networking and Data Fetching].
+
+== Choosing an API
+
+Apple's platforms offer networking at two levels, and the choice is usually easy:
+
+[cols="1,2,2",options="header"]
+|===
+| API | Use it for | In FieldNotes
+
+| `URLSession` (URL Loading System)
+| HTTP and HTTPS: REST and JSON APIs, file uploads and downloads, WebSockets, background transfers. It handles
+  HTTP/1.1, HTTP/2 and HTTP/3, caching, cookies, proxies, authentication and App Transport Security for you.
+| `NotesAPIClient`, `AttachmentDownloader`
+
+| Network framework (`NetworkConnection`, `NetworkListener`)
+| Your own protocols over TCP, UDP, QUIC or TLS; peer-to-peer and local-network connections; Bonjour.
+| the live "field session" channel and the Mac classroom listener
+
+| `NWPathMonitor` (Network framework)
+| Observing whether a network path is available and what kind it is.
+| `ConnectivityMonitor`
+|===
+
+Apple's technote *TN3151: Choosing the right networking API* gives the same advice: use `URLSession` for anything
+HTTP-based, and drop to the Network framework only for protocols it doesn't speak.
+
+See https://developer.apple.com/documentation/technotes/tn3151-choosing-the-right-networking-api[Apple Developer Documentation -- TN3151: Choosing the right networking API].
+
+== `NotesAPIClient`: the Async `URLSession` APIs
+
+Since iOS 15, `URLSession` has `async` methods that return a value and throw, instead of calling a completion
+handler. Each one takes an optional per-task delegate for authentication challenges or progress, and each one is
+cancelled automatically when the Swift task that awaits it is cancelled.
+
+=== The wire model: `RemoteNote`
+
+The server's JSON doesn't match the app's `Note` exactly: it uses snake_case keys, carries a server-side
+`+updated_at+` timestamp, and never sends photos inline. A separate `Codable` type describes the wire format, and maps to
+and from the value type that the rest of the app uses. The server can then change its format without touching
+`Note`, as the plan on xref:apps/apple/app-architecture.adoc[App Architecture the Apple Way] recommends for
+boundaries:
+
+[source,swift]
+----
+// Packages/FieldNotesKit/Sources/FieldNotesServices/Networking/RemoteNote.swift
+import Foundation
+import FieldNotesModel
+
+public struct RemoteNote: Codable, Sendable, Identifiable {
+    public var id: UUID
+    public var title: String
+    public var body: String
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var notebookID: UUID?
+    public var tags: [String]
+    public var isPinned: Bool
+    public var location: NoteLocation?
+
+    public init(_ note: Note, updatedAt: Date = .now) {
+        id = note.id; title = note.title; body = note.body; createdAt = note.createdAt
+        self.updatedAt = updatedAt; notebookID = note.notebookID; tags = note.tags
+        isPinned = note.isPinned; location = note.location
+    }
+
+    public var note: Note {
+        Note(id: id, title: title, body: body, createdAt: createdAt, notebookID: notebookID,
+             tags: tags, isPinned: isPinned, location: location)
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/encoding-and-decoding-custom-types[Apple Developer Documentation -- Encoding and Decoding Custom Types].
+
+`NoteLocation` is already `Codable` (it's part of the model extension listed on
+xref:apps/apple/swiftdata.adoc[Persisting Models with SwiftData]). The snake_case keys are handled by the decoder's
+key strategy below, not by `CodingKeys`.
+
+=== The client
+
+`NotesAPIClient` is an actor: it has a little mutable state (the decoder and encoder are configured once, and the
+client counts retries for logging), and callers from the main actor and from background tasks can share one instance
+safely. It never stores the access token. It asks for one per request, through a closure the app supplies from
+`KeychainStore` (see xref:apps/apple/security-and-privacy.adoc[Security and Privacy]):
+
+[source,swift]
+----
+// Packages/FieldNotesKit/Sources/FieldNotesServices/Networking/NotesAPIClient.swift
+import Foundation
+import FieldNotesModel
+
+public enum NotesAPIError: Error, Sendable {
+    case invalidResponse
+    case unauthorized                       // 401: the token expired or was revoked
+    case http(status: Int, retryAfter: Duration?)
+}
+
+public actor NotesAPIClient {
+    public static let productionBaseURL = URL(string: "https://api.fieldnotes.example.com")!
+
+    private let baseURL: URL
+    private let session: URLSession
+    private let tokenProvider: @Sendable () async throws -> String?
+    private let decoder: JSONDecoder
+    private let encoder: JSONEncoder
+
+    public init(baseURL: URL = NotesAPIClient.productionBaseURL,
+                session: URLSession = .shared,
+                tokenProvider: @escaping @Sendable () async throws -> String? = { nil }) {
+        self.baseURL = baseURL
+        self.session = session
+        self.tokenProvider = tokenProvider
+        decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        decoder.dateDecodingStrategy = .iso8601
+        encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
+    }
+
+    /// GET /v1/notes?since=<date>: the notes changed on the server since the last sync.
+    public func notes(since date: Date?) async throws -> [RemoteNote] {
+        var components = URLComponents(url: baseURL.appending(path: "v1/notes"), resolvingAgainstBaseURL: false)!
+        if let date {
+            components.queryItems = [URLQueryItem(name: "since", value: date.ISO8601Format())]
+        }
+        let request = try await authorizedRequest(for: components.url!)
+        let (data, response) = try await withRetries { try await self.session.data(for: request) }
+        try Self.validate(response)
+        return try decoder.decode([RemoteNote].self, from: data)
+    }
+
+    // MARK: - Helpers
+
+    private func authorizedRequest(for url: URL, method: String = "GET") async throws -> URLRequest {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let token = try await tokenProvider() {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        return request
+    }
+
+    private static func validate(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else { throw NotesAPIError.invalidResponse }
+        switch http.statusCode {
+        case 200..<300:
+            return
+        case 401:
+            throw NotesAPIError.unauthorized
+        default:
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+                .flatMap(Int.init).map { Duration.seconds($0) }
+            throw NotesAPIError.http(status: http.statusCode, retryAfter: retryAfter)
+        }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlsession/data(for:delegate:)[Apple Developer Documentation -- data(for:delegate:)].
+
+A few points are easy to miss:
+
+* **A non-2xx status isn't an error to `URLSession`.** `data(for:)` throws only when no response arrives at all:
+  no network, a TLS failure, a timeout, cancellation. A `404` or a `500` is a successful transfer that returns an
+  `HTTPURLResponse`, which is why every call goes through `+validate(_:)+`.
+* **The closure passed to `withRetries` is `@Sendable`**, so it isn't isolated to the actor. It may still read
+  `self.session`, because that's a `let` of a `Sendable` type, and it captures the finished `URLRequest` by value.
+* **The decoder strategies** handle the naming and date format once. The Swift reference covers the options on
+  xref:programming-languages/swift/codable-and-serialization.adoc[Codable and Serialization].
+
+For an unauthenticated resource, `data(from:)` takes a `URL` directly. *FieldNotes* uses it for the server's status
+endpoint, which the settings screen shows:
+
+[source,swift]
+----
+// NotesAPIClient.swift (continued)
+extension NotesAPIClient {
+    public struct ServiceStatus: Decodable, Sendable {
+        public var isAvailable: Bool
+        public var message: String?
+    }
+
+    /// GET /status: no token, no retries; a quick check for the settings screen.
+    public func serviceStatus() async throws -> ServiceStatus {
+        let (data, response) = try await session.data(from: baseURL.appending(path: "status"))
+        try Self.validate(response)
+        return try decoder.decode(ServiceStatus.self, from: data)
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlsession/data(from:delegate:)[Apple Developer Documentation -- data(from:delegate:)].
+
+=== Uploading
+
+`upload(for:from:)` sends a request body from memory; `upload(for:fromFile:)` streams it from a file, which is the
+better choice for anything large. *FieldNotes* sends changed notes in batches. The upload that `CloudNoteSyncer.sync()`
+leaves as a comment on xref:apps/apple/concurrency-in-apps.adoc[Swift Concurrency in Apps] is a call to `+push(_:)+`:
+
+[source,swift]
+----
+// NotesAPIClient.swift (continued)
+extension NotesAPIClient {
+    /// PUT /v1/notes: create or replace a batch of notes. Idempotent, so it's safe to retry.
+    public func push(_ notes: [RemoteNote]) async throws {
+        var request = try await authorizedRequest(for: baseURL.appending(path: "v1/notes"), method: "PUT")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = try encoder.encode(notes)
+        let (_, response) = try await withRetries { [request] in
+            try await self.session.upload(for: request, from: body)
+        }
+        try Self.validate(response)
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlsession/upload(for:from:delegate:)[Apple Developer Documentation -- upload(for:from:delegate:)].
+
+`PUT` with client-generated UUIDs makes the request *idempotent*: sending it twice leaves the server in the same
+state as sending it once. That property is what makes the automatic retries below safe. A `POST` that creates a new
+resource each time would need an idempotency key header instead.
+
+=== Streaming with `bytes(from:)`
+
+`bytes(from:)` and `bytes(for:)` return as soon as the response *headers* arrive, with an `AsyncBytes` sequence for
+the body. Iterating it reads the body as it arrives, and its `lines` property splits it into text lines. That fits
+a change feed that sends one JSON object per line (NDJSON) and keeps the connection open: *FieldNotes* applies each
+change the moment it arrives instead of waiting for a complete response:
+
+[source,swift]
+----
+// NotesAPIClient.swift (continued)
+extension NotesAPIClient {
+    /// GET /v1/notes/changes: a long-lived NDJSON stream, one RemoteNote per line.
+    /// Returns when the server closes the stream; throws CancellationError when the caller's task is cancelled.
+    public func followChanges(_ apply: @Sendable (RemoteNote) async -> Void) async throws {
+        let request = try await authorizedRequest(for: baseURL.appending(path: "v1/notes/changes"))
+        let (bytes, response) = try await session.bytes(for: request)
+        try Self.validate(response)
+        for try await line in bytes.lines where !line.isEmpty {
+            let change = try decoder.decode(RemoteNote.self, from: Data(line.utf8))
+            await apply(change)
+        }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlsession/bytes(from:delegate:)[Apple Developer Documentation -- bytes(from:delegate:)].
+
+`bytes(from:)` is the same call with a plain `URL`. The `validate` step runs before the loop, so a `401` stops the
+stream without reading an error page as JSON. `AsyncBytes` is also the way to show accurate progress for a
+download, by counting bytes against the response's `expectedContentLength`.
+
+=== Downloading a file
+
+`download(from:)` and `download(for:)` write the body to a temporary file and return its URL, so a large file never
+sits in memory. Unlike the delegate-based download task, the `async` method doesn't delete that file for you, as
+WWDC21's *Use async/await with URLSession* points out: move it where it belongs, or delete it. *FieldNotes* uses this form when
+the person opens a photo that isn't on the device yet; the background form for many photos is in the next section:
+
+[source,swift]
+----
+// NotesAPIClient.swift (continued)
+extension NotesAPIClient {
+    /// An authorized GET for one attachment; also used by AttachmentDownloader's background tasks.
+    public func downloadRequest(for attachment: PhotoAttachment) async throws -> URLRequest {
+        try await authorizedRequest(for: baseURL.appending(path: "v1/attachments/\(attachment.id.uuidString)"))
+    }
+
+    /// Downloads one attachment now, while the person waits, into the attachments folder.
+    public func downloadNow(_ attachment: PhotoAttachment) async throws -> URL {
+        let request = try await downloadRequest(for: attachment)
+        let (temporaryURL, response) = try await session.download(for: request)
+        try Self.validate(response)
+        try FieldNotesPaths.prepareAttachmentsDirectory()
+        let destination = FieldNotesPaths.attachments.appending(path: attachment.fileName)
+        try? FileManager.default.removeItem(at: destination)
+        try FileManager.default.moveItem(at: temporaryURL, to: destination)
+        return destination
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlsession/download(from:delegate:)[Apple Developer Documentation -- download(from:delegate:)]
+and https://developer.apple.com/documentation/foundation/urlsession/download(for:delegate:)[Apple Developer Documentation -- download(for:delegate:)].
+
+`FieldNotesPaths` and the backup exclusion of the attachments folder are on
+xref:apps/apple/preferences-files-and-documents.adoc[Preferences, Files and Document-Based Apps]. The image data
+itself ends up in SwiftData's external storage, as `PhotoRecord` on
+xref:apps/apple/swiftdata.adoc[Persisting Models with SwiftData] describes.
+
+=== Errors, retries and cancellation
+
+Three kinds of failure need different handling:
+
+* **Cancellation** is not a failure. When SwiftUI cancels a `.task` because the view went away, the pending
+  `URLSession` call throws `CancellationError` or `URLError(.cancelled)`. Swallow it and don't retry.
+* **Transient failures** are worth retrying after a delay: a timeout, a dropped connection, `503 Service
+  Unavailable`, `429 Too Many Requests`. Honor the server's `Retry-After` when there is one.
+* **Permanent failures** are not: `400`, `404`, `401` (refresh the token first), a decoding error, or
+  `URLError(.appTransportSecurityRequiresSecureConnection)`, which is a configuration bug.
+
+`withRetries` puts that policy in one place. It uses exponential backoff with jitter, and its sleep is
+`Task.sleep(for:)`, which throws when the task is cancelled, so a cancelled caller stops waiting immediately:
+
+[source,swift]
+----
+// NotesAPIClient.swift (continued)
+extension NotesAPIClient {
+    func withRetries<T: Sendable>(maxAttempts: Int = 3,
+                                  _ operation: @Sendable () async throws -> T) async throws -> T {
+        var attempt = 1
+        while true {
+            do {
+                return try await operation()
+            } catch {
+                guard attempt < maxAttempts, let delay = Self.retryDelay(for: error, attempt: attempt) else {
+                    throw error
+                }
+                try await Task.sleep(for: delay)   // throws CancellationError if the caller is cancelled
+                attempt += 1
+            }
+        }
+    }
+
+    private static func retryDelay(for error: any Error, attempt: Int) -> Duration? {
+        let backoff = Duration.milliseconds(500 * (1 << (attempt - 1)) + Int.random(in: 0...250))
+        switch error {
+        case is CancellationError:
+            return nil
+        case let urlError as URLError:
+            switch urlError.code {
+            case .timedOut, .networkConnectionLost, .notConnectedToInternet, .cannotConnectToHost:
+                return backoff
+            default:
+                return nil                  // .cancelled, ATS and TLS errors, bad URLs: don't retry
+            }
+        case let apiError as NotesAPIError:
+            guard case .http(let status, let retryAfter) = apiError, status == 429 || status >= 500 else {
+                return nil                  // 401 and other 4xx: retrying won't help
+            }
+            return retryAfter ?? backoff
+        default:
+            return nil
+        }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlerror[Apple Developer Documentation -- URLError].
+
+`withRetries` wraps only the network call. Every error it doesn't retry goes back to the caller unchanged, so a view
+can tell "offline" from "the server rejected this". Don't retry on `.notConnectedToInternet` in a tight loop,
+though: combine the retry with `waitsForConnectivity` or the `ConnectivityMonitor` below, so the app waits for the
+network to come back instead.
+
+=== Calling the client from a view
+
+The client reaches views through the environment, with an `@Entry` value as described on
+xref:apps/apple/app-architecture.adoc[App Architecture the Apple Way]. Pull to refresh on the note list then fetches
+remote changes and adds the ones the store doesn't have. The work runs in the `.refreshable` task, so SwiftUI cancels
+it if the list goes away:
+
+[source,swift]
+----
+// FieldNotes/Environment/NotesAPIClient+Environment.swift
+import SwiftUI
+import FieldNotesServices
+
+extension EnvironmentValues {
+    @Entry var notesAPIClient = NotesAPIClient()
+}
+
+// FieldNotes/Views/NoteList.swift (excerpt)
+import SwiftUI
+import FieldNotesModel
+import FieldNotesServices
+
+struct NoteList: View {
+    @Environment(NoteStore.self) private var store
+    @Environment(\.notesAPIClient) private var notesAPIClient
+    @AppStorage("lastRemoteSync") private var lastRemoteSync = Date.distantPast
+    @State private var loadError: (any Error)?
+    let notebookID: Notebook.ID?
+    @Binding var selection: Note.ID?
+
+    var body: some View {
+        List(store.notes.filter { $0.notebookID == notebookID }, selection: $selection) { note in
+            NoteRow(note: note)
+        }
+        .refreshable { await refreshFromServer() }
+    }
+
+    /// Main-actor work: reads and mutates the store. `.refreshable`'s closure is `@Sendable`, so it only awaits this.
+    private func refreshFromServer() async {
+        do {
+            let remote = try await notesAPIClient.notes(since: lastRemoteSync)
+            for note in remote.map(\.note) where !store.notes.contains(where: { $0.id == note.id }) {
+                store.add(note)
+            }
+            lastRemoteSync = .now
+        } catch is CancellationError {
+            // The list went away mid-refresh: nothing to report.
+        } catch {
+            loadError = error
+        }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/swiftui/view/refreshable(action:)[Apple Developer Documentation -- refreshable(action:)].
+
+The default value has no token provider. The app replaces it once, at the root, with
+`.environment(\.notesAPIClient, ...)` and a client whose token provider reads from `KeychainStore`, which
+xref:apps/apple/security-and-privacy.adoc[Security and Privacy] defines. `NoteList` also reads `NoteStore` from the
+environment, and the `WindowGroup` injects it with `.environment(store)` as on every other page.
+
+=== Session configuration
+
+`URLSession.shared` suits simple requests. A configured session changes behaviour for every task it creates, and three
+settings matter most on mobile:
+
+[source,swift]
+----
+// Packages/FieldNotesKit/Sources/FieldNotesServices/Networking/URLSession+FieldNotes.swift
+import Foundation
+
+extension URLSession {
+    /// The session NotesAPIClient uses in the app.
+    public static let fieldNotesAPI: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true            // wait for a network instead of failing at once
+        configuration.timeoutIntervalForResource = 60        // give up on a request after a minute in total
+        configuration.allowsConstrainedNetworkAccess = true  // the note list is small; Low Data Mode is fine
+        configuration.httpAdditionalHeaders = ["User-Agent": "FieldNotes/2.0"]
+        return URLSession(configuration: configuration)
+    }()
+}
+----
+
+See https://developer.apple.com/documentation/foundation/urlsessionconfiguration/waitsforconnectivity[Apple Developer Documentation -- waitsForConnectivity].
+
+With `waitsForConnectivity`, a request made offline doesn't fail with `.notConnectedToInternet`; it waits, up to
+`timeoutIntervalForResource`, and starts when a path appears. `allowsExpensiveNetworkAccess` and
+`allowsConstrainedNetworkAccess` let a session refuse cellular or Low Data Mode paths entirely; *FieldNotes* leaves the
+first on and sets the second explicitly, but its photo downloads (below) are discretionary instead.
+
+== Background Downloads: `AttachmentDownloader`
+
+A normal session's tasks stop when the app is suspended. A *background session* hands its transfers to a system
+daemon, `nsurlsessiond`, which keeps downloading while the app is suspended or even after the system terminated it,
+and then wakes or relaunches the app to deliver the results. It's the right tool for *FieldNotes*'s original-size
+photos: a notebook synced from another device can reference hundreds of them.
+
+Background sessions have rules that normal ones don't:
+
+* Only upload and download tasks from a file are supported, and the results arrive through a **delegate**, not
+  through `async` return values or completion handlers. The async `URLSession` methods can't be used on them.
+* The session is identified by a **string**, and the app must create exactly one session with that identifier per
+  process, then create it again with the same identifier when it's relaunched, so the system can reconnect it.
+* The system rate-limits relaunches. Start many tasks in one session, not one task after another.
+
+=== The downloader
+
+[source,swift]
+----
+// Packages/FieldNotesKit/Sources/FieldNotesServices/Networking/AttachmentDownloader.swift
+import Foundation
+import Synchronization
+import FieldNotesModel
+
+/// Owns the one background URLSession of the app. `@unchecked Sendable` because `session` is assigned once
+/// in `init` and never changed, and all other mutable state is behind a Mutex.
+public final class AttachmentDownloader: NSObject, @unchecked Sendable {
+    public static let sessionIdentifier = "com.example.fieldnotes.attachments"
+
+    /// One instance per process, created on first use, including when the system relaunches the app.
+    public static let shared = AttachmentDownloader()
+
+    public typealias FinishedHandler = @Sendable (_ attachmentID: UUID, _ file: URL) async -> Void
+
+    private struct State {
+        var finishedHandler: FinishedHandler?
+        var eventsFinished: [CheckedContinuation<Void, Never>] = []
+        var deliveredWithoutWaiter = false     // events finished before anyone started waiting
+    }
+
+    private var session: URLSession!
+    private let state = Mutex(State())
+
+    private override init() {
+        super.init()
+        let configuration = URLSessionConfiguration.background(withIdentifier: Self.sessionIdentifier)
+        configuration.sessionSendsLaunchEvents = true   // relaunch the app when transfers finish
+        configuration.isDiscretionary = true            // let the system pick Wi-Fi and power
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+    }
+
+    /// The app sets this once at launch: it stores the downloaded file in SwiftData (page 21).
+    public func setFinishedHandler(_ handler: @escaping FinishedHandler) {
+        state.withLock { $0.finishedHandler = handler }
+    }
+
+    public func enqueue(_ attachments: [PhotoAttachment], using client: NotesAPIClient) async throws {
+        for attachment in attachments {
+            let request = try await client.downloadRequest(for: attachment)
+            let task = session.downloadTask(with: request)
+            task.taskDescription = attachment.id.uuidString      // survives relaunch; maps the file back
+            task.countOfBytesClientExpectsToReceive = 4 * 1024 * 1024
+            task.resume()
+        }
+    }
+
+    /// Suspends until the session has delivered every pending event. Called on background relaunch.
+    public func waitForBackgroundEvents() async {
+        await withCheckedContinuation { continuation in
+            let alreadyDelivered = state.withLock { state in
+                if state.deliveredWithoutWaiter {
+                    state.deliveredWithoutWaiter = false
+                    return true
+                }
+                state.eventsFinished.append(continuation)
+                return false
+            }
+            if alreadyDelivered { continuation.resume() }
+        }
+    }
+}
+
+extension AttachmentDownloader: URLSessionDownloadDelegate {
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                           didFinishDownloadingTo location: URL) {
+        guard let id = downloadTask.taskDescription.flatMap(UUID.init(uuidString:)),
+              let http = downloadTask.response as? HTTPURLResponse, (200..<300).contains(http.statusCode)
+        else { return }
+        // `location` is deleted when this method returns: move the file synchronously, before returning.
+        let destination = FieldNotesPaths.attachments.appending(path: id.uuidString)
+        do {
+            try FieldNotesPaths.prepareAttachmentsDirectory()
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.moveItem(at: location, to: destination)
+        } catch {
+            return
+        }
+        if let handler = state.withLock({ $0.finishedHandler }) {
+            Task { await handler(id, destination) }
+        }
+    }
+
+    public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        // Failed tasks are retried at the next sync; resume data could be kept here for large files.
+    }
+
+    public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        let waiting = state.withLock { state in
+            defer { state.eventsFinished.removeAll() }
+            state.deliveredWithoutWaiter = state.eventsFinished.isEmpty
+            return state.eventsFinished
+        }
+        waiting.forEach { $0.resume() }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/foundation/downloading-files-in-the-background[Apple Developer Documentation -- Downloading files in the background].
+
+`isDiscretionary` lets the system delay transfers until the device is on Wi-Fi and power, which suits prefetching.
+For a download the person asked for, leave it `false` or use the foreground `+downloadNow(_:)+` above.
+`countOfBytesClientExpectsToReceive` helps the system schedule the work. The `taskDescription` carries the
+attachment's identifier, because after a relaunch the app has only the task and not the call that created it.
+Background tasks keep their request headers, so the `Authorization` header from `downloadRequest(for:)` travels with
+them; if a token can expire before the system runs a discretionary download, the server should accept short-lived
+signed URLs for attachments instead.
+
+The `deliveredWithoutWaiter` flag covers a race: recreating the session can deliver every event before
+`waitForBackgroundEvents()` starts waiting, and without the flag the wait would never end. `FieldNotesApp.init`
+calls `+AttachmentDownloader.shared.setFinishedHandler(_:)+` so that the handler is in place before any event
+arrives, including on a background relaunch.
+
+=== Handling a relaunch
+
+When the transfers finish while the app isn't running, the system launches it in the background and tells it which
+session has events. In a SwiftUI app, the `+.backgroundTask(.urlSession(_:))+` scene modifier receives that. Its action
+touches `AttachmentDownloader.shared`, which recreates the session with the same identifier, and then waits until
+the delegate has received everything. When the action returns, SwiftUI tells the system the app is done, and the
+system can take the snapshot for the app switcher and suspend it again:
+
+[source,swift]
+----
+// FieldNotes/FieldNotesApp.swift (excerpt: persistence wiring unchanged from Persisting Models with SwiftData)
+import SwiftUI
+import SwiftData
+import FieldNotesServices
+
+@main
+struct FieldNotesApp: App {
+    private let container: ModelContainer
+    @State private var store: NoteStore
+    @State private var connectivity = ConnectivityMonitor()
+
+    init() {
+        do {
+            container = try ModelContainer.fieldNotes()
+        } catch {
+            fatalError("FieldNotes could not open its store: \(error)")
+        }
+        _store = State(initialValue: NoteStore(
+            syncer: CloudNoteSyncer(),
+            persistence: SwiftDataNotePersistence(modelContainer: container)))
+        Self.registerDefaultPreferences()
+        // Also calls AttachmentDownloader.shared.setFinishedHandler(_:) here (described above).
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environment(store)
+                .environment(connectivity)
+                .task { await store.load() }
+                .task { await connectivity.run() }
+        }
+        .modelContainer(container)
+        .defaultAppStorage(.fieldNotesShared)
+        #if os(iOS) || os(visionOS)
+        .backgroundTask(.urlSession(AttachmentDownloader.sessionIdentifier)) {
+            await AttachmentDownloader.shared.waitForBackgroundEvents()
+        }
+        #endif
+    }
+}
+----
+
+See link:++https://developer.apple.com/documentation/swiftui/backgroundtask/urlsession(_:)++[+Apple Developer Documentation -- urlSession(_:)+]
+and link:++https://developer.apple.com/documentation/swiftui/scene/backgroundtask(_:action:)++[+Apple Developer Documentation -- backgroundTask(_:action:)+].
+
+The container, `SwiftDataNotePersistence` and `store.load()` wiring is the one from
+xref:apps/apple/swiftdata.adoc#_putting_the_container_in_the_environment[Persisting Models with SwiftData]; only the
+connectivity monitor and the background session handling are new here.
+
+A UIKit app, or a SwiftUI app that already routes this through its delegate, implements the app delegate method
+instead. Its `async` form is equivalent, and `FieldNotesAppDelegate` from
+xref:apps/apple/app-structure-and-lifecycle.adoc[App Structure and Life Cycle] would add:
+
+[source,swift]
+----
+// FieldNotes/iOS/FieldNotesAppDelegate.swift (excerpt)
+#if os(iOS) || os(visionOS)
+import UIKit
+import FieldNotesServices
+
+extension FieldNotesAppDelegate {
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String) async {
+        guard identifier == AttachmentDownloader.sessionIdentifier else { return }
+        await AttachmentDownloader.shared.waitForBackgroundEvents()
+    }
+}
+#endif
+----
+
+See link:++https://developer.apple.com/documentation/uikit/uiapplicationdelegate/application(_:handleeventsforbackgroundurlsession:completionhandler:)++[+Apple Developer Documentation -- application(_:handleEventsForBackgroundURLSession:completionHandler:)+].
+
+Use one of the two, not both. Background launch for a URL session is an iOS, iPadOS, visionOS and watchOS behaviour;
+on macOS, apps aren't relaunched for it, and a background session's transfers complete when the app next runs. The
+wider background-execution model, and the other background task types, are on
+xref:apps/apple/background-execution.adoc[Background Execution].
+
+=== Figure: a background download from start to relaunch
+
+[mermaid]
+....
+sequenceDiagram
+    participant App as FieldNotes app
+    participant D as nsurlsessiond (system daemon)
+    participant OS as iOS
+    participant Del as AttachmentDownloader (delegate)
+    App->>D: downloadTask(with:).resume() on session "com.example.fieldnotes.attachments"
+    App->>OS: person leaves the app
+    OS->>App: suspend, later terminate to free memory
+    D->>D: downloads continue on Wi-Fi and power (isDiscretionary)
+    D->>OS: all tasks finished, sessionSendsLaunchEvents = true
+    OS->>App: relaunch in the background
+    App->>App: .backgroundTask(.urlSession(id)) runs<br/>AttachmentDownloader.shared recreates the session
+    D->>Del: urlSession(_:downloadTask:didFinishDownloadingTo:) per file
+    Del->>Del: move file to Attachments, call finished handler
+    D->>Del: urlSessionDidFinishEvents(forBackgroundURLSession:)
+    Del-->>App: waitForBackgroundEvents() returns
+    App->>OS: background task complete: snapshot UI, suspend
+....
+
+Each step has a failure mode that the figure makes visible. If the app creates the session under a different
+identifier, or not at all, the daemon has nowhere to deliver the files. If the delegate doesn't move a file before
+returning, it's deleted. And if the action never returns, the system eventually ends the app for exceeding its
+background time.
+
+== Monitoring Connectivity: `ConnectivityMonitor`
+
+`NWPathMonitor` reports the current network *path*: whether one is available, and what it goes through. It conforms
+to `AsyncSequence`, so a `for await` loop receives every change, and the monitor stops when the loop ends. The
+properties *FieldNotes* cares about are:
+
+* `status`: `.satisfied` when a path is available;
+* `isExpensive`: the path uses cellular or a personal hotspot;
+* `isConstrained`: the person turned on **Low Data Mode** for this network.
+
+`ConnectivityMonitor` publishes those as observable properties, so any view can show an offline banner or hold back
+large downloads:
+
+[source,swift]
+----
+// Packages/FieldNotesKit/Sources/FieldNotesServices/Networking/ConnectivityMonitor.swift
+import Network
+import Observation
+
+@Observable
+@MainActor
+public final class ConnectivityMonitor {
+    public private(set) var isConnected = true
+    public private(set) var isExpensive = false
+    public private(set) var isConstrained = false
+
+    /// Downloads that can wait (prefetching original photos) only run on unmetered, unconstrained paths.
+    public var allowsLargeTransfers: Bool { isConnected && !isExpensive && !isConstrained }
+
+    public init() {}
+
+    /// Runs until the calling task is cancelled; start it from a view's `.task`.
+    public func run() async {
+        for await path in NWPathMonitor() {
+            isConnected = path.status == .satisfied
+            isExpensive = path.isExpensive
+            isConstrained = path.isConstrained
+        }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/network/nwpathmonitor[Apple Developer Documentation -- NWPathMonitor],
+https://developer.apple.com/documentation/network/nwpath/isexpensive[Apple Developer Documentation -- isExpensive]
+and https://developer.apple.com/documentation/network/nwpath/isconstrained[Apple Developer Documentation -- isConstrained].
+
+The app starts it with `.task { await connectivity.run() }`, as in the `FieldNotesApp` excerpt above, so it stops when
+the scene goes away. A view then reads it like any other observable model:
+
+[source,swift]
+----
+// FieldNotes/Views/OfflineBanner.swift
+import SwiftUI
+import FieldNotesServices
+
+struct OfflineBanner: View {
+    @Environment(ConnectivityMonitor.self) private var connectivity
+
+    var body: some View {
+        if !connectivity.isConnected {
+            Label("Offline. Notes will sync when you're back online.", systemImage: "wifi.slash")
+                .font(.footnote)
+                .padding(8)
+                .frame(maxWidth: .infinity)
+                .background(.thinMaterial)
+        }
+    }
+}
+
+#Preview {
+    OfflineBanner()
+        .environment(ConnectivityMonitor())
+}
+----
+
+See https://developer.apple.com/documentation/network/nwpath[Apple Developer Documentation -- NWPath].
+
+Use the monitor to *inform*, not to *gate*. A path can be `.satisfied` and the server still unreachable, and a request
+started offline with `waitsForConnectivity` succeeds as soon as the network returns. Apple's guidance is to attempt
+the request and handle failure, and to use path information to choose behaviour: lower-resolution images on a
+constrained path, or deferring the photo prefetch until `allowsLargeTransfers` is `true`.
+
+== The Network Framework: `NetworkConnection` and `NetworkListener` (26)
+
+The Network framework is for protocols that aren't HTTP. The 26 releases added a structured-concurrency API on top
+of it: `NetworkConnection` and `NetworkListener` describe their protocol stack declaratively, the way SwiftUI
+describes views, and send and receive with `async` methods instead of callbacks. *FieldNotes* uses it for one optional
+feature: a live *field session*, in which a group leader's device receives each participant's notes as they're
+captured.
+
+=== A client connection
+
+`NetworkConnection` is generic over its top protocol. Here that's `Coder`, which frames and encodes `Codable` values,
+over TLS, over TCP (TLS adds TCP implicitly). Sending a `RemoteNote` is then one `await`, and incoming messages are an
+`AsyncThrowingStream`:
+
+[source,swift]
+----
+// Packages/FieldNotesKit/Sources/FieldNotesServices/Networking/FieldSessionChannel.swift
+import Network
+
+public enum FieldSessionChannel {
+    /// Connects to the field-session relay, sends the participant's notes as they're captured,
+    /// and applies notes from other participants. Returns when the relay closes the connection.
+    public static func join(sending outgoing: AsyncStream<RemoteNote>,
+                            receiving apply: @escaping @Sendable (RemoteNote) async -> Void) async throws {
+        let connection = NetworkConnection(to: .hostPort(host: "live.fieldnotes.example.com", port: 7443)) {
+            Coder(RemoteNote.self, using: .json) {
+                TLS()
+            }
+        }
+
+        try await withThrowingDiscardingTaskGroup { group in
+            group.addTask {
+                for await note in outgoing {
+                    try await connection.send(note)
+                }
+            }
+            group.addTask {
+                for try await message in connection.messages {
+                    await apply(message.content)
+                }
+            }
+        }
+    }
+}
+----
+
+See https://developer.apple.com/documentation/network/networkconnection[Apple Developer Documentation -- NetworkConnection]
+and https://developer.apple.com/documentation/network/coder[Apple Developer Documentation -- Coder].
+
+The connection starts on its first send or receive, and it's cancelled when the task that uses it is cancelled, so
+the task group ties its lifetime to the caller. Other stacks are built the same way: `TLS()` alone gives a byte stream
+with `+send(_:)+` and `receive(exactly:)`, `TLV` adds type-length-value framing, and `QUIC` and `UDP` replace TCP. ATS
+doesn't apply to the Network framework, so the stack must choose TLS itself; this one does.
+
+=== A listener
+
+`NetworkListener` accepts connections with the same protocol stack. On macOS, the *FieldNotes* classroom companion
+advertises itself with Bonjour on the local network, and nearby iPads connect to it without typing an address:
+
+[source,swift]
+----
+// FieldNotes/macOS/ClassroomListener.swift
+#if os(macOS)
+import Network
+import FieldNotesServices
+
+func runClassroomListener(store: NoteStore) async throws {
+    let listener = try NetworkListener(for: BonjourListenerProvider(name: "FieldNotes Classroom",
+                                                                    type: "_fieldnotes._tcp")) {
+        Coder(RemoteNote.self, using: .json) {
+            TCP()
+        }
+    }
+    try await listener.run { connection in
+        for try await message in connection.messages {
+            let note = message.content.note
+            await MainActor.run { store.add(note) }
+        }
+    }
+}
+#endif
+----
+
+See https://developer.apple.com/documentation/network/networklistener[Apple Developer Documentation -- NetworkListener].
+
+`+run(_:)+` calls the closure once per incoming connection, each in its own child task, and returns only when the
+listener fails or its task is cancelled. This local-network example uses plain TCP to stay short; production code
+uses TLS with a local identity, as described in Apple's *Creating an Identity for Local Network TLS*. Browsing or
+advertising on the local network triggers the local-network privacy prompt, so the Info.plist needs
+`NSLocalNetworkUsageDescription` and an `NSBonjourServices` entry for `+_fieldnotes._tcp+`.
+
+See https://developer.apple.com/documentation/bundleresources/information-property-list/nslocalnetworkusagedescription[Apple Developer Documentation -- NSLocalNetworkUsageDescription].
+
+=== Legacy: `NWConnection`
+
+Before 26, the Network framework's Swift API was `NWConnection` and `NWListener`: callback-based, driven by a
+`stateUpdateHandler`, with sends and receives that take completion closures and run on a `DispatchQueue` you supply.
+They remain supported, and code targeting releases before 26 still uses them. New code with a 26 minimum, like
+*FieldNotes*, uses `NetworkConnection`. For comparison, the send side of the client above looks like this:
+
+[source,swift]
+----
+// Legacy: NWConnection with callbacks (not used by FieldNotes)
+import Foundation
+import Network
+
+func sendLegacy(_ data: Data) {
+    let connection = NWConnection(host: "live.fieldnotes.example.com", port: 7443, using: .tls)
+    connection.stateUpdateHandler = { state in
+        if case .failed(let error) = state { print("Connection failed: \(error)") }
+    }
+    connection.start(queue: .global())
+    connection.send(content: data, completion: .contentProcessed { error in
+        if let error { print("Send failed: \(error)") }
+        connection.cancel()
+    })
+}
+----
+
+See https://developer.apple.com/documentation/network/nwconnection[Apple Developer Documentation -- NWConnection].
+
+WWDC25's *Use structured concurrency with Network framework* walks through the migration, including framing with
+`TLV` and `Coder`, and browsing with `NetworkBrowser`.
+
+See https://developer.apple.com/videos/play/wwdc2025/250/[WWDC25 -- Use structured concurrency with Network framework].
+
+== App Transport Security
+
+App Transport Security (ATS) is on by default for every app. When the app uses the URL Loading System, ATS refuses
+any connection that isn't HTTPS with TLS 1.2 or later, a trusted certificate and forward-secrecy ciphers. A plain
+`http://` request fails with `URLError(.appTransportSecurityRequiresSecureConnection)`, and the console says that ATS
+blocked a cleartext load. *FieldNotes*'s own API is HTTPS, so it needs no configuration at all. The best fix for a
+failing server is always to fix the server.
+
+When a server can't be fixed, exceptions go in the `NSAppTransportSecurity` dictionary of the Info.plist, and they
+should be as narrow as possible: one domain, one relaxed rule. *FieldNotes* has two. A partner's legacy weather
+service is HTTP-only, and during development the app talks to a server on the local network:
+
+[source,xml]
+----
+<!-- FieldNotes/Info.plist (excerpt) -->
+<key>NSAppTransportSecurity</key>
+<dict>
+    <!-- Local addresses and .local names, for the development server only. -->
+    <key>NSAllowsLocalNetworking</key>
+    <true/>
+    <key>NSExceptionDomains</key>
+    <dict>
+        <key>weather.partner.example.org</key>
+        <dict>
+            <key>NSIncludesSubdomains</key>
+            <false/>
+            <key>NSExceptionAllowsInsecureHTTPLoads</key>
+            <true/>
+        </dict>
+    </dict>
+</dict>
+----
+
+See https://developer.apple.com/documentation/security/preventing-insecure-network-connections[Apple Developer Documentation -- Preventing Insecure Network Connections].
+
+Never ship `NSAllowsArbitraryLoads`: it turns ATS off for every domain, and App Store review asks for a justification
+for it and for insecure-load exceptions. `NSAllowsArbitraryLoadsInWebContent` is the narrower key for content shown in
+a `WKWebView`. To find out which exception a server actually needs, run Apple's diagnostic tool on a Mac:
+
+[source,shell]
+----
+nscurl --ats-diagnostics --verbose https://weather.partner.example.org
+----
+
+See https://developer.apple.com/documentation/security/identifying-the-source-of-blocked-connections[Apple Developer Documentation -- Identifying the Source of Blocked Connections].
+
+ATS covers the URL Loading System and the frameworks built on it, such as `WKWebView` and AVFoundation streaming. It
+does *not* cover the Network framework or BSD sockets, which is why the field-session stack above states `TLS()`
+explicitly.
+
+== Certificate Pinning
+
+Normal TLS trusts any certificate that chains to a root in the system trust store. *Pinning* narrows that to specific
+keys, so a certificate from a compromised or rogue authority, or a corporate proxy, is rejected. Its cost is
+operational: if the server rotates to a key that isn't pinned, the app can't connect until it's updated. Pin a backup
+key as well as the current one, and prefer pinning the issuing CA over the leaf.
+
+Since iOS 14 and macOS 11, ATS can pin declaratively, with no code, through `NSPinnedDomains`. Each entry lists the
+Base64-encoded SHA-256 hashes of the allowed public keys (SPKI):
+
+[source,xml]
+----
+<!-- FieldNotes/Info.plist (excerpt): pin the API's issuing CA, plus a backup CA. -->
+<key>NSAppTransportSecurity</key>
+<dict>
+    <key>NSPinnedDomains</key>
+    <dict>
+        <key>api.fieldnotes.example.com</key>
+        <dict>
+            <key>NSIncludesSubdomains</key>
+            <false/>
+            <key>NSPinnedCAIdentities</key>
+            <array>
+                <dict>
+                    <key>SPKI-SHA256-BASE64</key>
+                    <string>REPLACE-WITH-BASE64-SHA256-OF-ISSUING-CA-SPKI</string>
+                </dict>
+                <dict>
+                    <key>SPKI-SHA256-BASE64</key>
+                    <string>REPLACE-WITH-BASE64-SHA256-OF-BACKUP-CA-SPKI</string>
+                </dict>
+            </array>
+        </dict>
+    </dict>
+</dict>
+----
+
+See https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nspinneddomains[Apple Developer Documentation -- NSPinnedDomains].
+
+The two strings are placeholders; compute the real hashes from the server's certificate chain. Pinning in code, with a
+`URLSessionDelegate` that evaluates `SecTrust` in `+urlSession(_:didReceive:)+`, and the Keychain storage of the tokens
+that `NotesAPIClient` sends, are on xref:apps/apple/security-and-privacy.adoc[Security and Privacy]. The OAuth flow that
+produces those tokens is on xref:backend/oauth/native-and-mobile-apps.adoc[Native and Mobile Apps].
+
+== gRPC
+
+gRPC isn't part of Apple's SDKs. The open-source *gRPC Swift* project, now at version 2, generates `async` Swift
+clients and servers from `.proto` files and runs over HTTP/2, using SwiftNIO or, on Apple platforms, the Network
+framework as its transport. *FieldNotes* doesn't use it, because its API is small and JSON over `URLSession` is
+enough. A team whose backend already speaks gRPC adds it as a package dependency:
+
+[source,swift]
+----
+// swift-tools-version: 6.4
+// Package.swift of a hypothetical FieldNotesRPC package (FieldNotes itself doesn't use gRPC).
+import PackageDescription
+
+let package = Package(
+    name: "FieldNotesRPC",
+    platforms: [.iOS(.v26), .macOS(.v26), .watchOS(.v26), .visionOS(.v26)],
+    dependencies: [
+        .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.0.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.0.0"),
+        .package(url: "https://github.com/grpc/grpc-swift-protobuf.git", from: "2.0.0"),
+    ],
+    targets: [
+        .target(name: "FieldNotesRPC", dependencies: [
+            .product(name: "GRPCCore", package: "grpc-swift-2"),
+            .product(name: "GRPCNIOTransportHTTP2", package: "grpc-swift-nio-transport"),
+            .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
+        ])
+    ]
+)
+----
+
+See https://www.swift.org/blog/grpc-swift-2/[Swift.org -- gRPC Swift 2].
+
+The gRPC concepts themselves (services, streaming RPCs, deadlines) belong with the backend documentation, not here.
+
+== Availability and Requirements
+
+=== Platform availability
+
+[cols="2,1,1,1,1,1",options="header"]
+|===
+| API or feature | iOS | iPadOS | macOS | watchOS | visionOS
+
+| `URLSession` async `data`/`bytes`/`upload`/`download`
+| Yes | Yes | Yes | Yes | Yes
+
+| Background `URLSession` (`background(withIdentifier:)`)
+| Yes | Yes | Yes (no background relaunch) | Yes | Yes
+
+| SwiftUI `+.backgroundTask(.urlSession(_:))+`
+| Yes | Yes | Yes (no background relaunch) | Yes | Yes
+
+| `+application(_:handleEventsForBackgroundURLSession:)+`
+| Yes | Yes | Not available | Not available (use `WKApplicationDelegate`) | Yes
+
+| `NWPathMonitor` as an `AsyncSequence`, `isExpensive`, `isConstrained`
+| Yes | Yes | Yes | Yes | Yes
+
+| `NetworkConnection`, `NetworkListener`, `Coder`, `BonjourListenerProvider`
+| New in 26 | New in 26 | New in 26 | New in 26 (restricted, see below) | New in 26
+
+| `NWConnection`, `NWListener`
+| Yes | Yes | Yes | Yes (restricted, see below) | Yes
+
+| App Transport Security, `NSPinnedDomains`
+| Yes | Yes | Yes | Not listed in the documentation | Yes
+|===
+
+On watchOS, low-level networking (the Network framework, and `URLSessionStreamTask` or WebSocket tasks) is limited to
+specific situations, such as an active audio-streaming session, as Apple's technote *TN3135* explains.
+`URLSession` data, upload and download tasks work normally. The field-session feature is therefore not offered on
+the watch.
+
+See https://developer.apple.com/documentation/technotes/tn3135-low-level-networking-on-watchos[Apple Developer Documentation -- TN3135: Low-level networking on watchOS].
+
+=== Capabilities, accounts and devices
+
+* Networking itself needs no capability on iOS, iPadOS, watchOS and visionOS. A **sandboxed Mac app** needs the
+  *Outgoing Connections (Client)* capability for `NotesAPIClient`, and *Incoming Connections (Server)* for the
+  classroom listener.
+* Background relaunch for `AttachmentDownloader` is best tested on a **physical device**: the Simulator runs background
+  sessions, but it doesn't reproduce the daemon's scheduling, `isDiscretionary` delays or relaunch-after-termination
+  faithfully.
+* The Bonjour listener and the local-network prompt need `NSLocalNetworkUsageDescription` and `NSBonjourServices`,
+  and two devices on the same network to try out.
+* None of the examples needs a paid developer account.
+
+== References
+
+* https://developer.apple.com/documentation/foundation/url-loading-system[Apple Developer Documentation -- URL Loading System]
+* https://developer.apple.com/documentation/foundation/urlsession[Apple Developer Documentation -- URLSession]
+* https://developer.apple.com/documentation/foundation/urlsession/data(for:delegate:)[Apple Developer Documentation -- data(for:delegate:)]
+* https://developer.apple.com/documentation/foundation/urlsession/data(from:delegate:)[Apple Developer Documentation -- data(from:delegate:)]
+* https://developer.apple.com/documentation/foundation/urlsession/bytes(from:delegate:)[Apple Developer Documentation -- bytes(from:delegate:)]
+* https://developer.apple.com/documentation/foundation/urlsession/upload(for:from:delegate:)[Apple Developer Documentation -- upload(for:from:delegate:)]
+* https://developer.apple.com/documentation/foundation/urlsession/download(from:delegate:)[Apple Developer Documentation -- download(from:delegate:)]
+* https://developer.apple.com/documentation/foundation/urlsession/download(for:delegate:)[Apple Developer Documentation -- download(for:delegate:)]
+* https://developer.apple.com/documentation/foundation/urlerror[Apple Developer Documentation -- URLError]
+* https://developer.apple.com/documentation/foundation/encoding-and-decoding-custom-types[Apple Developer Documentation -- Encoding and Decoding Custom Types]
+* https://developer.apple.com/documentation/foundation/urlsessionconfiguration/waitsforconnectivity[Apple Developer Documentation -- waitsForConnectivity]
+* https://developer.apple.com/documentation/foundation/downloading-files-in-the-background[Apple Developer Documentation -- Downloading files in the background]
+* https://developer.apple.com/documentation/foundation/urlsessionconfiguration/background(withidentifier:)[Apple Developer Documentation -- background(withIdentifier:)]
+* https://developer.apple.com/documentation/foundation/urlsessiondownloaddelegate[Apple Developer Documentation -- URLSessionDownloadDelegate]
+* link:++https://developer.apple.com/documentation/swiftui/backgroundtask/urlsession(_:)++[+Apple Developer Documentation -- urlSession(_:)+]
+* link:++https://developer.apple.com/documentation/swiftui/scene/backgroundtask(_:action:)++[+Apple Developer Documentation -- backgroundTask(_:action:)+]
+* link:++https://developer.apple.com/documentation/uikit/uiapplicationdelegate/application(_:handleeventsforbackgroundurlsession:completionhandler:)++[+Apple Developer Documentation -- application(_:handleEventsForBackgroundURLSession:completionHandler:)+]
+* https://developer.apple.com/documentation/swiftui/view/refreshable(action:)[Apple Developer Documentation -- refreshable(action:)]
+* https://developer.apple.com/documentation/network[Apple Developer Documentation -- Network]
+* https://developer.apple.com/documentation/network/nwpathmonitor[Apple Developer Documentation -- NWPathMonitor]
+* https://developer.apple.com/documentation/network/nwpath[Apple Developer Documentation -- NWPath]
+* https://developer.apple.com/documentation/network/nwpath/isexpensive[Apple Developer Documentation -- isExpensive]
+* https://developer.apple.com/documentation/network/nwpath/isconstrained[Apple Developer Documentation -- isConstrained]
+* https://developer.apple.com/documentation/network/networkconnection[Apple Developer Documentation -- NetworkConnection]
+* https://developer.apple.com/documentation/network/networklistener[Apple Developer Documentation -- NetworkListener]
+* https://developer.apple.com/documentation/network/coder[Apple Developer Documentation -- Coder]
+* https://developer.apple.com/documentation/network/nwconnection[Apple Developer Documentation -- NWConnection]
+* https://developer.apple.com/documentation/bundleresources/information-property-list/nslocalnetworkusagedescription[Apple Developer Documentation -- NSLocalNetworkUsageDescription]
+* https://developer.apple.com/documentation/security/preventing-insecure-network-connections[Apple Developer Documentation -- Preventing Insecure Network Connections]
+* https://developer.apple.com/documentation/security/identifying-the-source-of-blocked-connections[Apple Developer Documentation -- Identifying the Source of Blocked Connections]
+* https://developer.apple.com/documentation/bundleresources/information-property-list/nsapptransportsecurity/nspinneddomains[Apple Developer Documentation -- NSPinnedDomains]
+* https://developer.apple.com/documentation/technotes/tn3151-choosing-the-right-networking-api[Apple Developer Documentation -- TN3151: Choosing the right networking API]
+* https://developer.apple.com/documentation/technotes/tn3135-low-level-networking-on-watchos[Apple Developer Documentation -- TN3135: Low-level networking on watchOS]
+* https://developer.apple.com/videos/play/wwdc2025/250/[WWDC25 -- Use structured concurrency with Network framework]
+* https://developer.apple.com/videos/play/wwdc2021/10095/[WWDC21 -- Use async/await with URLSession]
+* https://www.swift.org/blog/grpc-swift-2/[Swift.org -- gRPC Swift 2]
