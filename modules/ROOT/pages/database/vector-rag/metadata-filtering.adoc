@@ -1,0 +1,420 @@
+= Metadata Filtering
+:description: Combining vector similarity with metadata filters -- pre- vs. post- vs. in-graph filtering, the overfetch-then-filter failure mode, pgvector iterative index scans, sqlite-vec partition columns, filterable HNSW, and the Spring AI and LangChain filter languages.
+:keywords: metadata filtering, pre-filtering, post-filtering, overfetch, pgvector, iterative index scan, hnsw.iterative_scan, partial index, partitioning, multi-tenancy, sqlite-vec, filterable hnsw, qdrant, elasticsearch, lucene, redis, spring ai filter expression, langchain filter
+
+include::partial$vector-rag-disclaimer.adoc[]
+
+This page's examples target PostgreSQL 17 with pgvector 0.8.6, sqlite-vec 0.1.9, Spring Boot 4.1 with
+Spring AI 2.0.1, and LangChain / langchain-postgres 1.4 / 0.0.18. They filter the *DocsAssistant* chunks
+by the shared `component` metadata key (`vector-rag` or `spring-ai`), the same schema used throughout this
+section.
+
+== Why metadata needs its own storage
+
+An embedding vector only carries semantic similarity; it says nothing about which document a chunk came
+from, which tenant owns it, or when it was last updated. *DocsAssistant* keeps that information in
+ordinary structured columns -- `documents.component`, `chunks.section_path`, `chunks.chunk_index` -- next
+to the vector, rather than folding it into the embedding itself. Engines without a relational schema keep
+the same idea under a different name: a *payload* in Qdrant, a JSON attribute in a Redis vector set, or a
+plain column on a `vec0` virtual table. In every case, a query becomes two conditions joined together: "is
+this chunk about `component = 'vector-rag'`" and "is this chunk's embedding close to the query vector".
+
+=== Denormalizing `component` onto `chunk_embeddings`
+
+In the shared schema `component` lives on `documents`, two joins away from the vector in
+`chunk_embeddings`. PostgreSQL can only use a filter to steer an index scan -- through an iterative scan or a
+partial index, both below -- when that filter is on a column of the indexed table itself, so this page
+*deviates from the core DocsAssistant schema* and copies `component` onto `chunk_embeddings`:
+
+[source,sql]
+----
+ALTER TABLE chunk_embeddings ADD COLUMN component text;
+
+UPDATE chunk_embeddings ce
+SET component = d.component
+FROM chunks c
+JOIN documents d ON d.id = c.document_id
+WHERE c.id = ce.chunk_id;
+
+ALTER TABLE chunk_embeddings ALTER COLUMN component SET NOT NULL;
+----
+
+The ingestion job then writes `component` into both tables whenever it (re-)embeds a chunk. Every PostgreSQL
+query on this page filters on `ce.component`. See
+https://www.postgresql.org/docs/current/sql-altertable.html[PostgreSQL: ALTER TABLE] and
+https://www.postgresql.org/docs/current/sql-update.html[PostgreSQL: UPDATE] (the `FROM` form).
+
+=== Pre-, post- and in-graph filtering
+
+There are three ways to combine those two conditions, and the difference matters once an index is
+approximate rather than exact:
+
+* *Post-filtering* -- run the vector search first, take its top-`k` results, then discard the ones that
+  fail the metadata filter. Simple, but the filter never influences which candidates the index visits, so
+  a selective filter can shrink `k` matches down to very few, or none.
+* *Pre-filtering* -- evaluate the metadata filter first, restrict the candidate set to matching rows, then
+  run vector search only inside that restricted set (a `WHERE` clause ahead of a sequential/exact scan, or
+  a payload index consulted before the graph walk). Correct, but if pre-filtering falls back to a full
+  scan of the matching rows, it forfeits the ANN index's speed advantage precisely when the filter is
+  selective.
+* *In-graph (filtered ANN) filtering* -- the index walks its graph or candidate list and evaluates the
+  metadata filter on each candidate as it is visited, skipping non-matching nodes without abandoning the
+  approximate structure. This is what pgvector's iterative index scans, Qdrant's filterable HNSW, and
+  Lucene's pre-filtered `KnnFloatVectorQuery` all implement, each described below.
+
+=== The overfetch-then-filter failure mode
+
+A common, naive middle ground is to *overfetch*: ask the vector index for more neighbors than needed
+(say, `k = 50` when the application wants 5) and post-filter the extra headroom down to the real answer in
+application code. It works as long as the filter's selectivity is roughly known and the overfetch factor is
+generous enough -- but it fails silently once the filter is more selective than assumed:
+
+[source,python]
+----
+import numpy as np
+import psycopg
+from pgvector.psycopg import register_vector
+
+conn = psycopg.connect("dbname=docsassistant")
+register_vector(conn)
+
+query_embedding = np.array(query_vector)  # 768 floats from nomic-embed-text
+
+# plain ANN query: no WHERE clause, the HNSW index returns the 50 nearest chunks overall
+rows = conn.execute(
+    """
+    SELECT ce.chunk_id, ce.component, ce.embedding <=> %s AS distance
+    FROM chunk_embeddings ce
+    ORDER BY ce.embedding <=> %s
+    LIMIT 50
+    """,
+    (query_embedding, query_embedding),
+).fetchall()
+
+# post-filter in Python, then truncate to the 5 the prompt needs
+hits = [row for row in rows if row[1] == "spring-ai"][:5]
+# if fewer than 5 of the 50 nearest chunks overall are 'spring-ai' chunks, hits is short,
+# even though more matching chunks exist further down the true ranking
+----
+
+See https://github.com/pgvector/pgvector-python#psycopg-3[pgvector-python: Psycopg 3] for registering the
+`vector` type with Psycopg.
+
+Moving the filter into SQL does not fix this on its own. With the default settings an HNSW scan only produces
+its `hnsw.ef_search`-sized candidate list (40 by default), and PostgreSQL applies the `WHERE` clause to those
+candidates *after* the index scan, so the query below can still return fewer than 5 rows when `spring-ai`
+chunks are rare among the nearest neighbors:
+
+[source,sql]
+----
+SELECT ce.chunk_id, ce.embedding <=> '[...]'::vector AS distance
+FROM chunk_embeddings ce
+WHERE ce.component = 'spring-ai'
+ORDER BY ce.embedding <=> '[...]'::vector
+LIMIT 5;
+----
+
+The index's candidate list is dominated by embeddings from other components, so filtering it down to
+`spring-ai` starves the result set. Iterative index scans exist to fix exactly this. See
+https://github.com/pgvector/pgvector#filtering[pgvector: Filtering] for how approximate indexes apply filters
+after the index scan.
+
+== pgvector iterative index scans
+
+Since pgvector 0.8, an HNSW (or IVFFlat) scan can keep walking past its normal candidate-list limit when a
+`WHERE` filter is still discarding too many rows, instead of giving up with a short result set:
+
+[source,sql]
+----
+-- relaxed_order trades a small amount of ranking precision for completeness:
+-- it may return results slightly out of exact distance order once it has
+-- scanned past the point where order is still guaranteed
+SET hnsw.iterative_scan = relaxed_order;
+SET hnsw.max_scan_tuples = 20000;  -- upper bound on tuples visited before giving up
+
+SELECT ce.chunk_id, ce.embedding <=> '[...]'::vector AS distance
+FROM chunk_embeddings ce
+WHERE ce.component = 'spring-ai'
+ORDER BY ce.embedding <=> '[...]'::vector
+LIMIT 5;
+----
+
+`hnsw.iterative_scan` accepts `off` (the default -- the short-result behavior above),
+`strict_order` (keep expanding the candidate list but never return results out of true distance order,
+at a higher cost), or `relaxed_order` (expand and allow slightly out-of-order results, the cheaper
+option). `hnsw.max_scan_tuples` bounds how many tuples an iterative scan is allowed to visit before it
+stops and returns whatever it has found (20,000 by default), protecting a highly selective filter from
+scanning the entire table. IVFFlat has the equivalent `ivfflat.iterative_scan`, which only accepts
+`relaxed_order`. Because the filter is on `ce.component`, a column of the indexed table, the executor can
+check it on each tuple the index returns and keep scanning until 5 rows pass. The `chunks` columns (section
+path, content) can then be joined onto those 5 ids. See https://github.com/pgvector/pgvector#iterative-index-scans[pgvector: Iterative index scans].
+
+=== Partial indexes per component
+
+When a filter always targets the same small set of values -- here, `component` -- a *partial index*
+scoped to just that value avoids paying the iterative-scan cost altogether, at the price of one index per
+value:
+
+[source,sql]
+----
+CREATE INDEX chunk_embeddings_hnsw_vector_rag
+    ON chunk_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE component = 'vector-rag';
+
+-- the query's WHERE clause matches the index predicate, so the planner can choose this index
+SELECT ce.chunk_id, ce.embedding <=> '[...]'::vector AS distance
+FROM chunk_embeddings ce
+WHERE ce.component = 'vector-rag'
+ORDER BY ce.embedding <=> '[...]'::vector
+LIMIT 5;
+----
+
+An index predicate may only reference columns of the indexed table -- PostgreSQL rejects a subquery or a join
+to `documents` with "cannot use subquery in index predicate", which is why `component` was denormalized
+onto `chunk_embeddings` above. The planner only uses the partial index when it can prove the query's
+`WHERE` clause implies the predicate, so write the literal `ce.component = 'vector-rag'`; a parameterized
+`ce.component = $1` in a generic prepared-statement plan cannot be matched. Every vector in the partial
+index is a `vector-rag` vector, so the scan needs no filtering and returns full result sets. This only pays
+off for a small, stable set of filter values (a handful of components or tenants); a filter with many or
+unbounded distinct values needs the general iterative-scan approach instead. See
+https://github.com/pgvector/pgvector#filtering[pgvector: Filtering] and
+https://www.postgresql.org/docs/current/indexes-partial.html[PostgreSQL: Partial indexes].
+
+=== Partitioning per tenant
+
+At larger scale, declarative partitioning moves the split from "one index per value" to "one physical
+table per value", which also isolates storage, vacuum and bulk-delete operations per tenant. The example
+below is *outside the core DocsAssistant scenario*: it adds a separate, illustrative
+`tenant_chunk_embeddings` table for a multi-tenant deployment and leaves the shared `chunks` /
+`chunk_embeddings` tables unchanged:
+
+[source,sql]
+----
+CREATE TABLE tenant_chunk_embeddings (
+    tenant_id text NOT NULL,
+    chunk_id bigint NOT NULL REFERENCES chunks (id) ON DELETE CASCADE,
+    embedding vector(768) NOT NULL,
+    PRIMARY KEY (tenant_id, chunk_id)
+) PARTITION BY LIST (tenant_id);
+
+CREATE TABLE tenant_chunk_embeddings_acme
+    PARTITION OF tenant_chunk_embeddings FOR VALUES IN ('acme');
+CREATE TABLE tenant_chunk_embeddings_globex
+    PARTITION OF tenant_chunk_embeddings FOR VALUES IN ('globex');
+
+-- creating the index on the partitioned table creates one HNSW index per partition,
+-- each built and maintained independently
+CREATE INDEX ON tenant_chunk_embeddings
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+SELECT chunk_id, embedding <=> '[...]'::vector AS distance
+FROM tenant_chunk_embeddings
+WHERE tenant_id = 'acme'
+ORDER BY embedding <=> '[...]'::vector
+LIMIT 5;
+----
+
+A query that filters on `tenant_id` is routed by partition pruning to only the matching partition
+before the vector index is ever consulted. The scan then uses that partition's own HNSW index, whose every
+vector belongs to the tenant, so this is pre-filtering at the table level rather than the index level. See
+https://github.com/pgvector/pgvector#filtering[pgvector: Filtering] and
+https://www.postgresql.org/docs/current/ddl-partitioning.html[PostgreSQL: Table partitioning].
+
+== Metadata filtering across engines
+
+=== sqlite-vec partition-key columns
+
+A `vec0` virtual table accepts three kinds of extra columns next to the vector column: *metadata columns*
+(filterable in a KNN `WHERE` clause with `=`, `!=`, `<`, `<=`, `>`, `>=`), *auxiliary columns* (declared
+with a leading `+`, returned by `SELECT` but not usable in a KNN `WHERE` clause), and *partition-key
+columns*, which sqlite-vec uses to physically shard the underlying storage by value -- the SQLite analogue of
+pgvector's partial index, built into the virtual table itself:
+
+[source,sql]
+----
+CREATE VIRTUAL TABLE vec_chunks USING vec0(
+    chunk_id integer PRIMARY KEY,
+    embedding float[768],
+    component text PARTITION KEY
+);
+
+SELECT chunk_id, distance
+FROM vec_chunks
+WHERE embedding MATCH :query_embedding
+  AND component = 'spring-ai'
+  AND k = 5
+ORDER BY distance;
+----
+
+A partition key only accepts `=` in a KNN query, and the sqlite-vec docs recommend a few hundred or more
+vectors per partition value. See xref:database/vector-rag/sqlite-vector-search.adoc[] for the full two-table
+pattern this schema is part of, and
+https://alexgarcia.xyz/sqlite-vec/features/vec0.html#partition-keys[sqlite-vec: Partition keys] for the
+metadata-, auxiliary- and partition-key-column reference.
+
+=== Filterable HNSW, filtered kNN and pre-filtered KNN
+
+Every purpose-built or search-engine store documented elsewhere on this site implements some form of
+in-graph filtering, under its own name:
+
+* Qdrant evaluates payload-index conditions during the HNSW graph walk itself, so a selective filter
+  narrows the search without falling back to a full scan --
+  xref:database/qdrant/filtering-and-payload-indexing.adoc[Qdrant filtering and payload indexing].
+* Lucene's `KnnFloatVectorQuery` accepts a pre-filter query that is evaluated before the HNSW search, and
+  Elasticsearch's `dense_vector` `knn` clause exposes the same idea as a `filter` option --
+  xref:database/lucene/knn-vector-search.adoc[Lucene kNN vector search] and
+  xref:database/elasticsearch/vector-and-semantic-search.adoc[Elasticsearch vector & semantic search]
+  (filtered kNN).
+* Redis's `FT.SEARCH` composes an ordinary filter expression ahead of the `=>[KNN ...]` clause, and a
+  vector set's `VSIM` takes a `FILTER` expression evaluated during the similarity walk --
+  xref:database/redis/vector-search.adoc[Redis vector search].
+
+=== Multi-tenancy strategies
+
+The same three shapes recur regardless of engine: a *shared index with a filter column* (one HNSW index,
+one `component`/`tenant_id` column, the approach above), a *partitioned or sharded index per tenant*
+(pgvector table partitioning, a Qdrant user-defined shard per tenant via `shard_key`, or Weaviate-style
+native multi-tenancy), or a *fully separate index/collection per tenant* (maximum isolation, highest
+operational and memory overhead -- Qdrant's own guidance advises against one collection per tenant). Qdrant's
+recommended default is the shared shape: one collection with a keyword payload index marked
+`"is_tenant": true` on the tenant field. It can also combine the two as tiered multitenancy, with small
+tenants on a shared shard and large ones promoted to dedicated shards. See
+https://qdrant.tech/documentation/guides/multiple-partitions/[Qdrant: Multitenancy]. Shared-index filtering scales to many small tenants cheaply but relies on the
+engine's in-graph filtering staying efficient as selectivity drops; per-tenant indexes cost more but keep
+each tenant's search space, and blast radius, independent.
+
+== Framework filter languages
+
+=== Spring AI filter expressions
+
+Spring AI's `VectorStore.similaritySearch` accepts a `SearchRequest` carrying a filter expressed either as
+a small textual language or built programmatically. Both compile to the same expression tree, which each
+`VectorStore` implementation translates to its own native filter (a pgvector `WHERE` clause, a Qdrant
+payload filter, and so on):
+
+[source,java]
+----
+package com.example.docsassistant;
+
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.filter.Filter;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+
+public class FilteredSearch {
+
+    private static final FilterExpressionBuilder FILTER = new FilterExpressionBuilder();
+
+    public SearchRequest byComponent(String queryText, String component) {
+        // textual form
+        return SearchRequest.builder()
+                .query(queryText)
+                .topK(5)
+                .filterExpression("component == '" + component + "'")
+                .build();
+    }
+
+    public SearchRequest byComponentBuilder(String queryText, String component) {
+        // programmatic form -- safer against injection than string concatenation above
+        Filter.Expression filter = FILTER.eq("component", component).build();
+        return SearchRequest.builder()
+                .query(queryText)
+                .topK(5)
+                .filterExpression(filter)
+                .build();
+    }
+}
+----
+
+`FilterExpressionBuilder` also supports `and`, `or`, `not`, `in`, `gte`/`lte`, and nested groups, so richer
+conditions (`component == 'vector-rag' AND chunk_index >= 3`) compose the same way. See
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-filter-expressions[Integrating with
+Spring AI: filter expressions] for the wider `VectorStore` filtering surface, and the
+https://docs.spring.io/spring-ai/reference/api/vectordbs.html#_metadata_filters[Spring AI metadata filters]
+reference for the full expression grammar.
+
+=== LangChain `filter=`
+
+Each LangChain `VectorStore` accepts a store-specific `filter` argument on `similarity_search` (or inside
+`search_kwargs` when the store is wrapped as a retriever); the shape of the filter itself is not
+standardized across stores, since each one forwards it to its own native filtering mechanism:
+
+[source,python]
+----
+from langchain_postgres import PGVector
+
+results = vector_store.similarity_search(
+    "what does ef_search control",
+    k=5,
+    filter={"component": "vector-rag"},
+)
+
+retriever = vector_store.as_retriever(
+    search_kwargs={"k": 5, "filter": {"component": "vector-rag"}},
+)
+----
+
+`PGVector`'s `filter` accepts either a flat equality mapping or an operator form
+(`+{"component": {"$eq": "vector-rag"}}+`, plus `$in`, `$and`, `$or`, and range operators), translated to
+SQL on the
+`langchain_pg_embedding` metadata column; other stores accept their own native filter payload instead. See
+xref:database/vector-rag/integrating-with-langchain.adoc#langchain-vector-stores[Integrating with
+LangChain: vector stores] for the wider store survey, and the
+https://docs.langchain.com/oss/python/integrations/vectorstores/pgvector[LangChain: PGVector] reference for
+its filter syntax.
+
+[mermaid]
+....
+flowchart LR
+    subgraph Pre["Pre-filter / in-graph"]
+        P1[Apply component filter] --> P2[Vector search inside filtered set]
+    end
+    subgraph Post["Post-filter"]
+        Q1[Vector search top-k] --> Q2[Discard rows failing filter]
+    end
+    P2 --> R1[Full k results, filter honored during search]
+    Q2 --> R2[Fewer than k results, if filter is selective]
+....
+
+== In LangChain and Spring AI
+
+=== LangChain
+
+LangChain's `filter=`/`search_kwargs` parameter, shown above, is the framework's abstraction for
+combining a metadata condition with a similarity search; see
+xref:database/vector-rag/integrating-with-langchain.adoc#langchain-vector-stores[Integrating with
+LangChain: vector stores].
+
+=== Spring AI
+
+Spring AI's `SearchRequest.filterExpression(...)`, in both its textual and `FilterExpressionBuilder`
+forms, is the framework's portable filter language across every `VectorStore` implementation; see
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-filter-expressions[Integrating with
+Spring AI: filter expressions].
+
+== Related pages
+
+* xref:database/vector-rag/ann-indexes.adoc[] -- the HNSW parameters (`M`, `ef_construction`, `ef_search`)
+  that iterative scans and filterable HNSW build on.
+* xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[] -- the distance operators used in
+  every filtered query on this page.
+* xref:database/qdrant/filtering-and-payload-indexing.adoc[] -- Qdrant's payload index and filter-clause
+  model in depth.
+* xref:database/lucene/knn-vector-search.adoc[] and
+  xref:database/elasticsearch/vector-and-semantic-search.adoc[] -- pre-filtered and filtered kNN.
+* xref:database/redis/vector-search.adoc[] -- `FT.SEARCH` pre-filtering and `VSIM ... FILTER`.
+
+== References
+
+* https://github.com/pgvector/pgvector#iterative-index-scans[pgvector: Iterative index scans]
+* https://github.com/pgvector/pgvector#hnsw[pgvector: HNSW]
+* https://www.postgresql.org/docs/current/indexes-partial.html[PostgreSQL: Partial indexes]
+* https://www.postgresql.org/docs/current/ddl-partitioning.html[PostgreSQL: Table partitioning]
+* https://github.com/pgvector/pgvector#filtering[pgvector: Filtering]
+* https://qdrant.tech/documentation/guides/multiple-partitions/[Qdrant: Multitenancy]
+* https://alexgarcia.xyz/sqlite-vec/features/vec0.html[sqlite-vec: `vec0` virtual tables]
+* https://qdrant.tech/documentation/concepts/filtering/[Qdrant: Filtering]
+* https://www.elastic.co/docs/solutions/search/vector/knn[Elasticsearch: kNN search]
+* https://redis.io/docs/latest/develop/interact/search-and-query/query/vector-search/[Redis: Vector search]
+* https://docs.spring.io/spring-ai/reference/api/vectordbs.html#_metadata_filters[Spring AI: Metadata filters]
+* https://docs.langchain.com/oss/python/integrations/vectorstores/pgvector[LangChain: PGVector]

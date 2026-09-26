@@ -1,0 +1,451 @@
+= Production Considerations
+:description: Operating a vector-backed RAG pipeline in production -- scaling from SQLite to pgvector to a dedicated engine, capacity planning, batching and backup, access-control and privacy, observability and a launch checklist.
+:keywords: production, scaling, capacity planning, connection pooling, backup, restore, access control, tenant isolation, pii, prompt injection, observability, cost, langchain, spring ai
+:stem: latexmath
+
+include::partial$vector-rag-disclaimer.adoc[]
+
+Examples on this page target PostgreSQL 17 with pgvector 0.8.6, Python 3.12 with `psycopg` 3, Spring Boot 4.1
+with Spring AI 2.0.1, and langchain / langchain-core 1.4 / 1.6, on the *DocsAssistant* scenario used throughout
+this section. It assumes the concepts, schema and code from the earlier pages in this section and focuses on
+what changes once that pipeline has to run continuously, under load, with other people's data in it.
+
+== The scale path
+
+Most vector-backed applications outgrow their first storage choice, and the shared scenario's three engines
+(xref:database/vector-rag/sqlite-vector-search.adoc[], xref:database/vector-rag/postgresql-pgvector.adoc[] and
+a dedicated or managed engine) map onto three stages of that path rather than three unrelated options:
+
+* *SQLite + sqlite-vec* -- a single file, no server process, adequate for a desktop app, a CLI tool or a
+  prototype with a few hundred thousand chunks and one concurrent writer at a time.
+* *PostgreSQL + pgvector* -- a real server with concurrent writers, transactions, joins against relational
+  metadata and standard backup tooling; comfortable from a few hundred thousand up to tens of millions of
+  vectors on suitably sized hardware.
+* *A dedicated or managed engine* (Qdrant, a managed pgvector service, or another purpose-built store) --
+  needed once a single PostgreSQL instance can no longer hold the working set in memory, once query volume
+  needs horizontal read replicas or sharding beyond what one instance offers, or once the team needs
+  engine-native features (payload-aware sharding, disk-based ANN, multi-tenant collections) that pgvector does
+  not provide.
+
+xref:database/vector-rag/comparing-vector-databases.adoc[] is the fuller version of this decision, including
+the per-engine strengths-and-weaknesses table and the cloud-availability matrix; this page is about *when* to
+make the move, not *which* engine to move to.
+
+=== Capacity planning
+
+Capacity planning starts from the same per-vector memory footprint introduced for HNSW indexes on
+xref:database/vector-rag/ann-indexes.adoc#_memory_per_vector[ANN Indexes]:
+
+[stem]
+++++
+\text{bytes/vector} \approx d \cdot 4 + M \cdot 2 \cdot 4
+++++
+
+For the *DocsAssistant* scenario's stem:[d = 768] and stem:[M = 16], that formula gives 3200 bytes per vector,
+and xref:database/vector-rag/comparing-vector-databases.adoc[the capacity worked example] scales it up to a
+10-million-vector corpus (roughly 32 GB of RAM for the raw index) and shows how int8 and binary quantization
+change that number. Two additions matter specifically for a production rollout rather than a one-off estimate:
+
+* *Plan for the corpus size the application will reach in twelve months, not the size it starts at.* An
+  index that fits comfortably in RAM at launch can force an unplanned migration mid-quarter if chunk volume
+  grows faster than expected; re-run the formula against the growth forecast, not the current row count.
+* *Add headroom for concurrent index builds.* Rebuilding an HNSW index (after a bulk load, a parameter change,
+  or a `REINDEX`) needs the old index, the new index and the working set of vectors being processed all
+  resident at once in the worst case -- comfortably more than double the steady-state footprint above.
+
+=== Build vs. query resources
+
+Index *build* and index *query* have different resource profiles, and sizing a production deployment for only
+one of them is a common mistake:
+
+[cols="1,3,3"]
+|===
+|Phase |CPU / memory profile |Typical bottleneck
+
+|Build (HNSW insert, IVF training, bulk load)
+|CPU-bound (greedy graph search or k-means, single- or multi-threaded), plus the peak memory noted above during
+a concurrent rebuild.
+|`maintenance_work_mem` too low, or too few parallel workers, on pgvector's
+`CREATE INDEX ... USING hnsw` (xref:database/vector-rag/postgresql-pgvector.adoc[]).
+
+|Query (`ef_search` graph traversal)
+|Memory-bandwidth-bound: most of the time is spent reading graph neighbourhoods that are already resident once
+the index fits in RAM.
+|Steady-state RAM below the index size, forcing page cache evictions and disk reads on every query.
+|===
+
+A production database sized only for its query-time footprint will time out or fail its first bulk load or
+reindex; sizing for the larger of the two profiles (usually the build phase, briefly) avoids that. See the
+https://www.postgresql.org/docs/current/runtime-config-resource.html[PostgreSQL resource configuration
+reference] for `maintenance_work_mem` and parallel worker settings.
+
+== Operating the pipeline
+
+=== Batching, caches, connection pooling and async pipelines
+
+xref:database/vector-rag/generating-embeddings-in-practice.adoc[] already covers batching and content-hash
+caching for the embedding call itself; in production those techniques need to sit inside a pipeline that also
+manages database connections and concurrency. A connection pool avoids paying PostgreSQL's per-connection
+setup cost on every ingestion worker or request handler, and an async pipeline lets embedding calls (I/O- and
+GPU-bound) overlap with database writes (I/O-bound on a different resource):
+
+[source,python]
+----
+import asyncio
+
+from pgvector import Vector
+from pgvector.psycopg import register_vector_async
+from psycopg_pool import AsyncConnectionPool
+
+
+async def configure(conn) -> None:
+    await register_vector_async(conn)  # every pooled connection learns the vector type
+
+
+pool = AsyncConnectionPool(
+    conninfo="postgresql://docs:docs@localhost/docsassistant",
+    min_size=2,
+    max_size=10,
+    configure=configure,
+    open=False,
+)
+
+
+async def embed_and_store(chunk_id: int, text: str) -> None:
+    # embed_document_cached is from generating-embeddings-in-practice.adoc; wrap its list[float]
+    # in Vector so psycopg sends it as a vector rather than a double precision[]
+    vector = Vector(await asyncio.to_thread(embed_document_cached, text))
+    async with pool.connection() as conn:
+        await conn.execute(
+            "INSERT INTO chunk_embeddings (chunk_id, model, embedding) VALUES (%s, %s, %s) "
+            "ON CONFLICT (chunk_id) DO UPDATE SET model = EXCLUDED.model, embedding = EXCLUDED.embedding",
+            (chunk_id, "nomic-embed-text", vector),
+        )
+
+
+async def ingest_batch(chunks: list[tuple[int, str]]) -> None:
+    await pool.open()  # idempotent; an async pool must be opened inside the running event loop
+    await asyncio.gather(*(embed_and_store(chunk_id, text) for chunk_id, text in chunks))
+----
+
+See the https://www.psycopg.org/psycopg3/docs/advanced/pool.html[psycopg 3 connection pool documentation]
+and https://github.com/pgvector/pgvector-python#psycopg-3[pgvector-python: psycopg 3] for registering the
+vector type on pooled and async connections. On
+the JVM side, Spring AI's `PgVectorStore` reuses the Spring Boot-managed HikariCP pool automatically, and
+`VectorStore.add` accepts a `List<Document>` so a batch of chunks is written in one call rather than one
+insert per chunk -- see xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-vector-store-api[].
+
+=== Incremental updates, deletes and re-indexing
+
+A production ingestion pipeline runs continuously against a corpus that keeps changing, not once against a
+frozen snapshot, so it needs three operations kept safe under concurrent reads:
+
+[source,sql]
+----
+-- Incremental update: the WHERE clause leaves unchanged chunks alone, and RETURNING yields an id only for a
+-- chunk that was inserted or whose content changed -- exactly the chunks that need (re-)embedding (see the
+-- ingest.py pipeline on document-ingestion-and-chunking.adoc)
+INSERT INTO chunks (document_id, chunk_index, section_path, content, token_count, content_hash)
+VALUES (%(document_id)s, %(chunk_index)s, %(section_path)s, %(content)s, %(token_count)s, %(content_hash)s)
+ON CONFLICT (document_id, chunk_index) DO UPDATE
+    SET section_path = EXCLUDED.section_path,
+        content = EXCLUDED.content,
+        token_count = EXCLUDED.token_count,
+        content_hash = EXCLUDED.content_hash
+    WHERE chunks.content_hash IS DISTINCT FROM EXCLUDED.content_hash
+RETURNING id;
+
+-- Delete: ON DELETE CASCADE on chunk_embeddings.chunk_id removes the embedding automatically.
+-- current_indices is a Python list (psycopg 3 adapts it to an array); an empty list deletes every chunk
+DELETE FROM chunks
+WHERE document_id = %(document_id)s
+  AND chunk_index <> ALL(%(current_indices)s::int[]);
+
+-- Re-indexing without blocking readers or writers
+REINDEX INDEX CONCURRENTLY chunk_embeddings_hnsw;
+----
+
+The upsert's `ON CONFLICT (document_id, chunk_index)` target is the `chunks_document_chunk_key` unique
+constraint from xref:database/vector-rag/postgresql-pgvector.adoc#_the_docsassistant_schema[the
+*DocsAssistant* schema]. The delete uses `<> ALL(...)` with a list parameter because psycopg 3, unlike
+psycopg2, does not expand a Python tuple into an `IN (...)` list -- see
+https://www.psycopg.org/psycopg3/docs/basic/from_pg2.html#you-cannot-use-in-s-with-a-tuple[psycopg 3:
+Differences from psycopg2]. `REINDEX ... CONCURRENTLY` (PostgreSQL 12+) rebuilds the HNSW index without holding the exclusive lock a plain
+`REINDEX` takes, at the cost of roughly double the disk space while both copies exist. See the
+https://www.postgresql.org/docs/current/sql-reindex.html[PostgreSQL `REINDEX` reference]. sqlite-vec has no
+concurrent rebuild equivalent -- a `vec0` table's index is rebuilt by recreating the table, which is why
+xref:database/vector-rag/sqlite-vector-search.adoc[] scopes SQLite to single-writer, personal-scale
+deployments.
+
+=== Embedding-model versioning and migration
+
+Rolling out a new embedding model in production is the same operation as
+xref:database/vector-rag/generating-embeddings-in-practice.adoc#_re_embedding_and_migration_strategies[the
+re-embedding and migration strategies] described earlier in this section -- a new column, a shadow table, or
+dual writes followed by a verified cut-over -- with one addition specific to a live system: the cut-over must
+be a single atomic switch (a config flag flip, or a table rename inside one transaction) so that no query ever
+mixes vectors from two model versions, which
+xref:database/vector-rag/generating-embeddings-in-practice.adoc[the golden-rule section] explains is not a
+meaningful comparison even at the same dimensionality.
+
+=== Backup and restore
+
+A vector-backed database needs the same backup discipline as any other production database, plus, for
+file-based indexes, a way to snapshot the index files themselves:
+
+[source,shell]
+----
+# PostgreSQL + pgvector: a logical dump restores the schema, data and the HNSW index definition
+# (the index itself is rebuilt on restore, not copied byte-for-byte)
+pg_dump -Fc -d docsassistant -f docsassistant.dump
+pg_restore -d docsassistant docsassistant.dump
+
+# Or a physical base backup for point-in-time recovery of a larger database
+pg_basebackup -D /backups/docsassistant -Ft -z -P
+----
+
+See the https://www.postgresql.org/docs/current/backup.html[PostgreSQL backup and restore documentation]. A
+FAISS index is a single file written by `faiss.write_index` (xref:database/vector-rag/faiss.adoc[]) and is
+backed up like any other file; a sqlite-vec database is one SQLite file and can use SQLite's own
+https://www.sqlite.org/backup.html[online backup API] to copy a consistent snapshot without stopping writers.
+
+== Security
+
+=== Access control in the filter, not the prompt
+
+Telling the model "only answer using documents the user is allowed to see" is not access control -- it is a
+request the model can ignore, misread, or have overridden by injected content
+(see <<_prompt_injection_via_retrieved_content,Prompt injection via retrieved content>> below).
+Document-level access control has to be enforced in the *retrieval filter*, before any row reaches the prompt,
+the same way xref:database/vector-rag/metadata-filtering.adoc[] enforces `component` filters:
+
+[source,sql]
+----
+SELECT c.content, c.section_path, d.title,
+       ce.embedding <=> %(query_vector)s AS distance
+FROM chunk_embeddings ce
+JOIN chunks c ON c.id = ce.chunk_id
+JOIN documents d ON d.id = c.document_id
+WHERE d.component = ANY(%(allowed_components)s)   -- from the authenticated user's session, never from the prompt
+ORDER BY distance
+LIMIT 5;
+----
+
+The Spring AI equivalent builds the same restriction as a `Filter.Expression` attached to the
+`SearchRequest`, so it cannot be bypassed by anything in the retrieved text or the user's message:
+
+[source,java]
+----
+FilterExpressionBuilder b = new FilterExpressionBuilder();
+Filter.Expression allowedComponents = b.in("component", allowedComponentsForUser).build();
+
+List<Document> hits = vectorStore.similaritySearch(
+        SearchRequest.builder()
+                .query(question)
+                .filterExpression(allowedComponents)
+                .topK(5)
+                .build());
+----
+
+See xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-filter-expressions[Spring AI -- Filter
+expressions] for the full filter-expression syntax and
+xref:database/vector-rag/metadata-filtering.adoc[] for why pre-filtering at the index also avoids the
+overfetch-then-filter failure mode this same mechanism is built on.
+
+=== Tenant isolation
+
+The same filter mechanism extends to multi-tenant deployments: every retrieval query must carry a tenant
+predicate derived from the authenticated caller, never from a client-supplied parameter, and it should be
+enforced as close to the data as PostgreSQL row-level security or a per-tenant schema/partition allows rather
+than only in application code -- xref:database/vector-rag/metadata-filtering.adoc[the multi-tenancy strategies]
+covers partitioning per tenant and partial indexes for exactly this case.
+
+=== PII in embeddings
+
+An embedding is not an anonymisation technique. A dense vector can be inverted well enough, or matched closely
+enough against a database of known embeddings, to recover or re-identify the source text it was computed from,
+so storing an embedding of a document containing personal data carries the same data-protection obligations as
+storing the document itself -- access control, retention limits and deletion (including from `chunk_embeddings`
+and any framework-managed store) have to cover the vector table, not only the source-text table.
+
+=== Prompt injection via retrieved content
+
+Every chunk a retriever returns becomes part of the prompt the model sees, so a chunk containing text written
+to look like an instruction (a poisoned document, a scraped web page, a support ticket someone crafted) is a
+prompt-injection vector -- the same risk
+xref:apps/apple/apple-intelligence-and-machine-learning.adoc#_prompt_injection_and_agentic_features[Apple
+Intelligence and Machine Learning] describes for on-device tool calling, applied to RAG instead of on-device
+tools. The mitigations are the same in kind: treat retrieved content as data rather than as instructions in
+the system prompt, keep the model's tool permissions narrow (xref:database/vector-rag/agentic-rag.adoc[]
+covers tool permissioning and loop limits for the *DocsAssistant* agent), and verify generated answers against
+the sources actually retrieved rather than trusting the model's own citations.
+
+=== Local vs. hosted models for private data
+
+Choosing between a local model (Ollama's `nomic-embed-text` and `llama3.1:8b`, used throughout this section)
+and a hosted API is, for private or regulated data, primarily a data-residency decision rather than a quality
+or cost one: a local model never sends document content or queries to a third party, while a hosted API sends
+both the text being embedded and, for generation, the retrieved context on every call. A hybrid approach --
+local embedding and generation for sensitive corpora, a hosted model only for lower-sensitivity workloads -- is
+a common compromise when local hardware cannot match a hosted model's quality on every task.
+
+== Observability and cost
+
+=== Observability
+
+The signals worth alerting on for a RAG pipeline are different from a typical CRUD service's:
+
+* *Retrieval latency* -- p50/p99 time from query embedding to the filtered `similaritySearch` call returning,
+  measured separately from generation latency so a regression in `ef_search` or index size is visible on its
+  own.
+* *Empty-result rate* -- the fraction of queries where retrieval returns zero rows after filtering (not before)
+  -- a rising rate usually means a filter is too strict, an ingestion job silently stopped, or a query pattern
+  the corpus does not cover yet.
+* *Token usage* -- prompt tokens (retrieved context plus instructions) and completion tokens per request, both
+  because they drive hosted-API cost directly and because a growing prompt-token count is an early sign of
+  context-window pressure (xref:database/vector-rag/rag-fundamentals.adoc[] covers the `num_ctx` truncation
+  pitfall this feeds into).
+
+Spring AI instruments `ChatModel`, `EmbeddingModel` and advisor calls with Micrometer observations out of the
+box, so retrieval and generation latency and token counts are available through the same
+`/actuator/metrics` and tracing pipeline as the rest of a Spring Boot application:
+
+[source,yaml]
+----
+management:
+  tracing:
+    sampling:
+      probability: 1.0
+  observations:
+    key-values:
+      application: docsassistant
+----
+
+See the https://docs.spring.io/spring-ai/reference/observability/index.html[Spring AI observability reference]
+and the https://docs.langchain.com/langsmith/observability[LangSmith observability documentation] for the
+LangChain-side equivalent (trace-level latency and token counts across the retriever, prompt and model steps).
+
+=== Cost
+
+Cost accrues at three points in this pipeline, and they scale differently: embedding calls (per-token on a
+hosted API, amortised hardware cost when self-hosted with Ollama), the vector store itself
+(xref:database/vector-rag/comparing-vector-databases.adoc[the capacity worked example] ties this to RAM,
+disk or object-storage pricing depending on the engine), and generation (per-token, and typically the largest
+line item once retrieved context is added to every prompt). Batching and caching
+(xref:database/vector-rag/generating-embeddings-in-practice.adoc[]) reduce the first; quantization
+(xref:database/vector-rag/quantization-and-compression.adoc[]) reduces the second; keeping retrieved context
+tight -- lower `topK`, re-ranking to a smaller final set
+(xref:database/vector-rag/hybrid-search-and-reranking.adoc[]) -- reduces the third.
+
+=== Production checklist
+
+|===
+|Area |Before going live
+
+|Capacity
+|The HNSW memory formula has been run against the twelve-month growth forecast, with headroom for a concurrent
+rebuild.
+
+|Access control
+|Every retrieval query carries a filter derived from the authenticated caller, never from the prompt or a
+client-supplied parameter.
+
+|Backups
+|Automated `pg_dump` / `pg_basebackup` (or the engine's native snapshot mechanism) is scheduled and a restore
+has actually been tested.
+
+|Model versioning
+|`chunk_embeddings.model` (or the framework store's equivalent metadata) is populated and checked before any
+query compares vectors across it.
+
+|Observability
+|Retrieval latency, empty-result rate and token usage are dashboarded and alertable, not only logged.
+
+|Evaluation
+|A golden-question regression suite (xref:database/vector-rag/evaluating-rag-systems.adoc[]) runs before any
+chunking, model or index change ships.
+
+|Prompt injection
+|Retrieved content is treated as data, tool permissions are scoped narrowly, and answers are checked against
+the sources actually retrieved.
+
+|Cost
+|Token usage and vector-store sizing have an owner and a budget, not just a bill that arrives monthly.
+|===
+
+== The scale path in one diagram
+
+[mermaid]
+....
+flowchart LR
+    A[SQLite + sqlite-vec] -->|"Second concurrent writer needed,\nor corpus outgrows one file"| B[PostgreSQL + pgvector]
+    B -->|"Index no longer fits in one\ninstance's RAM, or need read\nreplicas / sharding"| C[Dedicated or managed engine]
+    B -->|"Team needs engine-native\nfeatures pgvector lacks"| C
+    C -->|"Ongoing capacity planning,\nobservability, cost review"| C
+....
+
+Each arrow is a capacity or feature trigger from the sections above, not a fixed timetable -- a corpus that
+stays under a few hundred thousand chunks with a single writer can stay on SQLite indefinitely, and one that
+starts large can skip straight from prototype to a dedicated engine.
+
+== In LangChain and Spring AI
+
+=== LangChain
+
+LangChain's `VectorStore` abstraction (xref:database/vector-rag/integrating-with-langchain.adoc#langchain-vector-stores[])
+means most of the scale path above is a constructor change, not a rewrite, but production deployment guidance
+for the surrounding application -- deployment topology, environment configuration, tracing -- lives in the
+LangGraph Platform docs rather than in the vector-store integration pages:
+
+[source,python]
+----
+# Same retrieval and RAG chain code; only the store constructor and its connection details change
+# across the scale path (SQLiteVec -> PGVector -> a dedicated engine's LangChain integration)
+from langchain_postgres import PGVector
+
+store = PGVector(embeddings=embeddings, collection_name="docsassistant", connection=DSN)
+----
+
+See the https://docs.langchain.com/langgraph-platform/deployment-options[LangGraph Platform deployment
+options] for production deployment topologies and the LangSmith observability link above for tracing.
+
+=== Spring AI
+
+Spring AI's observability instrumentation (above) and its `VectorStore` abstraction
+(xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-vector-store-api[]) cover the two
+production concerns most specific to the framework: switching the underlying store by starter alone, and
+getting retrieval/generation metrics through the same Micrometer pipeline as the rest of a Spring Boot
+application, including its actuator health and metrics endpoints once `spring-boot-starter-actuator` is on the
+classpath.
+
+== Related pages
+
+* xref:database/vector-rag/comparing-vector-databases.adoc[] -- the fuller scale, capacity and cost comparison
+  this page's scale path summarises.
+* xref:database/vector-rag/ann-indexes.adoc[] -- the HNSW memory formula reused for capacity planning above.
+* xref:database/vector-rag/generating-embeddings-in-practice.adoc[] -- the re-embedding and migration
+  strategies this page's model-versioning section builds on.
+* xref:database/vector-rag/metadata-filtering.adoc[] -- the filtering mechanisms access control and tenant
+  isolation are built on.
+* xref:database/vector-rag/evaluating-rag-systems.adoc[] -- the regression suite the production checklist
+  requires before shipping a pipeline change.
+* xref:database/vector-rag/postgresql-pgvector.adoc[] and xref:database/vector-rag/sqlite-vector-search.adoc[]
+  -- the two SQL-extension engines on the scale path.
+* xref:apps/apple/apple-intelligence-and-machine-learning.adoc[] -- the prompt-injection risks shared with any
+  system that mixes retrieved or user-supplied content into a model prompt.
+* xref:database/redis/deploying-on-aws.adoc[], xref:database/redis/deploying-on-google-cloud.adoc[] and
+  xref:database/redis/deploying-on-azure.adoc[] -- managed-deployment operational detail for one dedicated
+  engine on the scale path.
+
+== References
+
+* https://www.postgresql.org/docs/current/runtime-config-resource.html[PostgreSQL: Resource Consumption
+  configuration]
+* https://www.postgresql.org/docs/current/sql-reindex.html[PostgreSQL: `REINDEX`]
+* https://www.postgresql.org/docs/current/backup.html[PostgreSQL: Backup and Restore]
+* https://www.sqlite.org/backup.html[SQLite: Online Backup API]
+* https://www.psycopg.org/psycopg3/docs/advanced/pool.html[psycopg 3: Connection pools]
+* https://docs.spring.io/spring-ai/reference/observability/index.html[Spring AI: Observability]
+* https://docs.spring.io/spring-ai/reference/api/vectordbs.html#_metadata_filters[Spring AI: Metadata filters]
+* https://docs.langchain.com/langsmith/observability[LangSmith: Observability]
+* https://docs.langchain.com/langgraph-platform/deployment-options[LangGraph Platform: Deployment options]

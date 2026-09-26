@@ -1,0 +1,520 @@
+= Agent Memory & Semantic Cache
+:description: Short-term conversation windows vs. long-term vector-backed memory, a conversation-search schema for agent memory, Spring AI ChatMemory and LangGraph checkpointers, and semantic caching with invalidation and retention policies.
+:keywords: agent memory, conversation memory, episodic memory, semantic memory, chat memory, spring ai chatmemory, messagechatmemoryadvisor, vectorstorechatmemoryadvisor, langgraph checkpointer, semantic cache, answer cache, cosine similarity threshold, cache invalidation, retention policy
+
+include::partial$vector-rag-disclaimer.adoc[]
+
+This page's examples target PostgreSQL 17 with pgvector 0.8.6, Spring Boot 4.1 with Spring AI 2.0.1,
+LangChain / langchain-core / langgraph 1.4 / 1.6 / 1.2, and Ollama `nomic-embed-text` (768 dims, cosine) for
+the *DocsAssistant* scenario used throughout this section.
+
+== Short-term and long-term memory
+
+An agent that only sees the current prompt re-derives everything about the conversation from scratch on
+every turn. Two complementary memory shapes fix that, and *DocsAssistant* uses both.
+
+=== Conversation window (short-term memory)
+
+The simplest form of memory is just the last few turns, kept in process memory or passed back on every
+request: the most recent `N` messages of the current conversation, appended to the prompt so the model can
+refer to "it" or "that index" and mean the thing just discussed. It costs nothing to look up, degrades
+gracefully as the window slides, but disappears with the process and cannot recall anything said before it
+scrolled out of the window, or in a different conversation entirely.
+
+=== Vector-backed memory (long-term memory)
+
+Long-term memory keeps facts and past exchanges as embeddings in a vector store, so the agent can retrieve
+"what we discussed about `ef_search` three days ago" by *meaning* rather than by conversation id or recency.
+This is the same similarity-search machinery xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[]
+describes, applied to a different corpus: instead of documentation chunks, the indexed items are past
+messages, summaries, or extracted facts. It survives process restarts and spans conversations, at the cost
+of an embedding call per item stored and a similarity search per item retrieved.
+
+=== Episodic and semantic memory as embeddings
+
+Borrowing the cognitive-science distinction, it is useful to keep two kinds of long-term memory distinct
+even though both end up as embedded rows in the same kind of table:
+
+* *Episodic memory* -- specific past events: "the user asked about HNSW parameters on 2026-09-12", stored as
+  the raw message text (or a turn-level summary) and its embedding. *DocsAssistant*'s `messages` /
+  `message_embeddings` tables below are exactly this.
+* *Semantic memory* -- generalized facts extracted from those events and stored independently of when they
+  were said: "the user prefers Java examples over Python", "the user's project uses PostgreSQL, not SQLite".
+  Nothing in *DocsAssistant*'s schema forces a separate table for this; a common approach is a small
+  `agent_facts(id, subject, fact, embedding, updated_at)` table populated by an extraction step (an LLM call
+  that turns a conversation into zero or more standalone facts) rather than embedding raw turns.
+
+Both are retrieved the same way: embed the current query, run a similarity search, splice the results into
+the prompt.
+
+== Conversation search as agent memory
+
+*DocsAssistant* implements episodic long-term memory as conversation search: every message is embedded as it
+arrives, and a turn can pull in nearby or similar past messages instead of only the current window.
+
+=== The schema
+
+[source,sql]
+----
+CREATE TABLE conversations (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    title text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE messages (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id uuid NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    message_index int NOT NULL,
+    role text NOT NULL,       -- 'user' | 'assistant' | 'tool'
+    content text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (conversation_id, message_index)
+);
+
+CREATE TABLE message_embeddings (
+    message_id uuid PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    embedding vector(768) NOT NULL
+);
+
+CREATE INDEX message_embeddings_hnsw
+    ON message_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+----
+
+This mirrors the `documents` / `chunks` / `chunk_embeddings` split used for the documentation corpus
+(xref:database/vector-rag/postgresql-pgvector.adoc[]): a narrow table holding the vector, one row per
+embeddable unit, joined back to its parent row rather than widening it. See
+https://github.com/pgvector/pgvector#storing[pgvector: Storing vectors] and
+https://www.postgresql.org/docs/current/datatype-uuid.html[PostgreSQL: UUID type].
+
+=== Incremental embedding
+
+Messages are embedded one at a time, as they arrive, rather than in a batch job: each turn inserts its
+`messages` row, calls the embedding model once, and inserts the matching `message_embeddings` row in the
+same transaction, so a message is never searchable half-written.
+
+[source,python]
+----
+import ollama
+import psycopg
+from pgvector.psycopg import register_vector
+
+def store_message(conn: psycopg.Connection, conversation_id: str, message_index: int,
+                   role: str, content: str) -> None:
+    embedding = ollama.embed(model="nomic-embed-text", input=f"search_document: {content}")["embeddings"][0]
+    with conn.transaction():
+        message_id = conn.execute(
+            """
+            INSERT INTO messages (conversation_id, message_index, role, content)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (conversation_id, message_index, role, content),
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO message_embeddings (message_id, embedding) VALUES (%s, %s)",
+            (message_id, embedding),
+        )
+----
+
+The `search_document: ` prefix follows the same asymmetric-model convention as the documentation corpus,
+described on xref:database/vector-rag/generating-embeddings-in-practice.adoc[]. See
+https://ollama.com/blog/embedding-models[Ollama: Embedding models].
+
+=== Context-window retrieval (`±3` messages) in SQL
+
+Beyond similarity search, a hit in `message_embeddings` is often more useful with its surrounding
+conversational context attached, the same "context expansion" idea applied to chunks elsewhere in this
+section: given a matching `message_index`, pull the three messages before and after it from the same
+conversation.
+
+[source,sql]
+----
+WITH hit AS (
+    SELECT m.conversation_id, m.message_index
+    FROM message_embeddings me
+    JOIN messages m ON m.id = me.message_id
+    ORDER BY me.embedding <=> '[...]'::vector
+    LIMIT 1
+)
+SELECT m.message_index, m.role, m.content
+FROM messages m
+JOIN hit ON hit.conversation_id = m.conversation_id
+WHERE m.message_index BETWEEN hit.message_index - 3 AND hit.message_index + 3
+ORDER BY m.message_index;
+----
+
+This is the conversation-memory analogue of xref:database/vector-rag/postgresql-pgvector.adoc[]'s
+chunk-level schema: a numeric, gap-free `message_index` per conversation makes a `BETWEEN` range query
+sufficient, with no separate adjacency structure to maintain. See
+https://www.postgresql.org/docs/current/queries-with.html[PostgreSQL: `WITH` queries (CTEs)].
+
+=== Privacy considerations
+
+Conversation memory stores exactly what users typed, which routinely includes names, account details, or
+other data the user did not intend to become permanently searchable:
+
+* *Retention and deletion.* `ON DELETE CASCADE` from `conversations` down to `messages` and
+  `message_embeddings` means deleting a conversation actually removes its embeddings too, not just its
+  displayed text -- a real requirement, not a convenience, once a user asks for their data to be erased.
+* *Scope leakage.* A long-term memory search must always be scoped to the requesting user or tenant (an
+  additional `WHERE conversation_id IN (...)` or a `user_id` column joined in), never a global similarity
+  search across every user's conversations -- see the semantic-cache leakage risk below, which is the same
+  failure mode.
+* *What gets embedded.* Embedding raw message content means the embedding provider (local Ollama, in this
+  scenario, or a hosted API in general) receives that content; a hosted embedding API changes the data-
+  residency and retention picture even though the vectors themselves are not human-readable.
+* *Minimization.* Storing an extracted semantic fact ("prefers Java examples") instead of the verbatim
+  message that revealed it reduces what long-term memory retains, at the cost of the extraction step
+  described above.
+
+== Spring AI ChatMemory and LangGraph long-term memory
+
+=== Spring AI `ChatMemory` and `MessageChatMemoryAdvisor`
+
+Spring AI's `ChatMemory` abstraction is the short-term-window side of this page: it stores and replays the
+last messages of a conversation, keyed by a conversation id. `MessageChatMemoryAdvisor` reads that window
+before the call and appends the new turn after it:
+
+[source,java]
+----
+package com.example.docsassistant;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.chat.memory.repository.jdbc.JdbcChatMemoryRepository;
+import org.springframework.stereotype.Service;
+
+@Service
+public class DocsAssistantChatService {
+
+    private final ChatClient chatClient;
+
+    public DocsAssistantChatService(ChatClient.Builder chatClientBuilder,
+                                     JdbcChatMemoryRepository chatMemoryRepository) {
+        ChatMemory chatMemory = MessageWindowChatMemory.builder()
+                .chatMemoryRepository(chatMemoryRepository)
+                .maxMessages(20)
+                .build();
+        this.chatClient = chatClientBuilder
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+                .build();
+    }
+
+    public String ask(String conversationId, String question) {
+        return chatClient.prompt()
+                .user(question)
+                .advisors(advisor -> advisor.param(ChatMemory.CONVERSATION_ID, conversationId))
+                .call()
+                .content();
+    }
+}
+----
+
+`MessageWindowChatMemory` keeps the last `maxMessages` messages of each conversation (20 here), and the
+`conversationId` passed as an advisor parameter is the shared scenario's `conversations.id`, so both views key
+on the same identifier. They do not share rows, though: `JdbcChatMemoryRepository` (from the
+`spring-ai-starter-model-chat-memory-repository-jdbc` starter) persists messages in its own
+framework-managed `SPRING_AI_CHAT_MEMORY` table, created by its schema initializer
+(`spring.ai.chat.memory.repository.jdbc.initialize-schema`), not in the hand-written `conversations` /
+`messages` tables above -- the same "frameworks own their schema" rule as `PgVectorStore`'s own table.
+Making Spring AI read and write `messages` directly would need a custom `ChatMemoryRepository`
+implementation over those tables. See
+https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI: Chat Memory].
+
+=== `VectorStoreChatMemoryAdvisor` for long-term memory
+
+Where `MessageChatMemoryAdvisor` replays a bounded recent window, `VectorStoreChatMemoryAdvisor` instead
+retrieves the messages most *similar* to the current question from a `VectorStore` -- the framework-level
+equivalent of the `message_embeddings` similarity query above:
+
+[source,java]
+----
+package com.example.docsassistant;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.vectorstore.VectorStoreChatMemoryAdvisor;
+import org.springframework.ai.vectorstore.VectorStore;
+
+public class DocsAssistantLongTermMemory {
+
+    public ChatClient chatClient(ChatClient.Builder chatClientBuilder, VectorStore messageMemoryStore) {
+        return chatClientBuilder
+                .defaultAdvisors(VectorStoreChatMemoryAdvisor.builder(messageMemoryStore).build())
+                .build();
+    }
+}
+----
+
+`messageMemoryStore` here is a `VectorStore` dedicated to conversation memory (its own collection or table,
+kept separate from the *DocsAssistant* documentation store), and the advisor still keys retrieval by the
+same `conversationId`, so short-term and long-term memory can be combined on the same `ChatClient` by
+registering both advisors. See
+https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI: Chat Memory] and
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-chat-memory[Integrating with Spring AI:
+chat memory] for the wider `ChatMemory` surface.
+
+=== LangGraph checkpointer and store for long-term memory
+
+LangGraph separates the same two concerns explicitly: a *checkpointer* persists a graph run's state (the
+thread-scoped, short-term side, comparable to `ChatMemory`'s window) so a run can pause and resume, while a
+*store* holds memory that is meant to outlive any single thread (the long-term side) and is looked up across
+threads, typically by similarity search over embedded items -- the LangGraph analogue of
+`message_embeddings`. Both are pluggable against a persistent backend such as PostgreSQL rather than only
+the in-memory default: `PostgresSaver` (package `langgraph-checkpoint-postgres`) and `PostgresStore` (in the
+same package) each create and own their tables through `setup()`, separate from the hand-written schema
+above:
+
+[source,python]
+----
+from langchain.agents import create_agent
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.store.postgres import PostgresStore
+
+from docsassistant.search import search_docs
+
+DB_URI = "postgresql://docs:docs@localhost:5432/docsassistant"
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+with (
+    PostgresSaver.from_conn_string(DB_URI) as checkpointer,
+    PostgresStore.from_conn_string(DB_URI, index={"embed": embeddings, "dims": 768}) as store,
+):
+    checkpointer.setup()  # creates the checkpoint tables
+    store.setup()         # creates the store tables, with a pgvector index for `index`
+
+    user_id = "user-42"
+    # Long-term, cross-thread memory: an extracted semantic fact, embedded on write.
+    store.put((user_id, "facts"), "lang-pref", {"text": "prefers Java examples over Python"})
+
+    agent = create_agent(
+        model=ChatOllama(model="llama3.1:8b"),
+        tools=[search_docs],
+        checkpointer=checkpointer,  # short-term, thread-scoped state
+        store=store,                # long-term memory, readable from tools via runtime.store
+    )
+
+    # thread_id plays the role of conversations.id: resuming it replays that thread's messages.
+    config = {"configurable": {"thread_id": "3f2c9a1e-conversation"}}
+    agent.invoke({"messages": [{"role": "user", "content": "What does ef_search control?"}]}, config)
+
+    # Similarity search over the user's long-term memories, across every thread.
+    memories = store.search((user_id, "facts"), query="which language should examples use?", limit=3)
+----
+
+The checkpointer makes a second `agent.invoke(...)` with the same `thread_id` continue the same
+conversation, and the store's `search(...)` is the LangGraph counterpart of the `message_embeddings` /
+`agent_facts` similarity query above, scoped by the `(user_id, "facts")` namespace the same way a
+`user_id` filter scopes the SQL version. See
+https://docs.langchain.com/oss/python/langchain/short-term-memory[LangChain: Short-term memory] for
+`PostgresSaver`, https://docs.langchain.com/oss/python/langchain/long-term-memory[LangChain: Long-term memory]
+for `PostgresStore` and reading it from tools, and
+https://docs.langchain.com/oss/python/langgraph/persistence[LangGraph: Persistence] for checkpointers,
+threads and stores in general. xref:database/vector-rag/agentic-rag.adoc[Agentic RAG] covers the agent loop
+itself.
+
+== Semantic caching
+
+A *semantic cache* answers a paraphrased repeat of a question without calling the LLM again, by matching on
+the embedding of the question rather than its exact text.
+
+=== The `answer_cache` table
+
+[source,sql]
+----
+CREATE TABLE answer_cache (
+    id bigserial PRIMARY KEY,
+    question text NOT NULL,
+    embedding vector(768) NOT NULL,
+    answer text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX answer_cache_hnsw
+    ON answer_cache USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+----
+
+This is structurally the simplest table in the whole section: one row per cached question, no join to
+another table, because the cached answer itself is the payload rather than a pointer to one. See
+https://github.com/pgvector/pgvector#getting-started[pgvector: Getting started].
+
+=== Lookup with a similarity threshold
+
+A cache lookup embeds the incoming question, searches `answer_cache` for the nearest neighbor, and treats it
+as a hit only if the neighbor is close enough:
+
+[source,sql]
+----
+SELECT id, question, answer,
+       1 - (embedding <=> '[...]'::vector) AS similarity
+FROM answer_cache
+ORDER BY embedding <=> '[...]'::vector
+LIMIT 1;
+----
+
+[source,python]
+----
+def lookup_cache(conn, question_embedding, threshold: float = 0.92) -> str | None:
+    row = conn.execute(
+        """
+        SELECT answer, 1 - (embedding <=> %s) AS similarity
+        FROM answer_cache
+        ORDER BY embedding <=> %s
+        LIMIT 1
+        """,
+        (question_embedding, question_embedding),
+    ).fetchone()
+    if row is not None and row[1] >= threshold:
+        return row[0]
+    return None
+----
+
+A cosine-similarity hit threshold around `0.92` is a reasonable starting point for `nomic-embed-text` on
+short technical questions, but it is *not a universal constant*: it is specific to the embedding model, the
+kind of text being embedded, and how costly a wrong hit is for the application. It sits well above the loose
+"probably related" band (around `0.6`-`0.8`) that
+xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[] describes for retrieval, because a
+cache hit substitutes a *whole answer* rather than one candidate among
+several re-ranked results -- a false positive here is served directly to the user with no downstream check.
+Any deployment should re-tune the threshold against its own labeled paraphrase/non-paraphrase question pairs
+rather than reuse this figure unexamined.
+
+=== Insert
+
+A cache miss falls through to the LLM, and its answer is written back once generated, in the same shape as
+the lookup:
+
+[source,python]
+----
+def store_cache_entry(conn, question: str, question_embedding, answer: str) -> None:
+    conn.execute(
+        "INSERT INTO answer_cache (question, embedding, answer) VALUES (%s, %s, %s)",
+        (question, question_embedding, answer),
+    )
+----
+
+=== Invalidation
+
+An answer cached today can become wrong tomorrow, so `answer_cache` needs at least one invalidation
+mechanism beyond "never delete anything":
+
+* *TTL.* A scheduled job (or a `created_at`-filtered `WHERE` clause added to every lookup) drops or ignores
+  rows older than a fixed age, bounding how stale a served answer can be:
++
+[source,sql]
+----
+DELETE FROM answer_cache WHERE created_at < now() - interval '7 days';
+----
+* *Corpus version.* When the underlying documentation corpus changes (a new `chunk_embeddings` re-embedding
+  pass, per xref:database/vector-rag/generating-embeddings-in-practice.adoc[]'s re-embedding guidance, or a
+  content update), the cache should be invalidated alongside it -- either a bulk `TRUNCATE answer_cache`
+  after a corpus update, or a `corpus_version` column on both `answer_cache` and the source documents, so a
+  lookup can filter on "answers cached against the current corpus version only".
+
+=== Risks
+
+* *Stale or wrong hits.* A cached answer that was correct when written can go silently wrong once the
+  underlying facts change, and nothing in a plain similarity lookup detects that -- this is exactly what TTL
+  and corpus-version invalidation exist to bound.
+* *Near-miss false positives.* Two questions can sit just above the similarity threshold while actually
+  wanting different answers ("how do I delete an index" vs. "how do I disable an index"), so the cache
+  returns a confidently wrong answer instead of a slightly-slower correct one.
+* *Per-user data leakage.* If `answer_cache` is shared across users or tenants, one user's question and
+  answer can be surfaced to a different user whose semantically similar question happens to match -- the
+  same scoping requirement as long-term conversation memory above. A cache holding personalized answers
+  needs a `user_id`/`tenant_id` column folded into both the lookup filter and the uniqueness of what counts
+  as "the same question", or it needs to be restricted to answers that are safe to share across every user
+  in the first place.
+
+=== Forgetting and retention policies
+
+Deliberately forgetting is as much a design decision as caching in the first place: a retention policy
+states, for each table on this page, how long a row is kept and what triggers its removal --
+`answer_cache` rows expiring on a TTL or a corpus-version bump above, `messages` /
+`message_embeddings` rows removed with their parent `conversations` row on a user-deletion or
+data-retention request, and any extracted `agent_facts`-style semantic memory re-derived (or discarded)
+whenever the conversations it was extracted from are deleted. Treating forgetting as a first-class
+operation, rather than an afterthought once storage grows, keeps both memory tables and the semantic cache
+from becoming an unbounded, unaudited copy of everything ever said.
+
+[mermaid]
+....
+flowchart TD
+    U[User message arrives] --> E[Embed the question]
+    E --> C{answer_cache lookup\nsimilarity >= threshold?}
+    C -- hit --> A1[Return cached answer]
+    C -- miss --> W1[Read short-term window\nlast N messages]
+    W1 --> W2[Read long-term memory\nmessage_embeddings similarity search]
+    W2 --> G[Generate answer with LLM]
+    G --> A2[Return generated answer]
+    G --> S1[Write messages + message_embeddings\nincremental embedding]
+    G --> S2[Write answer_cache row]
+....
+
+== In LangChain and Spring AI
+
+=== LangChain
+
+LangChain's memory story for a `create_agent`-built agent is the same short-term/long-term split as above:
+thread-scoped state (comparable to Spring AI's `ChatMemory` window) and a separate, similarity-searched store
+for anything meant to persist across threads, both provided through LangGraph's checkpointer and store, since
+LangChain 1.x agents run on a LangGraph graph underneath. A tool reads the store through its injected
+`ToolRuntime`, so the agent itself decides when to recall a long-term memory:
+
+[source,python]
+----
+from langchain.tools import tool, ToolRuntime
+
+
+@tool
+def recall_user_facts(query: str, runtime: ToolRuntime) -> list[str]:
+    """Recall stored facts about the current user that are relevant to `query`."""
+    user_id = runtime.config["configurable"]["user_id"]
+    items = runtime.store.search((user_id, "facts"), query=query, limit=3)
+    return [item.value["text"] for item in items]
+----
+
+Passed in `create_agent(..., tools=[search_docs, recall_user_facts], checkpointer=checkpointer, store=store)`
+and invoked with `{"configurable": {"thread_id": ..., "user_id": ...}}`, this tool gives the agent on-demand
+long-term memory alongside the checkpointer's automatic short-term replay. See
+https://docs.langchain.com/oss/python/langchain/long-term-memory[LangChain: Long-term memory].
+
+=== Spring AI
+
+Spring AI's `MessageChatMemoryAdvisor` and `VectorStoreChatMemoryAdvisor`, both shown above, are this
+concept's framework abstraction: the same `conversationId` selects a short-term window or a long-term
+similarity search depending on which advisor (or both) is registered on the `ChatClient`. See
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-chat-memory[Integrating with Spring AI:
+chat memory].
+
+== Related pages
+
+* xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[] -- the cosine distance/similarity
+  conversion and threshold heuristics this page's cache lookup builds on.
+* xref:database/vector-rag/postgresql-pgvector.adoc[] -- the pgvector schema and HNSW indexing conventions
+  reused for `messages`, `message_embeddings` and `answer_cache`.
+* xref:database/vector-rag/generating-embeddings-in-practice.adoc[] -- incremental embedding, caching by
+  content hash, and re-embedding on a corpus change.
+* xref:database/vector-rag/agentic-rag.adoc[] -- the agent loop that reads this page's memory and cache on
+  every turn.
+* xref:database/redis/use-cases-and-patterns.adoc#_semantic_cache_and_agent_memory[Redis: semantic cache and
+  agent memory] -- the same pattern over Redis's `FT.SEARCH`/`VSIM` vector search.
+* xref:database/redis/spring-boot-redis-as-a-vector-database.adoc#_chat_memory_and_semantic_cache_on_redis[Redis
+  Spring Boot: chat memory and semantic cache] -- a `RedisChatMemoryRepository` and `RedisVectorStore` wired
+  the same way as this page's PostgreSQL examples.
+
+== References
+
+* https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI: Chat Memory]
+* https://docs.langchain.com/oss/python/langgraph/persistence[LangGraph: Persistence (checkpointers and stores)]
+* https://docs.langchain.com/oss/python/langchain/short-term-memory[LangChain: Short-term memory]
+* https://docs.langchain.com/oss/python/langchain/long-term-memory[LangChain: Long-term memory]
+* https://docs.langchain.com/oss/python/langgraph/agentic-rag[LangGraph: Agentic RAG]
+* https://github.com/pgvector/pgvector[pgvector]
+* https://github.com/pgvector/pgvector#iterative-index-scans[pgvector: Iterative index scans]
+* https://ollama.com/blog/embedding-models[Ollama: Embedding models]
