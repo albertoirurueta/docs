@@ -1,0 +1,511 @@
+= PostgreSQL & pgvector
+:description: Running vector search inside PostgreSQL with the pgvector extension -- types, operators, HNSW and IVFFlat tuning, the DocsAssistant schema, and clients from Python, Java and LangChain.
+:keywords: postgresql, pgvector, vector, halfvec, sparsevec, bit, hnsw, ivfflat, ef_search, ivfflat.probes, iterative scans, psycopg, register_vector, langchain-postgres, pgvector-python, spring ai, pgvectorstore, rds, aurora, alloydb, scann, pg_diskann
+
+include::partial$vector-rag-disclaimer.adoc[]
+
+Examples on this page target PostgreSQL 17 with pgvector 0.8.6 (the `pgvector/pgvector:pg17` Docker image),
+Python 3.12 with `psycopg` 3, and `langchain-postgres` 0.0.18. pgvector adds vector types, distance
+operators and ANN indexes directly to an ordinary PostgreSQL database, so the *DocsAssistant* corpus lives
+as regular rows alongside its embeddings, searchable with plain SQL and joined against any other table in
+the schema.
+
+== Installing pgvector
+
+`pgvector` ships as a Postgres extension, not a separate server -- the `pgvector/pgvector` Docker image
+bundles it on top of the official `postgres` image at a matching major version:
+
+[source,yaml]
+----
+# compose.yaml
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: docsassistant
+      POSTGRES_USER: docs
+      POSTGRES_PASSWORD: docs
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+----
+
+Once the container is running, the extension is enabled once per database:
+
+[source,sql]
+----
+CREATE EXTENSION IF NOT EXISTS vector;
+----
+
+See https://github.com/pgvector/pgvector#installation[pgvector: Installation] for building from source or
+installing on a self-managed Postgres instead of using the prebuilt image.
+
+== Vector types and their limits
+
+pgvector adds four column types, all built around the same distance operators (below) but trading precision
+and dimensionality for storage:
+
+[cols="1,2,2",options="header"]
+|===
+| Type | Storage | Notes
+
+| `vector`
+| 4 bytes/dimension (`float32`)
+| The default type. Up to 16,000 dimensions can be stored, but only up to 2,000 dimensions can be indexed
+with `hnsw`/`ivfflat`. The *DocsAssistant* scenario's `chunk_embeddings.embedding` column below is
+`vector(768)`, well under that limit.
+
+| `halfvec`
+| 2 bytes/dimension (`float16`)
+| Half the storage of `vector` at usually near-lossless recall. Indexable up to 4,000 dimensions.
+xref:database/vector-rag/quantization-and-compression.adoc[] covers converting an existing `vector` column
+to `halfvec` in detail.
+
+| `sparsevec`
+| proportional to non-zero entries only
+| For sparse embeddings (learned lexical vectors such as SPLADE), stored as index/value pairs rather than a
+dense array. Indexable up to 1,000 non-zero elements per vector.
+
+| `bit`
+| 1 bit/dimension
+| Binary vectors, typically produced by binary-quantizing a `vector`/`halfvec` column rather than embedded
+directly.
+xref:database/vector-rag/quantization-and-compression.adoc[] shows the binary-quantization query that
+produces `bit` values from `chunk_embeddings.embedding`.
+|===
+
+See https://github.com/pgvector/pgvector#pgvector[pgvector: README] for the full type reference.
+
+== Distance operators
+
+Every pgvector type supports a matching set of operators, used directly in `ORDER BY` to rank rows by
+similarity:
+
+[cols="1,2,2",options="header"]
+|===
+| Operator | Distance | Typical use
+
+| `<->`
+| Euclidean (L2)
+| Raw-magnitude embeddings where absolute distance matters.
+
+| `<#>`
+| Negative inner product
+| Cheapest to compute; equivalent to cosine ranking once every vector is unit-normalized.
+
+| `<=>`
+| Cosine distance
+| The *DocsAssistant* scenario's default -- `nomic-embed-text` embeddings are compared this way throughout
+xref:database/vector-rag/generating-embeddings-in-practice.adoc[].
+
+| `<+>`
+| L1 (taxicab/Manhattan)
+| Occasionally preferred for sparse or robustness-sensitive comparisons.
+
+| `<~>`
+| Hamming
+| `bit` columns only -- counts differing bits, the natural distance after binary quantization.
+
+| `<%>`
+| Jaccard
+| `bit` columns only -- set-similarity distance, sometimes preferred over Hamming for sparse binary
+patterns.
+|===
+
+[source,sql]
+----
+SELECT chunk_id, embedding <=> '[0.0123,-0.0871,...]'::vector(768) AS distance
+FROM chunk_embeddings
+ORDER BY distance
+LIMIT 5;
+----
+
+See https://github.com/pgvector/pgvector#getting-started[pgvector: Getting started] for the operator
+reference.
+
+== HNSW vs. IVFFlat
+
+pgvector offers the same two index families xref:database/vector-rag/ann-indexes.adoc[] introduces in
+general terms, using the parameter names the earlier page's cross-engine table already maps to `M` /
+`ef_construction` / `ef_search`:
+
+* *HNSW* -- `USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)` builds the graph
+at creation time. `m` bounds edges per node and `ef_construction` the build-time candidate list, exactly as
+xref:database/vector-rag/ann-indexes.adoc[]'s parameter table describes them. There is no training step:
+rows can be inserted before, during or after index creation, and recall/latency at query time is tuned
+per session with `SET hnsw.ef_search = 100;` -- no rebuild required.
+* *IVFFlat* -- `USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)` partitions vectors into
+`lists` clusters via k-means, then a query only scans the `ivfflat.probes` nearest clusters
+(`SET ivfflat.probes = 10;`). Unlike HNSW, IVFFlat's clusters are chosen from whatever data is present at
+build time, so **it should be built after the table is loaded**, not before -- an index built on an empty
+or small table produces poor cluster centroids that keep giving low recall even after more rows are
+inserted.
+
+Every pgvector operator has a matching *operator class* to select at index-creation time --
+`vector_l2_ops`, `vector_ip_ops`, `vector_cosine_ops`, `vector_l1_ops` for `vector`/`halfvec`, and
+`bit_hamming_ops` / `bit_jaccard_ops` for `bit` -- so the operator class chosen must match the operator
+used in `ORDER BY`, or the index is silently ignored.
+
+[source,sql]
+----
+-- HNSW, matching the DocsAssistant chunk_embeddings index below
+CREATE INDEX chunk_embeddings_hnsw
+    ON chunk_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- IVFFlat alternative on the same column, built after the table is loaded
+CREATE INDEX chunk_embeddings_ivfflat
+    ON chunk_embeddings USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+----
+
+See https://github.com/pgvector/pgvector#indexing[pgvector: Indexing] for both index types and their
+operator classes.
+
+=== Iterative scans for filtered search
+
+A `WHERE` clause combined with an `ORDER BY ... LIMIT` vector search can starve HNSW/IVFFlat of enough
+in-range candidates, returning fewer rows than `LIMIT` asked for --
+xref:database/vector-rag/metadata-filtering.adoc[] covers this failure mode and the overfetch-then-filter
+pattern in general. pgvector's own fix is an *iterative scan*: `SET hnsw.iterative_scan = relaxed_order;`
+(or `strict_order` to preserve exact distance ordering at a higher cost) tells the index to keep walking
+past its normal candidate budget until enough filtered rows are found, bounded by
+`SET hnsw.max_scan_tuples = 20000;` so a highly selective filter cannot scan the whole table. IVFFlat has
+the equivalent `ivfflat.iterative_scan`. See
+xref:database/vector-rag/metadata-filtering.adoc[] for the full pre-/post-/in-graph-filter comparison this
+setting belongs to.
+
+=== Build-time settings and bulk loads
+
+An HNSW or IVFFlat build is memory-bound: raising `maintenance_work_mem` (a session or server setting, e.g.
+`SET maintenance_work_mem = '1GB';`) before `CREATE INDEX` lets the build keep more of the graph or cluster
+state in memory instead of spilling to disk, which is usually the single biggest factor in build time.
+pgvector's HNSW build also supports parallel workers, controlled by the standard
+`max_parallel_maintenance_workers` setting, so a build can use several CPU cores at once.
+
+For a bulk load of the *DocsAssistant* corpus (or any large `COPY`/batch insert), dropping the vector index
+first, loading every row, and recreating the index afterward is faster than inserting into a live HNSW or
+IVFFlat index row by row -- each insert into a live HNSW index pays the same graph-wiring cost a build
+amortizes in bulk, and a live IVFFlat index cannot be reasoned about until the load is done anyway:
+
+[source,sql]
+----
+DROP INDEX IF EXISTS chunk_embeddings_hnsw;
+-- ... COPY or batch INSERT the corpus ...
+SET maintenance_work_mem = '1GB';
+CREATE INDEX chunk_embeddings_hnsw
+    ON chunk_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+----
+
+See https://github.com/pgvector/pgvector#index-build-time[pgvector: Index build time] for tuning build
+speed further.
+
+=== Confirming the index is used
+
+`EXPLAIN (ANALYZE)` shows whether a query actually took the vector index or fell back to a sequential scan
+-- the latter is the usual symptom of a mismatched operator class, a missing `ORDER BY`, or a `LIMIT` large
+enough that the planner decides a full scan is cheaper:
+
+[source,sql]
+----
+EXPLAIN (ANALYZE)
+SELECT chunk_id FROM chunk_embeddings
+ORDER BY embedding <=> '[0.0123,-0.0871,...]'::vector(768)
+LIMIT 5;
+----
+
+A plan reading `Index Scan using chunk_embeddings_hnsw` (rather than `Seq Scan on chunk_embeddings`)
+confirms the index is in play. See
+https://www.postgresql.org/docs/current/sql-explain.html[PostgreSQL: EXPLAIN] for reading the rest of the
+plan.
+
+== The DocsAssistant schema
+
+This is the canonical, hand-written *DocsAssistant* schema every other page's pgvector examples build on:
+`documents` holds one row per source file, `chunks` holds the chunked, full-text-indexed sections of a
+document, and `chunk_embeddings` holds each chunk's vector, kept in a separate table so a chunk can be
+re-embedded (or embedded by more than one model) without rewriting `chunks` itself.
+
+[source,sql]
+----
+CREATE TABLE documents (
+    id            bigserial PRIMARY KEY,
+    source_path   text UNIQUE NOT NULL,
+    title         text,
+    component     text,
+    content_hash  text,
+    updated_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX documents_component_idx ON documents (component);
+
+CREATE TABLE chunks (
+    id            bigserial PRIMARY KEY,
+    document_id   bigint NOT NULL REFERENCES documents (id) ON DELETE CASCADE,
+    chunk_index   int NOT NULL,
+    section_path  text,
+    content       text NOT NULL,
+    token_count   int,
+    content_hash  text,
+    tsv           tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+);
+
+CREATE INDEX chunks_tsv_gin ON chunks USING gin (tsv);
+
+CREATE TABLE chunk_embeddings (
+    chunk_id  bigint PRIMARY KEY REFERENCES chunks (id) ON DELETE CASCADE,
+    model     text NOT NULL,
+    embedding vector(768) NOT NULL
+);
+
+CREATE INDEX chunk_embeddings_hnsw
+    ON chunk_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+----
+
+`chunks.tsv` is a `GENERATED ALWAYS ... STORED` column: Postgres recomputes it from `content` on every
+insert or update, so `chunks_tsv_gin` always reflects current text without the application maintaining it
+by hand -- xref:database/vector-rag/hybrid-search-and-reranking.adoc[] uses this exact column for its
+`ts_rank_cd` full-text side of hybrid search. `documents_component_idx`, `chunks_tsv_gin` and
+`chunk_embeddings_hnsw` together are the three indexes the shared scenario fixes for this schema.
+
+=== Multilevel embeddings: document and chunk
+
+A single flat table of chunk embeddings scales less well as the corpus grows, because every query walks
+the same HNSW graph regardless of how unrelated most chunks are to the question. A *document-level*
+embedding -- one vector per document, usually the mean or a dedicated summary embedding -- lets a query
+first narrow down to the most relevant few documents, then search only those documents' chunks:
+
+[source,sql]
+----
+CREATE TABLE document_embeddings (
+    document_id bigint PRIMARY KEY REFERENCES documents (id) ON DELETE CASCADE,
+    model       text NOT NULL,
+    embedding   vector(768) NOT NULL
+);
+
+CREATE INDEX document_embeddings_hnsw
+    ON document_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- stage 1: nearest documents
+WITH top_documents AS (
+    SELECT document_id
+    FROM document_embeddings
+    ORDER BY embedding <=> $1
+    LIMIT 20
+)
+-- stage 2: nearest chunks, restricted to those documents
+SELECT c.id, c.content, ce.embedding <=> $1 AS distance
+FROM chunks c
+JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+JOIN top_documents td ON td.document_id = c.document_id
+ORDER BY distance
+LIMIT 5;
+----
+
+This is the same pre-filtering idea xref:database/vector-rag/metadata-filtering.adoc[] covers for
+structured metadata, applied instead along a document/chunk hierarchy.
+
+=== A processing queue table
+
+Ingesting the corpus -- reading a source file, chunking it, embedding each chunk -- is naturally
+asynchronous work, so a small queue table tracks what still needs (re-)processing independently of the
+`documents`/`chunks` tables themselves:
+
+[source,sql]
+----
+CREATE TABLE ingest_queue (
+    id           bigserial PRIMARY KEY,
+    source_path  text NOT NULL,
+    status       text NOT NULL DEFAULT 'pending',
+    enqueued_at  timestamptz NOT NULL DEFAULT now(),
+    processed_at timestamptz
+);
+
+CREATE INDEX ingest_queue_status_idx ON ingest_queue (status);
+----
+
+A worker polls `SELECT ... WHERE status = 'pending' ORDER BY enqueued_at LIMIT 1 FOR UPDATE SKIP LOCKED`,
+processes the file (chunk, embed, upsert into `documents`/`chunks`/`chunk_embeddings`), and updates
+`status` to `done` or `failed` with `processed_at = now()`. `FOR UPDATE SKIP LOCKED` lets several worker
+processes pull from the same queue without double-processing a row -- see
+https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL: `SELECT ... FOR
+UPDATE`].
+
+[mermaid]
+....
+erDiagram
+    DOCUMENTS ||--o{ CHUNKS : "has"
+    DOCUMENTS ||--o| DOCUMENT_EMBEDDINGS : "summarized by"
+    CHUNKS ||--|| CHUNK_EMBEDDINGS : "embedded as"
+    DOCUMENTS {
+        bigserial id PK
+        text source_path
+        text title
+        text component
+        text content_hash
+        timestamptz updated_at
+    }
+    CHUNKS {
+        bigserial id PK
+        bigint document_id FK
+        int chunk_index
+        text section_path
+        text content
+        int token_count
+        text content_hash
+        tsvector tsv
+    }
+    CHUNK_EMBEDDINGS {
+        bigint chunk_id PK, FK
+        text model
+        vector embedding
+    }
+    DOCUMENT_EMBEDDINGS {
+        bigint document_id PK, FK
+        text model
+        vector embedding
+    }
+    INGEST_QUEUE {
+        bigserial id PK
+        text source_path
+        text status
+        timestamptz enqueued_at
+        timestamptz processed_at
+    }
+....
+
+Framework-managed vector stores can live in the same `docsassistant` database without touching this
+hand-written schema: Spring AI's `PgVectorStore` creates and owns its own `docs_vector_store` table, and
+LangChain's `PGVector` owns its own tables under the `docsassistant` collection name -- both are covered in
+<<in-langchain-and-spring-ai>> below, and neither reuses `chunk_embeddings`.
+
+== Connecting with psycopg
+
+`psycopg` 3's `pgvector.psycopg.register_vector` teaches the driver to convert a Python list (or NumPy
+array) to and from pgvector's wire format automatically, so a query parameter or a fetched column is just a
+Python `list[float]`:
+
+[source,python]
+----
+import psycopg
+from pgvector.psycopg import register_vector
+
+conn = psycopg.connect(
+    "host=localhost dbname=docsassistant user=docs password=docs",
+    autocommit=True,
+)
+register_vector(conn)
+
+# insert one chunk's embedding
+embedding = [0.0123, -0.0871, 0.0456]  # a real 768-dim vector in practice
+conn.execute(
+    "INSERT INTO chunk_embeddings (chunk_id, model, embedding) VALUES (%s, %s, %s)"
+    " ON CONFLICT (chunk_id) DO UPDATE SET embedding = EXCLUDED.embedding",
+    (chunk_id, "nomic-embed-text", embedding),
+)
+
+# k-nearest-neighbor query
+query_embedding = [0.0110, -0.0850, 0.0470]
+rows = conn.execute(
+    "SELECT chunk_id, embedding <=> %s AS distance"
+    " FROM chunk_embeddings ORDER BY distance LIMIT 5",
+    (query_embedding,),
+).fetchall()
+----
+
+See https://github.com/pgvector/pgvector-python#psycopg-3[pgvector-python: psycopg 3] for the full client
+setup, including async connections.
+
+[[in-langchain-and-spring-ai]]
+== In LangChain and Spring AI
+
+=== LangChain
+
+`langchain-postgres`'s `PGVector` store wraps this same pgvector extension behind LangChain's standard
+vector-store interface, managing its own tables under a named collection (`docsassistant`, per the shared
+scenario) rather than the hand-written `chunk_embeddings` table above:
+
+[source,python]
+----
+from langchain_postgres import PGVector
+from langchain_ollama import OllamaEmbeddings
+
+vector_store = PGVector(
+    embeddings=OllamaEmbeddings(model="nomic-embed-text"),
+    collection_name="docsassistant",
+    connection="postgresql+psycopg://docs:docs@localhost:5432/docsassistant",
+    use_jsonb=True,
+)
+
+results = vector_store.similarity_search("What does ef_search control?", k=5)
+----
+
+See xref:database/vector-rag/integrating-with-langchain.adoc#langchain-vector-stores[LangChain vector
+stores] and https://github.com/pgvector/pgvector-python#langchain[pgvector-python: LangChain] for the
+integration's own connection and indexing options.
+
+=== Spring AI
+
+Spring AI's `PgVectorStore` gives the same `VectorStore` abstraction over a Spring Boot data source,
+creating and managing its own `docs_vector_store` table (configured via
+`spring.ai.vectorstore.pgvector.*` properties) rather than the `chunk_embeddings` table defined above --
+see xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-vector-store-api[Spring AI vector
+store API] for the full setup.
+
+== Managed pgvector on the clouds
+
+All three major clouds offer first-party managed Postgres with pgvector preinstalled, so most teams never
+run the `compose.yaml` above in production: AWS RDS for PostgreSQL and Aurora PostgreSQL both support the
+`vector` extension out of the box; Google Cloud offers it on Cloud SQL for PostgreSQL and on AlloyDB, where
+AlloyDB additionally provides its own `ScaNN` index as a faster alternative to HNSW/IVFFlat; and Azure
+Database for PostgreSQL Flexible Server supports pgvector plus the GA `pg_diskann` extension for
+disk-resident Vamana-style search at larger scale. xref:database/vector-rag/comparing-vector-databases.adoc[]
+compares these managed offerings against purpose-built engines in more depth, including cloud availability
+and pricing. As a rough scale guide: pgvector on a well-tuned managed instance comfortably serves a corpus
+from thousands up to tens of millions of chunks; once a single Postgres primary's HNSW build starts
+competing too heavily with OLTP traffic for CPU and memory, or the working set no longer fits comfortably
+in RAM, that is the signal to consider a dedicated vector engine or a disk-resident index such as
+`pg_diskann` instead of scaling the same table further.
+
+== Related pages
+
+* xref:database/choosing-the-right-database.adoc[] -- vector databases in the context of the wider database
+landscape.
+* xref:database/vector-rag/what-is-a-vector-database.adoc[] -- what a vector database is, before pgvector's
+specific implementation.
+* xref:database/vector-rag/embeddings.adoc[] and
+xref:database/vector-rag/generating-embeddings-in-practice.adoc[] -- producing the embeddings this page
+stores and queries.
+* xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[] -- the distance metrics behind
+`<->`, `<#>` and `<=>`.
+* xref:database/vector-rag/ann-indexes.adoc[] -- HNSW and IVF in general, with the parameter-name mapping
+this page's `m`/`ef_construction`/`ef_search` follow.
+* xref:database/vector-rag/quantization-and-compression.adoc[] -- `halfvec` and pgvector binary
+quantization in detail.
+* xref:database/vector-rag/faiss.adoc[] -- the same index families as a standalone library, without a
+database around them.
+* xref:database/vector-rag/metadata-filtering.adoc[] -- iterative scans and pre-/post-filtering in depth.
+* xref:database/vector-rag/comparing-vector-databases.adoc[] -- pgvector against purpose-built and other
+SQL-extension engines, including managed-cloud availability.
+
+== References
+
+* https://github.com/pgvector/pgvector[pgvector on GitHub] -- README with the full type, operator, index
+and client reference.
+* https://github.com/pgvector/pgvector/blob/master/CHANGELOG.md[pgvector CHANGELOG] -- version history,
+including when `halfvec`, `sparsevec`, iterative scans and parallel HNSW builds were added.
+* https://github.com/pgvector/pgvector-python[pgvector-python on GitHub] -- `psycopg`, `asyncpg`,
+SQLAlchemy, Django and LangChain client integrations.
+* https://www.postgresql.org/docs/current/sql-createextension.html[PostgreSQL: `CREATE EXTENSION`]
+* https://www.postgresql.org/docs/current/sql-explain.html[PostgreSQL: `EXPLAIN`]
+* https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL: `SELECT ... FOR
+UPDATE`]
+* https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-MAINTENANCE-WORK-MEM[PostgreSQL:
+`maintenance_work_mem`]

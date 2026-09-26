@@ -1,0 +1,314 @@
+= Vector Search in SQLite
+:description: sqlite-vec as an embedded vector index for SQLite -- vec0 virtual tables, KNN queries, the two-table pattern with FTS5 hybrid search, and migrating off the deprecated sqlite-vss.
+:keywords: sqlite, sqlite-vec, sqlite-vss, vec0, serialize_float32, fts5, hybrid search, turso, libsql, langchain, sqlitevec
+
+include::partial$vector-rag-disclaimer.adoc[]
+
+Examples on this page target Python 3.12, `sqlite-vec` 0.1.9 and SQLite's built-in `sqlite3` module (SQLite
+ships FTS5 in its default build on modern Python). SQLite is not a client/server database: it is an embedded,
+single-file, in-process engine, which makes it a natural fit for a *local*, personal-scale vector store --
+a desktop app, a CLI tool, a notebook, or an edge/mobile deployment -- where running a separate vector
+database would be pure operational overhead. The *DocsAssistant* scenario uses it as file `docsassistant.db`,
+with a `vec0` table `vec_chunks(chunk_id integer primary key, embedding float[768], component text)` alongside
+an FTS5 table `chunks_fts`, as an alternative to the server-based pgvector and Qdrant paths documented
+elsewhere in this section.
+
+== sqlite-vec: a `vec0` virtual table per collection
+
+`sqlite-vec` is a SQLite extension, written in pure C with no external dependencies, that adds a `vec0`
+virtual table type for storing and searching vectors. It ships as a Python wheel that also bundles the
+compiled extension, so there is nothing else to install on the host:
+
+[source,python]
+----
+# pip install sqlite-vec
+import sqlite3
+import sqlite_vec
+
+conn = sqlite3.connect("docsassistant.db")
+conn.enable_load_extension(True)
+sqlite_vec.load(conn)
+conn.enable_load_extension(False)
+
+conn.execute("""
+    CREATE VIRTUAL TABLE vec_chunks USING vec0(
+        chunk_id INTEGER PRIMARY KEY,
+        embedding FLOAT[768],
+        component TEXT PARTITION KEY
+    )
+""")
+----
+
+A `vec0` column's type declares both the element type and the fixed dimensionality: `float[768]` for
+32-bit float embeddings (`nomic-embed-text`'s native output), `int8[768]` for pre-quantized 8-bit
+embeddings, and `bit[768]` for a binary-quantized representation -- see
+xref:database/vector-rag/quantization-and-compression.adoc[] for how those narrower representations are
+produced. `component TEXT PARTITION KEY` is a *partition key*: a non-indexed column that `vec0` uses to
+physically segment storage, so filtering `WHERE component = 'vector-rag'` alongside a KNN search only scans
+that partition's rows instead of the whole table. Ordinary (non-partition) columns can also be declared
+directly on the `vec0` table as *metadata columns* (filterable but not part of the vector index) or
+*auxiliary columns*, marked `+AUXILIARY`, which store alongside the vector but are excluded from `SELECT *`
+and any implicit scan, for large unindexed payloads.
+
+Embeddings are inserted as raw bytes via `serialize_float32`, which packs a Python sequence of floats into
+the little-endian binary layout `vec0` expects:
+
+[source,python]
+----
+from sqlite_vec import serialize_float32
+
+embedding = [0.012, -0.034, 0.271]  # truncated; real vectors are 768-dim
+conn.execute(
+    "INSERT INTO vec_chunks (chunk_id, embedding, component) VALUES (?, ?, ?)",
+    (1001, serialize_float32(embedding), "vector-rag"),
+)
+conn.commit()
+----
+
+A KNN query is an ordinary `SELECT` with a special `MATCH` predicate: the query vector matched against the
+`embedding` column, combined with `k` to bound the candidate list and `ORDER BY distance` to get nearest
+neighbours first. `component = 'vector-rag'` alongside the `MATCH` clause is pushed down as a partition-key
+filter, so it prunes storage rather than post-filtering results:
+
+[source,python]
+----
+query = serialize_float32(query_embedding)  # 768 floats from nomic-embed-text
+rows = conn.execute(
+    """
+    SELECT chunk_id, distance
+    FROM vec_chunks
+    WHERE embedding MATCH ? AND k = 5 AND component = 'vector-rag'
+    ORDER BY distance
+    """,
+    (query,),
+).fetchall()
+----
+
+The distance metric is fixed per table at creation time via `distance_metric=cosine` (the default is
+L2/Euclidean); DocsAssistant's `nomic-embed-text` embeddings are compared with cosine distance, matching the
+metric used by its pgvector `vector_cosine_ops` index:
+
+[source,sql]
+----
+CREATE VIRTUAL TABLE vec_chunks USING vec0(
+    chunk_id INTEGER PRIMARY KEY,
+    embedding FLOAT[768] distance_metric=cosine,
+    component TEXT PARTITION KEY
+);
+----
+
+See the official https://alexgarcia.xyz/sqlite-vec/python.html[sqlite-vec Python API] and
+https://alexgarcia.xyz/sqlite-vec/features/vec0.html[`vec0` table] documentation for the full column-type
+and clause reference.
+
+== The two-table pattern: `vec_chunks` joined to `chunks`
+
+A `vec0` table is deliberately narrow: it stores an integer `rowid` (or an explicit `PRIMARY KEY` alias, as
+above), the vector, and whatever partition/metadata/auxiliary columns were declared -- it is not meant to
+hold large text content or a rich, evolving schema. The idiomatic pattern is therefore *two tables*: `chunks`
+holds the full row (content, section path, token count, timestamps, ...) with its own auto-incrementing
+primary key, and `vec_chunks` stores only `chunk_id` (matching `chunks.id`) and the embedding, joined at
+query time:
+
+[source,sql]
+----
+CREATE TABLE chunks (
+    id INTEGER PRIMARY KEY,
+    source_path TEXT NOT NULL,
+    section TEXT,
+    content TEXT NOT NULL,
+    component TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL
+);
+
+CREATE VIRTUAL TABLE vec_chunks USING vec0(
+    chunk_id INTEGER PRIMARY KEY,
+    embedding FLOAT[768] distance_metric=cosine,
+    component TEXT PARTITION KEY
+);
+----
+
+[source,sql]
+----
+SELECT c.id, c.source_path, c.section, c.content, v.distance
+FROM vec_chunks AS v
+JOIN chunks AS c ON c.id = v.chunk_id
+WHERE v.embedding MATCH :query_embedding AND v.k = 5
+ORDER BY v.distance;
+----
+
+=== The `rowid` / `INSERT OR REPLACE` pitfall
+
+`vec0`'s `chunk_id INTEGER PRIMARY KEY` is a SQLite `rowid` alias, and SQLite's `rowid` semantics apply: an
+`INSERT OR REPLACE` that targets an existing `chunk_id` deletes the old row and inserts a brand-new one with
+a *new internal rowid* unless the primary key value itself is supplied and matches -- which is normally fine
+for `vec0` specifically, since the declared `chunk_id` *is* the rowid alias, but it becomes a trap the moment
+application code assumes `INSERT OR REPLACE` is a safe general-purpose upsert for tables where the true
+primary key differs from the rowid (for example on the paired `chunks` table if it has its own surrogate key
+semantics or triggers keyed off insert order). The safer, explicit fix is a real `UPSERT`, which updates the
+existing row without a delete/insert cycle and preserves any FTS5 trigger or foreign-key relationship that
+depends on the row's identity being stable:
+
+[source,sql]
+----
+INSERT INTO vec_chunks (chunk_id, embedding, component)
+VALUES (:chunk_id, :embedding, :component)
+ON CONFLICT (chunk_id) DO UPDATE SET
+    embedding = excluded.embedding,
+    component = excluded.component;
+----
+
+Because `vec0` stores only the serialized vector and not the original float list, keeping the *raw*
+embeddings in the `chunks` table (or a side column/table) as JSON or a separate blob is worth doing whenever
+re-indexing is anticipated -- rebuilding a `vec0` table (for a new `distance_metric`, a new dimensionality
+after re-embedding, or an upgraded `sqlite-vec` version) means re-inserting every vector from scratch, and a
+`vec0` table itself has no export other than re-running the same `MATCH`-less scan.
+
+=== FTS5 hybrid search on `chunks_fts`
+
+SQLite's bundled FTS5 extension provides BM25-ranked full-text search as a second virtual table, kept in sync
+with `chunks` via ordinary triggers, exactly as any other SQLite full-text index:
+
+[source,sql]
+----
+CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='chunks', content_rowid='id');
+
+CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, content) VALUES (new.id, new.content);
+END;
+----
+
+A hybrid query runs the vector `MATCH` and the FTS5 `MATCH` as two separate `SELECT`s and fuses their ranked
+result lists in application code -- SQLite has no built-in RRF operator, so the fusion logic described on
+xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[] (reciprocal rank fusion over two
+ranked id lists) is exactly what bridges them:
+
+[source,python]
+----
+vector_hits = conn.execute(
+    "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ? AND k = 20 ORDER BY distance",
+    (serialize_float32(query_embedding),),
+).fetchall()
+
+fts_hits = conn.execute(
+    "SELECT rowid, bm25(chunks_fts) AS score FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY score LIMIT 20",
+    (fts_query,),
+).fetchall()
+# fuse vector_hits and fts_hits by reciprocal rank, as in similarity-metrics-and-semantic-search.adoc
+----
+
+See https://sqlite.org/fts5.html[SQLite -- FTS5 Extension] for the full query-syntax and ranking reference.
+
+== From sqlite-vss to sqlite-vec, and beyond a single file
+
+An older approach to vector search inside SQLite, `sqlite-vss`, embedded FAISS itself as its search backend
+through a pair of `vss0`/`vss_index` virtual tables; it has been unmaintained and marked deprecated by its
+own author since 2023, in favour of `sqlite-vec`. Where `sqlite-vss` vendored FAISS's C++ build (heavy,
+platform-specific, and inheriting FAISS's non-transactional semantics --
+xref:database/vector-rag/faiss.adoc#what-faiss-does-not-give-you[what FAISS does not give you]),
+today the answer is `sqlite-vec`: a small, dependency-free, pure-C reimplementation that plugs directly into
+SQLite's own transactional, single-file semantics instead of wrapping an external library. Existing
+`sqlite-vss` deployments migrate by re-creating a `vec0` table with the equivalent column types and
+re-inserting every embedding -- there is no automatic schema converter between the two extensions.
+
+Turso and its open-source engine libSQL (a SQLite fork) take a different route: native `F32_BLOB` vector
+columns and a `vector_top_k` index function built directly into the engine rather than as a loadable
+extension, backed by a DiskANN-derived index, plus a hosted, replicated service on top of the same file
+format -- useful when the appeal of SQLite's embedded model is wanted together with managed multi-region
+replication that `sqlite-vec` alone does not provide.
+
+Both remain personal-to-small-scale tools: a single writer, no built-in replication, and (for `sqlite-vec`)
+brute-force-oriented KNN rather than a tuned graph index at very large vector counts --
+xref:database/choosing-the-right-database.adoc#_vector_databases[] frames exactly this trade-off against
+purpose-built engines. LangChain wraps this store as `SQLiteVec`, letting the same retriever code target
+either backend behind its generic vector-store interface (see below).
+
+== In LangChain and Spring AI
+
+=== LangChain
+
+LangChain's `SQLiteVec` vector store wraps the two-table pattern shown above -- text, metadata and
+embeddings -- behind the same generic construction, similarity-search and retriever-conversion interface
+documented in
+xref:database/vector-rag/integrating-with-langchain.adoc#langchain-vector-stores[Vector stores]:
+
+[source,python]
+----
+from langchain_community.vectorstores import SQLiteVec
+from langchain_ollama import OllamaEmbeddings
+
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+store = SQLiteVec.from_texts(
+    texts=["HNSW indexes...", "pgvector basics...", "RAG with Spring AI..."],
+    embedding=embeddings,
+    table="docsassistant",
+    db_file="docsassistant.db",
+)
+hits = store.similarity_search("how do I speed up similarity search", k=5)
+----
+
+See https://docs.langchain.com/oss/python/integrations/vectorstores/sqlitevec[LangChain -- SQLiteVec] for
+the full constructor and connection options.
+
+=== Spring AI
+
+Spring AI ships no first-party SQLite vector store: the framework's `VectorStore` auto-configurations target
+client/server engines (pgvector, Redis, Qdrant, and others), and an embedded, single-file store with no
+network protocol does not fit that model any more than FAISS does (see
+xref:database/vector-rag/faiss.adoc#what-faiss-does-not-give-you[FAISS's equivalent gap]). A Spring
+application that specifically wants SQLite-backed vector search would implement the JDBC access itself
+against the `vec0` schema shown above rather than through a managed starter. See
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-vector-store-api[VectorStore API] for the
+general abstraction and the list of stores Spring AI does support out of the box.
+
+== Two-table schema
+
+[mermaid]
+....
+erDiagram
+    CHUNKS ||--|| VEC_CHUNKS : "id = chunk_id"
+    CHUNKS ||--|| CHUNKS_FTS : "id = rowid"
+    CHUNKS {
+        integer id PK
+        text source_path
+        text section
+        text content
+        text component
+        integer chunk_index
+    }
+    VEC_CHUNKS {
+        integer chunk_id PK
+        float_768 embedding
+        text component
+    }
+    CHUNKS_FTS {
+        integer rowid PK
+        text content
+    }
+....
+
+== Related pages
+
+* xref:database/vector-rag/faiss.adoc[] -- an embedded library with no persistence or SQL layer, contrasted
+  with sqlite-vec's transactional, single-file model.
+* xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[] -- the cosine-distance metric and
+  the reciprocal-rank-fusion technique used above for hybrid search.
+* xref:database/vector-rag/quantization-and-compression.adoc[] -- the `int8[...]` / `bit[...]` column types
+  `vec0` accepts for pre-quantized embeddings.
+* xref:database/vector-rag/ann-indexes.adoc[] -- the ANN theory behind graph-based indexes such as HNSW and
+  DiskANN, contrasted with sqlite-vec's brute-force-oriented KNN.
+* xref:database/qdrant/vector-indexing-and-hnsw.adoc[] -- a server-based, tunable HNSW implementation to
+  contrast with SQLite's embedded, single-writer model.
+* xref:database/choosing-the-right-database.adoc#_vector_databases[] -- when an embedded store like SQLite is
+  the right choice versus a purpose-built vector database.
+
+== References
+
+* https://alexgarcia.xyz/sqlite-vec/[sqlite-vec -- official site]
+* https://github.com/asg017/sqlite-vec[sqlite-vec on GitHub]
+* https://alexgarcia.xyz/sqlite-vec/python.html[sqlite-vec -- Python API]
+* https://alexgarcia.xyz/sqlite-vec/features/vec0.html[sqlite-vec -- `vec0` table features]
+* https://sqlite.org/fts5.html[SQLite -- FTS5 Extension]
+* https://github.com/asg017/sqlite-vss[sqlite-vss (historical, deprecated since 2023)]
+* https://docs.turso.tech/features/ai-and-embeddings/vector-search[Turso -- Vector search]
+* https://docs.langchain.com/oss/python/integrations/vectorstores/sqlitevec[LangChain -- SQLiteVec]

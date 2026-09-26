@@ -1,0 +1,493 @@
+= Retrieval Strategies
+:description: Turning a plain top-k similarity search into a retrieval pipeline -- thresholds, multilevel and context-expanded retrieval, query transformation, routing and diversity -- and how LangChain, LangChain4j and Spring AI package it as modular RAG.
+:keywords: top-k, similarity threshold, multilevel retrieval, context expansion, parent document retriever, query rewriting, multi-query expansion, hyde, query translation, conversation compression, query routing, self-query, mmr, re-ranking, modular rag, retrievalaugmentationadvisor, langchain, langchain4j, spring ai
+
+include::partial$vector-rag-disclaimer.adoc[]
+
+Examples on this page query the *DocsAssistant* schema from
+xref:database/vector-rag/postgresql-pgvector.adoc#_the_docsassistant_schema[the pgvector schema page] --
+PostgreSQL 17 with pgvector 0.8.6, Python 3.12 with `psycopg` 3 and `ollama` 0.34, LangChain / LangChain-core
+1.4, LangChain4j 1.20.1, and Spring Boot 4.1 with Spring AI 2.0.1. None of the techniques below are engine
+features: they sit in the application layer, between "run a vector search" and "hand the LLM some text", and
+apply equally to pgvector, Qdrant, Elasticsearch or any other store.
+
+== Top-k, thresholds and multilevel retrieval
+
+=== Two thresholds: retrieval and display
+
+A single similarity cutoff forces a trade-off between two different jobs. Retrieval wants recall: pull in
+everything that might be relevant, because a re-ranker or the LLM itself can discard weak candidates later.
+Display wants precision: showing the user (or citing to the user) a "source" that scored 0.31 cosine
+similarity erodes trust even if it never influenced the generated answer. The fix is two thresholds instead
+of one -- a low bar for what gets fetched, and a stricter bar for what gets *shown* or cited:
+
+[source,python]
+----
+RETRIEVAL_TOP_K = 20
+RETRIEVAL_MIN_SIMILARITY = 0.35   # generous: false positives are cheap, false negatives are not
+DISPLAY_MIN_SIMILARITY = 0.55     # only these are cited back to the user as sources
+
+def search_docs(query: str, component: str | None = None, k: int = 5) -> list[dict]:
+    query_vector = embed(f"search_query: {query}")
+    candidates = fetch_candidates(query_vector, component, limit=RETRIEVAL_TOP_K,
+                                   min_similarity=RETRIEVAL_MIN_SIMILARITY)
+    for hit in candidates:
+        hit["citable"] = hit["similarity"] >= DISPLAY_MIN_SIMILARITY
+    return candidates[:k]
+----
+
+`fetch_candidates` is the plain pgvector `ORDER BY embedding <=> $1 LIMIT $2` query against
+`chunk_embeddings` from xref:database/vector-rag/postgresql-pgvector.adoc[]; the two constants are the only
+new piece of logic. Cosine distance and similarity are related by `similarity = 1 - distance` for
+normalized vectors, as covered in
+xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[].
+
+=== Multilevel retrieval: document- and chunk-level search merged
+
+xref:database/vector-rag/postgresql-pgvector.adoc#_multilevel_embeddings_document_and_chunk[The pgvector
+schema page] introduces `document_embeddings` and shows a two-stage query that narrows to the nearest
+documents first, then searches only those documents' chunks. That two-stage form trades recall for speed:
+a chunk in a document whose *overall* summary embedding did not make the top 20 is never considered, even
+if that one chunk is an excellent match. Multilevel retrieval keeps the speed-up but restores recall by
+*merging* the document-narrowed chunk search with an unrestricted chunk-level search, then deduplicating:
+
+[source,sql]
+----
+WITH chunk_level AS (
+    SELECT c.id AS chunk_id, ce.embedding <=> $1 AS distance
+    FROM chunk_embeddings ce
+    JOIN chunks c ON c.id = ce.chunk_id
+    ORDER BY distance
+    LIMIT 20
+),
+top_documents AS (
+    SELECT document_id
+    FROM document_embeddings
+    ORDER BY embedding <=> $1
+    LIMIT 5
+),
+document_level AS (
+    SELECT c.id AS chunk_id, ce.embedding <=> $1 AS distance
+    FROM chunks c
+    JOIN chunk_embeddings ce ON ce.chunk_id = c.id
+    JOIN top_documents td ON td.document_id = c.document_id
+)
+SELECT chunk_id, MIN(distance) AS distance
+FROM (SELECT * FROM chunk_level UNION ALL SELECT * FROM document_level) merged
+GROUP BY chunk_id
+ORDER BY distance
+LIMIT 5;
+----
+
+The `chunk_level` branch is an ordinary flat scan over `chunk_embeddings_hnsw`, cheap enough to run
+unconditionally at a modest `LIMIT`; the `document_level` branch adds candidates from documents the
+document-level index judged relevant even if a given chunk's own embedding ranked further down. `GROUP BY
+chunk_id` with `MIN(distance)` deduplicates a chunk that both branches happened to surface. See
+https://www.postgresql.org/docs/current/queries-union.html[PostgreSQL: Combining queries (`UNION`)] for the
+set-operation semantics used above.
+
+== Context expansion and parent-document retrieval
+
+=== Expanding a hit by neighbouring chunks
+
+A chunk boundary rarely lines up with the boundary of the idea a user asked about: the sentence that
+answers the question may sit one chunk before or after the one that scored highest. Rather than chunking
+more coarsely (which hurts embedding precision), context expansion fetches a small window of neighbouring
+chunks -- by `chunk_index`, cheaply, once the hit is known -- and stitches them into one block before it
+reaches the prompt:
+
+[source,sql]
+----
+SELECT c.id, c.chunk_index, c.content
+FROM chunks c
+WHERE c.document_id = $1
+  AND c.chunk_index BETWEEN $2 - 1 AND $2 + 1   -- +/- N neighbours, N = 1 here
+ORDER BY c.chunk_index;
+----
+
+`$1`/`$2` are the winning hit's `document_id` and `chunk_index` from the top-k query above; `N` is a small
+constant (1-2) tuned against the corpus's typical chunk size, since a larger window dilutes relevance with
+unrelated neighbouring content just as an overly coarse chunk would.
+
+=== Parent-document retrieval
+
+Context expansion recovers *nearby* chunks; parent-document retrieval instead keeps the searchable unit and
+the returned unit deliberately different in granularity. Small chunks are embedded and indexed because they
+give the most precise similarity match, but what is returned and passed to the LLM is the *larger* parent
+section (or whole document) each small chunk belongs to -- so `section_path` becomes the join key back to
+a coarser unit instead of a fixed `+/- N` window:
+
+[source,sql]
+----
+-- small chunks are what chunk_embeddings indexes and what the ORDER BY ... LIMIT above searches;
+-- once a chunk_id wins, its parent section is fetched by section_path instead of by chunk_index range
+SELECT c.content
+FROM chunks c
+WHERE c.document_id = $1
+  AND c.section_path = $2   -- the winning chunk's section_path
+ORDER BY c.chunk_index;
+----
+
+This is the same "small-to-big" idea `document-ingestion-and-chunking` pages describe for chunking itself,
+applied at retrieval time instead of ingestion time: the parent unit does not need to be re-embedded, only
+re-assembled from the already-stored `chunks` rows that share its `section_path`.
+
+== Query transformation, routing and diversity
+
+A user's literal query string is rarely the best possible input to a vector search: it may be
+under-specified, phrased as a question rather than a statement, refer back to earlier conversation turns,
+or be in a language the corpus is not written in. Query transformation rewrites or expands the query
+*before* it is embedded and searched.
+
+=== Rewrite
+
+An LLM call turns a terse or ambiguous query into one better suited to semantic search -- expanding
+abbreviations, resolving what "it" refers to, or restating a question as a statement closer to how the
+corpus itself is phrased:
+
+[source,python]
+----
+REWRITE_PROMPT = (
+    "Rewrite the user query as a precise, self-contained search query for a technical "
+    "documentation corpus. Return only the rewritten query.\n\nQuery: {query}"
+)
+
+def rewrite_query(query: str) -> str:
+    response = ollama.chat(model="llama3.1:8b", options={"temperature": 0.1},
+                            messages=[{"role": "user", "content": REWRITE_PROMPT.format(query=query)}])
+    return response["message"]["content"].strip()
+----
+
+=== Multi-query expansion
+
+Instead of betting on one rewritten query, an LLM generates several paraphrases of the same question, each
+is embedded and searched independently, and the result sets are merged (typically deduplicated and unioned,
+or fused by rank as in xref:database/vector-rag/hybrid-search-and-reranking.adoc[]). This trades one query
+for several searches in exchange for recall: a paraphrase closer to the corpus's own wording surfaces
+chunks the original phrasing alone would miss:
+
+[source,python]
+----
+MULTI_QUERY_PROMPT = (
+    "Generate 3 different rephrasings of this question for a documentation search "
+    "engine, one per line, no numbering.\n\nQuestion: {query}"
+)
+
+def expand_query(query: str) -> list[str]:
+    response = ollama.chat(model="llama3.1:8b", options={"temperature": 0.3},
+                            messages=[{"role": "user", "content": MULTI_QUERY_PROMPT.format(query=query)}])
+    return [line.strip() for line in response["message"]["content"].splitlines() if line.strip()]
+
+def multi_query_search(query: str, k: int = 5) -> list[dict]:
+    seen, merged = set(), []
+    for variant in [query, *expand_query(query)]:
+        for hit in search_docs(variant, k=k):
+            if hit["chunk_id"] not in seen:
+                seen.add(hit["chunk_id"])
+                merged.append(hit)
+    return merged[:k]
+----
+
+=== HyDE: hypothetical document embeddings
+
+HyDE flips the direction of the match: instead of embedding the (short, sparse) query and comparing it
+against chunk embeddings, an LLM first drafts a *hypothetical answer* to the question -- even one it is not
+sure is correct -- and that answer's embedding is searched instead. A fabricated but plausible answer tends
+to sit closer, in embedding space, to a real correct chunk than the bare question does, because both are
+now written in the same register (declarative technical prose) rather than a question and an answer:
+
+[source,python]
+----
+HYDE_PROMPT = "Write a short, confident technical answer to this question:\n\n{query}"
+
+def hyde_search(query: str, k: int = 5) -> list[dict]:
+    hypothetical_answer = ollama.chat(
+        model="llama3.1:8b",
+        options={"temperature": 0.2},
+        messages=[{"role": "user", "content": HYDE_PROMPT.format(query=query)}],
+    )["message"]["content"]
+    hyde_vector = embed(f"search_document: {hypothetical_answer}")
+    return fetch_candidates(hyde_vector, limit=k)
+----
+
+Note the embedding prefix switches from `search_query:` to `search_document:` -- the hypothetical answer is
+document-shaped text, not a query, for `nomic-embed-text`'s asymmetric embedding convention. See
+https://arxiv.org/abs/2212.10496[Gao et al., "Precise Zero-Shot Dense Retrieval without Relevance Labels"]
+(the paper that introduced HyDE).
+
+=== Translation
+
+When the corpus is written in one language (English, for *DocsAssistant*) but users query in another, an
+LLM translation pass before embedding keeps the query and the corpus in the same embedding neighbourhood --
+most embedding models are far stronger at monolingual similarity than at true cross-lingual matching:
+
+[source,python]
+----
+TRANSLATE_PROMPT = "Translate this text to English. Return only the translation.\n\n{query}"
+
+def translate_query(query: str) -> str:
+    response = ollama.chat(model="llama3.1:8b", options={"temperature": 0.0},
+                            messages=[{"role": "user", "content": TRANSLATE_PROMPT.format(query=query)}])
+    return response["message"]["content"].strip()
+----
+
+=== Compressing chat history into a standalone question
+
+In a multi-turn conversation the latest user turn is often elliptical ("what about the HNSW one?"), only
+meaningful together with earlier turns. Before retrieval, an LLM call condenses the whole exchange into one
+standalone question that carries the missing context, so the retriever never has to reason about
+conversation state at all:
+
+[source,python]
+----
+CONDENSE_PROMPT = (
+    "Given this conversation and a follow-up message, rephrase the follow-up as a "
+    "standalone question that can be understood without the conversation.\n\n"
+    "Conversation:\n{history}\n\nFollow-up: {query}\nStandalone question:"
+)
+
+def condense_history(history: list[dict], query: str) -> str:
+    transcript = "\n".join(f"{m['role']}: {m['content']}" for m in history)
+    response = ollama.chat(model="llama3.1:8b", options={"temperature": 0.0},
+                            messages=[{"role": "user",
+                                       "content": CONDENSE_PROMPT.format(history=transcript, query=query)}])
+    return response["message"]["content"].strip()
+----
+
+=== Query routing across stores
+
+*DocsAssistant* keeps its hand-written schema, a Spring AI `PgVectorStore`, a LangChain `PGVector`
+collection and a LangChain4j `PgVectorEmbeddingStore` all in the same database -- and a larger system might
+route entirely different query types to entirely different stores (a product catalogue in Qdrant, support
+tickets in Elasticsearch, code in a dedicated store). Query routing decides, per query, *which* store or
+retriever to search, typically with a small LLM classification call over the available sources' names and
+descriptions rather than a fixed rule per query type:
+
+[source,python]
+----
+ROUTES = {
+    "vector-rag": "Conceptual documentation about vector databases and RAG",
+    "spring-ai": "Documentation about building RAG applications with Spring AI",
+}
+
+ROUTE_PROMPT = (
+    "Pick the single best source for this question from: {routes}. "
+    "Reply with only the source name.\n\nQuestion: {query}"
+)
+
+def route_query(query: str) -> str:
+    response = ollama.chat(model="llama3.1:8b", options={"temperature": 0.0}, messages=[{
+        "role": "user",
+        "content": ROUTE_PROMPT.format(routes=", ".join(ROUTES), query=query),
+    }])
+    return response["message"]["content"].strip()
+----
+
+This is the same `component` metadata key the shared schema already carries, used here to pick a source
+*before* searching instead of filtering *after* -- see
+xref:database/vector-rag/metadata-filtering.adoc[] for the latter.
+
+=== Self-query: an LLM-extracted metadata filter
+
+A self-query retriever lets a natural-language query carry its own structured filter implicitly: "pgvector
+pages from the vector-rag component" should search for "pgvector" *and* filter on `component = 'vector-rag'`,
+without the caller writing that filter by hand. An LLM call, given the metadata schema, extracts the search
+text and the filter separately:
+
+[source,python]
+----
+SELF_QUERY_PROMPT = (
+    "Given the query below and these metadata fields -- component (string), title (string) -- "
+    "extract a JSON object with two keys: \"search_text\" (the semantic part of the query) and "
+    "\"filter\" (a dict of field: value pairs to filter on, or {{}} if none apply).\n\nQuery: {query}"
+)
+
+def self_query(query: str) -> dict:
+    response = ollama.chat(model="llama3.1:8b", options={"temperature": 0.0},
+                            messages=[{"role": "user", "content": SELF_QUERY_PROMPT.format(query=query)}])
+    return json.loads(response["message"]["content"])
+----
+
+`filter` here plugs directly into the same pgvector `WHERE` clause, Spring AI filter expression, or
+LangChain `filter=` argument that xref:database/vector-rag/metadata-filtering.adoc[] documents by hand;
+self-query only automates *producing* that filter from free text.
+
+=== MMR and diversity
+
+Once a candidate set is assembled, Maximal Marginal Relevance re-ranks it by relevance *and* dissimilarity
+to what has already been selected, so the final context is not five near-duplicate chunks from the same
+section. This page does not repeat that algorithm:
+xref:database/vector-rag/hybrid-search-and-reranking.adoc#_mmr_source_diversity[MMR / source diversity]
+covers it in full, immediately after the re-ranking step below, since both operate on the same fused
+candidate list.
+
+=== Re-ranking
+
+Re-ranking -- narrowing a cheap top-N candidate set with an expensive, more accurate cross-encoder model --
+is likewise not repeated here:
+xref:database/vector-rag/hybrid-search-and-reranking.adoc#_re_ranking[Re-ranking] covers the cross-encoder
+model, its LangChain `ContextualCompressionRetriever` wrapper, and its place in a Spring AI
+`DocumentPostProcessor`.
+
+== Modular retrieval as a pipeline
+
+Every technique above -- rewrite, expand, translate, route, retrieve, join, re-rank, diversify -- is a
+distinct, composable stage rather than one monolithic "search" call. Spring AI's `RetrievalAugmentationAdvisor`
+and LangChain4j's `RetrievalAugmentor` both name this explicitly as *modular RAG*: a fixed pipeline of
+pluggable stages, each independently swappable, as opposed to a single hand-written retrieval function.
+
+[mermaid]
+....
+flowchart LR
+    Q[User query] --> QT[Query transformers\nrewrite / compress / translate]
+    QT --> QE[Query expander\nmulti-query / HyDE]
+    QE --> QR{Query router}
+    QR --> R1[Document retriever\nvector store A]
+    QR --> R2[Document retriever\nvector store B]
+    R1 --> DJ[Document joiner]
+    R2 --> DJ
+    DJ --> PP[Post-processors\nre-rank / MMR]
+    PP --> CTX[Augmented context]
+....
+
+== In LangChain and Spring AI
+
+=== LangChain
+
+`MultiQueryRetriever`, `ParentDocumentRetriever` and `SelfQueryRetriever` package the hand-written multi-query,
+parent-document and self-query patterns above as drop-in retrievers. As of LangChain 1.x they live in the
+`langchain_classic` package, alongside the `EnsembleRetriever` and `ContextualCompressionRetriever` covered in
+xref:database/vector-rag/hybrid-search-and-reranking.adoc[]:
+
+[source,python]
+----
+from langchain_classic.retrievers.multi_query import MultiQueryRetriever
+from langchain_classic.retrievers import ParentDocumentRetriever
+from langchain_classic.retrievers.self_query.base import SelfQueryRetriever
+from langchain_classic.storage import InMemoryStore
+from langchain_classic.chains.query_constructor.schema import AttributeInfo
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+
+llm = ChatOllama(model="llama3.1:8b", temperature=0.1)
+
+multi_query_retriever = MultiQueryRetriever.from_llm(
+    retriever=vector_store.as_retriever(search_kwargs={"k": 5}),
+    llm=llm,
+)
+
+parent_document_retriever = ParentDocumentRetriever(
+    vectorstore=vector_store,
+    docstore=InMemoryStore(),
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+
+self_query_retriever = SelfQueryRetriever.from_llm(
+    llm=llm,
+    vectorstore=vector_store,
+    document_contents="Technical documentation about vector databases and RAG",
+    metadata_field_info=[
+        AttributeInfo(name="component", description="doc component: vector-rag or spring-ai", type="string"),
+    ],
+)
+----
+
+See
+https://reference.langchain.com/python/langchain_classic/retrievers/[LangChain: `langchain_classic.retrievers`
+reference], which is part of
+xref:database/vector-rag/integrating-with-langchain.adoc#langchain-retrievers[LangChain's retriever
+abstractions].
+
+=== Spring AI
+
+Spring AI's `RetrievalAugmentationAdvisor` wires the whole pipeline from the diagram above through one
+builder: `queryTransformers` (rewrite, compression, translation), `queryExpander` (multi-query),
+`documentRetriever` (per store) and `documentJoiner` (merging multiple retrievers' or queries' results):
+
+[source,java]
+----
+RewriteQueryTransformer rewriteQueryTransformer = RewriteQueryTransformer.builder()
+        .chatClientBuilder(chatClientBuilder)
+        .build();
+
+CompressionQueryTransformer compressionQueryTransformer = CompressionQueryTransformer.builder()
+        .chatClientBuilder(chatClientBuilder)
+        .build();
+
+TranslationQueryTransformer translationQueryTransformer = TranslationQueryTransformer.builder()
+        .chatClientBuilder(chatClientBuilder)
+        .targetLanguage("english")
+        .build();
+
+MultiQueryExpander multiQueryExpander = MultiQueryExpander.builder()
+        .chatClientBuilder(chatClientBuilder)
+        .numberOfQueries(3)
+        .build();
+
+Advisor retrievalAugmentationAdvisor = RetrievalAugmentationAdvisor.builder()
+        .queryTransformers(rewriteQueryTransformer, compressionQueryTransformer, translationQueryTransformer)
+        .queryExpander(multiQueryExpander)
+        .documentRetriever(VectorStoreDocumentRetriever.builder()
+                .vectorStore(vectorStore)
+                .similarityThreshold(0.35)
+                .build())
+        .documentJoiner(new ConcatenationDocumentJoiner())
+        .build();
+
+String answer = chatClient.prompt()
+        .advisors(retrievalAugmentationAdvisor)
+        .user("What does ef_search control in an HNSW index?")
+        .call()
+        .content();
+----
+
+Spring AI does not ship a built-in query router as of 2.0.1; the common pattern is a custom
+`DocumentRetriever` that inspects the (possibly transformed) query and delegates to one of several
+`VectorStoreDocumentRetriever` instances, one per store, mirroring the LangChain4j `QueryRouter` below. See
+https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI: Retrieval
+Augmented Generation], which defines
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-modular-rag[Spring AI's modular RAG
+building blocks].
+
+=== LangChain4j
+
+LangChain4j's `RetrievalAugmentor` names the same three extension points directly: a `QueryTransformer`
+rewrites or compresses the query, a `QueryRouter` decides which `ContentRetriever`(s) to query, and a
+`ContentAggregator` joins (and can re-rank) their combined results:
+
+[source,java]
+----
+RetrievalAugmentor retrievalAugmentor = DefaultRetrievalAugmentor.builder()
+        .queryTransformer(CompressingQueryTransformer.builder()
+                .chatModel(chatModel)
+                .build())
+        .queryRouter(new LanguageModelQueryRouter(chatModel, Map.of(
+                vectorRagRetriever, "Documentation about vector databases and RAG",
+                springAiRetriever, "Documentation about Spring AI"
+        )))
+        .contentAggregator(new ReRankingContentAggregator(scoringModel))
+        .build();
+----
+
+See https://docs.langchain4j.dev/tutorials/rag/[LangChain4j: Retrieval-Augmented Generation], which is part of
+xref:database/vector-rag/integrating-with-langchain.adoc#langchain4j[LangChain4j's own integration coverage].
+
+== Related pages
+
+* xref:database/vector-rag/postgresql-pgvector.adoc[]
+* xref:database/vector-rag/hybrid-search-and-reranking.adoc[]
+* xref:database/vector-rag/metadata-filtering.adoc[]
+* xref:database/vector-rag/similarity-metrics-and-semantic-search.adoc[]
+* xref:database/qdrant/rag-integration-patterns.adoc[]
+
+== References
+
+* https://arxiv.org/abs/2212.10496[Gao et al., "Precise Zero-Shot Dense Retrieval without Relevance Labels"
+  (HyDE)]
+* https://reference.langchain.com/python/langchain_classic/retrievers/[LangChain: `langchain_classic.retrievers`
+  reference]
+* https://docs.langchain.com/oss/python/langchain/retrieval[LangChain: Retrieval concepts]
+* https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI: Retrieval
+  Augmented Generation]
+* https://docs.langchain4j.dev/tutorials/rag/[LangChain4j: Retrieval-Augmented Generation]
+* https://www.postgresql.org/docs/current/queries-union.html[PostgreSQL: Combining queries (`UNION`)]
