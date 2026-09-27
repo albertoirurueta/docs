@@ -1,0 +1,484 @@
+= Azure Container Registry
+:description: Azure Container Registry SKUs, pushing and building images, ACR Tasks, managed-identity pulls from Container Apps/App Service/AKS, geo-replication, retention and private endpoints.
+:keywords: azure container registry, acr, az acr create, az acr login, az acr build, az acr task, acr tasks, AcrPull, managed identity image pull, attach-acr, geo-replication, retention policy, private endpoint, github actions oidc
+
+include::partial$azure-disclaimer.adoc[]
+
+Examples on this page target Azure CLI 2.90.0 (checked 2026-09-26); re-verify current commands and flags
+against `az acr --help` and the linked reference pages before relying on them in a pipeline, since ACR's CLI
+surface (regional endpoints, artifact streaming, dedicated agent pools) has moved quickly in recent releases.
+
+Every Bookshelf service image -- `catalog-api`, `orders-api`, `notifier` -- is built, stored and pulled through
+one private registry, `acrbookshelf`. This page covers that registry end to end: choosing a SKU, getting images
+in (`docker push`, `az acr build`, ACR Tasks), and getting images out again without ever handing a compute
+service a password -- Container Apps, App Service and AKS each pull `acrbookshelf` using a managed identity
+holding the `AcrPull` role. xref:cloud/azure/identity-and-access.adoc[] covers managed identities and
+`DefaultAzureCredential` in general; this page only covers the registry side of that pull.
+
+== Container registries and SKUs
+
+Azure Container Registry (ACR) is a private, Docker/OCI-compatible registry offered in three SKUs (pricing
+plans): **Basic**, **Standard** and **Premium**. All three provide the same data-plane APIs, Microsoft Entra
+authentication, image deletion, webhooks and availability-zone redundancy (where the region supports zones) --
+the differences are storage/throughput and a set of Premium-only features:
+
+[cols="2,1,1,1"]
+|===
+| Feature | Basic | Standard | Premium
+
+| Included storage
+| 10 GiB
+| 100 GiB
+| 500 GiB
+
+| Webhooks
+| 2
+| 10
+| 500
+
+| Anonymous pull access
+| No
+| Yes
+| Yes
+
+| Artifact cache rules
+| No
+| Yes
+| Yes
+
+| Geo-replication
+| No
+| No
+| Yes
+
+| Private endpoints (Private Link)
+| No
+| No
+| Yes
+
+| Dedicated data endpoints
+| No
+| No
+| Yes
+
+| Content trust (image signing)
+| No
+| No
+| Yes
+
+| Customer-managed keys
+| No
+| No
+| Yes
+
+| Retention policy for untagged manifests
+| No
+| No
+| Yes (preview)
+
+| Repository-scoped tokens/scope maps
+| 100
+| 500
+| 50,000
+|===
+
+Bookshelf runs `acrbookshelf` as **Premium**, because it is the only tier that unlocks the geo-replication,
+private endpoint and retention features covered later on this page. A registry can be moved between SKUs later
+(`az acr update --sku`) with no downtime, though moving down from Premium requires first deleting any
+geo-replicas or connected registries the higher tier created. Every SKU shares the same request-rate limits
+model (requests per minute, per registry and per identity) with Premium roughly doubling Basic/Standard's
+limits; a registry that consistently hits `429 Too Many Requests` is a signal to move up a tier rather than to
+retry harder.
+
+The registry ships with an **admin user** account (a single shared username/password pair) that is disabled by
+default on a newly created registry. Leave it disabled -- it is a shared secret with no per-caller identity or
+audit trail, which is exactly what the managed-identity pull flow later on this page exists to avoid. It is
+useful only for the earliest manual `docker login` while nothing else is wired up yet, and even then
+`az acr login` (below) is the better default because it reuses the caller's own Azure CLI/Entra session instead
+of a shared password.
+
+=== In the Azure portal
+
+. From the portal's search bar, type *Container registries* and select **Create**.
+. On the **Basics** tab, choose the subscription and resource group (`rg-bookshelf`), a globally unique
+  **Registry name** (`acrbookshelf`), the **Location** (`East US 2`), and a **Pricing plan** (*Premium* for the
+  features covered below; *Basic* or *Standard* are enough for a registry that only ever needs push/pull).
+. Leave the **Networking** tab's *Connectivity configuration* on **Public access** for now -- switching to
+  *Private access* and adding a private endpoint is covered under <<geo-rep-retention-pe>> below.
+. Select **Review + create**, then **Create**.
+. Once deployed, open the registry's **Overview** blade to confirm the **Login server** (`acrbookshelf.azurecr.io`)
+  and, under **Settings** -> **Access keys**, confirm the **Admin user** toggle is left **Disabled**.
+
+=== With the Azure CLI
+
+[source,bash]
+----
+export RG=rg-bookshelf
+export LOCATION=eastus2
+export ACR=acrbookshelf
+
+az group create --name $RG --location $LOCATION
+
+az acr create \
+  --name $ACR \
+  --resource-group $RG \
+  --sku Premium
+----
+
+References: https://learn.microsoft.com/azure/container-registry/container-registry-skus[Azure Container
+Registry SKU features and limits], https://learn.microsoft.com/cli/azure/acr#az-acr-create[`az acr create`].
+
+== Signing in and pushing images
+
+`az acr login` authenticates the local Docker (or Podman/`nerdctl`) daemon against a registry using the caller's
+own Azure CLI session, so no separate registry credential ever needs to be typed or stored locally.
+
+=== In the Azure portal
+
+. Open `acrbookshelf` -> **Repositories** to browse existing repositories and tags once images have been pushed
+  -- the portal has no interactive `docker push` equivalent; pushing is always done from a client machine or a
+  build pipeline.
+. Selecting a repository lists its tags with size, digest and last-updated date; selecting a tag exposes
+  **Delete** for manual cleanup and a **Manifest** view of the underlying OCI manifest.
+
+=== With the Azure CLI
+
+[source,bash]
+----
+# Authenticate the local Docker daemon against acrbookshelf
+az acr login --name $ACR
+
+# Tag a locally built image for the registry, then push it
+docker tag catalog-api:latest "$ACR.azurecr.io/com.example.bookshelf/catalog-api:latest"
+docker push "$ACR.azurecr.io/com.example.bookshelf/catalog-api:latest"
+
+# List what actually landed in the registry
+az acr repository list --name $ACR --output table
+az acr repository show-tags --name $ACR --repository com.example.bookshelf/catalog-api --output table
+----
+
+References: https://learn.microsoft.com/azure/container-registry/container-registry-get-started-azure-cli[Quickstart:
+Create a private container registry using the Azure CLI],
+https://learn.microsoft.com/cli/azure/acr#az-acr-login[`az acr login`].
+
+== Cloud builds with `az acr build`
+
+`az acr build` queues an image build *inside* Azure -- streaming the Dockerfile build log back to the caller --
+without needing a local Docker daemon at all. The build context can be a local directory, a remote Git URL, or
+an OCI artifact reference; ACR provisions the build compute, runs the build, and (unless `--no-push` is passed)
+pushes the resulting image straight into the same registry.
+
+=== In the Azure portal
+
+. Open `acrbookshelf` -> **Services** -> **Tasks** -> **Quick task** (or **Run** on an existing task, covered
+  next) to trigger a one-off build from the portal, pointing it at a Git repository URL and Dockerfile path.
+. The **Run history** tab under **Tasks** shows every build's status and streamed log, whether it was triggered
+  from the portal, the CLI, or an automated trigger.
+
+=== With the Azure CLI
+
+[source,bash]
+----
+# Build the local context as a Linux image and push it to acrbookshelf
+az acr build \
+  --registry $ACR \
+  --image "com.example.bookshelf/catalog-api:{{.Run.ID}}" \
+  .
+
+# Build from a remote Git context instead of the local directory
+az acr build \
+  --registry $ACR \
+  --image "com.example.bookshelf/catalog-api:{{.Run.ID}}" \
+  https://github.com/example-org/bookshelf-catalog-api.git
+----
+
+References: https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-quick-build[Build
+and run a container image using Azure Container Registry Tasks],
+https://learn.microsoft.com/cli/azure/acr#az-acr-build[`az acr build`].
+
+== ACR Tasks: automated builds on commit and base-image update
+
+`az acr build` is a one-off, manually queued build. **ACR Tasks** (`az acr task`) turns the same build into a
+standing definition that runs automatically on a *commit trigger* (a push or pull request against a linked Git
+repository) or a *base-image trigger* (the `FROM` image in the Dockerfile gets a new version in the registry, so
+every image built from it is rebuilt and repatched). A task can also run on a timer, or on demand.
+
+=== In the Azure portal
+
+. Open `acrbookshelf` -> **Services** -> **Tasks** -> **Add** -> **Quick task** for a one-off run, or
+  **Add** -> a Git-context task wizard for a standing task wired to commit/base-image triggers.
+. On the task's own blade, **Triggers** shows and toggles the commit trigger and base-image trigger
+  independently; **Run history** shows every automated and manual run with its streamed log.
+
+=== With the Azure CLI
+
+[source,bash]
+----
+# Create a standing task: rebuilds on every commit to main, and on a new base-image digest
+az acr task create \
+  --registry $ACR \
+  --name build-catalog-api \
+  --image "com.example.bookshelf/catalog-api:{{.Run.ID}}" \
+  --context https://github.com/example-org/bookshelf-catalog-api.git \
+  --branch main \
+  --file Dockerfile \
+  --git-access-token "$GIT_PAT" \
+  --commit-trigger-enabled true \
+  --base-image-trigger-enabled true
+
+# Trigger a manual run outside the commit/base-image triggers
+az acr task run --registry $ACR --name build-catalog-api
+
+# Inspect recent runs and their logs
+az acr task list-runs --registry $ACR --output table
+az acr task logs --registry $ACR --run-id <run-id>
+----
+
+`--git-access-token` is a personal access token (or, for a GitHub App integration, its token) with permission to
+add the webhook the commit trigger depends on -- never write the token's actual value into a committed file;
+pass it from a secret store or an interactive prompt. ACR Tasks (classic, single- and multi-step) remains the
+supported way to run in-registry builds; Microsoft Learn has not published a newer replacement for it as of this
+page's last check, so a Bookshelf task defined today does not need a migration plan.
+
+References:
+https://learn.microsoft.com/azure/container-registry/container-registry-tasks-overview[Automate container image
+builds with Azure Container Registry Tasks],
+https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-build-task[Automate image
+builds when source code is updated (commit triggers)],
+https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-base-image-update[Automate
+image builds when a base image is updated],
+https://learn.microsoft.com/cli/azure/acr/task[`az acr task`].
+
+== Managed-identity pulls (`AcrPull`) from compute services
+
+Every Bookshelf compute service authenticates its own image pull with a managed identity holding the built-in
+**AcrPull** role on `acrbookshelf`, scoped to the registry -- never with the admin account's username/password,
+and never with a long-lived personal access token embedded in a deployment manifest. `AcrPull` is a data-plane
+role: it lets the identity pull image layers and manifests, and nothing else. The three compute services covered
+elsewhere in this section wire it up differently, since none of them share a single `--attach-acr` flag:
+
+* xref:cloud/azure/aks-clusters.adoc[] is the only one of the three whose `az aks create`/`az aks update` accepts
+  `--attach-acr` directly -- it creates (or reuses) the cluster's kubelet identity and assigns `AcrPull` to it in
+  one step.
+* xref:cloud/azure/container-apps.adoc[] has no `--attach-acr` equivalent; a Container App's own system- or
+  user-assigned identity is pointed at the registry with `--registry-identity`, and `az containerapp create`/
+  `update` attempts the `AcrPull` role assignment automatically when the caller has permission to create it.
+* xref:cloud/azure/app-service-and-functions.adoc[] also has no `--attach-acr` equivalent; App Service instead
+  reads a `acrUseManagedIdentityCreds` site setting, with the identity (system- or user-assigned) and the
+  `AcrPull` role assignment configured as separate steps.
+
+=== In the Azure portal
+
+. **AKS** -- open the `aks-bookshelf` cluster's blade, **Cluster configuration**, then use the *Integrations* ->
+  *Container registry* setting to attach `acrbookshelf` (equivalent to `--attach-acr`); alternatively, open
+  `acrbookshelf`'s own **Access control (IAM)** and assign `AcrPull` directly to the cluster's kubelet identity.
+. **Container Apps** -- on the `catalog-api` container app, open **Containers** -> **Edit and deploy**, set
+  **Image source** to *Azure Container Registry*, **Authentication** to *Managed Identity*, and pick the
+  identity; the portal offers to add the `AcrPull` role assignment for that identity automatically.
+. **App Service** -- on the `catalog-api` web app, open **Deployment Center**, choose `acrbookshelf` as the
+  registry image source and **Managed identity** as the authentication type; enable a system- or user-assigned
+  identity first under **Identity** if none is attached yet.
+
+=== With the Azure CLI
+
+[source,bash]
+----
+# AKS: attach acrbookshelf at cluster creation (or on an existing cluster with az aks update)
+az aks create \
+  --name aks-bookshelf \
+  --resource-group $RG \
+  --attach-acr $ACR
+
+az aks update \
+  --name aks-bookshelf \
+  --resource-group $RG \
+  --attach-acr $ACR
+
+# Container Apps: pull using the container app's own system-assigned identity
+az containerapp create \
+  --name catalog-api \
+  --resource-group $RG \
+  --environment $ENV \
+  --image "$ACR.azurecr.io/com.example.bookshelf/catalog-api:latest" \
+  --registry-server "$ACR.azurecr.io" \
+  --registry-identity system
+
+# App Service: create a system-assigned identity, grant AcrPull, then switch pull auth to managed identity
+az webapp identity assign --name catalog-api --resource-group $RG
+
+PRINCIPAL_ID=$(az webapp identity show --name catalog-api --resource-group $RG --query principalId -o tsv)
+ACR_ID=$(az acr show --name $ACR --query id -o tsv)
+
+az role assignment create \
+  --assignee-object-id "$PRINCIPAL_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role AcrPull \
+  --scope "$ACR_ID"
+
+az webapp config set \
+  --name catalog-api \
+  --resource-group $RG \
+  --generic-configurations '{"acrUseManagedIdentityCreds": true}'
+----
+
+References:
+https://learn.microsoft.com/azure/aks/cluster-container-registry-integration[Integrate Azure Container Registry
+with Azure Kubernetes Service], https://learn.microsoft.com/azure/container-apps/managed-identity-image-pull[Pull
+images from Azure Container Registry in Azure Container Apps using a managed identity],
+https://azure.github.io/AppService/2024/09/17/How-to-pull-from-ACR-with-Managed-Identity-using-Windows-containers.html[Configure
+App Service to pull from ACR with a managed identity],
+https://learn.microsoft.com/azure/role-based-access-control/built-in-roles#acrpull[`AcrPull` built-in role].
+
+[[geo-rep-retention-pe]]
+== Geo-replication, retention and private endpoints (Premium)
+
+Three Premium-only features round out `acrbookshelf` for a production footprint:
+
+**Geo-replication** creates additional, fully writable copies (*geo-replicas*) of the registry in other Azure
+regions, all reachable through the same global login server (`acrbookshelf.azurecr.io`) and the same set of
+credentials and role assignments. Azure routes each request to whichever geo-replica gives the caller the best
+network performance, which is usually the closest one, and automatically reroutes away from a geo-replica that
+becomes unhealthy. Replication between geo-replicas is *eventually consistent* -- a pipeline that pushes an image
+in one region and immediately expects a pull to see it in another region can occasionally hit a `manifest
+unknown` error until replication catches up, so a cross-region CI/CD pipeline should build in retry-with-backoff
+around that window, or pin push and pull to the same region's *regional endpoint* to sidestep it entirely.
+Storage is billed once per geo-replica, so replicating a registry into three regions roughly triples its storage
+cost.
+
+**Retention policy** (currently a preview feature) automatically deletes *untagged* manifests a configurable
+number of days after they lose their last tag, which is what keeps a registry that constantly retags (rather
+than deletes) old builds from growing without bound. It never touches a manifest that still has a tag pointing
+at it. Deleted image data cannot be recovered, so set the retention window deliberately and keep it disabled on
+any repository still pulled by digest rather than by tag.
+
+**Private endpoint** (Azure Private Link) gives `acrbookshelf` a private IP address inside a virtual network, so
+traffic between a client on that network and the registry never crosses the public internet; combined with
+disabling public network access, it restricts the registry to callers reachable through that network (plus any
+explicitly allowed trusted services). A private endpoint also auto-enables *dedicated data endpoints*, giving
+each geo-replica its own IP for image-layer downloads instead of sharing Azure Storage's shared public endpoints.
+Disabling public network access breaks `az acr build`/ACR Tasks unless a dedicated agent pool is used, since
+Tasks' build compute otherwise reaches the registry over its public endpoint.
+
+=== In the Azure portal
+
+. **Geo-replication** -- open `acrbookshelf` -> **Services** -> **Geo-replications**, select a region on the map,
+  and select **Create**.
+. **Retention** -- open `acrbookshelf` -> **Policies** -> **Retention (Preview)**, set **Status** to *Enabled*
+  and choose the number of days, then **Save**.
+. **Private endpoint** -- open `acrbookshelf` -> **Settings** -> **Networking** -> **Private access** ->
+  **Create a private endpoint connection**, choose the virtual network/subnet, and integrate it with a
+  `privatelink.azurecr.io` private DNS zone; then, on the **Public access** tab, set **Public network access** to
+  *Disabled*.
+
+=== With the Azure CLI
+
+[source,bash]
+----
+# Geo-replication: add a replica in a second region
+az acr replication create --registry $ACR --location westeurope
+az acr replication list --registry $ACR --output table
+
+# Retention: delete untagged manifests 30 days after they lose their last tag
+az acr config retention update \
+  --registry $ACR \
+  --status enabled \
+  --days 30 \
+  --type UntaggedManifests
+
+# Private endpoint: disable the subnet's network policies, then create the endpoint
+az network vnet subnet update \
+  --name <subnet-name> \
+  --vnet-name <vnet-name> \
+  --resource-group $RG \
+  --disable-private-endpoint-network-policies
+
+az network private-endpoint create \
+  --name pe-acrbookshelf \
+  --resource-group $RG \
+  --vnet-name <vnet-name> \
+  --subnet <subnet-name> \
+  --private-connection-resource-id "$(az acr show --name $ACR --query id -o tsv)" \
+  --group-ids registry \
+  --connection-name pe-acrbookshelf-connection
+
+# Once the private endpoint and its DNS records are in place, close off the public endpoint
+az acr update --name $ACR --public-network-enabled false
+----
+
+References: https://learn.microsoft.com/azure/container-registry/container-registry-geo-replication[Geo-replication
+in Azure Container Registry],
+https://learn.microsoft.com/azure/container-registry/container-registry-retention-policy[Set a retention policy
+to retain untagged manifests],
+https://learn.microsoft.com/azure/container-registry/container-registry-private-link[Set up a private endpoint
+with Private Link for Azure Container Registry], https://learn.microsoft.com/cli/azure/acr/replication[`az acr
+replication`], https://learn.microsoft.com/cli/azure/acr/config/retention[`az acr config retention`].
+
+== Pushing from GitHub Actions with OIDC
+
+A GitHub Actions workflow that builds and pushes an image to `acrbookshelf` should authenticate the same way any
+other CI/CD caller does in this section: workload identity federation, not a stored ACR admin password or a
+long-lived service-principal secret. The workflow mechanics -- the federated credential, `azure/login`'s
+`id-token: write` permission, and the build/push steps themselves -- are already covered end to end on
+xref:backend/docker/ci-cd-with-github-actions.adoc[]; the only ACR-specific requirement on top of that flow is
+that the workflow's service principal (or managed identity) holds `AcrPush` (or `AcrPull` for a workflow that
+only deploys, never builds) scoped to `acrbookshelf`, assigned the same way as the `AcrPull` role assignments
+above.
+
+== Clean up
+
+[source,bash]
+----
+az group delete --name "$RG" --yes --no-wait
+----
+
+Deleting `rg-bookshelf` removes `acrbookshelf` along with every image, geo-replica and private endpoint it holds
+-- there is no separate purge or soft-delete step to run first by default, and no recovery window afterwards.
+The one built-in exception is the Premium retention policy covered above: it is not a registry-wide soft-delete
+of everything in the registry, but if left enabled it continues to prune *untagged* manifests on its own schedule
+right up until the registry itself is deleted, which is worth turning off first if a deletion is meant to be
+delayed rather than immediate.
+
+== Related pages
+
+* xref:cloud/azure/choosing-a-compute-service.adoc[]
+* xref:cloud/azure/container-apps.adoc[]
+* xref:cloud/azure/container-apps-scaling-jobs-and-dapr.adoc[]
+* xref:cloud/azure/app-service-and-functions.adoc[]
+* xref:cloud/azure/aks-clusters.adoc[]
+* xref:cloud/azure/aks-microservices.adoc[]
+* xref:cloud/azure/identity-and-access.adoc[]
+* xref:backend/docker/ci-cd-with-github-actions.adoc[]
+
+== References
+
+* https://learn.microsoft.com/azure/container-registry/container-registry-skus[Azure Container Registry SKU
+  features and limits]
+* https://learn.microsoft.com/azure/container-registry/container-registry-get-started-azure-cli[Quickstart:
+  Create a private container registry using the Azure CLI]
+* https://learn.microsoft.com/cli/azure/acr#az-acr-create[`az acr create`]
+* https://learn.microsoft.com/cli/azure/acr#az-acr-login[`az acr login`]
+* https://learn.microsoft.com/cli/azure/acr#az-acr-build[`az acr build`]
+* https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-quick-build[Build and run a
+  container image using Azure Container Registry Tasks]
+* https://learn.microsoft.com/azure/container-registry/container-registry-tasks-overview[Automate container
+  image builds with Azure Container Registry Tasks]
+* https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-build-task[Automate image
+  builds when source code is updated]
+* https://learn.microsoft.com/azure/container-registry/container-registry-tutorial-base-image-update[Automate
+  image builds when a base image is updated]
+* https://learn.microsoft.com/cli/azure/acr/task[`az acr task`]
+* https://learn.microsoft.com/azure/aks/cluster-container-registry-integration[Integrate Azure Container Registry
+  with Azure Kubernetes Service]
+* https://learn.microsoft.com/azure/container-apps/managed-identity-image-pull[Pull images from Azure Container
+  Registry in Azure Container Apps using a managed identity]
+* https://learn.microsoft.com/azure/role-based-access-control/built-in-roles#acrpull[`AcrPull` built-in role]
+* https://learn.microsoft.com/azure/container-registry/container-registry-geo-replication[Geo-replication in
+  Azure Container Registry]
+* https://learn.microsoft.com/azure/container-registry/container-registry-retention-policy[Set a retention
+  policy to retain untagged manifests]
+* https://learn.microsoft.com/azure/container-registry/container-registry-private-link[Set up a private endpoint
+  with Private Link for Azure Container Registry]
+* https://learn.microsoft.com/cli/azure/acr/replication[`az acr replication`]
+* https://learn.microsoft.com/cli/azure/acr/config/retention[`az acr config retention`]
+* https://learn.microsoft.com/azure/developer/github/connect-from-azure[Connect GitHub Actions to Azure using
+  OpenID Connect]
