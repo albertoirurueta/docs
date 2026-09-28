@@ -556,21 +556,21 @@ same disclaimer/cheat-sheet/PDF/nav/bibliography conventions.
 
 **Parallelizable: yes** (single task; sub-tasks in order, after Group 9).
 
-- [ ] Task 25. Verify against the integration branch and compute merge readiness.
-  - [ ] Task 25.1. Commit on `feature/205` with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01YHinbxfoUe4fRK7UhVB3by`.
+- [x] Task 25. Verify against the integration branch and compute merge readiness.
+  - [x] Task 25.1. Commit on `feature/205` with the trailer `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01YHinbxfoUe4fRK7UhVB3by`.
     Do not push, and don't commit `.secrets.baseline`. Then `git fetch origin` and merge the latest
     `origin/feature/213-ai-section` into `feature/205`.
     * **Expected conflict points:** the AI block in `nav.adoc`, `ai/index.adoc` `== Sub-sections` /
       `== Books used in this section` / `:keywords:`, and the root `:keywords:`.
     * **How to resolve:** keep every sibling's entries, in the fixed sub-section order.
     * If nothing is new, record "already up to date".
-  - [ ] Task 25.2. Re-run the Antora build and Mermaid validation on the merged result via `iru-gate-runner`. Both
+  - [x] Task 25.2. Re-run the Antora build and Mermaid validation on the merged result via `iru-gate-runner`. Both
     must be clean.
-  - [ ] Task 25.3. Confirm prerequisite **#202** is merged into the integration branch:
+  - [x] Task 25.3. Confirm prerequisite **#202** is merged into the integration branch:
     `git fetch origin && git branch -r --merged origin/feature/213-ai-section | grep -x "  origin/feature/202"`,
     or `gh pr list --base feature/213-ai-section --state merged --json number,headRefName,title` (GitHub MCP
     equivalent if `gh` unavailable in the executing environment).
-  - [ ] Task 25.4. Write the *Merge readiness* block to `<scratchpad>/merge-readiness-205.md`:
+  - [x] Task 25.4. Write the *Merge readiness* block to `<scratchpad>/merge-readiness-205.md`:
     ```
     ### Merge readiness
     - Target branch: feature/213-ai-section (NOT main; this PR must never be merged into main)
