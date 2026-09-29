@@ -1,0 +1,740 @@
+= Deploying Remote Servers
+:stem: latexmath
+:description: Taking the docs-assistant MCP server to production -- a Dockerfile per stack (Python mcp 2.2 on uv, Spring Boot 4.1 on Java 21, Node 24 with Express) that were built and passed the contract script, stateless scaling behind a load balancer with a shared requestState key, capacity math with Little's law, gateways that route and rate-limit on Mcp-Method and Mcp-Name, TLS and Host/Origin allowlists, 429 handling, and publishing to the MCP Registry (preview) with server.json.
+:keywords: deploy mcp server, remote mcp server, dockerfile, docker compose, kubernetes, load balancer, stateless, sticky sessions, RequestStateSecurity, createRequestStateCodec, nginx, gateway, Mcp-Method, Mcp-Name, TLS termination, dns rebinding, allowed_hosts, allowedHosts, rate limit, 429, Retry-After, capacity planning, Little's law, MCP Registry, server.json, mcp-publisher, private registry, subregistry
+
+include::partial$ai-mcp-disclaimer.adoc[]
+
+This page was written on 2026-09-29 against the https://modelcontextprotocol.io/specification/2026-07-28[2026-07-28 revision]
+of the specification, the Python `mcp` SDK 2.2.0, `@modelcontextprotocol/server` 2.2.0 with `@modelcontextprotocol/express`
+2.0.1, and the MCP Java SDK 2.0.1 with Spring AI 2.0.1 on Spring Boot 4.1.1 (see the xref:ai/mcp/index.adoc[Model Context Protocol]
+baseline). The three Dockerfiles below were built with Docker 29.8 on an arm64 machine, run, and driven by the shared contract
+script from xref:ai/mcp/testing-and-debugging.adoc[Testing & Debugging]; the results are collected in <<_what_was_run>>.
+
+A remote MCP server is an ordinary HTTP service, and the 2026-07-28 revision made it a *well-behaved* one: every request is
+self-contained, so nothing has to be pinned to a process and any healthy replica can answer. Deploying it therefore
+reuses the container, load-balancer and gateway practices from the xref:backend/docker/index.adoc[Docker] pages, plus four MCP-specific
+concerns: the `Host` allowlist that the SDKs enable by default, the key that protects `requestState` across replicas, gateways
+that can route on `Mcp-Method` and `Mcp-Name`, and the registry metadata that lets others discover the server.
+
+== Containerising the docs-assistant
+
+The same `docs-assistant` server from the three stack pages is packaged three times. The rules are the same for each and
+follow xref:backend/docker/image-best-practices-and-security.adoc[Image Best Practices and Supply-Chain Security]:
+
+* *Multi-stage builds*: the build stage holds the compilers and package managers, the runtime stage holds only what runs
+  (see xref:backend/docker/build-cache-and-multi-stage-builds.adoc[Build Cache and Multi-Stage Builds]).
+* *A non-root user* with a numeric UID, so Kubernetes `runAsNonRoot` can verify it.
+* *A `HEALTHCHECK`* that does not need `curl`, which the slim runtime images lack, and that survives the `Host` allowlist.
+* *No secrets in the image.* Nothing in these files, in the build arguments or in the layers holds a key; the request-state key
+  and any credentials arrive as environment variables at run time, from a secret store (checked in
+  <<_what_was_run>> by inspecting the image configuration).
+* *Bind to all interfaces inside the container* (`0.0.0.0`), because the container's loopback is not reachable from the
+  proxy. That is exactly the setting under which the SDKs stop protecting you with their localhost allowlist, so each
+  Dockerfile is paired with an explicit `Host` allowlist for the public name.
+
+The Dockerfile fundamentals are on xref:backend/docker/dockerfile-fundamentals.adoc[Dockerfile Fundamentals], the Spring specifics
+(layered jars, JRE-only runtime, memory settings) on xref:backend/docker/java-and-spring-boot-images.adoc[Java and Spring Boot Images],
+and pushing the result somewhere your cluster can pull it on xref:backend/docker/registries-and-docker-hub.adoc[Registries and Docker Hub].
+
+[cols="1,2,2,1", options="header"]
+.The three images as built
+|===
+| Stack | Base images | Runs as | Image size
+
+| Python `mcp` 2.2
+| `python:3.12-slim` (build and runtime), `uv` 0.12.8 copied from its official image
+| UID 10001
+| 173 MB
+
+| Spring Boot 4.1 / Spring AI 2.0
+| `maven:3.9-eclipse-temurin-21` to build, `eclipse-temurin:21-jre` to run
+| UID 10001
+| 372 MB
+
+| Node 24 / TypeScript
+| `node:24-slim` (build and runtime)
+| `node` (UID 1000, built into the image)
+| 274 MB
+|===
+
+=== Python: `mcp` v2 over Streamable HTTP
+
+The v2 server object needs two changes for production and one new file. First, `MCPServer` gets a `RequestStateSecurity`
+whose key comes from the environment (the reason is in <<_scaling_stateless_servers>>), and a plain `/healthz` route, registered
+with `custom_route`, which the SDK documents for health checks and serves without authorization:
+
+[source,python]
+.server.py -- the parts that change for deployment
+----
+import os
+
+from mcp.server import MCPServer
+from mcp.server.mcpserver import RequestStateSecurity
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse
+
+# Every replica must seal and verify requestState with the same key(s); the key comes from the environment
+# (in production injected from a secret store), never from the image.
+mcp = MCPServer(
+    "docs-assistant",
+    version="1.0.0",
+    request_state_security=RequestStateSecurity(keys=[os.environ["MCP_STATE_KEY"]]),
+)
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request: Request) -> PlainTextResponse:
+    return PlainTextResponse("ok")
+
+# ... search_docs, the docs:// resource template and answer_with_citations are unchanged
+----
+
+Second, the entry point binds to `0.0.0.0` and passes a `TransportSecuritySettings`. The SDK enables DNS-rebinding protection
+automatically only when it is bound to a loopback address; with `0.0.0.0` you must supply the allowlist yourself, and a request whose
+`Host` is not on it gets `421` (a bad `Origin` gets `403`). Entries match exactly, and an entry ending in `:*` matches any port:
+
+[source,python]
+.serve.py -- bind to all interfaces, allow only the public name
+----
+import os
+
+from mcp.server.transport_security import TransportSecuritySettings
+
+from server import mcp
+
+public_host = os.environ["PUBLIC_HOST"]  # for example docs.example.com
+
+security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    # The proxy forwards the original Host; localhost:* keeps the container healthcheck working.
+    allowed_hosts=[public_host, "localhost:*", "127.0.0.1:*"],
+    allowed_origins=[f"https://{public_host}"],
+)
+
+if __name__ == "__main__":
+    mcp.run("streamable-http", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), transport_security=security)
+----
+
+`mcp.run("streamable-http", host=..., port=..., transport_security=...)` is the v2 signature: bind address, port and security
+are `run()` arguments, no longer constructor arguments (see xref:ai/mcp/python-servers.adoc[Python MCP Servers]). The Dockerfile uses `uv`
+in the build stage to create the virtual environment and copies only that environment into the runtime stage:
+
+[source,dockerfile]
+.python/Dockerfile
+----
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:0.12.8 /uv /usr/local/bin/uv
+RUN uv venv /opt/venv && uv pip install --python /opt/venv/bin/python "mcp==2.2.0"
+
+FROM python:3.12-slim
+ENV PATH="/opt/venv/bin:$PATH" PYTHONUNBUFFERED=1 PORT=8000
+RUN useradd --system --uid 10001 --no-create-home app
+COPY --from=build /opt/venv /opt/venv
+WORKDIR /app
+COPY server.py serve.py store.py ./
+USER 10001
+EXPOSE 8000
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/healthz', timeout=2)"]
+CMD ["python", "serve.py"]
+----
+
+A plain `pip` build is the same shape: replace the `uv` lines with `python -m venv /opt/venv && /opt/venv/bin/pip install "mcp==2.2.0"`.
+The healthcheck uses the interpreter that is already there. It calls `localhost:8000`, which is why `localhost:*` sits on the allowlist.
+
+Derived from the https://py.sdk.modelcontextprotocol.io/[Python SDK documentation] and checked against the installed package
+(`MCPServer.run`, `streamable_http_app`, `TransportSecuritySettings`, `RequestStateSecurity`, `custom_route`).
+
+=== Spring Boot 4.1: multi-stage on Java 21
+
+Two changes to the server from xref:ai/mcp/spring-boot-servers.adoc[Spring Boot MCP Servers]: the Actuator starter for health
+probes, and production properties. The protocol is set to `STATELESS` so that the container can be replicated freely; the
+reasoning is in <<_scaling_stateless_servers>>.
+
+[source,properties]
+.src/main/resources/application.properties
+----
+spring.application.name=docs-assistant
+spring.ai.mcp.server.name=docs-assistant
+spring.ai.mcp.server.version=1.0.0
+# STATELESS holds no session, so any replica can serve any request. STREAMABLE keeps a session id and needs affinity.
+spring.ai.mcp.server.protocol=STATELESS
+spring.ai.mcp.server.type=SYNC
+spring.main.banner-mode=off
+# Behind a TLS-terminating proxy: honour X-Forwarded-* headers.
+server.forward-headers-strategy=framework
+server.shutdown=graceful
+management.endpoints.web.exposure.include=health
+management.endpoint.health.probes.enabled=true
+----
+
+`server.forward-headers-strategy=framework` makes Spring honour `X-Forwarded-For` and `X-Forwarded-Proto` from the proxy,
+`server.shutdown=graceful` lets in-flight requests finish when a replica is replaced, and the `health` endpoint with probes enabled
+serves `/actuator/health/readiness` for Docker and Kubernetes. The `spring-boot-starter-actuator` dependency is the only addition to the `pom.xml`.
+
+[source,dockerfile]
+.java/Dockerfile
+----
+# syntax=docker/dockerfile:1
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /build
+COPY pom.xml .
+RUN --mount=type=cache,target=/root/.m2 mvn -q -B dependency:go-offline
+COPY src ./src
+RUN --mount=type=cache,target=/root/.m2 mvn -q -B -DskipTests package \
+ && java -Djarmode=tools -jar target/docs-assistant-1.0.0.jar extract --layers --destination /build/layers
+
+FROM eclipse-temurin:21-jre
+RUN useradd --system --uid 10001 --no-create-home app
+WORKDIR /app
+COPY --from=build /build/layers/dependencies/ ./
+COPY --from=build /build/layers/spring-boot-loader/ ./
+COPY --from=build /build/layers/snapshot-dependencies/ ./
+COPY --from=build /build/layers/application/ ./
+USER 10001
+EXPOSE 8080
+ENV JAVA_TOOL_OPTIONS="-XX:MaxRAMPercentage=75"
+HEALTHCHECK --interval=15s --timeout=3s --start-period=40s --retries=3 \
+  CMD ["bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /actuator/health/readiness HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+ENTRYPOINT ["java", "-jar", "docs-assistant-1.0.0.jar"]
+----
+
+`java -Djarmode=tools -jar app.jar extract --layers` splits the executable jar into dependency and application layers, so a code change rebuilds
+only a few kilobytes of layer (the technique is explained on xref:backend/docker/java-and-spring-boot-images.adoc[Java and Spring Boot Images]).
+`-XX:MaxRAMPercentage=75` sizes the heap from the container's memory limit. The runtime image has no `curl`, so the healthcheck opens a TCP
+socket with `bash`. The Spring HTTP endpoint is unauthenticated by default; put the resource-server configuration from
+xref:ai/mcp/authorization.adoc[Authorization] in front of it before exposing the image.
+
+Derived from the https://docs.spring.io/spring-ai/reference/api/mcp/mcp-streamable-http-server-boot-starter-docs.html[Spring AI Streamable-HTTP MCP server reference]
+and the Spring Boot container-images documentation; the property names were exercised by the run in <<_what_was_run>>.
+
+=== Node 24: multi-stage for the Express server
+
+The TypeScript server binds to all interfaces, names the hosts it serves, and adds a health route. `createMcpExpressApp` takes
+`allowedHosts` and `allowedOrigins` as *hostnames without ports*, and it applies them to every route, so `localhost` is listed
+for the container healthcheck:
+
+[source,typescript]
+.src/http.ts
+----
+import { createMcpExpressApp } from '@modelcontextprotocol/express';
+import { toNodeHandler } from '@modelcontextprotocol/node';
+import { createMcpHandler } from '@modelcontextprotocol/server';
+import { createDocsAssistant } from './server.js';
+
+const publicHost = process.env.PUBLIC_HOST ?? 'localhost'; // for example docs.example.com
+const port = Number(process.env.PORT ?? 3000);
+
+// Bind to all interfaces inside the container, but only answer for the names we serve.
+const app = createMcpExpressApp({
+    host: '0.0.0.0',
+    allowedHosts: [publicHost, 'localhost'],
+    allowedOrigins: [publicHost]
+});
+app.get('/healthz', (_req, res) => void res.type('text/plain').send('ok'));
+
+const node = toNodeHandler(createMcpHandler(createDocsAssistant));
+app.all('/mcp', (req, res) => void node(req, res, req.body));
+
+app.listen(port, '0.0.0.0', () => console.error(`docs-assistant listening on :${port}/mcp`));
+----
+
+[source,dockerfile]
+.ts/Dockerfile
+----
+# syntax=docker/dockerfile:1
+FROM node:24-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig.json ./
+COPY src ./src
+RUN npx tsc && npm prune --omit=dev
+
+FROM node:24-slim
+ENV NODE_ENV=production PORT=3000
+WORKDIR /app
+COPY --from=build --chown=node:node /app/node_modules ./node_modules
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node package.json ./
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 \
+  CMD ["node", "-e", "fetch('http://localhost:3000/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+CMD ["node", "dist/http.js"]
+----
+
+The build stage installs everything, compiles with `tsc` (the `tsconfig.json` sets `outDir`, unlike the type-check-only one from
+xref:ai/mcp/nodejs-servers.adoc[Node.js MCP Servers]) and prunes development dependencies; the runtime stage copies only
+`node_modules`, `dist` and `package.json`, whose `"type": "module"` Node needs to load the compiled files. `NODE_ENV=production` is set,
+the process runs as the built-in `node` user, and the healthcheck uses Node's own `fetch`, again because `curl` is absent.
+
+Derived from the https://ts.sdk.modelcontextprotocol.io/v2/[TypeScript SDK documentation] and the type declarations of `@modelcontextprotocol/express` 2.0.1.
+
+[[_what_was_run]]
+=== What was run
+
+Each image was built with `docker build`, checked with `docker build --check` (no warnings), started with its environment supplied on the
+command line, and then given the contract script:
+
+[source,bash]
+.Building, running and testing the three images
+----
+docker build -t docs-assistant-py python
+docker run -d -p 8100:8000 -e PUBLIC_HOST=docs.example.com \
+  -e MCP_STATE_KEY="$(openssl rand -base64 32)" docs-assistant-py
+
+INSPECTOR=./node_modules/.bin/mcp-inspector ./contract.sh http://localhost:8100/mcp
+----
+
+[cols="2,3", options="header"]
+.Results
+|===
+| Image | Outcome
+
+| Python
+| Healthy. Contract script: six of six steps pass, including the multi-round-trip elicitation. The container ran as UID 10001 and the image
+  configuration held no `MCP_STATE_KEY`.
+
+| Node
+| Healthy. Six of six steps pass. Reached through `127.0.0.1` the server answered `403`, because only `docs.example.com` and `localhost` are allowed;
+  the script passes when the URL uses `localhost`.
+
+| Spring Boot
+| Healthy through the readiness endpoint. Five of five steps pass with `PROTOCOL_ERA=legacy` (the Java SDK speaks protocol 2025-11-25, so there is no
+  modern-era or elicitation step); see xref:ai/mcp/spring-boot-servers.adoc[Spring Boot MCP Servers].
+|===
+
+A `POST` with `Host: evil.example.net` was rejected with `421` by the Python image and `403` by the Node image; a valid `Host` with
+`Origin: https://evil.example.net` was rejected with `403` by both. Not run: an image scan, pushing to a registry, and a load test of the Spring image.
+
+== Scaling stateless servers
+
+Before 2026-07-28 a session id tied a client to one process, so replicas needed sticky routing or a shared session store. The revision removed
+protocol sessions and the `Mcp-Session-Id` header, so a load balancer may send each request to any replica; the reasoning is on
+xref:ai/mcp/transports.adoc[Transports]. What is left to get right is small.
+
+[mermaid]
+....
+flowchart LR
+  C1[MCP client A] -->|HTTPS POST /mcp| GW
+  C2[MCP client B] -->|HTTPS POST /mcp| GW
+  subgraph edge [Edge]
+    GW[Gateway: TLS, rate limit, routing on Mcp-Method and Mcp-Name]
+  end
+  GW -->|HTTP, Host forwarded| R1[docs-assistant replica 1]
+  GW --> R2[docs-assistant replica 2]
+  GW --> R3[docs-assistant replica N]
+  S[(Secret store: state key)] -.->|env at start| R1
+  S -.-> R2
+  S -.-> R3
+  R1 & R2 & R3 --> V[(Vector store)]
+....
+
+[cols="1,3", options="header"]
+.What each stack needs to be replicated
+|===
+| Stack | Requirement
+
+| Python `mcp` 2.2
+| `MCPServer` seals `requestState` with a key generated per process, so an elicitation retry that lands on another replica is rejected. Give every replica the same
+  `RequestStateSecurity(keys=[...])`, read from a secret store as in `server.py` above. The key ring rotates: `keys[0]` seals, every key unseals, so roll a new
+  key out as `[old, new]`, then `[new, old]`, then `[new]` once the time-to-live (600 seconds by default) has passed.
+
+| TypeScript 2.2
+| The SDK applies no protection to `requestState` on its own. A handler that mints state must use `createRequestStateCodec` with a key of at least 32 bytes that every
+  replica shares, and pass its `verify` to `ServerOptions.requestState.verify`. The `docs-assistant` above mints no state (it reads `inputResponses`), so it
+  needs no key; the factory-per-request design of `createMcpHandler` already keeps replicas interchangeable.
+
+| Spring AI 2.0 / Java SDK 2.0
+| `STATELESS` keeps no session, so any replica serves any request, at the price of features that need a server-to-client channel. `STREAMABLE` keeps an `Mcp-Session-Id`
+  (protocol 2025-11-25), so either run one instance or give the balancer affinity, for example `hash $http_mcp_session_id consistent;` in an nginx `upstream`.
+  Prefer `STATELESS` for anything you intend to scale.
+|===
+
+Two further points apply everywhere. A `subscriptions/listen` response stream stays on the replica that accepted it for as long as it is open, so
+the gateway's read timeout and any connection draining must allow for it, and clients simply reconnect if the stream ends. And a rolling update
+must keep the *same* state key across old and new replicas for the length of the rollout, or in-flight elicitations fail.
+
+=== Compose
+
+Compose can run several replicas behind a gateway on one host, which is enough for a staging environment and for the tests on this page. The key is
+required in the environment, not written in the file, and the service runs with a read-only filesystem and no capabilities (see
+xref:backend/docker/compose-fundamentals.adoc[Docker Compose Fundamentals] and xref:backend/docker/compose-in-practice.adoc[Compose in Practice]):
+
+[source,yaml]
+.compose.yaml
+----
+services:
+  docs-assistant:
+    image: docs-assistant-py
+    environment:
+      PUBLIC_HOST: docs.example.com
+      MCP_STATE_KEY: ${MCP_STATE_KEY:?export MCP_STATE_KEY from your secret store}
+    deploy:
+      replicas: 3
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  gateway:
+    image: nginx:1.29
+    depends_on:
+      docs-assistant:
+        condition: service_healthy
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+----
+
+`MCP_STATE_KEY=$(openssl rand -base64 32) docker compose up -d` (or a value exported by your secret manager) starts three replicas, and the gateway
+resolves the service name to all three addresses. The `${MCP_STATE_KEY:?...}` form makes Compose stop with an error when the variable is missing rather than start a
+server with no key.
+
+=== Kubernetes
+
+On Kubernetes the same idea is a `Deployment` with a `Service` in front, the key read from a `Secret`, and a readiness probe that sends the
+`Host` the allowlist accepts. The manifest parses as YAML but was not applied to a cluster (no cluster was available):
+
+[source,yaml]
+.k8s.yaml
+----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docs-assistant
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: docs-assistant }
+  template:
+    metadata:
+      labels: { app: docs-assistant }
+    spec:
+      containers:
+        - name: docs-assistant
+          image: registry.example.com/docs/docs-assistant:1.0.0
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PUBLIC_HOST
+              value: docs.example.com
+            - name: MCP_STATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: docs-assistant-state
+                  key: key
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8000, httpHeaders: [{ name: Host, value: localhost }] }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: docs-assistant
+spec:
+  selector: { app: docs-assistant }
+  ports:
+    - port: 80
+      targetPort: 8000
+----
+
+Rolling updates, autoscaling on CPU or on requests per second, and pod disruption budgets are on
+xref:backend/docker/orchestration-swarm-and-kubernetes.adoc[Orchestration: Swarm Mode and Kubernetes]; secrets belong in the cluster's secret store
+or an external one, never in the image or in a manifest checked into the repository.
+
+== Sizing the fleet
+
+Stateless replicas make capacity a queueing question. Four measurable quantities describe the load:
+
+* stem:[\lambda], the arrival rate of HTTP requests at the gateway (requests per second);
+* stem:[S], the mean service time of one request on a replica (seconds), which for `search_docs` is dominated by the vector-store query;
+* stem:[c], how many requests one replica works on concurrently (worker threads, event-loop tasks, or connection-pool slots, whichever saturates first);
+* stem:[\rho], the target utilisation, the fraction of that concurrency you plan to use at peak.
+
+*Little's law* says the average number of requests in flight in a stable system is the arrival rate times the mean time each spends in it:
+
+[stem]
+++++
+L = \lambda \, W
+++++
+
+Applied to service time alone, stem:[a = \lambda S] is the *offered load*, the average number of busy workers in the whole fleet. One replica has stem:[c]
+workers, and you want them busy only a fraction stem:[\rho] of the time, so the number of replicas is
+
+[stem]
+++++
+N = \left\lceil \frac{\lambda \, S}{c \, \rho} \right\rceil
+++++
+
+and the utilisation you actually get is stem:[\rho_{\text{actual}} = \lambda S / (N c)]. Two MCP-specific corrections matter. First, an elicitation costs *two*
+requests, the one that returns `input_required` and the retry, so if a fraction stem:[p] of calls elicit, the request rate at the gateway is
+
+[stem]
+++++
+\lambda = \lambda_{\text{calls}} \, (1 + p)
+++++
+
+Second, keep headroom for failure and rollout: provision stem:[N + k] replicas so that losing stem:[k] still leaves utilisation at or below stem:[\rho].
+Why not run hotter: as utilisation approaches one, waiting time grows roughly like stem:[1/(1-\rho)], so a fleet at 90% is not 50% slower than one at 60%, it is several
+times slower at the tail.
+
+*Worked example.* The docs assistant peaks at stem:[\lambda_{\text{calls}} = 100] `tools/call` per second and one call in five elicits, so stem:[p = 0.2]
+and stem:[\lambda = 100 \times 1.2 = 120] requests per second. A load test shows a mean service time stem:[S = 0.35] s and that one replica sustains stem:[c = 8]
+concurrent requests before latency climbs. Target stem:[\rho = 0.6]:
+
+[stem]
+++++
+a = 120 \times 0.35 = 42, \qquad N = \left\lceil \frac{42}{8 \times 0.6} \right\rceil = \lceil 8.75 \rceil = 9
+++++
+
+By Little's law about 42 requests are in flight in the fleet, roughly 4.7 per replica. With nine replicas the utilisation is stem:[42/72 \approx 0.58]; if one fails it
+rises to stem:[42/64 \approx 0.66], still acceptable, so one spare replica (ten in total) gives stem:[\rho \approx 0.53] in normal operation and absorbs a failure and a rolling update.
+Treat stem:[S] and stem:[c] as things you measure with a load test against the real image, not as constants: they change with the vector store, the tool, and the
+number of worker threads in the process.
+
+A per-client limit at the gateway (next sections) bounds one caller's share of stem:[\lambda]. A token bucket refilling at stem:[r] requests per second with capacity stem:[b]
+admits at most stem:[rT + b] requests from that client in any window of length stem:[T] seconds; for the `search_docs` bucket below, stem:[r = 2] and stem:[b = 5]
+(the burst of 4 plus the request being admitted) allow at most stem:[2 \times 60 + 5 = 125] in a minute, and the thirty-request burst in the test admitted five.
+
+== Gateways that route on `Mcp-Method` and `Mcp-Name`
+
+Because of the mirrored headers described on xref:ai/mcp/transports.adoc[Transports], a gateway can act on the *kind* of request without parsing JSON:
+`Mcp-Method` carries the JSON-RPC method (`tools/call`, `tools/list`, `resources/read`, ...) and `Mcp-Name` carries the tool or prompt name, or the resource
+URI, for the methods that have one. A server that processes the body must reject a mismatch with `400` and error `-32020`, which is what makes it safe for the
+gateway to trust the header: a client cannot pass a cheap header and run an expensive body. The same protection tells you the limits of the technique.
+
+* Trust the headers only when `MCP-Protocol-Version` names a version that requires the validation; the specification says an intermediary that enforces policy on
+  mirrored headers should reject requests with an older or missing version rather than trust them.
+* A name that is not header-safe is sent as `=?base64?...?=`, so a rule that matches a plain tool name will not match an encoded one; keep tool names to plain ASCII.
+* `Mcp-Param-*` headers, from `x-mcp-header` in a tool's schema, are visible to every hop, so never mirror a secret or personal data into one.
+
+The nginx configuration below was run in front of three Python replicas with a self-signed certificate for `docs.example.com`. It terminates TLS,
+forwards the original `Host` (which the replica's allowlist needs), keeps the response unbuffered for streamed replies, and rate-limits only `tools/call`,
+with a second, tighter bucket for `search_docs`:
+
+[source,nginx]
+.nginx.conf
+----
+events {}
+http {
+  resolver 127.0.0.11 valid=5s;          # Compose DNS: one A record per replica
+  limit_req_status 429;
+
+  # Only tools/call is rate-limited; other methods get an empty key, which limit_req does not count.
+  map $http_mcp_method $limit_key {
+    default     "";
+    "tools/call" $binary_remote_addr;
+  }
+  # A stricter bucket for one expensive tool.
+  map $http_mcp_name $heavy_key {
+    default        "";
+    "search_docs"  $binary_remote_addr;
+  }
+  limit_req_zone $limit_key zone=mcp_calls:10m rate=20r/s;
+  limit_req_zone $heavy_key zone=mcp_heavy:10m rate=2r/s;
+
+  server {
+    listen 8443 ssl;
+    server_name docs.example.com;
+    ssl_certificate     /etc/nginx/certs/tls.crt;
+    ssl_certificate_key /etc/nginx/certs/tls.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    error_page 429 = @rate_limited;
+    location @rate_limited {
+      default_type application/json;
+      add_header Retry-After 1 always;
+      return 429 '{"error":"rate limited, retry later"}';
+    }
+
+    location = /mcp {
+      # The 2026-07-28 endpoint accepts POST only (the GET stream was removed; the specification says to answer GET
+      # and DELETE from older clients with 405), so reject other verbs early.
+      if ($request_method != POST) { return 405; }
+      limit_req zone=mcp_calls burst=40 nodelay;
+      limit_req zone=mcp_heavy burst=4 nodelay;
+
+      set $backend docs-assistant:8000;
+      proxy_pass http://$backend;
+      proxy_http_version 1.1;
+      proxy_set_header Host              $host;
+      proxy_set_header X-Forwarded-For   $remote_addr;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header Connection        "";
+      proxy_buffering off;               # keep streamed (SSE) responses flowing
+      proxy_read_timeout 3600s;          # long-lived subscriptions/listen streams
+      proxy_next_upstream error timeout http_502 http_503;
+    }
+  }
+}
+----
+
+The `map` blocks turn the two headers into rate-limit keys (nginx exposes `Mcp-Method` as `$http_mcp_method`); `limit_req` ignores a request whose key is empty,
+so `tools/list` and `server/discover` are never limited. Other routing rules follow the same pattern: send `tools/call` for a slow tool to a separate pool with its own scaling,
+or send `resources/read` to a cache. Envoy and Kubernetes Gateway API implementations can match on request headers in the same way, and an API gateway that authenticates
+the caller can combine the header with the caller's identity (for example the `sub` claim of the validated access token) to build a per-tenant key.
+
+Derived from the https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http[Streamable HTTP transport] page of the specification and the
+https://nginx.org/en/docs/http/ngx_http_limit_req_module.html[nginx `limit_req` documentation]. The behaviour in the next two sections was observed with this configuration.
+
+== TLS and origin checks
+
+Terminate TLS at the gateway and speak plain HTTP to the replicas on a private network, unless your policy requires encryption in transit inside the cluster, in which case use
+mutual TLS from a service mesh rather than certificates baked into the images. The authorization specification requires every authorization-server endpoint to be served over HTTPS, and clients send
+bearer tokens to the MCP endpoint, so there is no reason to offer the MCP endpoint over plain HTTP: redirect port 80 to 443 at the edge and add HSTS. Certificates and keys are mounted from a
+secret store, as in the Compose file, and never copied into an image (see xref:backend/docker/security.adoc[Docker Security]).
+
+Terminating TLS also changes what the replica sees, and this is where deployments go wrong:
+
+* The replica receives the public `Host` only if the proxy forwards it (`proxy_set_header Host $host` above). If the proxy sends its upstream name instead, the SDK's `Host` allowlist rejects every
+  request with `421` or `403`.
+* Both `Host` and `Origin` allowlists exist to stop *DNS rebinding*: a malicious web page makes the victim's browser resolve an attacker-controlled name to an address you serve, and the browser then sends
+  requests with `Origin` set to the attacker's page. The specification requires servers to validate `Origin` and answer `403` for an invalid one. Non-browser MCP clients send no `Origin`, so the check does
+  not affect them. List the exact public host in the allowlist; do not disable the protection to make an error go away.
+* The healthcheck reaches the replica directly, with a `localhost` `Host`. Either allow it, as above, or make the probe send the public name.
+* Behind the proxy, authorization metadata and the `WWW-Authenticate` challenge must advertise the *public* URL (`https://docs.example.com/mcp`), not the container's; see
+  xref:ai/mcp/authorization.adoc[Authorization]. On Spring that is what `server.forward-headers-strategy=framework` is for.
+
+== Rate limits and 429 handling
+
+Rate limits protect the fleet from one client, and the capacity calculation above from a spike. Put them at the gateway, where they cost nothing to the replicas, and design them around cost:
+
+* *Key per client*, not per IP address, once you authenticate: a validated token's subject or client id, so that a whole office behind one address is not throttled together and one
+  token cannot be spread over many addresses.
+* *Limit by cost.* A `tools/list` or `server/discover` is cheap and cacheable (`ttlMs` and `cacheScope` on the result say so), while `tools/call` for a vector search or a
+  code-execution tool is not. The nginx example limits only `tools/call`, with a smaller bucket for `search_docs`; each tool that has a distinct cost profile gets its own bucket.
+* *Bound concurrency as well as rate*: a cap on simultaneous requests per client stops a few slow calls from occupying the workers that stem:[c] counts.
+* *Cap the request body* (`max_request_body_size` in Python, `jsonLimit` in `createMcpExpressApp`, `client_max_body_size` in nginx) so that an oversized `inputResponses` cannot be used to exhaust memory.
+
+A rejected request under the configuration above looks like this; a burst of thirty `tools/call` for `search_docs` from one address returned five `200` responses followed by `429`
+for the rest, while thirty `tools/list` in the same window were all served:
+
+[source,http]
+.The gateway's 429 response
+----
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 1
+
+{"error":"rate limited, retry later"}
+----
+
+On the client side, a `429` (and `503`) is transient: wait for `Retry-After` when present, otherwise back off exponentially with jitter, limit the number of retries, and never retry a
+non-idempotent tool blindly; the `idempotentHint` annotation is only a hint, so a tool that spends money or sends mail needs its own idempotency key. Because the MCP layer does not
+define a rate-limit result, an agent that gets a `429` from a tool call should surface a clear failure to the model ("the documentation service is busy, try again shortly") rather than loop on it.
+The nginx body above is not a JSON-RPC error; if your clients expect one, return a JSON-RPC error object with a server-defined code from the gateway.
+
+== The MCP Registry (preview) and `server.json`
+
+Once the server is public, other people and tools need to find it. The *MCP Registry* is the official metadata repository for publicly accessible MCP servers, and is described by its own
+documentation as being in *preview*: breaking changes or data resets may occur before general availability. It stores *metadata*, not code: a `server.json` points at the place the server
+lives, either an installable package on a public package registry (npm, PyPI, NuGet, Cargo, or an OCI image on Docker Hub, GitHub Container Registry and a few others) or a remote endpoint.
+Server names use reverse DNS, and the registry supports both open- and closed-source servers, as long as the installation method or the endpoint is publicly reachable.
+
+For this deployment the relevant form is a *remote*: the `remotes` array names the Streamable HTTP endpoint, and `headers` tells clients which header to send. The `isSecret` flag marks
+the value as one clients must treat as a secret; the file holds no token, only the description of the header.
+
+[source,json]
+.server.json for the remote docs-assistant
+----
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.example/docs-assistant",
+  "title": "Docs Assistant",
+  "description": "Searches the documentation of the Irurueta libraries and returns cited pages.",
+  "version": "1.0.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://docs.example.com/mcp",
+      "headers": [
+        {
+          "name": "Authorization",
+          "description": "Bearer access token issued by the authorization server",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
+----
+
+The file was validated against the published JSON Schema for the `2025-12-11` schema version with `jsonschema` (valid; the same file with `"type": "bogus"` was rejected). The fields to know:
+
+* `name`: reverse-DNS namespace and server, for example `com.example/docs-assistant` or `io.github.<user>/<server>`. It must match the namespace you authenticate for.
+* `version`: required, unique per publication, and immutable once published; the registry recommends semantic versioning and rejects ranges such as `^1.2.3`. To change metadata you publish a new version.
+* `remotes[].type`: `streamable-http`, or `sse` only to support existing clients (the SSE transport is deprecated). `remotes[].url` may contain `\{variable}` placeholders described in `variables`.
+* `packages[]`: for locally run servers, with `registryType` (`npm`, `pypi`, `oci`, ...), an `identifier` and a `transport`. A server may carry both `remotes` and `packages`.
+* `_meta`: only the `io.modelcontextprotocol.registry/publisher-provided` key is preserved, up to 4096 bytes.
+
+The publishing flow uses the `mcp-publisher` CLI:
+
+[source,bash]
+.Publishing a server (the `com.example` namespace is verified through DNS)
+----
+mcp-publisher init                        # writes a server.json template
+mcp-publisher login dns --domain "example.com" --private-key "$MCP_REGISTRY_KEY"
+mcp-publisher publish
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=com.example/docs-assistant"
+----
+
+*Namespace verification* is what stops one publisher claiming another's name. `mcp-publisher login github` verifies `io.github.<user>/` and `io.github.<org>/` names through a GitHub
+device-code flow. `mcp-publisher login dns` verifies a domain by a TXT record on the domain that holds an Ed25519 or ECDSA P-384 public key, and `mcp-publisher login http` by a file
+served at `/.well-known/mcp-registry-auth`; in both cases you then log in with the matching private key, which may live in a KMS (Google Cloud KMS and Azure Key Vault are supported) so that the key never
+sits on a laptop or in CI variables. Packages are verified separately: an npm package carries an `mcpName` property equal to the server name, and an OCI image carries the label
+`io.modelcontextprotocol.server.name`. Publishing can also run from GitHub Actions, where the recommended authentication is OIDC rather than a stored secret. The command lines above
+come from the registry's quickstart, authentication and package-type pages; the publish itself was not run, because it would create a public entry.
+
+=== Private registries and subregistries
+
+The official registry does *not* accept private servers: those reachable only on a private network (`mcp.acme-corp.internal`) or installed from a private package registry. It is also not designed to
+be self-hosted. For an organisation the answer is a *private registry* or *subregistry*: any service that implements the registry's OpenAPI specification, so that hosts and tools that speak the
+registry API can consume it. Aggregators and marketplaces do the same on the public side, pulling the official data roughly hourly through its read-only `GET /v0.1/servers` endpoint and adding curation
+or ratings. Practically:
+
+* Keep the same `server.json` format for internal servers, with an internal namespace and `remotes` URLs on your private domain, and publish them to your own registry API.
+* Use the registry as the *allowlist* for hosts: a client or agent platform that only offers servers from your registry gives you review, ownership and versioning in one place, which is the deployment-side
+  counterpart of the approval gates in xref:ai/mcp/authorization.adoc[Authorization].
+* Mirror what you trust from the public registry rather than letting every developer add arbitrary servers; the official registry delegates scanning to package registries and aggregators, so vetting remains your job.
+
+== Where to go next
+
+* xref:ai/mcp/testing-and-debugging.adoc[Testing & Debugging] holds the contract script the three images pass and the CI recipe to run it against a deployed URL.
+* xref:ai/mcp/transports.adoc[Transports] explains the headers a gateway routes on and the `Host` and `Origin` checks.
+* xref:ai/mcp/authorization.adoc[Authorization] puts OAuth in front of the endpoint you just exposed.
+* xref:ai/mcp/security.adoc[MCP Security] covers the threats that remain once the deployment is correct.
+* xref:backend/docker/index.adoc[Docker] is the reference for the images, Compose files and orchestration used here.
+
+== References
+
+* https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http[MCP specification 2026-07-28 -- Streamable HTTP]
+* https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization[MCP specification 2026-07-28 -- Authorization]
+* https://modelcontextprotocol.io/docs/2026-07-28/tutorials/security/security_best_practices[MCP -- Security best practices]
+* https://modelcontextprotocol.io/registry/about[MCP Registry -- About]
+* https://modelcontextprotocol.io/registry/quickstart[MCP Registry -- Quickstart: publish an MCP server]
+* https://modelcontextprotocol.io/registry/remote-servers[MCP Registry -- Publishing remote servers]
+* https://modelcontextprotocol.io/registry/authentication[MCP Registry -- Authentication]
+* https://modelcontextprotocol.io/registry/package-types[MCP Registry -- Supported package types]
+* https://modelcontextprotocol.io/registry/versioning[MCP Registry -- Versioning published servers]
+* https://modelcontextprotocol.io/registry/registry-aggregators[MCP Registry -- Aggregators]
+* https://modelcontextprotocol.io/registry/faq[MCP Registry -- Frequently asked questions]
+* https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json[server.json JSON Schema (2025-12-11)]
+* https://github.com/modelcontextprotocol/registry[MCP Registry repository]
+* https://py.sdk.modelcontextprotocol.io/[MCP Python SDK documentation]
+* https://ts.sdk.modelcontextprotocol.io/v2/[MCP TypeScript SDK documentation]
+* https://docs.spring.io/spring-ai/reference/api/mcp/mcp-streamable-http-server-boot-starter-docs.html[Spring AI -- Streamable-HTTP MCP server]
+* https://nginx.org/en/docs/http/ngx_http_limit_req_module.html[nginx -- ngx_http_limit_req_module]
