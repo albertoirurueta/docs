@@ -1,0 +1,627 @@
+= Testing
+:description: How to test LangChain and LangGraph applications with pytest -- unit tests with fake chat models, node-by-node and partial-execution tests of graphs, integration tests against Ollama started by Testcontainers, and snapshot tests of topology and trajectories -- shown on DocsAssistant.
+:keywords: langchain testing, langgraph testing, pytest, GenericFakeChatModel, fake chat model, InMemorySaver, graph.nodes, update_state as_node, partial execution, Testcontainers, OllamaContainer, ChatOllama, integration tests, pytest markers, snapshot testing, syrupy, trajectory, DocsAssistant
+
+include::partial$ai-langchain-disclaimer.adoc[]
+
+This page was written against `langchain` 1.4.3, `langchain-core` 1.6.5, `langgraph` 1.2.12 and version 1.1.0 of
+`langchain-ollama` on Python 3.12, with `pytest` 9.1.1, `syrupy` 6.1.1 and `testcontainers` 4.15.0, as verified on 2026-09-29.
+The running example is *DocsAssistant*, which answers questions over this site's documentation with Ollama's
+`llama3.1:8b` chat model and the `nomic-embed-text` embedding model over the pgvector store from
+xref:database/vector-rag/integrating-with-langchain.adoc[Integrating with LangChain]. Every test in this page was run
+with `pytest`. The unit and snapshot tests use a scripted fake chat model, so their outputs are exactly what you would
+see; the integration test is described in its own section, together with what was and was not run.
+
+An LLM application is a deterministic program wrapped around a nondeterministic component. Testing it well means
+keeping those two apart: everything deterministic (routing functions, state updates, tool logic, the shape of the
+graph) is tested fast and exactly, with the model replaced by a script; the one nondeterministic part is tested
+separately, less often, and by asserting on structure instead of wording. LangChain's own testing guide draws the same
+three-way split into unit tests, integration tests and evals. This page covers the first two plus snapshots;
+xref:ai/langchain/evaluation.adoc[Evaluation] covers scoring quality, and the framework-neutral view of measuring an
+agent is in xref:ai/agents/agent-evaluation.adoc[Agent Evaluation].
+
+== The test pyramid for LLM applications
+
+[cols="1,2,2,1",options="header"]
+|===
+| Layer | What it checks | Model | Runs
+| Unit | Routing, node logic, tool logic, message flow, persistence | Scripted fake | Every save
+| Snapshot | Graph topology, tool-call trajectory | Scripted fake | Every save
+| Integration | Real model plus real tool wiring: schemas line up, tool calls are emitted | Real (Ollama) | CI, pre-deploy
+| Evals | Answer quality and trajectory quality over a dataset | Real, plus a judge | Scheduled, on changes to prompts or models
+|===
+
+Pin behaviour, not prose. A unit test that a graph routes an empty retrieval to the fallback branch will still pass
+after a model upgrade; a test that the answer equals a particular sentence will not.
+
+== Project layout
+
+All snippets below live in one small project. The application code is two modules, the graph from
+xref:ai/langchain/langgraph-workflows.adoc[LangGraph Workflows] reduced to its essentials and the agent from
+xref:ai/langchain/agents-with-create-agent.adoc[Agents with create_agent]:
+
+.Layout of the DocsAssistant test project
+[source,text]
+----
+docsassistant/
+    graph.py          # rewrite -> retrieve -> draft | no_answer
+    agent.py          # docs_search tool + make_agent(model, checkpointer)
+tests/
+    fakes.py          # ScriptedChat
+    conftest.py       # ollama_endpoint fixture (Testcontainers)
+    test_agent.py
+    test_graph.py
+    test_snapshots.py
+    test_integration.py
+pytest.ini
+----
+
+The graph takes its model and retriever as parameters instead of creating them at import time. That single decision
+makes everything below possible: a test passes a fake model and a lambda, production passes `ChatOllama` and a
+pgvector retriever.
+
+.docsassistant/graph.py -- dependencies are injected so tests can replace them
+[source,python]
+----
+from typing import Callable, Literal
+
+from langchain_core.language_models import BaseChatModel
+from langgraph.graph import END, START, StateGraph
+from typing_extensions import TypedDict
+
+Retriever = Callable[[str], list[str]]
+
+
+class State(TypedDict, total=False):
+    question: str
+    query: str
+    context: list[str]
+    answer: str
+
+
+def make_nodes(model: BaseChatModel, retriever: Retriever):
+    def rewrite(state: State) -> dict:
+        query = model.invoke(f"Rewrite as a search query: {state['question']}").text
+        return {"query": query.strip()}
+
+    def retrieve(state: State) -> dict:
+        return {"context": retriever(state["query"])}
+
+    def draft(state: State) -> dict:
+        prompt = "Answer from this context only:\n" + "\n".join(state["context"]) + f"\nQ: {state['question']}"
+        return {"answer": model.invoke(prompt).text}
+
+    def no_answer(state: State) -> dict:
+        return {"answer": "I could not find that in the documentation."}
+
+    return rewrite, retrieve, draft, no_answer
+
+
+def route_after_retrieve(state: State) -> Literal["draft", "no_answer"]:
+    return "draft" if state.get("context") else "no_answer"
+
+
+def build_graph(model: BaseChatModel, retriever: Retriever) -> StateGraph:
+    rewrite, retrieve, draft, no_answer = make_nodes(model, retriever)
+    graph = StateGraph(State)
+    graph.add_node("rewrite", rewrite)
+    graph.add_node("retrieve", retrieve)
+    graph.add_node("draft", draft)
+    graph.add_node("no_answer", no_answer)
+    graph.add_edge(START, "rewrite")
+    graph.add_edge("rewrite", "retrieve")
+    graph.add_conditional_edges("retrieve", route_after_retrieve)
+    graph.add_edge("draft", END)
+    graph.add_edge("no_answer", END)
+    return graph
+----
+
+`build_graph` returns the uncompiled `StateGraph`, so each test compiles its own copy, with its own checkpointer when
+it needs one. LangGraph's testing guide recommends exactly this: because many LangGraph agents depend on state, create
+the graph before each test that uses it and compile it with a new checkpointer instance, so no state is carried over
+from one test to the next. The agent module holds one tool and a factory:
+
+.docsassistant/agent.py -- a tool and an agent factory that accepts any model
+[source,python]
+----
+from langchain.agents import create_agent
+from langchain.tools import tool
+
+CORPUS = {
+    "vector-rag/chunking.adoc": "Chunk size and overlap control retrieval quality.",
+    "vector-rag/pgvector.adoc": "pgvector stores embeddings in PostgreSQL.",
+}
+
+
+@tool
+def docs_search(query: str) -> str:
+    """Search the documentation and return matching page paths with a one-line snippet."""
+    hits = [f"{path}: {text}" for path, text in CORPUS.items() if query.lower() in text.lower()]
+    return "\n".join(hits) or "No results."
+
+
+def make_agent(model, checkpointer=None):
+    return create_agent(
+        model,
+        tools=[docs_search],
+        system_prompt="You are DocsAssistant. Use docs_search before answering.",
+        checkpointer=checkpointer,
+    )
+----
+
+Both files are deliberately small stand-ins for the real DocsAssistant modules, whose retriever queries pgvector
+(see xref:ai/langchain/retrieval-and-rag-bridge.adoc[Retrieval & the RAG Bridge]). See
+https://docs.langchain.com/oss/python/langgraph/use-graph-api[LangGraph -- Use the graph API] and
+https://docs.langchain.com/oss/python/langchain/agents[LangChain -- Agents] for the APIs used.
+
+== Unit tests with fake chat models
+
+`langchain-core` ships `GenericFakeChatModel`: you give it an iterator of `AIMessage` objects or plain strings, and
+each model call returns the next one. It supports normal and streaming use, and it can script tool calls, which is
+what makes it useful for agents. The one catch is that `create_agent` calls `bind_tools` on the model when tools are
+present, and the fake does not implement it. A three-line subclass fixes that:
+
+.tests/fakes.py -- a scripted model that tolerates bind_tools
+[source,python]
+----
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+
+class ScriptedChat(GenericFakeChatModel):
+    """GenericFakeChatModel that tolerates bind_tools, which create_agent calls when tools are given."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+def scripted(*messages):
+    return ScriptedChat(messages=iter(messages))
+----
+
+Test the tool on its own first, since it is an ordinary function behind `.invoke`, and then the whole loop. The script
+below plays the part of the model: first it asks for `docs_search`, then, after seeing the tool result, it answers.
+
+.tests/test_agent.py -- tool logic and the agent loop with a scripted model
+[source,python]
+----
+from langchain.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
+
+from docsassistant.agent import docs_search, make_agent
+from tests.fakes import scripted
+
+
+def test_docs_search_tool_alone():
+    assert "pgvector.adoc" in docs_search.invoke({"query": "pgvector"})
+    assert docs_search.invoke({"query": "zzz"}) == "No results."
+
+
+def test_agent_calls_the_search_tool_then_answers():
+    model = scripted(
+        AIMessage(content="", tool_calls=[ToolCall(name="docs_search", args={"query": "pgvector"}, id="call_1")]),
+        AIMessage(content="pgvector stores embeddings in PostgreSQL."),
+    )
+    result = make_agent(model).invoke({"messages": [HumanMessage("Where are embeddings stored?")]})
+
+    kinds = [type(m).__name__ for m in result["messages"]]
+    assert kinds == ["HumanMessage", "AIMessage", "ToolMessage", "AIMessage"]
+    tool_msg = next(m for m in result["messages"] if isinstance(m, ToolMessage))
+    assert tool_msg.tool_call_id == "call_1"
+    assert "pgvector.adoc" in tool_msg.content
+    assert result["messages"][-1].content.startswith("pgvector stores")
+----
+
+Both tests pass. The assertions check the message sequence, the link between the tool call and its result through
+the call ID, and that the real tool ran and produced the page path. They do not check what a real model would say,
+because nothing here is a real model. The script is also strict: if the agent asked the model for a third reply,
+the exhausted iterator would raise and fail the test, so an accidental extra model call cannot slip through.
+
+The mocking guide: https://docs.langchain.com/oss/python/langchain/test/unit-testing[Unit testing].
+
+=== Multi-turn behaviour with InMemorySaver
+
+State-dependent behaviour needs a checkpointer, and `InMemorySaver` is the one to use in tests: nothing to start,
+nothing to clean up, and a fresh instance per test gives a fresh world. Reading the state back with `get_state` lets
+the test assert on what was persisted, not just on what the last call returned.
+
+.tests/test_agent.py -- persistence across turns and thread isolation
+[source,python]
+----
+from langchain.messages import HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
+
+from docsassistant.agent import make_agent
+from tests.fakes import scripted
+
+
+def test_second_turn_sees_the_first_one():
+    model = scripted("Noted, you use pgvector.", "You told me you use pgvector.")
+    agent = make_agent(model, checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "t-1"}}
+
+    agent.invoke({"messages": [HumanMessage("I use pgvector.")]}, config)
+    agent.invoke({"messages": [HumanMessage("What do I use?")]}, config)
+
+    history = agent.get_state(config).values["messages"]
+    assert [m.content for m in history if isinstance(m, HumanMessage)] == ["I use pgvector.", "What do I use?"]
+    assert len(history) == 4
+
+
+def test_threads_are_isolated():
+    agent = make_agent(scripted("a", "b"), checkpointer=InMemorySaver())
+    agent.invoke({"messages": [HumanMessage("one")]}, {"configurable": {"thread_id": "A"}})
+    agent.invoke({"messages": [HumanMessage("two")]}, {"configurable": {"thread_id": "B"}})
+    assert len(agent.get_state({"configurable": {"thread_id": "A"}}).values["messages"]) == 2
+----
+
+The second test is the one that guards the multi-user requirement: two thread IDs must never share history. The
+production checkpointers (Postgres and friends) are covered in
+xref:ai/langchain/short-term-memory-and-checkpointers.adoc[Short-Term Memory & Checkpointers]; tests use the in-memory
+one and leave the database out of the unit layer.
+
+Unit testing and `InMemorySaver`: https://docs.langchain.com/oss/python/langchain/test/unit-testing[Unit testing].
+
+== Testing graphs node by node
+
+A LangGraph graph is a set of ordinary functions plus wiring, so there are three levels of test, from cheapest to
+most integrated. They all use fresh objects per test.
+
+*Level 1: the pure pieces.* Routing functions and node functions are plain Python. If the graph is built from factory
+functions (like `make_nodes` above), a test can call a node with a hand-made state and never touch LangGraph:
+
+.tests/test_graph.py -- routers and node functions without the graph
+[source,python]
+----
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
+from docsassistant.graph import build_graph, make_nodes, route_after_retrieve
+
+
+def fake(*replies):
+    return GenericFakeChatModel(messages=iter(replies))
+
+
+def test_route_is_a_pure_function():
+    assert route_after_retrieve({"context": ["x"]}) == "draft"
+    assert route_after_retrieve({"context": []}) == "no_answer"
+    assert route_after_retrieve({}) == "no_answer"
+
+
+def test_a_node_function_without_the_graph():
+    rewrite, *_ = make_nodes(fake("  chunk overlap  "), retriever=lambda q: [])
+    assert rewrite({"question": "How much should chunks overlap?"}) == {"query": "chunk overlap"}
+----
+
+*Level 2: one node of the compiled graph.* A compiled graph exposes its nodes as `graph.nodes`, and each node can be
+invoked alone. That runs the node the way LangGraph would, including any reducers or wrappers around it, but bypasses
+checkpointers and the other nodes:
+
+.tests/test_graph.py -- invoking a single node of the compiled graph
+[source,python]
+----
+def test_one_node_of_the_compiled_graph():
+    graph = build_graph(fake(), retriever=lambda q: [f"hit for {q}"]).compile()
+    assert graph.nodes["retrieve"].invoke({"query": "pgvector"}) == {"context": ["hit for pgvector"]}
+----
+
+*Level 3: whole paths, each branch on purpose.* Run the graph end to end and script the model so that each conditional
+edge is taken once. The fallback test below relies on the strict script: only one reply is queued, so if `draft` ran
+it would call the model a second time and the exhausted fake would fail the test.
+
+.tests/test_graph.py -- end-to-end paths through both branches
+[source,python]
+----
+def test_end_to_end_happy_path():
+    graph = build_graph(fake("pgvector", "It is PostgreSQL."), retriever=lambda q: ["pgvector stores embeddings"]).compile()
+    result = graph.invoke({"question": "What is pgvector?"})
+    assert result["answer"] == "It is PostgreSQL."
+    assert result["query"] == "pgvector"
+
+
+def test_empty_retrieval_takes_the_fallback_branch():
+    # Only one scripted reply: a second model call would exhaust the script and fail the test, proving draft never ran.
+    graph = build_graph(fake("nothing"), retriever=lambda q: []).compile()
+    assert graph.invoke({"question": "?"})["answer"].startswith("I could not find")
+----
+
+The node-testing guide: https://docs.langchain.com/oss/python/langgraph/test[Test (LangGraph)].
+
+=== Partial execution
+
+Sometimes an end-to-end run is too long and a single node too small: you want to start in the middle. LangGraph's
+guide does this with persistence. Compile with a checkpointer, call `update_state` with `as_node` set to the node
+*before* the one you want to start from (the state is saved as if that node had just finished), then invoke with
+`None` and the same thread ID. The guide stops a run early with `interrupt_after`; here the tail of the graph is short
+enough to run to the end:
+
+.tests/test_graph.py -- start the run after retrieval, without ever calling the retriever
+[source,python]
+----
+import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+
+
+def test_partial_execution_runs_only_the_tail():
+    graph = build_graph(fake("Because of overlap."), retriever=lambda q: pytest.fail("retrieve must not run")).compile(
+        checkpointer=InMemorySaver()
+    )
+    config = {"configurable": {"thread_id": "partial"}}
+    graph.update_state(config, {"question": "Why overlap?", "context": ["overlap keeps context"]}, as_node="retrieve")
+    result = graph.invoke(None, config)
+    assert result["answer"] == "Because of overlap."
+----
+
+The retriever here would fail the test if it were called, which proves the run really did resume after `retrieve`
+and went straight to the conditional edge. The same mechanism is what
+xref:ai/langchain/human-in-the-loop-and-time-travel.adoc[Human-in-the-Loop & Time Travel] uses to fork and replay runs.
+
+Partial execution: https://docs.langchain.com/oss/python/langgraph/test[Test (LangGraph)].
+
+Running the whole unit and snapshot suite:
+
+.Output of `pytest -v` (fake models; the integration test is deselected by default)
+[source,text]
+----
+collected 13 items / 1 deselected / 12 selected
+
+tests/test_agent.py::test_docs_search_tool_alone PASSED                  [  8%]
+tests/test_agent.py::test_agent_calls_the_search_tool_then_answers PASSED [ 16%]
+tests/test_agent.py::test_second_turn_sees_the_first_one PASSED          [ 25%]
+tests/test_agent.py::test_threads_are_isolated PASSED                    [ 33%]
+tests/test_graph.py::test_route_is_a_pure_function PASSED                [ 41%]
+tests/test_graph.py::test_a_node_function_without_the_graph PASSED       [ 50%]
+tests/test_graph.py::test_one_node_of_the_compiled_graph PASSED          [ 58%]
+tests/test_graph.py::test_end_to_end_happy_path PASSED                   [ 66%]
+tests/test_graph.py::test_empty_retrieval_takes_the_fallback_branch PASSED [ 75%]
+tests/test_graph.py::test_partial_execution_runs_only_the_tail PASSED    [ 83%]
+tests/test_snapshots.py::test_graph_topology PASSED                      [ 91%]
+tests/test_snapshots.py::test_agent_trajectory PASSED                    [100%]
+
+2 snapshots passed.
+======================= 12 passed, 1 deselected in 0.43s =======================
+----
+
+== Snapshotting
+
+A snapshot test stores a known-good output in a file and fails when the output changes; you review the diff and either
+fix the code or accept the new snapshot. It suits outputs that are large or awkward to assert by hand, and it is the
+right tool for two things in an agent: the *shape of the graph* and the *trajectory* of a run. This page uses
+https://github.com/syrupy-project/syrupy[syrupy], a pytest plugin whose `snapshot` fixture compares a value with the
+stored one and writes new snapshots when you pass `--snapshot-update`. It is a general pytest tool, not part of
+LangChain; the pattern works with any snapshot library.
+
+The compiled graph can render itself as Mermaid text with `get_graph().draw_mermaid()`, which makes a stable,
+reviewable description of the topology. The trajectory is worth snapshotting after projecting it down to the fields
+you care about (message type, content, names of tool calls) so that generated message IDs do not make every run differ:
+
+.tests/test_snapshots.py -- snapshot the topology and the tool-call trajectory
+[source,python]
+----
+from langchain.messages import AIMessage, HumanMessage, ToolCall
+
+from docsassistant.agent import make_agent
+from docsassistant.graph import build_graph
+from tests.fakes import scripted
+
+
+def test_graph_topology(snapshot):
+    graph = build_graph(scripted(), retriever=lambda q: []).compile()
+    assert graph.get_graph().draw_mermaid() == snapshot
+
+
+def test_agent_trajectory(snapshot):
+    model = scripted(
+        AIMessage(content="", tool_calls=[ToolCall(name="docs_search", args={"query": "chunk"}, id="call_1")]),
+        AIMessage(content="Tune chunk size and overlap."),
+    )
+    result = make_agent(model).invoke({"messages": [HumanMessage("How do I tune retrieval?")]})
+    trajectory = [
+        {"type": m.type, "content": m.content, "tool_calls": [tc["name"] for tc in getattr(m, "tool_calls", [])]}
+        for m in result["messages"]
+    ]
+    assert trajectory == snapshot
+----
+
+The first run with `pytest --snapshot-update` reports `2 snapshots generated` and writes
+`tests/__snapshots__/test_snapshots.ambr`, which is committed like source. The topology snapshot contains the graph
+below, as syrupy recorded it:
+
+.The recorded topology snapshot (excerpt of test_snapshots.ambr)
+[source,text]
+----
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	rewrite(rewrite)
+	retrieve(retrieve)
+	draft(draft)
+	no_answer(no_answer)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> rewrite;
+	retrieve -.-> draft;
+	retrieve -.-> no_answer;
+	rewrite --> retrieve;
+	draft --> __end__;
+	no_answer --> __end__;
+----
+
+Rendered, that is the following graph, where dotted arrows are the conditional edges:
+
+.The DocsAssistant graph; dotted arrows are the conditional edges
+[mermaid]
+....
+flowchart LR
+  S([START]) --> R[rewrite]
+  R --> V[retrieve]
+  V -.-> D[draft]
+  V -.-> N[no_answer]
+  D --> E([END])
+  N --> E
+....
+
+To see what a failing snapshot looks like, a node named `audit` was inserted between `rewrite` and `retrieve`. The run
+then fails with a diff rather than a bare inequality:
+
+.Output when the graph changes (abridged)
+[source,text]
+----
+E       AssertionError: assert [+ received] == [- snapshot]
+E           '''
+E           ...
+E           	no_answer(no_answer)
+E         + 	audit(audit)
+E           	__end__([<p>__end__</p>]):::last
+E           	__start__ --> rewrite;
+E         + 	audit --> retrieve;...
+FAILED tests/test_snapshots.py::test_graph_topology
+----
+
+Reverting the change made the suite pass again. That is the workflow: an intentional change to the graph is accepted
+with `--snapshot-update` in the same pull request, so a reviewer sees the topology diff next to the code diff, while
+an accidental change (a dropped edge, a renamed node) fails CI. Snapshot only what is deterministic. Model output
+recorded from a real model is a poor snapshot, because it changes between runs; LangChain's integration-testing guide
+suggests recording HTTP traffic with `vcrpy` and the `pytest-recording` plugin for that case, at the price of
+re-recording cassettes whenever prompts, tools or expected trajectories change.
+
+Recording HTTP calls: https://docs.langchain.com/oss/python/langchain/test/integration-testing[Integration testing].
+
+== Integration tests against Ollama
+
+Unit tests with a fake prove that your code is correct given a model that behaves as scripted. They cannot prove that
+a real model, given your tool schemas and prompts, actually asks for the tool, or that the provider integration is
+wired correctly. Integration tests make real calls, so LangChain's guide gives three rules that this page follows:
+keep them apart from unit tests with a pytest marker and exclude them from the default run, load credentials from
+the environment, and assert on structure instead of exact content.
+
+The configuration keeps them out of the default run:
+
+.pytest.ini -- integration tests are opt-in
+[source,ini]
+----
+[pytest]
+markers =
+    integration: tests that need Docker and a real Ollama model
+addopts = -m "not integration"
+----
+
+Local models change the usual advice about cost and keys: an Ollama model costs nothing per call and needs no API
+key, so the remaining concern is *where Ollama runs*. There are two good answers. In CI you often already have an
+Ollama service, and the tests should use it. On a laptop, or where no service exists, Testcontainers can start a
+throwaway Ollama in Docker for the test session. One fixture supports both, choosing by an environment variable:
+
+.tests/conftest.py -- reuse OLLAMA_BASE_URL, or start Ollama in Docker with Testcontainers
+[source,python]
+----
+import os
+
+import pytest
+
+
+@pytest.fixture(scope="session")
+def ollama_endpoint():
+    """Start Ollama in Docker with Testcontainers, or reuse OLLAMA_BASE_URL when CI already runs one."""
+    if url := os.environ.get("OLLAMA_BASE_URL"):
+        yield url
+        return
+    try:
+        from testcontainers.community.ollama import OllamaContainer
+    except ImportError:
+        pytest.skip("testcontainers is not installed")
+    model = os.environ.get("TEST_OLLAMA_MODEL", "llama3.1:8b")
+    try:
+        container = OllamaContainer(image="ollama/ollama:0.12.6")
+        container.start()
+    except Exception as exc:  # Docker not running, image cannot be pulled, ...
+        pytest.skip(f"Docker/Ollama unavailable: {exc}")
+    try:
+        container.pull_model(model)
+        yield container.get_endpoint()
+    finally:
+        container.stop()
+----
+
+`OllamaContainer` is the Testcontainers for Python module for Ollama; in the installed version it lives in
+`testcontainers.community.ollama`, and the older `testcontainers.ollama` path still imports but warns that it is
+deprecated. It exposes port 11434, waits for the server to log that it is listening, and provides `pull_model` and
+`get_endpoint`. The fixture is session-scoped because starting the container and pulling a multi-gigabyte model is far
+too slow to repeat per test. A missing Docker daemon skips the test instead of failing it, so a developer without
+Docker still gets a green run. Pin the image tag: `latest` makes the suite depend on whatever Ollama release shipped
+last night. To avoid pulling the model on every run, pass `ollama_home` to mount a host directory that already holds
+models, or commit the container to an image once with `commit_to_image` and reuse it. The general treatment of running
+Ollama in containers is in xref:ai/local-llms/ollama.adoc[Ollama].
+
+The test itself points `ChatOllama` at the endpoint and asserts on structure:
+
+.tests/test_integration.py -- a real model must ask for the search tool
+[source,python]
+----
+import os
+
+import pytest
+from langchain.agents import create_agent
+from langchain.messages import AIMessage, HumanMessage
+from langchain_ollama import ChatOllama
+
+from docsassistant.agent import docs_search
+
+pytestmark = pytest.mark.integration
+
+
+def test_real_model_asks_for_the_search_tool(ollama_endpoint):
+    model = ChatOllama(model=os.environ.get("TEST_OLLAMA_MODEL", "llama3.1:8b"), base_url=ollama_endpoint, temperature=0)
+    agent = create_agent(model, tools=[docs_search], system_prompt="Always call docs_search before answering.")
+    result = agent.invoke({"messages": [HumanMessage("Where are embeddings stored? Search for 'pgvector'.")]})
+
+    # Assert on structure, not wording: the exact text differs from run to run.
+    calls = [tc["name"] for m in result["messages"] if isinstance(m, AIMessage) for tc in m.tool_calls]
+    assert "docs_search" in calls
+    assert isinstance(result["messages"][-1], AIMessage)
+    assert result["messages"][-1].content
+----
+
+What was actually run: `llama3.1:8b` is a 4.9 GB download, so the test was executed with the environment variable
+`TEST_OLLAMA_MODEL=qwen3:0.6b`, a small tool-capable model, in a real `ollama/ollama:0.12.6` container started by the
+fixture above. It passed (`1 passed, 12 deselected`), taking about eight minutes, almost all of it image and model
+downloads. The same test with `llama3.1:8b` was not run, so treat that model name in the default as untested here.
+The run also printed a `DeprecationWarning` from the container module about its log-waiting helper, which does not
+affect the result.
+
+Run it explicitly, since the default run deselects it:
+
+.Running the integration tests
+[source,bash]
+----
+pytest -m integration                        # starts Ollama with Testcontainers, pulls llama3.1:8b
+OLLAMA_BASE_URL=http://localhost:11434 pytest -m integration   # reuse an Ollama that is already running
+----
+
+Keep these tests few and focused. One behaviour per test, temperature 0, and the smallest model that can still call
+tools keep them fast; asserting that the right tool is requested with the right argument shape is stable across models,
+while asserting on the wording of the answer is not. For measuring how *good* the answers are, across many questions
+and with an LLM judge, use datasets and evaluators from xref:ai/langchain/evaluation.adoc[Evaluation] rather than
+growing the pytest suite. Model-specific setup for local models is in
+xref:ai/langchain/local-models.adoc[Local Models], and the same testing ideas for MCP servers are in
+xref:ai/mcp/testing-and-debugging.adoc[Testing & Debugging MCP Servers].
+
+Integration testing and the Testcontainers module: https://docs.langchain.com/oss/python/langchain/test/integration-testing[Integration testing]
+and https://testcontainers-python.readthedocs.io/en/latest/modules/ollama/README.html[Testcontainers for Python: Ollama].
+
+== Putting it together
+
+A workable layout for DocsAssistant: unit and snapshot tests on every commit (under a second, no Docker, no network);
+the integration test in CI on merges and before a deployment (see xref:ai/langchain/deployment.adoc[Deployment]);
+evaluations on a schedule and whenever a prompt, tool description or model version changes. Tool descriptions count as
+code for this purpose, because the model reads them; the design principles are in
+xref:ai/agents/tool-design.adoc[Tool Design]. Version-migration breakage (for example the move from
+`create_react_agent` to `create_agent`) shows up first in the snapshot and unit layers, which is the reason to have
+them. Tracing a failing integration run in LangSmith is covered in
+xref:ai/langchain/observability-with-langsmith.adoc[Observability with LangSmith].
+
+== References
+
+* https://docs.langchain.com/oss/python/langchain/test[Test (LangChain)]
+* https://docs.langchain.com/oss/python/langchain/test/unit-testing[Unit testing]
+* https://docs.langchain.com/oss/python/langchain/test/integration-testing[Integration testing]
+* https://docs.langchain.com/oss/python/langgraph/test[Test (LangGraph)]
+* https://docs.pytest.org/en/stable/[pytest documentation]
+* https://github.com/syrupy-project/syrupy[syrupy]
+* https://testcontainers-python.readthedocs.io/en/latest/modules/ollama/README.html[Testcontainers for Python: Ollama]
+* https://ollama.com/library/llama3.1[Ollama: llama3.1]
