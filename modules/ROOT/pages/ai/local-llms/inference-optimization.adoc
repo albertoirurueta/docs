@@ -1,0 +1,274 @@
+= Inference Optimization
+:description: Making local inference fast -- prefill vs. decode, TTFT, TPOT, throughput and goodput defined precisely, batching, prompt and prefix caching, speculative decoding, FlashAttention and grouped-query attention, tuning context length and parallel slots, and a Python script that measures TTFT and TPOT against any OpenAI-compatible endpoint.
+:keywords: inference optimization, prefill, decode, ttft, time to first token, tpot, time per output token, inter-token latency, throughput, goodput, slo, batching, continuous batching, prompt caching, prefix caching, kv cache reuse, speculative decoding, acceptance rate, flashattention, grouped-query attention, gqa, mqa, context length tuning, parallel slots, num_parallel, benchmark script, streaming latency
+:stem: latexmath
+
+include::partial$ai-local-llms-disclaimer.adoc[]
+
+This page was written against Ollama 0.34.4, llama.cpp v0.5.0 and vLLM 0.30.0, with Python 3.12 and `openai`
+3.20.0 for the measuring script, as checked on 2026-09-28 (see the xref:ai/local-llms/index.adoc[Running LLMs
+Locally] baseline). TTFT, TPOT and their effect on cost from the *caller's* side -- including hosted-API pricing --
+are on xref:ai/llm-foundations/cost-latency-and-throughput.adoc[Cost, Latency & Throughput]; this page looks at the
+same metrics from the side of the machine that runs the model.
+
+== Prefill vs. decode
+
+Every request runs in two phases with opposite bottlenecks:
+
+* *Prefill* processes the whole prompt in one forward pass, computing the KV cache for every input token. The
+  work is large matrix-matrix multiplications over many tokens at once, so prefill is *compute-bound* and its
+  duration grows with prompt length. It determines the time to the first token.
+* *Decode* then generates one token per forward pass, each pass reading all active weights and the KV cache from
+  memory to produce a single token. The arithmetic per byte read is tiny, so decode is *memory-bandwidth-bound*
+  (see xref:ai/local-llms/hardware-sizing.adoc#_memory_bandwidth_and_mbu[Memory bandwidth and MBU]). It
+  determines the time per output token.
+
+.Prefill and decode on a single request's timeline
+image::ai-local-llms-prefill-decode.svg[Timeline showing a long compute-bound prefill block ending at the first token, followed by many short memory-bound decode steps, with TTFT and TPOT marked]
+
+Almost every optimization below targets one of the two phases: caching and chunking target prefill; batching,
+quantization, speculative decoding and GQA target decode.
+
+== TTFT, TPOT, throughput and goodput
+
+For a request with stem:[n_{in}] prompt tokens that generates stem:[n_{out}] tokens, sent at stem:[t_0], with the
+first token at stem:[t_1] and the last at stem:[t_{n}]:
+
+[stem]
+++++
+\text{TTFT} = t_1 - t_0
+\qquad
+\text{TPOT} = \frac{t_{n} - t_1}{n_{out} - 1}
+\qquad
+\text{latency} = \text{TTFT} + \text{TPOT}\,(n_{out} - 1)
+++++
+
+TPOT is also called *inter-token latency* (vLLM's metric is `vllm:inter_token_latency_seconds`). Two throughput
+figures matter for a server running many requests in a window of stem:[T] seconds:
+
+[stem]
+++++
+\text{throughput}_{out} = \frac{\sum_i n_{out,i}}{T}
+\qquad
+\text{goodput} = \frac{\left|\{\, i : \text{TTFT}_i \le \tau_{TTFT} \ \wedge\ \text{TPOT}_i \le \tau_{TPOT} \,\}\right|}{T}
+++++
+
+*Throughput* counts every token; *goodput* counts only requests that met the service-level objectives
+stem:[\tau_{TTFT}] and stem:[\tau_{TPOT}] (https://arxiv.org/abs/2401.09670[Zhong et al., DistServe]). Batching
+more requests always raises throughput, but past some load it pushes TTFT and TPOT beyond what users tolerate and
+goodput falls. For an interactive assistant such as DocsAssistant, goodput is the number to optimise.
+
+== Batching
+
+On a GPU, decoding one sequence leaves most of the compute idle, because the weights read for one token can serve
+many sequences at the same cost. *Batching* decodes several sequences in the same forward pass, so throughput rises
+almost linearly until compute or KV-cache memory runs out, while each sequence's TPOT grows only slowly.
+
+* llama.cpp: `-np N` slots with continuous batching (default on); `-c` is shared by the slots.
+* Ollama: `OLLAMA_NUM_PARALLEL` requests per model (memory scales with it times the context).
+* vLLM / SGLang: continuous batching is always on; `--max-num-seqs` caps concurrent sequences.
+
+[source,shell]
+----
+llama serve -hf bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M -np 4 -c 32768
+OLLAMA_NUM_PARALLEL=4 OLLAMA_CONTEXT_LENGTH=8192 ollama serve
+----
+
+See the https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp server README],
+https://docs.ollama.com/faq[Ollama -- FAQ] and xref:ai/local-llms/vllm-and-sglang.adoc[vLLM & SGLang]. On a laptop
+with one user, batching buys nothing; on a shared server it is the main lever.
+
+== Prompt and prefix caching
+
+If two requests start with the same tokens -- the same system prompt, tool definitions or document -- the KV
+cache for that prefix can be reused instead of recomputed, turning part of the prefill into a lookup:
+
+[stem]
+++++
+\text{TTFT} \approx t_{prefill}(n_{in} - n_{cached}) + t_{lookup}
+++++
+
+* llama.cpp reuses a slot's cache for a following request with the same prefix (`cache_prompt`, on by default on
+  `/completion`), and can save and restore slot caches (`/slots/\{id}?action=save`).
+* vLLM's *automatic prefix caching* and SGLang's *RadixAttention* share cached blocks across all requests.
+
+To benefit, put the *stable* parts first (system prompt, tools, retrieved documents in a fixed order) and the
+variable part last. Anything that changes the beginning of the prompt on every request -- a timestamp, a random
+ID -- defeats the cache: the vLLM documentation notes that Claude Code's per-request attribution header did
+exactly that until vLLM worked around it. See
+https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/[vLLM -- Automatic prefix caching] and the
+https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp server README].
+
+== Speculative decoding
+
+A cheap *draft* proposes stem:[\gamma] tokens; the target model checks them all in one forward pass and keeps the
+longest accepted prefix plus one token of its own. If each draft token is accepted with probability
+stem:[\alpha], the expected number of tokens produced per target forward pass is
+
+[stem]
+++++
+E[\text{tokens per step}] = \frac{1 - \alpha^{\gamma + 1}}{1 - \alpha}
+++++
+
+(https://arxiv.org/abs/2211.17192[Leviathan et al.]). The output distribution is exactly the target model's, so
+quality is unchanged. It pays off when stem:[\alpha] is high -- code edits, structured output, RAG answers that quote
+their sources -- and when the draft is much cheaper than the target; on a busy batched server the spare compute it
+needs may not exist. Engine flags are on xref:ai/local-llms/llama-cpp.adoc#_speculative_decoding[llama.cpp] and
+xref:ai/local-llms/vllm-and-sglang.adoc#_speculative_decoding[vLLM & SGLang]:
+
+[source,shell]
+----
+llama serve -m Qwen3-4B.gguf --spec-type ngram-simple --spec-draft-n-max 64
+----
+
+See https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md[llama.cpp -- Speculative decoding].
+
+== FlashAttention
+
+Standard attention materialises the stem:[T \times T] score matrix in GPU memory. *FlashAttention* computes the
+same result in tiles that stay in on-chip SRAM, never writing the full matrix, which cuts memory traffic and makes
+long-context prefill much faster and leaner (https://arxiv.org/abs/2205.14135[Dao et al.]). It is an exact
+algorithm, not an approximation. Engines enable it automatically where the backend supports it:
+
+[source,shell]
+----
+llama serve -hf bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M -fa on -c 65536
+OLLAMA_FLASH_ATTENTION=1 ollama serve
+----
+
+llama.cpp's `-fa` defaults to `auto`, and Ollama requires Flash Attention for a quantized KV cache. See the
+https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp server README] and
+https://docs.ollama.com/faq[Ollama -- FAQ].
+
+== Grouped-query attention
+
+Multi-head attention caches keys and values for every head. *Multi-query attention* (MQA) shares one K/V head
+across all query heads; *grouped-query attention* (GQA) shares each K/V head across a group
+(https://arxiv.org/abs/2305.13245[Ainslie et al.]). With stem:[n_q] query heads and stem:[n_{kv}] KV heads, the KV
+cache shrinks by
+
+[stem]
+++++
+\frac{M_{kv}^{GQA}}{M_{kv}^{MHA}} = \frac{n_{kv}}{n_q}
+++++
+
+so a model with 32 query heads and 8 KV heads caches a quarter as much per token -- which is why the
+xref:ai/local-llms/hardware-sizing.adoc#_kv_cache_size[KV-cache formula] uses stem:[n_{kv}], not the number of
+attention heads. GQA is a property of the model, chosen at training time; you benefit from it by choosing GQA
+models (virtually all current ones), not by a flag. You can read a model's ratio from its `config.json`
+(`num_attention_heads` vs. `num_key_value_heads`):
+
+[source,python]
+----
+import json
+
+cfg = json.load(open("config.json"))
+print(cfg["num_attention_heads"], cfg["num_key_value_heads"])
+----
+
+Ollama's FAQ notes that models with a high GQA ratio are more sensitive to KV-cache quantization, because each
+cached head serves more query heads. See https://docs.ollama.com/faq[Ollama -- FAQ].
+
+== Tuning context length and parallel slots
+
+Context length and concurrency compete for the same KV-cache memory
+(stem:[M_{kv} \propto T \cdot B]). A practical order of operations:
+
+. Size the context to the workload, not to the model's maximum: RAG with five 500-token chunks needs about 8k;
+  coding agents need 64k or more.
+. Fit the weights plus that context entirely on the GPU (`100% GPU` in `ollama ps`, all layers with `-ngl`); an
+  offloaded layer costs more than a smaller context.
+. Only then add parallel slots, and remember that in llama.cpp `-c` is shared by the slots.
+. Quantize the KV cache (`q8_0`) if memory is the limit before the GPU's compute is.
+. Measure TTFT and TPOT at each step with the script below.
+
+[source,shell]
+----
+# DocsAssistant on a 16 GB GPU: 16k context per user, 2 users
+llama serve -hf bartowski/Meta-Llama-3.1-8B-Instruct-GGUF:Q4_K_M -c 32768 -np 2 -ngl all -ctk q8_0 -ctv q8_0
+----
+
+See the https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp server README] and
+https://docs.ollama.com/context-length[Ollama -- Context length].
+
+== Measuring locally
+
+This script streams one request at a time against any OpenAI-compatible endpoint and reports TTFT and TPOT with
+the definitions above. It measures stream chunks, which most local servers send one token at a time; when the
+server reports `usage` at the end of the stream, the script uses the exact token count instead.
+
+[source,python]
+----
+"""Measure TTFT and TPOT against any OpenAI-compatible endpoint (Ollama, llama.cpp, vLLM, SGLang, NIM, ...)."""
+import os
+import statistics
+import time
+
+from openai import OpenAI
+
+client = OpenAI(base_url=os.environ.get("BASE_URL", "http://localhost:11434/v1"),
+                api_key=os.environ.get("API_KEY", "not-needed"))
+MODEL = os.environ.get("MODEL", "llama3.1:8b")
+PROMPT = "Explain, in about 200 words, how a vector database answers a nearest-neighbour query."
+
+
+def measure() -> tuple[float, float, int]:
+    t0 = time.perf_counter()
+    first = last = None
+    chunks, usage_tokens = 0, None
+    stream = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": PROMPT}],
+        max_tokens=300,
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+    for chunk in stream:
+        if chunk.usage is not None:
+            usage_tokens = chunk.usage.completion_tokens
+        if chunk.choices and chunk.choices[0].delta.content:
+            now = time.perf_counter()
+            first = first or now
+            last = now
+            chunks += 1
+    n_out = usage_tokens or chunks
+    ttft = first - t0
+    tpot = (last - first) / max(n_out - 1, 1)
+    return ttft, tpot, n_out
+
+
+measure()  # warm-up: loads the model, fills caches
+runs = [measure() for _ in range(5)]
+print(f"TTFT median {statistics.median(r[0] for r in runs):.3f} s")
+print(f"TPOT median {statistics.median(r[1] for r in runs) * 1000:.1f} ms  "
+      f"(~{1 / statistics.median(r[1] for r in runs):.1f} tokens/s per stream)")
+print(f"output tokens per run: {[r[2] for r in runs]}")
+----
+
+The warm-up call matters: the first request after a model is loaded (or after Ollama unloads it, see
+xref:ai/local-llms/ollama.adoc#_keeping_models_loaded[keep_alive]) includes load time in its TTFT. Vary
+`PROMPT` length to see prefill cost grow and TPOT stay flat; for concurrent load, use the harness on
+xref:ai/local-llms/vllm-and-sglang.adoc#_a_benchmark_harness[vLLM & SGLang]. See
+https://github.com/openai/openai-python[openai-python].
+
+Serving at scale -- autoscaling on these metrics, capacity planning, SLO dashboards and cost attribution across
+many models -- is the subject of the planned *LLMOps & Evaluation* sub-section.
+
+== References
+
+* https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp -- server README]
+* https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative.md[llama.cpp -- Speculative decoding]
+* https://docs.ollama.com/faq[Ollama -- FAQ]
+* https://docs.ollama.com/context-length[Ollama -- Context length]
+* https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/[vLLM -- Automatic prefix caching]
+* https://docs.vllm.ai/en/stable/[vLLM -- Documentation]
+* https://github.com/openai/openai-python[openai-python]
+* https://arxiv.org/abs/2211.17192[Leviathan et al. -- Fast Inference from Transformers via Speculative Decoding]
+* https://arxiv.org/abs/2205.14135[Dao et al. -- FlashAttention: Fast and Memory-Efficient Exact Attention with
+  IO-Awareness]
+* https://arxiv.org/abs/2305.13245[Ainslie et al. -- GQA: Training Generalized Multi-Query Transformer Models from
+  Multi-Head Checkpoints]
+* https://arxiv.org/abs/2401.09670[Zhong et al. -- DistServe: Disaggregating Prefill and Decoding for Goodput-optimized
+  Large Language Model Serving]
+* https://arxiv.org/abs/2309.06180[Kwon et al. -- Efficient Memory Management for Large Language Model Serving
+  with PagedAttention]
