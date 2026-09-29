@@ -1,0 +1,775 @@
+= Observability with LangSmith
+:description: How to trace LangChain and LangGraph agents with LangSmith -- LANGSMITH_TRACING, @traceable, metadata and tags, threads, token and cost tracking, masking and sampling, OpenTelemetry export, and Langfuse and Phoenix as alternatives -- with every snippet run against a local stand-in for the LangSmith API.
+:keywords: langsmith, observability, tracing, LANGSMITH_TRACING, LANGSMITH_API_KEY, LANGSMITH_PROJECT, traceable, tracing_context, run tree, metadata, tags, threads, thread_id, session_id, uuid7, usage_metadata, cost tracking, token usage, hide_inputs, hide_outputs, create_anonymizer, sampling rate, opentelemetry, LANGSMITH_OTEL_ENABLED, LANGSMITH_OTEL_ONLY, otlp, langfuse, arize phoenix, openinference, llmops, DocsAssistant
+:stem: latexmath
+
+include::partial$ai-langchain-disclaimer.adoc[]
+
+This page was written against `langchain` 1.4.3, `langchain-core` 1.6.5, `langgraph` 1.2.12 and `langsmith` 0.14.1 on
+Python 3.12, with `opentelemetry-sdk` 1.45.0, `langfuse` 4.15.6, `arize-phoenix-otel` 0.17.2 and
+`openinference-instrumentation-langchain` 0.1.76 for the alternatives section, as verified on 2026-09-29. The running
+example is *DocsAssistant*, which answers questions over this site's documentation with Ollama's `llama3.1:8b` chat
+model and `nomic-embed-text` embeddings (see xref:ai/local-llms/ollama.adoc[Ollama]). Neither Ollama nor a LangSmith
+account was available while the snippets were checked. Every output below was produced by running the code against
+the real SDKs with a scripted fake chat model, tracing to a tiny local HTTP server that records what the LangSmith
+client sends (or to an in-memory OpenTelemetry exporter), so the *shape* of what leaves the process is real. What was
+*not* run: ingestion in the LangSmith UI, its dashboards and alerts, the server-side cost computation from its model
+price table, an OTLP export to a real endpoint, and the Langfuse and Phoenix back ends themselves.
+
+An agent that "works" in a demo and an agent that works in production differ mostly in what you can see when it
+misbehaves. A single user question becomes a model call, a tool call, another model call, maybe a retry, and the
+only honest record of that sequence is a *trace*. The vendor-neutral side of this -- what a span should contain, the
+OpenTelemetry GenAI conventions, shadow deploys and canaries -- is covered in
+xref:ai/agents/observability-for-agents.adoc[Observability for Agents]. This page is the LangChain side: how
+LangSmith, the observability platform from the makers of LangChain, records LangChain and LangGraph runs, and the
+knobs you turn to make those recordings useful and safe.
+
+== What LangSmith records
+
+A LangSmith *trace* is a tree of *runs*. Each run is one unit of work with a name, a type (`chain`, `llm`, `tool`,
+`retriever`, ...), inputs, outputs, timings, tags, metadata and, for model calls, token usage. Traces are grouped
+into *projects*, and traces that belong to one conversation can be grouped again into *threads*. The SDK collects
+runs in the process and ships them to the API in the background, so tracing adds no network round trip to the
+request path.
+
+.Where a run goes: straight to LangSmith, or through OpenTelemetry to several back ends
+[mermaid]
+....
+flowchart LR
+    App["DocsAssistant<br/>LangChain / LangGraph / @traceable"] --> SDK["langsmith SDK<br/>client + run tree"]
+    SDK -->|"HTTPS, background batches"| LS["LangSmith<br/>projects, threads, cost"]
+    SDK -.->|"OTLP, when OTel mode is on"| Col["OpenTelemetry Collector"]
+    Col --> LS
+    Col --> Other["Other back ends<br/>Grafana, Datadog, Phoenix"]
+....
+
+See https://docs.langchain.com/langsmith/observability[LangSmith -- Observability] for the platform overview.
+
+== Setup: a local stand-in for the LangSmith API
+
+The examples need to prove *what the SDK sends* without an account. `capture.py` starts a small HTTP server on a
+random local port and records every run it receives; `fake.py` is a chat model that first asks for the `search_docs`
+tool and then answers, reporting token usage like a real provider does. Both are test scaffolding: none of the
+application code further down knows about them.
+
+.capture.py -- records the runs the LangSmith client sends
+[source,python]
+----
+"""A local stand-in for the LangSmith API that records the runs the SDK sends."""
+import gzip
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PLACEHOLDER = "unused"  # the local server ignores credentials
+RUNS: dict[str, dict] = {}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _read(self) -> bytes:
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        return gzip.decompress(body) if self.headers.get("content-encoding") == "gzip" else body
+
+    def do_POST(self):
+        raw = self._read()
+        if self.path.endswith("/runs/batch"):
+            batch = json.loads(raw)
+            for run in batch.get("post", []) + batch.get("patch", []):
+                RUNS.setdefault(run["id"], {}).update(run)
+        elif self.path.rstrip("/").split("/")[-1] == "runs" or "/runs/" in self.path:
+            run = json.loads(raw)
+            run_id = run.get("id") or self.path.rstrip("/").split("/")[-1]
+            RUNS.setdefault(run_id, {"id": run_id}).update(run)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    do_PATCH = do_POST
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"version": "0.0.0", "batch_ingest_config": {"use_multipart_endpoint": False, "scale_up_qsize_trigger": 1000, "scale_up_nthreads_limit": 1, "scale_down_nempty_trigger": 4, "size_limit": 100, "size_limit_bytes": 20971520}}).encode())
+
+    def log_message(self, *args):
+        pass
+
+
+def start() -> str:
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_port}"
+----
+
+.fake.py -- a scripted chat model with token usage
+[source,python]
+----
+"""A scripted fake chat model: asks for search_docs, then answers with the tool result."""
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+
+
+class ScriptedChat(BaseChatModel):
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-fake"
+
+    def _get_ls_params(self, stop=None, **kwargs):
+        params = super()._get_ls_params(stop=stop, **kwargs)
+        params.update(ls_provider="ollama", ls_model_name="llama3.1:8b")
+        return params
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        if isinstance(messages[-1], ToolMessage):
+            msg = AIMessage(content=f"According to the docs: {messages[-1].content}",
+                            usage_metadata={"input_tokens": 90, "output_tokens": 20, "total_tokens": 110})
+        else:
+            msg = AIMessage(content="", tool_calls=[{"name": "search_docs", "args": {"query": "ef_search"}, "id": "call_1"}],
+                            usage_metadata={"input_tokens": 60, "output_tokens": 12, "total_tokens": 72})
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+----
+
+The application code below is what you would ship. The scripts that run it set `LANGSMITH_ENDPOINT` to the local
+server and the placeholder string from `capture.py` as the API key; in production neither appears in source, as the next section shows.
+
+== Turning tracing on
+
+Tracing a LangChain or LangGraph application needs no code changes, only environment variables:
+
+.Enabling tracing (shell)
+[source,bash]
+----
+export LANGSMITH_TRACING=true
+# LANGSMITH_API_KEY comes from your secret store or CI secret -- never from source control
+export LANGSMITH_PROJECT=docsassistant-dev   # optional; defaults to "default"
+# accounts outside the US default region also set LANGSMITH_ENDPOINT to their regional API URL
+# keys linked to several workspaces also set LANGSMITH_WORKSPACE_ID
+----
+
+See https://docs.langchain.com/langsmith/trace-with-langchain[LangSmith -- Trace LangChain applications] and
+https://docs.langchain.com/langsmith/log-traces-to-project[Log traces to a specific project]. Older tutorials use
+`LANGCHAIN_TRACING_V2` and `LANGCHAIN_API_KEY`. The current documentation uses the `LANGSMITH_` names, and new code
+should too; the SDK still falls back to the `LANGCHAIN_` spelling of variables it knows.
+
+With those set, every `create_agent` or LangGraph run is traced: each graph node, model call and tool call becomes a
+child run. DocsAssistant's agent, with the model passed in so the scripts can swap in the fake:
+
+.docs_agent.py -- the agent under trace
+[source,python]
+----
+from langchain.agents import create_agent
+from langchain.tools import tool
+
+
+@tool
+def search_docs(query: str) -> str:
+    """Search this site's documentation."""
+    return "ef_search sets the HNSW candidate list size."
+
+
+def build_agent(model, **kwargs):
+    # model = init_chat_model("ollama:llama3.1:8b") in the real application
+    return create_agent(model, tools=[search_docs], name="docs_assistant", **kwargs)
+----
+
+.run_agent.py -- run one turn and read back what was recorded
+[source,python]
+----
+import os
+import time
+
+import capture
+
+url = capture.start()
+os.environ.update(LANGSMITH_TRACING="true", LANGSMITH_ENDPOINT=url, LANGSMITH_API_KEY=capture.PLACEHOLDER,
+                  LANGSMITH_PROJECT="docsassistant-dev", LANGCHAIN_CALLBACKS_BACKGROUND="false")
+
+import langsmith as ls
+from langchain_core.tracers.langchain import wait_for_all_tracers
+
+from docs_agent import build_agent
+from fake import ScriptedChat
+
+agent = build_agent(ScriptedChat())
+thread_id = str(ls.uuid7())
+agent.invoke(
+    {"messages": [("user", "What does ef_search control?")]},
+    config={"tags": ["docsassistant", "prod-canary"],
+            "metadata": {"thread_id": thread_id, "user_tier": "free"},
+            "run_name": "docs_assistant_turn"},
+)
+wait_for_all_tracers()
+time.sleep(0.5)
+
+for run in sorted(capture.RUNS.values(), key=lambda r: r["dotted_order"]):
+    depth = run["dotted_order"].count(".")
+    md = run["extra"]["metadata"]
+    print("  " * depth + f'{run["name"]} [{run["run_type"]}] tags={run["tags"]}'
+          f' thread_id_set={md.get("thread_id") == thread_id}')
+    if run["run_type"] == "llm":
+        usage = run["outputs"]["generations"][0][0]["message"]["kwargs"]["usage_metadata"]
+        print("  " * depth + "  ", md["ls_provider"], md["ls_model_name"], usage)
+----
+
+.Output
+[source,text]
+----
+docs_assistant_turn [chain] tags=['docsassistant', 'prod-canary'] thread_id_set=True
+  model [chain] tags=['docsassistant', 'prod-canary', 'graph:step:1'] thread_id_set=True
+    ScriptedChat [llm] tags=['docsassistant', 'prod-canary', 'seq:step:1'] thread_id_set=True
+       ollama llama3.1:8b {'input_tokens': 60, 'output_tokens': 12, 'total_tokens': 72}
+  tools [chain] tags=['docsassistant', 'graph:step:2', 'prod-canary'] thread_id_set=True
+    search_docs [tool] tags=['docsassistant', 'prod-canary', 'seq:step:1'] thread_id_set=True
+  model [chain] tags=['docsassistant', 'prod-canary', 'graph:step:3'] thread_id_set=True
+    ScriptedChat [llm] tags=['docsassistant', 'prod-canary', 'seq:step:1'] thread_id_set=True
+       ollama llama3.1:8b {'input_tokens': 90, 'output_tokens': 20, 'total_tokens': 110}
+----
+
+The `model` and `tools` runs are LangGraph nodes, `ScriptedChat` is the model call (a real run shows `ChatOllama`),
+and `search_docs` is the tool. Each `llm` run carries the provider and model name LangChain reports and the token
+usage the model returned, which is what the cost section builds on. Note `run_name` in the config: it renamed the
+root run from the agent's `name` to `docs_assistant_turn`.
+
+== @traceable for your own code
+
+Not everything worth tracing is a LangChain component. `@traceable` turns any function into a run; calls made from
+inside a traced function nest under it automatically. `run_type` tells LangSmith how to render the run (`retriever`,
+`llm`, `tool`, `chain`).
+
+.docs_app.py -- a hand-written pipeline, traced
+[source,python]
+----
+from langsmith import get_current_run_tree, traceable
+
+
+@traceable(run_type="retriever", name="search_docs")
+def search_docs(query: str, k: int = 3) -> list[dict]:
+    # the real version queries the pgvector store from the RAG pages
+    return [{"page_content": "ef_search sets the HNSW candidate list size.",
+             "metadata": {"source": "hnsw.adoc"}}]
+
+
+@traceable(run_type="llm", metadata={"ls_provider": "ollama", "ls_model_name": "llama3.1:8b"})
+def call_model(question: str, context: list[dict]) -> dict:
+    # normally: call Ollama and read the token counts from its response
+    get_current_run_tree().set(
+        usage_metadata={"input_tokens": 120, "output_tokens": 24, "total_tokens": 144})
+    return {"role": "assistant",
+            "content": "ef_search controls how many candidates HNSW keeps while searching."}
+
+
+@traceable(name="docs_assistant", tags=["docsassistant"], metadata={"app_version": "1.4.0"})
+def answer(question: str) -> str:
+    context = search_docs(question)
+    return call_model(question, context)["content"]
+----
+
+.run_traceable.py -- call it and read back the run tree
+[source,python]
+----
+import os
+
+import langsmith as ls
+
+import capture
+
+url = capture.start()
+os.environ["LANGSMITH_TRACING"] = "true"
+os.environ["LANGSMITH_PROJECT"] = "docsassistant-dev"
+client = ls.Client(api_url=url, api_key=capture.PLACEHOLDER, auto_batch_tracing=False)
+
+from docs_app import answer
+
+with ls.tracing_context(client=client, metadata={"env": "dev"}):
+    answer("What does ef_search control?",
+           langsmith_extra={"tags": ["eval-smoke"], "metadata": {"user_tier": "free"}})
+client.flush()
+
+for run in sorted(capture.RUNS.values(), key=lambda r: r["dotted_order"]):
+    depth = run["dotted_order"].count(".")
+    md = run["extra"]["metadata"]
+    print("  " * depth + f'{run["name"]} [{run["run_type"]}] tags={run["tags"]}')
+    print("  " * depth + "  ", {k: md[k] for k in ("app_version", "env", "user_tier", "usage_metadata") if k in md})
+----
+
+.Output
+[source,text]
+----
+docs_assistant [chain] tags=['eval-smoke', 'docsassistant']
+   {'app_version': '1.4.0', 'env': 'dev', 'user_tier': 'free'}
+  search_docs [retriever] tags=['eval-smoke', 'docsassistant']
+     {'app_version': '1.4.0', 'env': 'dev', 'user_tier': 'free'}
+  call_model [llm] tags=['eval-smoke', 'docsassistant']
+     {'app_version': '1.4.0', 'env': 'dev', 'user_tier': 'free', 'usage_metadata': {'input_tokens': 120, 'output_tokens': 24, 'total_tokens': 144}}
+----
+
+`LANGSMITH_TRACING` controls whether `@traceable` records anything, and the harness sets it exactly as your
+deployment would. Reach the current run from inside the function with `get_current_run_tree()`, as `call_model` did
+to attach token counts. See https://docs.langchain.com/langsmith/annotate-code[LangSmith -- Custom instrumentation]
+for `@traceable`, the `trace` context manager and the lower-level `RunTree` API.
+
+== Metadata and tags
+
+*Tags* are short labels for filtering (`prod-canary`, `eval-smoke`); *metadata* is a dictionary of key-value pairs
+for anything you would want to group or filter by later (app version, user tier, feature flag, tenant). Both can be
+attached at four levels, and all four appeared in the outputs above:
+
+* on the decorator: `@traceable(tags=[...], metadata={...})`
+* per call: `langsmith_extra={"tags": [...], "metadata": {...}}`
+* for a whole scope: `with ls.tracing_context(metadata={...}):`
+* on a LangChain or LangGraph run: `config={"tags": [...], "metadata": {...}}`
+
+The first `run_traceable.py` output shows the inheritance rule that matters: `app_version` (decorator), `user_tier`
+(per call) and `env` (scope) reached the child runs too, so filtering on one tag or metadata key finds every run of
+the trace, not only the root. The same holds for the `config` route in the agent output. Keep tags for a small,
+stable vocabulary and metadata for high-cardinality values, and never put personal data in either -- metadata is
+searchable by everyone with access to the project. See
+https://docs.langchain.com/langsmith/add-metadata-tags[LangSmith -- Add metadata and tags to traces].
+
+Metadata is also how you stamp experiments, which is why the version and canary labels are worth adding from the
+first release: xref:ai/langchain/evaluation.adoc[Evaluation] uses the same fields to compare runs across releases.
+
+== Threads
+
+A chat is not one trace but many: one per user turn. LangSmith groups those turns into a *thread* when every run in
+them carries the same value under the metadata key `thread_id` (or `session_id`). Its documentation recommends UUID
+version 7 identifiers, and the SDK provides `uuid7`. The catch, straight from that page, is that the key must be on
+*all* runs, child runs included, or thread filtering and token counts skip them.
+
+With LangGraph you rarely add it by hand. The checkpointer already needs a `thread_id` for
+xref:ai/langchain/short-term-memory-and-checkpointers.adoc[short-term memory], and it lands in run metadata on its
+own:
+
+.run_threads.py -- two turns of one conversation
+[source,python]
+----
+import os
+import time
+
+import capture
+
+url = capture.start()
+os.environ.update(LANGSMITH_TRACING="true", LANGSMITH_ENDPOINT=url, LANGSMITH_API_KEY=capture.PLACEHOLDER,
+                  LANGCHAIN_CALLBACKS_BACKGROUND="false")
+
+import langsmith as ls
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langgraph.checkpoint.memory import InMemorySaver
+
+from docs_agent import build_agent
+from fake import ScriptedChat
+
+agent = build_agent(ScriptedChat(), checkpointer=InMemorySaver())
+thread_id = str(ls.uuid7())
+for question in ["What does ef_search control?", "And m?"]:
+    agent.invoke({"messages": [("user", question)]}, config={"configurable": {"thread_id": thread_id}})
+wait_for_all_tracers()
+time.sleep(0.5)
+
+runs = list(capture.RUNS.values())
+llm_runs = [r for r in runs if r["run_type"] == "llm"]
+print("root runs:", sum(r["dotted_order"].count(".") == 0 for r in runs), "| all runs:", len(runs))
+print("runs carrying thread_id:", sum(r["extra"]["metadata"].get("thread_id") == thread_id for r in runs))
+print("tokens in the thread:", sum(
+    r["outputs"]["generations"][0][0]["message"]["kwargs"]["usage_metadata"]["total_tokens"]
+    for r in llm_runs))
+----
+
+.Output
+[source,text]
+----
+root runs: 2 | all runs: 14
+runs carrying thread_id: 14
+tokens in the thread: 364
+----
+
+Two turns produced two root runs and fourteen runs in total, and all fourteen carry the thread's identifier, so
+LangSmith can show the conversation as one thread and total its tokens (364 here: the sum of the four model calls).
+Use the same identifier for the checkpointer, for tracing and for your own logs, and a support ticket that quotes it
+leads straight to the conversation. For a plain `@traceable` chat function, pass
+`metadata={"thread_id": thread_id}` on the root call, and check that children inherit it. See
+https://docs.langchain.com/langsmith/threads[LangSmith -- Configure threads].
+
+== Token and cost tracking
+
+For model calls made through LangChain, LangSmith records token usage from the message's `usage_metadata`, which is
+what the outputs above showed. Cost is derived on the server: LangSmith needs the token counts, the model and
+provider (`ls_model_name`, `ls_provider` in the run metadata) and a price for that model from its model pricing table,
+which comes pre-filled for the major hosted models and can be overridden. A local Ollama model has no per-token
+price, so its traces are about tokens and latency, and you add a price entry only if you want a cost estimate.
+
+For anything the table cannot know, send the numbers yourself. An LLM run accepts `input_cost` and `output_cost` (in
+dollars) inside `usage_metadata`, and any other run -- a paid search API, say -- accepts `total_cost`. The cost of a
+call with \(n_i\) input and \(n_o\) output tokens at prices \(p_i\) and \(p_o\) per million tokens is
+
+\[
+c = \frac{n_i\,p_i + n_o\,p_o}{10^6}
+\]
+
+and for a thread the costs of all its runs add up, which is why the thread metadata must be on every run:
+
+.run_cost.py -- client-side costs for a model call and a paid tool
+[source,python]
+----
+import os
+
+import capture
+
+url = capture.start()
+os.environ.update(LANGSMITH_TRACING="true", LANGSMITH_ENDPOINT=url, LANGSMITH_API_KEY=capture.PLACEHOLDER)
+
+from langsmith import Client, get_current_run_tree, tracing_context, traceable
+
+# Illustrative prices in USD per million tokens -- not any provider's real price list.
+PRICE_IN, PRICE_OUT = 3.00, 15.00
+
+
+@traceable(run_type="llm", metadata={"ls_provider": "my_provider", "ls_model_name": "my_model"})
+def hosted_model(messages: list) -> dict:
+    tokens_in, tokens_out = 2_000, 400  # normally read from the provider's response
+    get_current_run_tree().set(usage_metadata={
+        "input_tokens": tokens_in,
+        "output_tokens": tokens_out,
+        "input_cost": tokens_in * PRICE_IN / 1e6,
+        "output_cost": tokens_out * PRICE_OUT / 1e6,
+    })
+    return {"role": "assistant", "content": "..."}
+
+
+@traceable(run_type="tool", name="paid_search_api")
+def paid_search_api(query: str) -> list:
+    get_current_run_tree().set(usage_metadata={"total_cost": 0.0015})
+    return []
+
+
+@traceable(name="turn")
+def turn():
+    paid_search_api("ef_search")
+    hosted_model([])
+
+
+client = Client(api_url=url, api_key=capture.PLACEHOLDER, auto_batch_tracing=False)
+with tracing_context(client=client):
+    turn()
+client.flush()
+
+for run in sorted(capture.RUNS.values(), key=lambda r: r["dotted_order"]):
+    print(run["name"], run["extra"]["metadata"].get("usage_metadata"))
+----
+
+.Output
+[source,text]
+----
+turn None
+paid_search_api {'total_cost': 0.0015}
+hosted_model {'input_tokens': 2000, 'output_tokens': 400, 'input_cost': 0.006, 'output_cost': 0.006}
+----
+
+With the illustrative prices of 3 and 15 dollars per million tokens, 2,000 input and 400 output tokens cost
+\(2000 \cdot 3 / 10^6 + 400 \cdot 15 / 10^6 = 0.012\) dollars, split evenly as the output shows. The prices in that
+script are made up for the arithmetic; take real ones from your provider. What LangSmith then does with the numbers --
+per-trace breakdowns, project totals, dashboards -- lives in its UI and was not run here. See
+https://docs.langchain.com/langsmith/cost-tracking[LangSmith -- Cost tracking].
+
+== Controlling what leaves the process
+
+A trace contains prompts, retrieved passages and model answers, which is exactly the material a privacy review asks
+about. Four controls decide what is recorded, and the last three belong on the client rather than in a wiki page:
+
+* *Selective tracing* -- leave `LANGSMITH_TRACING` unset and switch tracing on for one code path with
+  `tracing_context(enabled=True)`, or the reverse: keep it on and exclude a path with `enabled=False`.
+* *Masking* -- `hide_inputs` and `hide_outputs` on the `Client` (or `LANGSMITH_HIDE_INPUTS=true` and
+  `LANGSMITH_HIDE_OUTPUTS=true`) replace what is sent with a function of it; `create_anonymizer` builds such a
+  function from regular expressions.
+* *Sampling* -- `LANGSMITH_TRACING_SAMPLING_RATE`, or `tracing_sampling_rate` on a `Client`, between 0 and 1, keeps
+  only that fraction of traces, which bounds volume and cost on a busy service.
+* *Redacting secrets* -- LangSmith documents ready-made patterns for API keys and tokens
+  (https://docs.langchain.com/langsmith/redact-secrets[Redact secrets from traces]); use them as well as anonymizing PII.
+
+.run_controls.py -- what is actually sent under each setting
+[source,python]
+----
+import os
+import time
+
+import capture
+
+url = capture.start()
+os.environ.update(LANGSMITH_TRACING="true", LANGSMITH_ENDPOINT=url, LANGSMITH_API_KEY=capture.PLACEHOLDER,
+                  LANGCHAIN_CALLBACKS_BACKGROUND="false")
+
+import langsmith as ls
+from langsmith.anonymizer import create_anonymizer
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tracers.langchain import wait_for_all_tracers
+
+chain = RunnableLambda(lambda x: {"answer": x["q"].upper(), "email": "ana@example.com"}).with_config(run_name="echo")
+
+
+def sent():
+    wait_for_all_tracers()
+    time.sleep(0.5)
+    rows = [f'{r["name"]}: inputs={r["inputs"]} outputs={r.get("outputs")}' for r in capture.RUNS.values()]
+    capture.RUNS.clear()
+    return rows or "nothing sent"
+
+
+chain.invoke({"q": "traced"})
+print("LANGSMITH_TRACING=true :", sent())
+
+with ls.tracing_context(enabled=False):
+    chain.invoke({"q": "not traced"})
+print("tracing_context off    :", sent())
+
+masking = ls.Client(api_url=url, api_key=capture.PLACEHOLDER,
+                    hide_inputs=lambda inputs: {},
+                    hide_outputs=lambda outputs: {"keys": list(outputs)})
+with ls.tracing_context(client=masking, enabled=True):
+    chain.invoke({"q": "secret question"})
+masking.flush()
+print("hide_inputs/outputs    :", sent())
+
+anonymizer = create_anonymizer([{"pattern": r"[\w.+-]+@[\w-]+\.[\w.]+", "replace": "<email>"}])
+redacting = ls.Client(api_url=url, api_key=capture.PLACEHOLDER, anonymizer=anonymizer)
+with ls.tracing_context(client=redacting, enabled=True):
+    chain.invoke({"q": "mail ana@example.com"})
+redacting.flush()
+print("create_anonymizer      :", sent())
+
+sampling = ls.Client(api_url=url, api_key=capture.PLACEHOLDER, tracing_sampling_rate=0.0)
+with ls.tracing_context(client=sampling, enabled=True):
+    chain.invoke({"q": "sampled out"})
+sampling.flush()
+print("tracing_sampling_rate=0:", sent())
+----
+
+.Output
+[source,text]
+----
+LANGSMITH_TRACING=true : ["echo: inputs={'q': 'traced'} outputs={'answer': 'TRACED', 'email': 'ana@example.com'}"]
+tracing_context off    : nothing sent
+hide_inputs/outputs    : ["echo: inputs={} outputs={'keys': ['answer', 'email']}"]
+create_anonymizer      : ["echo: inputs={'q': 'mail <email>'} outputs={'answer': 'MAIL <email>', 'email': '<email>'}"]
+tracing_sampling_rate=0: nothing sent
+----
+
+Under `enabled=False` and a sampling rate of 0 nothing was sent. Masking replaced the inputs entirely and reduced the
+outputs to their keys, and the anonymizer rewrote the e-mail address inside otherwise intact inputs and outputs.
+Masking runs in your process before the network, so the redacted value is the only one LangSmith ever sees; that is
+also why it complements, and does not replace, the input and output filters in
+xref:ai/agents/agent-guardrails-and-safety.adoc[Agent Guardrails & Safety]. See
+https://docs.langchain.com/langsmith/mask-inputs-outputs[LangSmith -- Prevent logging of sensitive data] and
+https://docs.langchain.com/langsmith/sample-traces[Sample traces].
+
+== OpenTelemetry export
+
+LangSmith speaks OpenTelemetry both ways. For LangChain and LangGraph applications, installing the extra
+(`pip install "langsmith[otel]"`) and setting `LANGSMITH_OTEL_ENABLED=true` makes the SDK emit OpenTelemetry spans
+in addition to sending runs to LangSmith; adding `LANGSMITH_OTEL_ONLY=true` sends *only* spans. If your process has
+already registered a global tracer provider before the LangChain components are created, the SDK uses it, so spans go
+wherever your existing OpenTelemetry pipeline sends them. The script below registers an in-memory exporter, which is
+the easiest way to see exactly what would be exported:
+
+.run_otel.py -- LangChain runs as OpenTelemetry spans
+[source,python]
+----
+import os
+
+import capture
+
+os.environ.update(LANGSMITH_TRACING="true", LANGSMITH_OTEL_ENABLED="true", LANGSMITH_OTEL_ONLY="true",
+                  LANGSMITH_API_KEY=capture.PLACEHOLDER, LANGCHAIN_CALLBACKS_BACKGROUND="false")
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+exporter = InMemorySpanExporter()
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(exporter))
+trace.set_tracer_provider(provider)  # before any LangChain component is created
+
+from langchain_core.tracers.langchain import wait_for_all_tracers
+
+from docs_agent import build_agent
+from fake import ScriptedChat
+
+agent = build_agent(ScriptedChat())
+agent.invoke({"messages": [("user", "What does ef_search control?")]},
+             config={"tags": ["docsassistant"], "metadata": {"thread_id": "t-1"}})
+wait_for_all_tracers()
+provider.force_flush()
+
+for span in exporter.get_finished_spans():
+    a = span.attributes
+    print(f'{span.name:12} kind={a["langsmith.span.kind"]:5} thread_id={a["langsmith.metadata.thread_id"]}'
+          f' tags={a["langsmith.span.tags"]} total_tokens={a.get("gen_ai.usage.total_tokens")}')
+llm = next(s for s in exporter.get_finished_spans() if s.attributes["langsmith.span.kind"] == "llm")
+print(sorted(k for k in llm.attributes if k.startswith("gen_ai.")))
+----
+
+.Output
+[source,text]
+----
+docs_assistant kind=chain thread_id=t-1 tags=docsassistant total_tokens=None
+model        kind=chain thread_id=t-1 tags=graph:step:1, docsassistant total_tokens=None
+ScriptedChat kind=llm   thread_id=t-1 tags=seq:step:1, docsassistant total_tokens=72
+tools        kind=chain thread_id=t-1 tags=graph:step:2, docsassistant total_tokens=None
+search_docs  kind=tool  thread_id=t-1 tags=seq:step:1, docsassistant total_tokens=None
+model        kind=chain thread_id=t-1 tags=graph:step:3, docsassistant total_tokens=None
+ScriptedChat kind=llm   thread_id=t-1 tags=seq:step:1, docsassistant total_tokens=110
+['gen_ai.completion', 'gen_ai.operation.name', 'gen_ai.prompt', 'gen_ai.request.model', 'gen_ai.serialized.name', 'gen_ai.system', 'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens', 'gen_ai.usage.total_tokens']
+----
+
+The graph came out as one span per run, keeping LangSmith's run type in `langsmith.span.kind`, the tags in
+`langsmith.span.tags`, the metadata under `langsmith.metadata.<key>` and the token usage in the `gen_ai.usage.*`
+attributes of the model spans. Those are the attribute names LangSmith maps back to run fields when it receives such
+spans, so the same conventions work in both directions. A fuller list is on the documentation page linked below.
+
+Two smaller facts. https://docs.langchain.com/langsmith/log-traces-to-project[LangSmith -- Log traces to a specific project] documents a newer switch for the same choice, the
+`tracing_mode` argument of `Client` or the `LANGSMITH_TRACING_MODE` environment variable, with the values `langsmith`
+(the default), `otel` and `hybrid` (Python only). In the installed SDK (0.14.1) `LANGSMITH_TRACING_MODE` takes
+precedence, and the `LANGSMITH_OTEL_ENABLED` and `LANGSMITH_OTEL_ONLY` variables used above are its legacy spelling of
+`hybrid` and `otel`. The OpenTelemetry page still documents those two variables, which is why the script uses them, but
+prefer `LANGSMITH_TRACING_MODE` in new code and check both pages for the version you install. And the
+regular OpenTelemetry environment variables apply to the export: `OTEL_EXPORTER_OTLP_ENDPOINT` overrides the
+destination, `OTEL_SERVICE_NAME` names the service, and `OTEL_RESOURCE_ATTRIBUTES` attaches process-level attributes
+such as the deployment environment to every trace. Pointing it at an OpenTelemetry Collector lets one stream of spans
+fan out to LangSmith and to other back ends, as in the diagram at the top of this page; that export was not run
+here. To send a non-LangChain application's spans to LangSmith directly, point the OTLP exporter at LangSmith's
+`/otel` endpoint with the API key as a header, both taken from the environment. See
+https://docs.langchain.com/langsmith/trace-with-opentelemetry[LangSmith -- Trace with OpenTelemetry].
+
+== Alternatives: Langfuse and Phoenix
+
+LangSmith is not the only sink for LangChain traces, and the framework does not lock you in: LangChain's callback
+system and OpenTelemetry both give other tools a way in. Two open-source options are common:
+
+* *Langfuse* -- an LLM engineering platform you can self-host or use as a service. It integrates through a
+  LangChain callback handler; keys and host come from `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and
+  `LANGFUSE_BASE_URL` (the older `LANGFUSE_HOST` is still read) in the environment.
+* *Arize Phoenix* -- an open-source observability and evaluation tool built on OpenTelemetry and the OpenInference
+  conventions, which instruments LangChain once at startup.
+
+.run_alt.py -- the same agent traced with Langfuse and with Phoenix
+[source,python]
+----
+import os
+
+import capture
+
+os.environ.update(LANGFUSE_PUBLIC_KEY=capture.PLACEHOLDER, LANGFUSE_SECRET_KEY=capture.PLACEHOLDER,
+                  LANGFUSE_BASE_URL="http://127.0.0.1:9", LANGFUSE_TRACING_ENABLED="false")
+
+from langfuse.langchain import CallbackHandler
+from openinference.instrumentation.langchain import LangChainInstrumentor
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from phoenix.otel import register
+
+from docs_agent import build_agent
+from fake import ScriptedChat
+
+agent = build_agent(ScriptedChat())
+
+# Langfuse: a callback handler per run
+result = agent.invoke({"messages": [("user", "What does ef_search control?")]},
+                      config={"callbacks": [CallbackHandler()]})
+print("langfuse: run completed with", len(result["messages"]), "messages")
+
+# Phoenix: OpenTelemetry auto-instrumentation, once at startup
+tracer_provider = register(project_name="docsassistant", auto_instrument=False, batch=False)
+exporter = InMemorySpanExporter()
+tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+LangChainInstrumentor().instrument(tracer_provider=tracer_provider)
+agent.invoke({"messages": [("user", "What does ef_search control?")]})
+print("phoenix :", [(s.name, s.attributes["openinference.span.kind"]) for s in exporter.get_finished_spans()])
+----
+
+.Output
+[source,text]
+----
+langfuse: run completed with 4 messages
+phoenix : [('ScriptedChat', 'LLM'), ('model', 'CHAIN'), ('search_docs', 'TOOL'), ('tools', 'CHAIN'), ('ScriptedChat', 'LLM'), ('model', 'CHAIN'), ('docs_assistant', 'CHAIN')]
+----
+
+The Langfuse handler was constructed with tracing switched off and placeholder local settings, so this proves the import
+path and that the agent runs with the handler attached, not that a Langfuse server received a trace. The Phoenix run
+was captured in memory: the OpenInference instrumentation produced one span per LangChain step with
+`openinference.span.kind` values `LLM`, `TOOL` and `CHAIN`. Phoenix's startup banner printed above the last two lines
+and is omitted. The table compares the three on the questions that usually decide the choice.
+
+.LangSmith, Langfuse and Phoenix compared
+[cols="1,2,2,2"]
+|===
+| | LangSmith | Langfuse | Phoenix
+
+| Integration with LangChain
+| Environment variables, no code
+| Callback handler on each call
+| OpenInference instrumentation, once
+
+| Wire format
+| Its own run format; OpenTelemetry optional
+| Its own SDK and API
+| OpenTelemetry with OpenInference attributes
+
+| Hosting
+| Managed service; self-hosted deployment is also documented
+| Managed service or self-hosted
+| Open source, self-hosted
+
+| Fit
+| Deepest link to LangChain datasets, evaluation and deployment
+| Framework-agnostic tracing plus prompts and evaluation
+| OpenTelemetry-native pipelines and interactive analysis
+|===
+
+Choose on where the data may live, on whether your organization already runs OpenTelemetry, and on how the traces
+connect to your evaluation workflow. The same OpenTelemetry route above lets you send one trace stream to several
+tools, so the decision is less final than it looks. See https://langfuse.com/integrations/frameworks/langchain[Langfuse -- LangChain integration]
+and https://arize.com/docs/phoenix[Phoenix documentation].
+
+== From traces to operations
+
+Tracing is the input, not the outcome. The habits that turn it into an operating practice:
+
+* Trace from the first commit, in development, into a `-dev` project, so the first production incident is not also
+  your first look at a trace.
+* Use one identifier per conversation (the `thread_id`) across the checkpointer, the traces and your application
+  logs.
+* Add release metadata (version, prompt version, model) to every run so a regression can be pinned on a change.
+* Turn interesting production traces into test cases; that loop is the subject of
+  xref:ai/langchain/evaluation.adoc[Evaluation] and xref:ai/langchain/testing.adoc[Testing].
+* Watch cost and latency per thread, not only per request, because an agent's cost is a property of the whole
+  conversation.
+* Decide up front what may be recorded, and configure masking and sampling before real users arrive.
+
+Running all of this as a discipline -- dashboards, alerting, budgets, prompt and model rollouts -- is the subject of
+the planned LLMOps sub-section. For the deployment side of LangSmith see xref:ai/langchain/deployment.adoc[Deployment],
+and for where an agent's own context choices show up in a trace, xref:ai/agents/context-engineering-for-agents.adoc[Context Engineering for Agents].
+
+== References
+
+* https://docs.langchain.com/langsmith/observability[LangSmith -- Observability]
+* https://docs.langchain.com/oss/python/langchain/observability[LangChain -- LangSmith Observability]
+* https://docs.langchain.com/langsmith/trace-with-langchain[LangSmith -- Trace LangChain applications]
+* https://docs.langchain.com/langsmith/annotate-code[LangSmith -- Custom instrumentation (`@traceable`)]
+* https://docs.langchain.com/langsmith/add-metadata-tags[LangSmith -- Add metadata and tags to traces]
+* https://docs.langchain.com/langsmith/threads[LangSmith -- Configure threads]
+* https://docs.langchain.com/langsmith/cost-tracking[LangSmith -- Cost tracking]
+* https://docs.langchain.com/langsmith/log-traces-to-project[LangSmith -- Log traces to a specific project]
+* https://docs.langchain.com/langsmith/mask-inputs-outputs[LangSmith -- Prevent logging of sensitive data]
+* https://docs.langchain.com/langsmith/sample-traces[LangSmith -- Sample traces]
+* https://docs.langchain.com/langsmith/redact-secrets[LangSmith -- Redact secrets from traces]
+* https://docs.langchain.com/langsmith/trace-with-opentelemetry[LangSmith -- Trace with OpenTelemetry]
+* https://langfuse.com/integrations/frameworks/langchain[Langfuse -- LangChain integration]
+* https://github.com/langfuse/langfuse[Langfuse on GitHub]
+* https://arize.com/docs/phoenix[Arize Phoenix documentation]
+* https://github.com/Arize-ai/phoenix[Arize Phoenix on GitHub]
