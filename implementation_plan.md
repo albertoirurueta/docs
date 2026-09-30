@@ -194,14 +194,14 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 4 — Cheat sheet (Parallelizable: no — Task 26 summarises every page written in Groups 2–3 and Task 25 lists them)
 
-- [ ] **Task 25. `cheat-sheet.adoc`**: list what the sheet covers, cross-reference every page grouped like the nav, link
+- [x] **Task 25. `cheat-sheet.adoc`**: list what the sheet covers, cross-reference every page grouped like the nav, link
   `xref:attachment$ai-rag-systems-cheat-sheet.pdf[Download the RAG Systems in Production Cheat Sheet (PDF)]`.
-- [ ] **Task 26. `modules/ROOT/attachments/ai-rag-systems-cheat-sheet.pdf`**
-  - [ ] Task 26.1. Write a print-ready A4 HTML/CSS in the scratchpad directory (not committed), dense multi-column,
+- [x] **Task 26. `modules/ROOT/attachments/ai-rag-systems-cheat-sheet.pdf`**
+  - [x] Task 26.1. Write a print-ready A4 HTML/CSS in the scratchpad directory (not committed), dense multi-column,
     colour-coded boxes, header line with version baseline and date, breadcrumb footer, styled consistently with
     `vector-rag-cheat-sheet.pdf` and `azure-cheat-sheet.pdf`; content covers every concept listed in the issue's
     cheat-sheet section.
-  - [ ] Task 26.2. Render with the pre-installed headless Chromium; verify it is **exactly one A4 page** (e.g. `pdfinfo`)
+  - [x] Task 26.2. Render with the pre-installed headless Chromium; verify it is **exactly one A4 page** (e.g. `pdfinfo`)
     and legible; commit only the PDF.
 
 ### Group 5 — Cross-links in existing pages (Parallelizable: yes — each task edits a different existing file)
