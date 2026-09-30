@@ -206,12 +206,12 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 5 — Cross-links in existing pages (Parallelizable: yes — each task edits a different existing file)
 
-- [ ] **Task 27. `database/vector-rag/index.adoc`**: reading path gets "next: RAG Systems in Production" xref to
+- [x] **Task 27. `database/vector-rag/index.adoc`**: reading path gets "next: RAG Systems in Production" xref to
   `ai/rag-systems/index.adoc`.
-- [ ] **Task 28. One sentence + xref each** in `database/vector-rag/{production-considerations,evaluating-rag-systems,agent-memory-and-semantic-cache,retrieval-strategies,document-ingestion-and-chunking}.adoc`
+- [x] **Task 28. One sentence + xref each** in `database/vector-rag/{production-considerations,evaluating-rag-systems,agent-memory-and-semantic-cache,retrieval-strategies,document-ingestion-and-chunking}.adoc`
   linking the matching new page (do not duplicate content; keep existing anchors intact).
-- [ ] **Task 29. `database/neo4j/vector-search-and-genai.adoc`**: link the two GraphRAG pages.
-- [ ] **Task 30. Check existing files mentioning `rag-systems`** (list in "Current code state"): replace any "planned"
+- [x] **Task 29. `database/neo4j/vector-search-and-genai.adoc`**: link the two GraphRAG pages.
+- [x] **Task 30. Check existing files mentioning `rag-systems`** (list in "Current code state"): replace any "planned"
   prose with real xrefs and confirm the anchors they target exist.
 
 ### Group 6 — Sub-section validation (Parallelizable: no — checks depend on all previous groups)
