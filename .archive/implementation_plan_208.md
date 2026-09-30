@@ -227,13 +227,13 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 7 — Integration-branch verification (Parallelizable: no — strictly sequential; each step depends on the previous result)
 
-- [ ] **Task 33. Merge the latest `origin/feature/213-ai-section` into `feature/208`** and resolve conflicts.
+- [x] **Task 33. Merge the latest `origin/feature/213-ai-section` into `feature/208`** and resolve conflicts.
   - Expected conflict points: the `** xref:ai/index.adoc[AI]` block in `modules/ROOT/nav.adoc`, `modules/ROOT/pages/ai/index.adoc`
     → `== Sub-sections`, and the `:keywords:` of the root and AI index pages.
   - Resolve by keeping every sibling's entries, in the fixed sub-section order.
-- [ ] **Task 34. Run `npm run validate:mermaid` and `npx antora antora-playbook.yml` (or `/iru-build-docs`) on the merged
+- [x] **Task 34. Run `npm run validate:mermaid` and `npx antora antora-playbook.yml` (or `/iru-build-docs`) on the merged
   result.** Must finish with no xref, AsciiDoc or Mermaid errors.
-- [ ] **Task 35. Compute merge readiness.** For each prerequisite `#D` in {198, 197, 206}: run
+- [x] **Task 35. Compute merge readiness.** For each prerequisite `#D` in {198, 197, 206}: run
   `git fetch origin && git branch -r --merged origin/feature/213-ai-section | grep -x "  origin/feature/D"` or list merged PRs
   into `feature/213-ai-section` (`gh pr list --base feature/213-ai-section --state merged --json number,headRefName,title`,
   or the GitHub MCP equivalent when `gh` is unavailable; note the branches may have been squash-merged so the PR
@@ -246,5 +246,17 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
   - Antora build + Mermaid validation on the merged result: <✅ passed / ❌ failed>
   - Status: <✅ READY: can be merged into feature/213-ai-section after human review
             | ⏳ WAIT: keep as draft until <#D, …> are merged into feature/213-ai-section, then re-merge feature/213-ai-section and rebuild>
+  - Reaches main only via the final integration PR feature/213-ai-section → main, owned by collector issue #213, after all 15 AI issues are merged
+  ```
+
+  Result recorded on 2026-09-30 (merge of `origin/feature/213-ai-section` at 0bf2018b into `feature/208` was a no-op:
+  the integration branch had not moved since the fork):
+
+  ```
+  ### Merge readiness
+  - Target branch: feature/213-ai-section (NOT main; this PR must never be merged into main)
+  - Prerequisites: #198 ✅ merged into feature/213-ai-section (PR #221, squash commit 8b127a17) / #197 ✅ merged into feature/213-ai-section (PR #222, squash commit bfdf41f7) / #206 ✅ merged into feature/213-ai-section (PR #220, squash commit f531470a)
+  - Antora build + Mermaid validation on the merged result: ✅ passed (npx antora antora-playbook.yml: exit 0, no warnings or errors; npm run validate:mermaid: all 689 diagrams parsed)
+  - Status: ✅ READY: can be merged into feature/213-ai-section after human review
   - Reaches main only via the final integration PR feature/213-ai-section → main, owned by collector issue #213, after all 15 AI issues are merged
   ```
