@@ -1,0 +1,385 @@
+= Production RAG Architecture
+:description: The reference architecture of a production RAG service -- ingestion and query planes, a stateless orchestrator with parallel fan-out and gather, independently scaled tiers, a latency budget with TTFT and TPOT, DIY versus RAG platforms, total cost of ownership and a plan from proof of concept to production -- in LangChain, Spring AI and LangChain4j.
+:keywords: rag architecture, production rag, reference architecture, microservices, stateless orchestrator, fan-out, gather, asyncio.gather, RetrievalAugmentationAdvisor, MultiQueryExpander, taskExecutor, DefaultRetrievalAugmentor, DefaultQueryRouter, ReRankingContentAggregator, latency budget, TTFT, TPOT, P95, scaling tiers, rag platform, total cost of ownership, TCO, proof of concept, docsassistant
+
+include::partial$ai-rag-systems-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against `langchain-core` 1.6.6 on Python 3.12, Spring AI 2.0.1 on Spring Boot 4.1.1
+with Java 21, and LangChain4j 1.20.2 (see the xref:ai/rag-systems/index.adoc#_version_baseline[version baseline]). The
+Python orchestrator was run against in-memory retrievers; the Java classes were compiled against the released jars and
+were not run against a live model or store.
+
+A prototype RAG application is one process: it loads documents, embeds them, answers a question and exits. A
+production service is two systems that share a set of stores. The *ingestion plane* turns changing sources into
+indexed, access-tagged chunks; the *query plane* turns an authenticated request into a grounded, cited, streamed
+answer inside a latency budget. Keeping the planes apart is the single most useful architectural decision: they scale
+on different signals (documents per hour versus requests per second), fail differently, and are deployed on different
+schedules. The foundations of each box -- embeddings, ANN indexes, chunking and retrieval -- are in
+xref:database/vector-rag/index.adoc[Vector Databases & RAG]; the scale path and capacity numbers for the vector store
+itself are in xref:database/vector-rag/production-considerations.adoc[Production Considerations]. This page is about the
+service around them.
+
+== The reference architecture
+
+image::ai-rag-systems-reference-architecture.svg["Reference architecture of a production RAG service. The ingestion plane reads sources, parses, redacts and tags, chunks, embeds and writes to the stores. The stores are PostgreSQL with pgvector, Neo4j, a conversation store, Redis caches and an object store for originals. The query plane has an API gateway with OAuth2 and rate limits, input guardrails with query condensation, a fan-out to vector, keyword and graph retrievers with the ACL filter, gather and rerank, a streaming generator with prompt caching, and output checks for citations and faithfulness, all driven by a stateless orchestrator. Cross-cutting: OpenTelemetry, online evaluation, audit log, secrets and clients.",width=860,role=text-center]
+
+The boxes map to pages of this sub-section:
+
+[cols="2,3,2", options="header"]
+|===
+| Component | Responsibility | Page
+
+| Parse, redact and tag
+| Turns PDFs, HTML and scans into structured text with metadata, removes PII, attaches ACL groups and a content hash.
+| xref:ai/rag-systems/document-parsing.adoc[Document Parsing], xref:ai/rag-systems/ingestion-pipelines-and-freshness.adoc[Ingestion Pipelines & Freshness]
+
+| Chunk, embed, index writer
+| Splits along structure, embeds in batches, upserts and deletes by stable IDs.
+| xref:database/vector-rag/document-ingestion-and-chunking.adoc[Document Ingestion & Chunking], xref:ai/rag-systems/advanced-indexing-patterns.adoc[Advanced Indexing Patterns]
+
+| API gateway
+| Authenticates, rate-limits and versions the public contract.
+| xref:ai/rag-systems/serving-rag-as-an-api.adoc[Serving RAG as an API]
+
+| Input guardrails and condensation
+| Screens the request and rewrites a follow-up into a standalone query.
+| xref:ai/rag-systems/guardrails-and-prompt-injection.adoc[Guardrails & Prompt Injection], xref:ai/rag-systems/conversational-rag-and-memory.adoc[Conversational RAG & Memory]
+
+| Fan-out retrievers
+| Vector, keyword and graph or SQL retrieval in parallel, each with the caller's ACL filter.
+| xref:ai/rag-systems/query-understanding-and-routing.adoc[Query Understanding & Routing], xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]
+
+| Gather and rerank
+| Deduplicates, fuses (reciprocal rank fusion) and reranks with a cross-encoder.
+| xref:database/vector-rag/hybrid-search-and-reranking.adoc[Hybrid Search & Re-ranking]
+
+| Generator and output checks
+| Streams the answer with citations, then verifies them and the faithfulness of the answer.
+| xref:ai/rag-systems/citations-and-grounding.adoc[Citations & Grounding], xref:ai/rag-systems/hallucination-detection-and-correction.adoc[Hallucination Detection & Correction]
+
+| Caches and conversation store
+| Response, retrieval and semantic caches; checkpoints and long-term memory.
+| xref:ai/rag-systems/caching-latency-and-cost.adoc[Caching, Latency & Cost]
+|===
+
+== A stateless orchestrator with fan-out and gather
+
+The orchestrator is the only component that knows the whole request. It must be *stateless*: the conversation, the
+cache and the index live in the stores, so any replica can serve any turn, a crashed pod loses nothing, and the
+horizontal pod autoscaler can add replicas without sticky sessions. Its main job is to run the independent retrievals
+*concurrently* and to enforce a deadline on each, so that one slow backend degrades the answer instead of stalling it.
+
+With \(k\) retrievers run sequentially the retrieval stage costs \(\sum_i T_i\); run concurrently it costs
+\(\max_i T_i\), bounded by the per-retriever timeout \(\tau\):
+
+\[
+T_{retr}^{seq} = \sum_{i=1}^{k} T_i
+\qquad\text{versus}\qquad
+T_{retr}^{par} = \min\left(\max_{i} T_i,\ \tau\right)
+\]
+
+In Python the fan-out is `asyncio.gather` over the async `ainvoke` of each LangChain retriever, with `asyncio.wait_for`
+enforcing the deadline. The result is deduplicated by chunk ID and fused with reciprocal rank fusion before the
+reranker sees it:
+
+.docsassistant/orchestrator.py -- parallel fan-out with deadlines and RRF (Python, `langchain-core` 1.6.6)
+[source,python]
+----
+import asyncio
+from collections import defaultdict
+
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+
+
+async def _one(name: str, retriever: BaseRetriever, query: str, timeout_s: float) -> list[Document]:
+    try:
+        docs = await asyncio.wait_for(retriever.ainvoke(query), timeout=timeout_s)
+    except TimeoutError:
+        return []                         # a slow backend degrades the answer, it does not block it
+    for doc in docs:
+        doc.metadata["retriever"] = name
+    return docs
+
+
+async def fan_out(query: str, retrievers: dict[str, BaseRetriever], timeout_s: float = 0.3,
+                  rrf_k: int = 60, top_n: int = 20) -> list[Document]:
+    """Run every retriever concurrently, then fuse the rankings with reciprocal rank fusion."""
+    ranked_lists = await asyncio.gather(*(_one(n, r, query, timeout_s) for n, r in retrievers.items()))
+    scores: dict[str, float] = defaultdict(float)
+    by_id: dict[str, Document] = {}
+    for docs in ranked_lists:
+        for rank, doc in enumerate(docs, start=1):
+            chunk_id = doc.metadata["chunk_id"]
+            scores[chunk_id] += 1.0 / (rrf_k + rank)
+            by_id.setdefault(chunk_id, doc)
+    best = sorted(scores, key=scores.get, reverse=True)[:top_n]
+    return [by_id[chunk_id] for chunk_id in best]
+----
+
+Source: https://docs.langchain.com/oss/python/langchain/retrieval[LangChain -- Retrieval] and
+https://docs.python.org/3/library/asyncio-task.html#asyncio.gather[Python -- asyncio.gather].
+
+Spring AI parallelises retrieval inside `RetrievalAugmentationAdvisor`: when a `QueryExpander` produces several
+queries, the advisor retrieves for each of them on the `TaskExecutor` passed to its builder, and a `DocumentJoiner`
+merges the results. On Spring Boot 4.1 with `spring.threads.virtual.enabled=true`, the auto-configured
+`applicationTaskExecutor` runs each retrieval on a virtual thread:
+
+.RagPipelineConfig.java -- parallel retrieval in the advisor (Java, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.rag.architecture;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
+import org.springframework.ai.rag.generation.augmentation.ContextualQueryAugmenter;
+import org.springframework.ai.rag.preretrieval.query.expansion.MultiQueryExpander;
+import org.springframework.ai.rag.retrieval.join.ConcatenationDocumentJoiner;
+import org.springframework.ai.rag.retrieval.search.VectorStoreDocumentRetriever;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.task.TaskExecutor;
+
+@Configuration
+public class RagPipelineConfig {
+
+    @Bean
+    RetrievalAugmentationAdvisor ragAdvisor(ChatClient.Builder builder, VectorStore vectorStore,
+                                            TaskExecutor applicationTaskExecutor) {
+        return RetrievalAugmentationAdvisor.builder()
+                // three paraphrases plus the original question, retrieved concurrently
+                .queryExpander(MultiQueryExpander.builder()
+                        .chatClientBuilder(builder.clone())
+                        .numberOfQueries(3)
+                        .includeOriginal(true)
+                        .build())
+                .documentRetriever(VectorStoreDocumentRetriever.builder()
+                        .vectorStore(vectorStore)
+                        .similarityThreshold(0.5)
+                        .topK(8)
+                        .build())
+                .documentJoiner(new ConcatenationDocumentJoiner())      // deduplicates by document ID
+                .queryAugmenter(ContextualQueryAugmenter.builder().allowEmptyContext(false).build())
+                .taskExecutor(applicationTaskExecutor)
+                .build();
+    }
+
+    @Bean
+    ChatClient docsChatClient(ChatClient.Builder builder, RetrievalAugmentationAdvisor ragAdvisor) {
+        return builder.defaultAdvisors(ragAdvisor).build();
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI -- Retrieval
+Augmented Generation] (modular RAG) and
+https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html[Spring Boot -- Task Execution
+and Scheduling].
+
+LangChain4j's `DefaultRetrievalAugmentor` does the same with a `QueryRouter` that returns several `ContentRetriever`
+instances: the augmentor calls them on the `Executor` it is given and hands every result list to the
+`ContentAggregator`, here a `ReRankingContentAggregator` backed by a cross-encoder `ScoringModel`:
+
+.FanOutAugmentor.java -- routing to two retrievers in parallel and reranking (Java, LangChain4j 1.20.2)
+[source,java]
+----
+package com.example.docsassistant.l4j.architecture;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import dev.langchain4j.model.scoring.ScoringModel;
+import dev.langchain4j.rag.DefaultRetrievalAugmentor;
+import dev.langchain4j.rag.RetrievalAugmentor;
+import dev.langchain4j.rag.content.aggregator.ReRankingContentAggregator;
+import dev.langchain4j.rag.content.retriever.ContentRetriever;
+import dev.langchain4j.rag.query.router.DefaultQueryRouter;
+
+public final class FanOutAugmentor {
+
+    private FanOutAugmentor() {
+    }
+
+    public static RetrievalAugmentor create(ContentRetriever vectorRetriever, ContentRetriever keywordRetriever,
+                                            ScoringModel crossEncoder) {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        return DefaultRetrievalAugmentor.builder()
+                .queryRouter(new DefaultQueryRouter(vectorRetriever, keywordRetriever))
+                .contentAggregator(ReRankingContentAggregator.builder()
+                        .scoringModel(crossEncoder)
+                        .minScore(0.3)
+                        .maxResults(6)
+                        .build())
+                .executor(executor)            // both retrievers run concurrently
+                .build();
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/tutorials/rag/[LangChain4j -- RAG] (Advanced RAG: query router, content
+aggregator).
+
+== Independent scaling tiers
+
+The components have different resource profiles, so they scale on different metrics and often on different node
+pools:
+
+[cols="2,2,3", options="header"]
+|===
+| Tier | Bound by | Scale on
+
+| API and orchestrator
+| I/O (waiting on stores and models)
+| Concurrent requests or open SSE streams; cheap CPU pods, many replicas, virtual threads or `asyncio`.
+
+| Retrieval (vector, keyword, graph)
+| Memory and I/O in the store
+| Query rate and index size; read replicas of PostgreSQL, Neo4j read replicas, see xref:database/vector-rag/production-considerations.adoc[Production Considerations].
+
+| Reranker and embedding of queries
+| GPU or CPU matrix work
+| Batch queue depth; a small GPU pool or a hosted endpoint.
+
+| Generator
+| GPU memory and tokens per second
+| Tokens per second and queue time; a hosted API with rate-limit headroom, or a vLLM fleet as in xref:ai/local-llms/vllm-and-sglang.adoc[vLLM & SGLang].
+
+| Ingestion workers
+| CPU (parsing, OCR) and GPU (VLM parsing, embedding)
+| Backlog of the ingestion topic or job queue; scale to zero between loads.
+|===
+
+Scaling the orchestrator without scaling the generator only moves the queue. Track queue time at the model tier
+separately from the model's own latency; see xref:ai/rag-systems/observability-and-tracing.adoc[Observability & Tracing].
+
+== The latency budget
+
+Users judge a streaming answer by *time to first token* (TTFT) and by how fast the text arrives afterwards (*time per
+output token*, TPOT). For a single-turn RAG request the end-to-end latency is approximately
+
+\[
+T \approx T_{retr} + T_{rerank} + T_{TTFT} + n_{out}\,T_{TPOT}
+\]
+
+where \(n_{out}\) is the number of generated tokens, \(T_{TTFT}\) grows with the prompt length (the retrieved context
+is prefilled before the first token) and \(T_{retr}\) is the parallel retrieval time from the previous section. A
+worked DocsAssistant budget, at P95 rather than the mean, because the tail is what users remember:
+
+[cols="2,1,3", options="header"]
+|===
+| Stage | P95 budget | How to stay inside it
+
+| Auth, guardrails, condensation
+| 150 ms
+| Small classifier for input checks; condensation only when there is history.
+
+| Retrieval fan-out
+| 300 ms
+| Parallel with a 300 ms deadline per retriever; HNSW `ef_search` tuned on the golden set.
+
+| Rerank 40 candidates
+| 150 ms
+| Batched cross-encoder on GPU; skip when the top vector score is decisive.
+
+| TTFT with 4 000 prompt tokens
+| 800 ms
+| Prompt caching of the stable prefix; a smaller model for easy questions (model cascades).
+
+| 300 output tokens
+| \(300 \times 20\ \text{ms} = 6\ \text{s}\)
+| Streamed, so the user reads while it generates; cap `max_tokens`.
+|===
+
+Everything before the first token -- about 1.4 s here -- is *perceived* latency; the generation time is mostly hidden
+by streaming. That is why the first budget line to cut is almost never the model: it is sequential retrieval, an
+unconditional reranker or a long prompt. The cost side of the same trade-offs is on
+xref:ai/rag-systems/caching-latency-and-cost.adoc[Caching, Latency & Cost].
+
+== DIY or a RAG platform
+
+A managed "RAG as a service" platform (hosted ingestion, retrieval and generation behind one API) and a DIY stack
+built from a framework and your own stores are both legitimate. The decision is mostly about control and data
+boundaries, not features:
+
+[cols="2,3,3", options="header"]
+|===
+| Criterion | DIY (framework + your stores) | Platform
+
+| Parsing and chunking control
+| Full: your parser ladder, your metadata.
+| The platform's pipeline; custom parsing is usually a pre-processing step you run.
+
+| Access control
+| Your ACL model, enforced in your filters.
+| Whatever the platform's document permissions support; check it maps to your identity provider.
+
+| Data residency and privacy
+| Wherever you deploy; on-premises models possible.
+| The vendor's regions and sub-processors.
+
+| Time to first release
+| Weeks.
+| Days.
+
+| Operating cost
+| Infrastructure plus the team that runs it.
+| Per-query or per-document pricing; low fixed cost.
+
+| Lock-in
+| Framework-level only.
+| API, index format and evaluation tooling.
+|===
+
+A common path is to prototype on a platform to learn which questions users ask, then move the high-volume or
+high-sensitivity flows to a DIY stack. Whichever you choose, keep an internal interface such as `POST /v1/ask` in front
+of it so that the choice can change without touching clients, and keep a platform-independent golden set (see
+xref:ai/rag-systems/evaluation-at-scale.adoc[Evaluation at Scale]) so that the two can be compared on your own
+questions. Many small, uncoordinated RAG deployments inside one organisation ("RAG sprawl") are a governance problem:
+each one re-ingests the same documents with its own permissions. A shared ingestion plane with per-application query
+planes avoids it.
+
+== Total cost of ownership
+
+The monthly cost of a RAG service is the sum of a per-request part and a fixed part:
+
+\[
+C_{month} = Q \cdot \left(c_{emb} + c_{retr} + c_{rerank} + c_{in}\,n_{in} + c_{out}\,n_{out}\right)
+  + C_{ingest} + C_{stores} + C_{ops}
+\]
+
+with \(Q\) questions per month, \(c_{in}\) and \(c_{out}\) the price per input and output token, and \(n_{in}\)
+dominated by the retrieved context. For most question-answering workloads the generator term dominates, which is why
+context size (fewer, better chunks after reranking), caching and model cascades are the biggest levers. The fixed
+part is often underestimated: re-parsing and re-embedding the corpus after a model change, the vector store's memory,
+evaluation runs, and the people on call. Put a price on a full re-index before choosing an embedding model; see
+xref:database/vector-rag/generating-embeddings-in-practice.adoc[Generating Embeddings in Practice] for re-embedding
+strategies.
+
+== From proof of concept to production
+
+A plan that has worked for DocsAssistant-sized services, in the order that reduces risk fastest:
+
+. *Collect real questions* from the proof of concept and turn a hundred of them into a golden set with expected sources
+  (xref:ai/rag-systems/evaluation-at-scale.adoc[Evaluation at Scale]).
+. *Fix ingestion first*: parse the hardest documents correctly and attach ACLs and content hashes
+  (xref:ai/rag-systems/document-parsing.adoc[Document Parsing], xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]).
+. *Freeze the API contract* and stream from day one (xref:ai/rag-systems/serving-rag-as-an-api.adoc[Serving RAG as an API]).
+. *Persist conversations* keyed by the authenticated user (xref:ai/rag-systems/conversational-rag-and-memory.adoc[Conversational RAG & Memory]).
+. *Add citations and an abstain path* before widening the audience (xref:ai/rag-systems/citations-and-grounding.adoc[Citations & Grounding]).
+. *Instrument* every stage and set the latency and cost budgets as alerts (xref:ai/rag-systems/observability-and-tracing.adoc[Observability & Tracing]).
+. *Gate changes in CI* on the golden set, then roll out models and prompts blue/green
+  (xref:ai/rag-systems/deployment-patterns.adoc[Deployment Patterns]).
+
+The latency budget, stateless orchestration, scaling tiers, TCO and platform choice follow the concepts of
+Mendelevitch and Bao, _Hands-On RAG for Production_ (Chapters 4 and 5), and Huyen, _AI Engineering_ (Chapter 10),
+paraphrased; see the xref:ai/rag-systems/index.adoc#_bibliography[bibliography].
+
+== References
+
+* https://docs.langchain.com/oss/python/langchain/retrieval[LangChain -- Retrieval]
+* https://docs.python.org/3/library/asyncio-task.html[Python -- Coroutines and Tasks]
+* https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI -- Retrieval Augmented Generation]
+* https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html[Spring Boot -- Task Execution and Scheduling]
+* https://docs.langchain4j.dev/tutorials/rag/[LangChain4j -- RAG]
+* https://arxiv.org/abs/2005.11401[Lewis et al., Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks]

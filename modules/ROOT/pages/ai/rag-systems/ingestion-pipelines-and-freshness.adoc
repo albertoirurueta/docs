@@ -1,0 +1,478 @@
+= Ingestion Pipelines & Freshness
+:description: Keeping a RAG index correct as sources change -- batch and streaming ingestion, idempotent restartable jobs with deterministic IDs, incremental updates with content hashes, CDC with Debezium and Kafka for event-driven re-indexing, deletes and tombstones, PII redaction with Presidio at ingest, provenance hashes, the Spring AI ETL pipeline, the LangChain RecordManager and index() API, and the LangChain4j EmbeddingStoreIngestor.
+:keywords: ingestion pipeline, rag freshness, batch ingestion, streaming ingestion, idempotent jobs, restartable jobs, deterministic ids, content hash, incremental indexing, change data capture, cdc, debezium, kafka, tombstone, deletes, re-indexing, presidio, pii redaction, provenance hash, spring ai etl, DocumentReader, DocumentTransformer, DocumentWriter, TokenTextSplitter, KeywordMetadataEnricher, RecordManager, SQLRecordManager, index, langchain-classic, EmbeddingStoreIngestor, removeAll, MetadataFilterBuilder, docsassistant
+
+include::partial$ai-rag-systems-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against `langchain-classic` 1.0.8, `langchain-core` 1.6.6, `langchain-postgres`
+0.0.18, `langchain-text-splitters` 1.1.2, Presidio 2.2.364 and `confluent-kafka` 2.15.1 on Python 3.12, Spring AI 2.0.1
+with Spring for Apache Kafka on Spring Boot 4.1.1, LangChain4j 1.20.2, and Debezium's PostgreSQL connector (see the
+xref:ai/rag-systems/index.adoc#_version_baseline[version baseline]). The indexing code was run against the released
+packages with an in-memory vector store and a SQLite record manager (add, update, skip and delete behaved as described);
+the redaction code was checked against the released Presidio packages but not run, because no spaCy model was
+installed; Kafka, Debezium and PostgreSQL were not run; the Java classes were compiled against the released jars.
+
+An index is a *cache* of the sources, and like every cache it goes stale. A page is edited and the index still returns
+the old paragraph; a document is deleted and the assistant keeps quoting it; a nightly job crashes halfway and the next
+run duplicates every chunk it had already written. Freshness is not a feature added later -- it is a property of the
+ingestion design. The chunking and loading basics are in
+xref:database/vector-rag/document-ingestion-and-chunking.adoc[Document Ingestion & Chunking]; this page is about running
+ingestion continuously and correctly.
+
+== Batch and streaming ingestion
+
+[cols="1,2,2", options="header"]
+|===
+| Mode | When | Shape
+
+| Batch
+| Initial loads, re-embedding after a model change, sources without change events (a shared drive, an export).
+| A scheduled job lists sources, compares hashes with the last run and processes the differences; parallelised with a
+  job queue, Spark, Ray, Dask or Airflow when the corpus is large.
+
+| Streaming
+| Sources that emit change events (a database, a CMS webhook, Git pushes) and freshness targets of minutes.
+| A consumer reads change events from Kafka and re-indexes one document per event.
+
+| Hybrid
+| Most production systems.
+| Streaming for day-to-day changes, a periodic batch *reconciliation* that catches missed events and deletes orphans.
+|===
+
+Whatever the mode, ingestion should *acknowledge asynchronously*: the API that accepts a new document returns
+`202 Accepted` with a job ID, and the client polls or subscribes for completion (see
+xref:ai/rag-systems/serving-rag-as-an-api.adoc#_asynchronous_ingestion_endpoints[asynchronous ingestion endpoints]).
+Parsing a 300-page PDF with OCR can take minutes; nobody should hold an HTTP request open for it.
+
+The freshness a user experiences is the sum of the delays along the path:
+
+\[
+\Delta_{fresh} = \Delta_{event} + \Delta_{queue} + \Delta_{parse} + \Delta_{embed} + \Delta_{index\ visible}
+\]
+
+For a streaming pipeline on pgvector, \(\Delta_{index\ visible}\) is the commit (HNSW inserts are visible immediately);
+some managed vector stores index asynchronously and add seconds. Measure \(\Delta_{fresh}\) end to end with a canary
+document edited on a schedule, and alert on it.
+
+== Idempotent, restartable jobs
+
+Ingestion jobs fail: a parser crashes on one file, the embedding API rate-limits, a pod is evicted. A job is safe to
+re-run only if processing the same input twice leaves the same index. Four rules make it so:
+
+* *Deterministic IDs.* Derive every chunk ID from its source and position (or content), for example
+  `sha256(source_id + ":" + chunk_index)`, and *upsert* by that ID. A retry overwrites instead of duplicating.
+* *Content hashes.* Store a hash of each chunk's text (and of the parser version) and skip embedding when it has not
+  changed. Re-embedding is the expensive step.
+* *Per-document transactions.* Replace all chunks of a document in one operation (delete by `source` then insert, in
+  one transaction where the store allows it), so that a crash never leaves half a document.
+* *A job ledger.* Record per document: status (`queued`, `parsing`, `embedded`, `failed`), attempts, last error, parser
+  used and timestamps. Stalled documents (in `parsing` for longer than the timeout) are retried or surfaced on a
+  dashboard; poison documents go to a dead-letter queue after N attempts.
+
+LangChain implements the first three rules in the *indexing API*: `index()` hashes every document (content plus
+metadata), stores the hashes in a `RecordManager`, writes only new or changed documents, and -- with `cleanup` --
+deletes documents from the vector store that no longer come from a source. In LangChain 1.x the `index()` helper and
+`SQLRecordManager` live in `langchain-classic`:
+
+.docsassistant/ingest/indexing.py -- incremental, idempotent indexing (Python, `langchain-classic` 1.0.8)
+[source,python]
+----
+import os
+
+from langchain_classic.indexes import SQLRecordManager, index
+from langchain_core.documents import Document
+from langchain_core.vectorstores import VectorStore
+
+record_manager = SQLRecordManager(namespace="pgvector/docsassistant", db_url=os.environ["RECORD_MANAGER_DB_URL"])
+record_manager.create_schema()
+
+
+def sync(documents: list[Document], vector_store: VectorStore) -> dict:
+    """Write new and changed chunks, delete stale chunks of the same sources, skip unchanged ones."""
+    result = index(
+        documents,
+        record_manager,
+        vector_store,
+        cleanup="incremental",        # delete old chunks of every source present in this batch
+        source_id_key="source",       # the metadata key that identifies the source document
+        key_encoder="sha256",
+    )
+    return dict(result)               # {'num_added': .., 'num_updated': .., 'num_skipped': .., 'num_deleted': ..}
+
+
+def delete_source(source: str, vector_store: VectorStore) -> int:
+    """Remove every chunk of a deleted source document."""
+    keys = record_manager.list_keys(group_ids=[source])
+    if keys:
+        vector_store.delete(ids=keys)
+        record_manager.delete_keys(keys)
+    return len(keys)
+----
+
+Source: https://reference.langchain.com/python/langchain_classic/indexes/[LangChain reference -- langchain_classic.indexes]
+and https://docs.langchain.com/oss/python/langchain/retrieval[LangChain -- Retrieval].
+
+`cleanup="incremental"` deletes the old chunks of a source as soon as a new version of that source is indexed, so it is
+safe for streaming updates. `cleanup="full"` deletes everything that was not in *this* call, so it belongs only in a
+batch reconciliation that sees the whole corpus. The record manager must live in a database that survives restarts;
+SQLite is for tests. The vector store must support deleting by ID, which `PGVector` and `PGVectorStore` do.
+
+== Change data capture with Debezium and Kafka
+
+When the source of truth is a database -- DocsAssistant's CMS stores pages in a PostgreSQL `documents` table --
+change data capture (CDC) turns every committed change into an event without touching the application. Debezium's
+PostgreSQL connector reads the write-ahead log through logical replication and publishes one event per row change to a
+Kafka topic (`docs.public.documents`). Each event carries an envelope with `op` (`c` create, `u` update, `d` delete, `r`
+snapshot read), `before` and `after` row images, and source metadata. After a delete, Debezium also emits a *tombstone*
+(a record with the same key and a null value) so that log compaction can remove the key.
+
+[mermaid]
+....
+sequenceDiagram
+  participant CMS as CMS (PostgreSQL)
+  participant DBZ as Debezium connector
+  participant K as Kafka topic docs.public.documents
+  participant W as Re-index worker
+  participant V as Vector store
+  CMS->>DBZ: WAL change (UPDATE documents)
+  DBZ->>K: event op=u, after={id, body, acl}
+  K->>W: consume (key = document id)
+  W->>W: parse, redact, chunk, hash
+  W->>V: replace chunks of source id
+  CMS->>DBZ: WAL change (DELETE)
+  DBZ->>K: event op=d, then tombstone (null value)
+  K->>W: consume
+  W->>V: delete chunks of source id
+....
+
+Keying the topic by document ID matters: Kafka orders events per partition, so all changes of one document arrive in
+order at one consumer, and a re-index never races with a later delete of the same document. The worker commits its
+Kafka offset only after the index write succeeded, so a crash replays the event and the idempotent write absorbs it.
+The Kafka side -- partitions, consumer groups, delivery guarantees, Kafka Connect -- is covered in
+xref:backend/messaging/kafka-connect.adoc[Kafka Connect], xref:backend/messaging/kafka-consumers.adoc[Kafka Consumers]
+and xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees].
+
+.docsassistant/ingest/cdc_worker.py -- re-index on Debezium events, commit after the write (Python, `confluent-kafka` 2.15.1)
+[source,python]
+----
+import json
+import os
+
+from confluent_kafka import Consumer
+from langchain_core.documents import Document
+
+from docsassistant.ingest.indexing import delete_source, sync
+from docsassistant.ingest.pipeline import to_chunks, vector_store   # ladder + redact() + splitter
+
+consumer = Consumer({
+    "bootstrap.servers": os.environ["KAFKA_BOOTSTRAP_SERVERS"],
+    "group.id": "docsassistant-reindex",
+    "enable.auto.commit": False,        # commit only after the index write
+    "auto.offset.reset": "earliest",
+})
+consumer.subscribe(["docs.public.documents"])
+
+while True:
+    msg = consumer.poll(1.0)
+    if msg is None or msg.error():
+        continue
+    if msg.value() is None:              # tombstone after a delete: nothing left to do
+        consumer.commit(message=msg)
+        continue
+    payload = json.loads(msg.value())["payload"]
+    row = payload["after"] or payload["before"]
+    source = f"cms/{row['id']}"
+    if payload["op"] == "d":
+        delete_source(source, vector_store)
+    else:                                # c, u, r
+        doc = Document(page_content=row["body"], metadata={"source": source, "acl": row["acl"]})
+        sync(to_chunks(doc), vector_store)
+    consumer.commit(message=msg)
+----
+
+Source: https://debezium.io/documentation/reference/stable/connectors/postgresql.html[Debezium -- PostgreSQL connector]
+(change event values, tombstone events) and
+https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html[confluent-kafka Python client].
+
+The same worker in Spring uses a `@KafkaListener` with manual acknowledgement and replaces a document's chunks through
+the portable `VectorStore.delete(Filter.Expression)` and `add(List<Document>)`. Deterministic, name-based UUIDs make the
+write idempotent (the pgvector store's default ID column is a UUID):
+
+.CdcReindexListener.java -- event-driven re-indexing (Java, Spring AI 2.0.1, Spring for Apache Kafka)
+[source,java]
+----
+package com.example.docsassistant.rag.ingest;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.IntStream;
+
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.kafka.annotation.KafkaListener;
+import org.springframework.kafka.support.Acknowledgment;
+import org.springframework.stereotype.Component;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
+@Component
+public class CdcReindexListener {
+
+    private final VectorStore vectorStore;
+    private final TokenTextSplitter splitter = TokenTextSplitter.builder().withChunkSize(512).build();
+    private final JsonMapper json = JsonMapper.builder().build();
+
+    public CdcReindexListener(VectorStore vectorStore) {
+        this.vectorStore = vectorStore;
+    }
+
+    // requires spring.kafka.listener.ack-mode=manual
+    @KafkaListener(topics = "docs.public.documents", groupId = "docsassistant-reindex")
+    public void onChange(ConsumerRecord<String, String> record, Acknowledgment ack) {
+        if (record.value() == null) {            // tombstone
+            ack.acknowledge();
+            return;
+        }
+        JsonNode payload = json.readTree(record.value()).path("payload");
+        JsonNode row = payload.path("after").isNull() ? payload.path("before") : payload.path("after");
+        String source = "cms/" + row.path("id").asString();
+
+        var filter = new FilterExpressionBuilder().eq("source", source).build();
+        vectorStore.delete(filter);                                  // remove the old version (or the deleted doc)
+        if (!"d".equals(payload.path("op").asString())) {
+            Document doc = new Document(row.path("body").asString(),
+                    Map.of("source", source, "acl", row.path("acl").asString()));
+            List<Document> chunks = splitter.apply(List.of(doc));
+            List<Document> withIds = IntStream.range(0, chunks.size())
+                    .mapToObj(i -> chunks.get(i).mutate()
+                            .id(UUID.nameUUIDFromBytes((source + ":" + i).getBytes(StandardCharsets.UTF_8)).toString())
+                            .build())
+                    .toList();
+            vectorStore.add(withIds);
+        }
+        ack.acknowledge();                                           // commit only after the write succeeded
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/vectordbs.html[Spring AI -- Vector Databases] (deleting by filter
+expression) and https://docs.spring.io/spring-kafka/reference/kafka/receiving-messages/listener-annotation.html[Spring
+for Apache Kafka -- @KafkaListener].
+
+The delete-then-add pair is not atomic across the two calls. If readers must never see a document with zero chunks,
+write the new chunks under a new `version` metadata value first, switch the read filter, then delete the old version --
+or use a store that supports transactional replacement.
+
+== Deletes and tombstones
+
+Deletes are the part of freshness most pipelines get wrong, and the most dangerous to get wrong: a deleted document may
+have been deleted *because* it must no longer be shown. Handle three cases explicitly:
+
+* *Hard deletes at the source* (a CDC `d` event, a file removed from the bucket): delete every chunk with that `source`
+  from every index, cache and graph (xref:ai/rag-systems/graphrag-and-knowledge-graph-construction.adoc[GraphRAG &
+  Knowledge Graph Construction] covers tombstoning in the graph), and invalidate cached answers that cited it
+  (xref:ai/rag-systems/caching-latency-and-cost.adoc[Caching, Latency & Cost]).
+* *Missed deletes* (a consumer was down, a source without events): the periodic reconciliation lists all source IDs,
+  compares them with the IDs in the index and deletes orphans. `index(..., cleanup="full")` does this for LangChain.
+* *Soft deletes and retention* (a document archived, a legal hold): keep the chunks but set `status=archived` in
+  metadata and filter on it at query time; delete for real when retention expires.
+
+== PII redaction at ingest
+
+Personal data in the corpus flows everywhere downstream: into embeddings, into prompts sent to a model provider, into
+answers, logs and caches. Redacting it *once*, at ingestion, is cheaper and safer than filtering every output. Presidio
+detects entities with a mix of named-entity recognition, regular expressions and checksums, and replaces them with typed
+placeholders, so the text stays readable and searchable ("contact `<PERSON>` at `<EMAIL_ADDRESS>`"):
+
+.docsassistant/ingest/redaction.py -- typed PII redaction (Python, Presidio 2.2.364)
+[source,python]
+----
+from langchain_core.documents import Document
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+
+analyzer = AnalyzerEngine()            # needs a spaCy model, e.g. en_core_web_lg, installed
+anonymizer = AnonymizerEngine()
+ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "IBAN_CODE", "CREDIT_CARD", "IP_ADDRESS"]
+
+
+def redact(doc: Document) -> Document:
+    findings = analyzer.analyze(text=doc.page_content, entities=ENTITIES, language="en", score_threshold=0.6)
+    result = anonymizer.anonymize(
+        text=doc.page_content,
+        analyzer_results=findings,
+        operators={"DEFAULT": OperatorConfig("replace")},     # default replacement is "<ENTITY_TYPE>"
+    )
+    counts: dict[str, int] = {}
+    for item in result.items:
+        counts[item.entity_type] = counts.get(item.entity_type, 0) + 1
+    return Document(page_content=result.text, metadata={**doc.metadata, "pii_redacted": counts})
+----
+
+Source: https://microsoft.github.io/presidio/analyzer/[Presidio -- Analyzer] and
+https://microsoft.github.io/presidio/anonymizer/[Presidio -- Anonymizer].
+
+Typed placeholders keep answers useful ("the owner of this service is `<PERSON>`") without leaking the value. When some
+users *are* entitled to see the value, do not redact the index; instead keep the entities and enforce access at query
+time, as described in xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]. Store the redaction
+counts, not the values, so that auditors can see what was removed.
+
+== Provenance hashes
+
+Every chunk should answer "where did this come from, and is it still what the source says?". DocsAssistant stores four
+provenance fields in chunk metadata:
+
+[cols="1,3", options="header"]
+|===
+| Field | Content
+
+| `source`
+| The stable source ID (`cms/42`, `git/docs/modules/ROOT/pages/ai/index.adoc`).
+
+| `source_hash`
+| SHA-256 of the original file bytes or row, so a reconciliation can detect a changed source without re-parsing it.
+
+| `content_hash`
+| SHA-256 of the chunk text after parsing and redaction, so unchanged chunks are not re-embedded.
+
+| `pipeline`
+| The parser, parser version, chunker settings and embedding model version, so a pipeline change can be targeted.
+|===
+
+The hashes also give tamper evidence: if a chunk's text no longer matches its `content_hash`, something wrote to the
+index outside the pipeline.
+
+== The Spring AI ETL pipeline
+
+Spring AI structures ingestion as *extract, transform, load*: a `DocumentReader` (a `Supplier<List<Document>>`), one or
+more `DocumentTransformer` instances (each a `Function<List<Document>, List<Document>>`) and a `DocumentWriter` (a
+`Consumer<List<Document>>`, which every `VectorStore` implements). The functional shapes make a pipeline a composition:
+
+.EtlPipeline.java -- read, split, enrich, write (Java, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.rag.ingest;
+
+import java.util.List;
+
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.document.DocumentReader;
+import org.springframework.ai.model.transformer.KeywordMetadataEnricher;
+import org.springframework.ai.reader.tika.TikaDocumentReader;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Service;
+
+@Service
+public class EtlPipeline {
+
+    private final VectorStore vectorStore;
+    private final KeywordMetadataEnricher keywords;
+    private final TokenTextSplitter splitter = TokenTextSplitter.builder().withChunkSize(512).build();
+
+    public EtlPipeline(VectorStore vectorStore, ChatModel chatModel) {
+        this.vectorStore = vectorStore;
+        this.keywords = KeywordMetadataEnricher.builder(chatModel).keywordCount(5).build();
+    }
+
+    public int ingest(Resource resource, String source, String acl) {
+        DocumentReader reader = new TikaDocumentReader(resource);                 // extract
+        List<Document> docs = reader.get().stream()
+                .map(d -> d.mutate().metadata("source", source).metadata("acl", acl).build())
+                .toList();
+        List<Document> chunks = keywords.apply(splitter.apply(docs));            // transform
+        vectorStore.accept(chunks);                                               // load
+        return chunks.size();
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html[Spring AI -- ETL Pipeline].
+
+The vector-store side of the ETL pipeline (writers, batching strategies, filter expressions) is on
+xref:database/vector-rag/integrating-with-spring-ai.adoc#spring-ai-etl[Integrating with Spring AI: ETL]. For large batch
+loads, run the pipeline from a Spring Batch job so that restarts, chunk-oriented processing and the job ledger come for
+free (see xref:backend/spring-batch/index.adoc[Spring Batch]).
+
+== The LangChain4j EmbeddingStoreIngestor
+
+LangChain4j's `EmbeddingStoreIngestor` runs a document transformer, a splitter, a segment transformer, the embedding
+model and the store write in one call. Removing the previous version of the source first with `removeAll(Filter)`
+makes the ingest idempotent per document:
+
+.Ingestion.java -- per-document replace with the ingestor (Java, LangChain4j 1.20.2)
+[source,java]
+----
+package com.example.docsassistant.l4j.ingest;
+
+import static dev.langchain4j.store.embedding.filter.MetadataFilterBuilder.metadataKey;
+
+import dev.langchain4j.data.document.Document;
+import dev.langchain4j.data.document.splitter.DocumentSplitters;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.embedding.EmbeddingModel;
+import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.EmbeddingStoreIngestor;
+import dev.langchain4j.store.embedding.IngestionResult;
+
+public class Ingestion {
+
+    private final EmbeddingStore<TextSegment> store;
+    private final EmbeddingStoreIngestor ingestor;
+
+    public Ingestion(EmbeddingStore<TextSegment> store, EmbeddingModel embeddingModel) {
+        this.store = store;
+        this.ingestor = EmbeddingStoreIngestor.builder()
+                .documentSplitter(DocumentSplitters.recursive(1500, 150))
+                .textSegmentTransformer(segment -> TextSegment.from(
+                        segment.metadata().getString("title") + "\n\n" + segment.text(),   // context header
+                        segment.metadata()))
+                .embeddingModel(embeddingModel)
+                .embeddingStore(store)
+                .build();
+    }
+
+    public IngestionResult replace(Document document, String source, String acl) {
+        document.metadata().put("source", source).put("acl", acl);
+        store.removeAll(metadataKey("source").isEqualTo(source));      // delete the previous version
+        return ingestor.ingest(document);
+    }
+
+    public void delete(String source) {
+        store.removeAll(metadataKey("source").isEqualTo(source));
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/tutorials/rag/[LangChain4j -- RAG] (Embedding Store Ingestor) and
+https://docs.langchain4j.dev/integrations/embedding-stores/pgvector/[LangChain4j -- PGVector].
+
+`removeAll(Filter)` is implemented by the pgvector, Neo4j and most other stores; check the store's page before relying
+on it. The segment transformer above prepends the document title to every segment before embedding, a cheap form of the
+contextual retrieval described in xref:ai/rag-systems/advanced-indexing-patterns.adoc[Advanced Indexing Patterns].
+
+Ingestion at scale (parallel frameworks, idempotent restartable jobs, stalled-document observability), freshness with
+CDC, and redaction and provenance hashing follow the concepts of Mendelevitch and Bao, _Hands-On RAG for Production_
+(Chapters 3 and 4), paraphrased; see the xref:ai/rag-systems/index.adoc#_bibliography[bibliography].
+
+== References
+
+* https://reference.langchain.com/python/langchain_classic/indexes/[LangChain reference -- langchain_classic.indexes]
+* https://docs.langchain.com/oss/python/integrations/vectorstores/pgvector[LangChain -- PGVector]
+* https://debezium.io/documentation/[Debezium documentation] and
+  https://debezium.io/documentation/reference/stable/connectors/postgresql.html[Debezium PostgreSQL connector]
+* https://kafka.apache.org/documentation/[Apache Kafka documentation]
+* https://docs.confluent.io/platform/current/clients/confluent-kafka-python/html/index.html[confluent-kafka Python client]
+* https://microsoft.github.io/presidio/[Presidio]
+* https://docs.spring.io/spring-ai/reference/api/etl-pipeline.html[Spring AI -- ETL Pipeline]
+* https://docs.spring.io/spring-ai/reference/api/vectordbs.html[Spring AI -- Vector Databases]
+* https://docs.spring.io/spring-kafka/reference/index.html[Spring for Apache Kafka]
+* https://docs.langchain4j.dev/tutorials/rag/[LangChain4j -- RAG]
