@@ -85,34 +85,34 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 1 — Scaffolding and landing page (Parallelizable: no — Tasks 2–4 edit shared files and Task 2 needs the partial and version facts from Task 1)
 
-- [ ] **Task 1. Verify the version baseline and create the disclaimer partial**
-  - [ ] Task 1.1. Verify against current official docs/registries and record with today's date: LangChain/langchain-classic/
+- [x] **Task 1. Verify the version baseline and create the disclaimer partial**
+  - [x] Task 1.1. Verify against current official docs/registries and record with today's date: LangChain/langchain-classic/
     langgraph/langchain-text-splitters, FastAPI + `EventSourceResponse`, Docling, Unstructured, Spring AI 2.0.x on Spring
     Boot 4.1.x, LangChain4j 1.20.x and `langchain4j-community-neo4j`, neo4j-graphrag, Neo4j calendar version,
     MCP spec revision used by this site (2026-07-28), Presidio, HHEM, RAGAS/DeepEval/Open RAG Eval. Also check whether
     `backend/oauth/*` exists in `modules/ROOT/pages/backend/`.
-  - [ ] Task 1.2. Create `modules/ROOT/partials/ai-rag-systems-disclaimer.adoc` containing only the single `[IMPORTANT]`
+  - [x] Task 1.2. Create `modules/ROOT/partials/ai-rag-systems-disclaimer.adoc` containing only the single `[IMPORTANT]`
     block: the house AI-assistance disclosure plus the pointer
     `xref:ai/rag-systems/index.adoc#_bibliography[bibliography]` (mirror `ai-spring-ai-disclaimer.adoc`).
-- [ ] **Task 2. Create `modules/ROOT/pages/ai/rag-systems/index.adoc`**
-  - [ ] Task 2.1. Header, intro with dated version baseline, the "what Vector Databases & RAG covers vs. this sub-section"
+- [x] **Task 2. Create `modules/ROOT/pages/ai/rag-systems/index.adoc`**
+  - [x] Task 2.1. Header, intro with dated version baseline, the "what Vector Databases & RAG covers vs. this sub-section"
     table, the reading path, the DocsAssistant production-service scenario, and a `== Version baseline` table.
-  - [ ] Task 2.2. Write `== Bibliography` from the issue: requester-provided books (full bibliographic data, publisher
+  - [x] Task 2.2. Write `== Bibliography` from the issue: requester-provided books (full bibliographic data, publisher
     page, official code repository each), official documentation, specifications and standards, papers and
     engineering articles; every source linked; close with the house-style note (books are consulted references, not the
     primary source of any example; official docs authoritative). Only real, resolvable URLs from the issue — verify
     each still resolves; no PDFs committed.
-  - [ ] Task 2.3. Note the outdated points in the books in prose (LangChain 1.x renames, LangChain4j 0.35 → 1.20, Spring AI
+  - [x] Task 2.3. Note the outdated points in the books in prose (LangChain 1.x renames, LangChain4j 0.35 → 1.20, Spring AI
     pre-1.0 → 2.0.1, Haystack 3.x, Streamlit-only UI layer).
-- [ ] **Task 3. Update `modules/ROOT/nav.adoc`**: add `*** xref:ai/rag-systems/index.adoc[RAG Systems in Production]` and
+- [x] **Task 3. Update `modules/ROOT/nav.adoc`**: add `*** xref:ai/rag-systems/index.adoc[RAG Systems in Production]` and
   a `****` child for each of the 21 other pages, grouped like the outline (Architecture, Ingestion, Retrieval,
   Conversation & answers, Exposing RAG, Knowledge graphs, Operations, Cheat Sheet (PDF) last), placed after the Spring AI
   block and before Git & GitHub.
-- [ ] **Task 4. Update the landing pages**
-  - [ ] Task 4.1. `modules/ROOT/pages/ai/index.adoc`: turn the "planned" bullet into an xref bullet with a one-paragraph
+- [x] **Task 4. Update the landing pages**
+  - [x] Task 4.1. `modules/ROOT/pages/ai/index.adoc`: turn the "planned" bullet into an xref bullet with a one-paragraph
     description; append RAG-systems terms to `:keywords:`; add `rag-systems` bibliography xrefs to the "Cited on" lists
     of the six books in `== Books used in this section` (add entries for books not yet listed there).
-  - [ ] Task 4.2. `modules/ROOT/pages/index.adoc`: append the same terms to `:keywords:` (do not touch the picker image).
+  - [x] Task 4.2. `modules/ROOT/pages/index.adoc`: append the same terms to `:keywords:` (do not touch the picker image).
 
 ### Group 2 — Build pages, part 1: architecture, ingestion, retrieval, conversation, answers, security (Parallelizable: yes — one new file per task; each task also creates its own figures; no shared files)
 
