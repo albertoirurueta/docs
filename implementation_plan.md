@@ -160,35 +160,35 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 3 — Build pages, part 2: exposure, knowledge graphs, operations (Parallelizable: yes — one new file per task, no shared files; tasks link to Group 2 page names, which are fixed by Task 3's nav)
 
-- [ ] **Task 16. `serving-rag-as-an-api.adoc`**: API contract (`question`, `conversationId`, `filters` → `answer`,
+- [x] **Task 16. `serving-rag-as-an-api.adoc`**: API contract (`question`, `conversationId`, `filters` → `answer`,
   `citations`, `usage`, `traceId`), OpenAPI definition, SSE (FastAPI `EventSourceResponse` + `astream`; Spring
   `Flux<ServerSentEvent>` via `ChatClient.stream()`; LangChain4j `TokenStream` → SSE), WebSocket variant, async ingestion
   endpoints with job status, idempotency keys, OAuth2/JWT, rate limiting, versioning, CORS, minimal browser widget consuming
   the stream; link `backend/springboot/rest-apis`, `backend/oauth/*` if present (Task 1.1); Conversational Channels named
   in prose only.
-- [ ] **Task 17. `rag-behind-mcp.adoc`**: expose the same retriever via MCP: `search_docs` tool with `outputSchema`,
+- [x] **Task 17. `rag-behind-mcp.adoc`**: expose the same retriever via MCP: `search_docs` tool with `outputSchema`,
   `docs://` resources, citation prompt, caller-identity → ACL mapping, consumption from Claude Code, Copilot and a LangGraph
   agent, Python MCP SDK and Spring AI server code, Neo4j MCP servers; link `ai/mcp/rag-over-mcp` and other `ai/mcp/*`
   pages for protocol depth without duplication.
-- [ ] **Task 18. `caching-latency-and-cost.adoc`**: response/retrieval/chunk/semantic caches, similarity thresholds,
+- [x] **Task 18. `caching-latency-and-cost.adoc`**: response/retrieval/chunk/semantic caches, similarity thresholds,
   event-driven invalidation (Kafka / Redis Pub/Sub), prompt caching, model cascades, per-request token cost accounting with
   MathJax; link `database/redis/use-cases-and-patterns`, `agent-memory-and-semantic-cache`.
-- [ ] **Task 19. `graphrag-and-knowledge-graph-construction.adoc`**: when KG-hybrid beats vector-only, Microsoft GraphRAG
+- [x] **Task 19. `graphrag-and-knowledge-graph-construction.adoc`**: when KG-hybrid beats vector-only, Microsoft GraphRAG
   local vs. global and cost, LLM extraction (neo4j-graphrag `SimpleKGPipeline`, LLM Graph Builder, LangChain
   `LLMGraphTransformer`), entity resolution, incremental updates (CDC → `MERGE`, tombstoning), Java Neo4j vector stores
   + Cypher; SVG `ai-rag-systems-kg-construction.svg`; link `database/neo4j/vector-search-and-genai`.
-- [ ] **Task 20. `text2cypher-and-graph-retrievers.adoc`**: `VectorCypherRetriever`, `Text2CypherRetriever`,
+- [x] **Task 20. `text2cypher-and-graph-retrievers.adoc`**: `VectorCypherRetriever`, `Text2CypherRetriever`,
   `HybridRetriever`, schema injection, few-shot examples, read-only execution and validation, LangChain4j community Neo4j
   text-to-Cypher retriever, `langchain-neo4j`.
-- [ ] **Task 21. `graph-powered-recommendations.adoc`**: LLM-summarised behaviour embeddings + GDS KNN/Louvain hybrid
+- [x] **Task 21. `graph-powered-recommendations.adoc`**: LLM-summarised behaviour embeddings + GDS KNN/Louvain hybrid
   recommendations updated to Spring AI 2.0 and LangChain4j 1.20 (from the Neo4j book's Ch. 8–10 concepts, paraphrased).
-- [ ] **Task 22. `evaluation-at-scale.adoc`**: synthetic test sets, reference-free metrics (UMBRELA, nuggets),
+- [x] **Task 22. `evaluation-at-scale.adoc`**: synthetic test sets, reference-free metrics (UMBRELA, nuggets),
   RAGAS/DeepEval/Open RAG Eval, CI regression gates for chunking/model/prompt changes, online sampled judging,
   champion/challenger A/B, feedback flywheel; MathJax for metrics; link `evaluating-rag-systems`; LLMOps named in prose.
-- [ ] **Task 23. `observability-and-tracing.adoc`**: spans for retrieve/rerank/generate/tool, OTel GenAI semantic
+- [x] **Task 23. `observability-and-tracing.adoc`**: spans for retrieve/rerank/generate/tool, OTel GenAI semantic
   conventions, metrics (TTFT, P95, tokens, empty-retrieval, citation and handoff rates), Langfuse/Phoenix/LangSmith, Spring AI
   Micrometer, LangChain4j listeners; link `ai/langchain/observability-with-langsmith`, `ai/spring-ai/observability`.
-- [ ] **Task 24. `deployment-patterns.adoc`**: containers, Cloud Run/ECS/AKS/Kubernetes, GPU inference services, secrets,
+- [x] **Task 24. `deployment-patterns.adoc`**: containers, Cloud Run/ECS/AKS/Kubernetes, GPU inference services, secrets,
   blue/green prompt and model rollouts, initial vs. incremental loads, DR/backups; link existing Docker, Azure and
   `ai/local-llms` pages (verify their paths first).
 
