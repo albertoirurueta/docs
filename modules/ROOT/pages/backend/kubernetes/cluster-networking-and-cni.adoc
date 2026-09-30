@@ -1,0 +1,276 @@
+= Cluster Networking, CNI and Service Mesh
+:description: The Kubernetes network model -- a routable IP per Pod with no NAT, Pod / Service / node CIDRs -- CNI plugins (Flannel, Calico, Cilium) and eBPF dataplanes, dual-stack clusters, ClusterIP allocation, and a service mesh layer on top (mTLS, traffic management, sidecar vs ambient, Istio, Linkerd).
+:keywords: Kubernetes networking, network model, routable IP per Pod, no NAT, Pod CIDR, Service CIDR, node CIDR, CNI, Container Network Interface, Flannel, Calico, Cilium, eBPF dataplane, VXLAN, BGP, dual-stack, IPv4 IPv6, ClusterIP allocation, service mesh, mTLS, traffic management, sidecar proxy, ambient mesh, Istio, Linkerd, Envoy, ztunnel
+
+include::partial$kubernetes-disclaimer.adoc[]
+
+Every page in this section so far has taken Pod-to-Pod and Pod-to-Service reachability for granted. This page is
+written against **Kubernetes 1.37** and opens up what makes that reachability true: the network model every other
+networking page (xref:backend/kubernetes/services.adoc[Services], xref:backend/kubernetes/dns-and-service-discovery.adoc[DNS
+and Service Discovery], xref:backend/kubernetes/ingress.adoc[Ingress], xref:backend/kubernetes/gateway-api.adoc[the
+Gateway API] and xref:backend/kubernetes/network-policies.adoc[Network Policies]) is built on top of, the CNI plugin
+that implements it, and -- as an optional layer above all of it -- a service mesh.
+
+== The network model
+
+Kubernetes defines a small set of rules that every network implementation must satisfy, and deliberately says
+nothing about how they are satisfied -- that is left to a pluggable CNI plugin, below. The rules themselves are
+simple to state and easy to underestimate:
+
+* *Every Pod gets its own routable IP address*, from the cluster's Pod network, and that address is unique
+  cluster-wide -- not just within a node.
+* *Pods can reach every other Pod's IP directly, with no NAT*, regardless of which node either one runs on. A Pod on
+  node A talks to a Pod on node B exactly as it would talk to a Pod on its own node: same IP, same port, no
+  address translation in between.
+* *Nodes can reach every Pod's IP*, again with no NAT, which is what lets the kubelet's own health checks and
+  `kubectl exec`/`logs`/`port-forward` work uniformly regardless of where a Pod lands.
+* *A Pod sees its own IP the same way everything else sees it.* A container never has to account for a NAT boundary
+  between what it thinks its address is and what the rest of the cluster sees.
+
+This is what xref:backend/kubernetes/pods.adoc[Pods] means when it says a Pod's network namespace gives it "its own
+IP and route into the cluster network": that route is only usable at all because the underlying network satisfies
+these four rules. Contrast this with Docker's default networking (see
+xref:backend/docker/networking.adoc[Docker Networking]), where a container's address is private to its host and
+reaching it from elsewhere requires NAT and published ports -- Kubernetes networking exists specifically to remove
+that boundary at cluster scale, so that a Service (xref:backend/kubernetes/services.adoc[Services]) can treat every
+backend Pod, on any node, as equally reachable.
+
+=== Three address ranges
+
+A cluster carves out three separate CIDR (Classless Inter-Domain Routing) ranges, each serving a different purpose,
+and confusing them is the most common source of "why can't this reach that" debugging:
+
+[cols="1,3",options="header"]
+|===
+| CIDR | What lives there
+
+| Node CIDR (cluster subnet)
+| The actual machines' addresses -- a node's `InternalIP`, assigned by the underlying infrastructure (a cloud VPC
+  subnet, or a kind/minikube Docker network) the same way any other host on that network is addressed. Kubernetes
+  does not manage this range; it only reads it.
+
+| Pod CIDR
+| The range Pod IPs are allocated from, set cluster-wide with `--cluster-cidr` (or, on a per-node basis, as each
+  Node object's `spec.podCIDR`, a slice the CNI plugin hands out to Pods scheduled on that node) -- for example
+  `10.244.0.0/16` split into a `/24` per node. Every Pod on every node draws its address from this one flat range,
+  which is what makes "no NAT" possible: nothing needs to distinguish "local subnet" from "remote subnet" the way a
+  home router would.
+
+| Service CIDR
+| A separate, virtual range (for example `10.96.0.0/12`) that `ClusterIP`s are allocated from -- see <<clusterip-allocation>>
+  below. Nothing actually lives at a ClusterIP the way a Pod lives at a Pod IP; kube-proxy (or an eBPF
+  equivalent) intercepts packets addressed to it and rewrites them to a real Pod IP in the Pod CIDR. `--service-cluster-ip-range`
+  sets it on `kube-apiserver`, and it must never overlap the Pod CIDR or the node CIDR.
+|===
+
+`kubectl cluster-info dump` and `kubectl get nodes -o jsonpath='{.items[*].spec.podCIDR}'` show the ranges a running
+cluster actually uses. Getting these three ranges to not overlap each other, and to not overlap whatever network the
+cluster's own hosts sit on, is one of the few genuinely manual steps left in
+xref:backend/kubernetes/cluster-setup-and-administration.adoc[Cluster Setup and Administration]'s kubeadm walkthrough.
+Source: https://kubernetes.io/docs/concepts/cluster-administration/networking/[Kubernetes Docs -- Cluster Networking].
+
+== CNI plugins
+
+Kubernetes itself implements none of the rules above -- it defines the *Container Network Interface (CNI)*, a small
+spec (a plugin binary, invoked by the kubelet with a JSON network configuration, that must attach or detach a
+container's network namespace) that any networking implementation can satisfy. `kind` installs a minimal one,
+`kindnet`, automatically (see xref:backend/kubernetes/introduction-and-architecture.adoc[Introduction and
+Architecture]); a production cluster chooses one deliberately:
+
+[cols="1,3,1",options="header"]
+|===
+| Plugin | Approach | Dataplane
+
+| Flannel
+| The simplest option: a flat overlay network, most commonly VXLAN-encapsulating Pod traffic between nodes. No
+  NetworkPolicy enforcement on its own (it is usually paired with Calico's policy engine, "Canal", for that).
+| iptables
+
+| Calico
+| Routes Pod traffic natively with BGP (no encapsulation, when the underlying network permits it) or falls back to
+  IP-in-IP/VXLAN where it does not. Enforces `NetworkPolicy` (and its own richer `CalicoNetworkPolicy` CRD) natively.
+| iptables or eBPF (selectable)
+
+| Cilium
+| Built around eBPF from the ground up rather than iptables rules: Pod routing, `NetworkPolicy` and Service load
+  balancing are all implemented as eBPF programs attached to kernel hooks, which scales far better than iptables'
+  linear rule chains on clusters with many Services. Also offers `kube-proxy` replacement (see below), Hubble for
+  network observability, and its own eBPF-based service mesh mode (<<service-mesh>>).
+| eBPF
+|===
+
+*eBPF dataplanes* in general (Cilium's being the most widely deployed) replace both the CNI plugin's own packet
+forwarding and kube-proxy's Service load balancing with programs that run inside the kernel, attached to network
+hooks, instead of the traditional iptables/nftables rule chains kube-proxy programs (see
+xref:backend/kubernetes/services.adoc[Services]). The practical difference shows up at scale: an iptables chain that
+must be walked linearly for every packet gets slower as the number of Services grows, while an eBPF hash-map lookup
+does not. `kube-proxy` itself can be run in `ebpf`-replacement mode alongside a CNI plugin that supports it (Cilium's
+"kube-proxy replacement" is the most common), or kube-proxy can be disabled entirely and its job taken over by the
+CNI plugin's own eBPF programs. Source:
+https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/[Kubernetes Docs -- Network
+Plugins].
+
+Only one CNI plugin runs per cluster (Calico's "Canal" bundling is the one common exception, layering Flannel's
+dataplane with Calico's policy engine). Switching plugins on a live cluster is a disruptive, node-by-node operation,
+which is why it is worth deciding deliberately during
+xref:backend/kubernetes/cluster-setup-and-administration.adoc[cluster setup] rather than after Pods are already
+scheduled.
+
+== Dual-stack clusters
+
+A *dual-stack* cluster assigns every Pod and Service both an IPv4 and an IPv6 address, rather than one or the other.
+Enabling it means the CNI plugin supports dual-stack (not every plugin's every mode does -- verify against the
+chosen plugin's own docs before relying on it) and giving `kube-apiserver`, `kube-controller-manager` and
+`kube-proxy` two comma-separated CIDRs each, one per address family:
+
+[source,shell]
+----
+--service-cluster-ip-range=10.96.0.0/12,fd00:96::/112
+--cluster-cidr=10.244.0.0/16,fd00:244::/56
+--node-cidr-mask-size-ipv4=24
+--node-cidr-mask-size-ipv6=64
+----
+
+A dual-stack Service's `spec.ipFamilyPolicy` controls what it actually gets:
+
+[cols="1,3",options="header"]
+|===
+| `ipFamilyPolicy` | Result
+
+| `SingleStack` (default)
+| One ClusterIP, in the cluster's first configured family.
+
+| `PreferDualStack`
+| Two ClusterIPs (one per family) on a dual-stack cluster; silently falls back to `SingleStack` on a single-stack
+  one, which makes it the safe default for a manifest that must run on either.
+
+| `RequireDualStack`
+| Two ClusterIPs, and the Service creation fails outright if the cluster is not dual-stack.
+|===
+
+`spec.ipFamilies` (an ordered list, e.g. `["IPv4", "IPv6"]`) picks which family is primary when a Service has both --
+primarily relevant for `.status.loadBalancer` behaviour and for clients that only try the first address a DNS lookup
+returns. *Bookshelf*'s own manifests stay single-stack (IPv4) throughout this section for simplicity; a production
+cluster that must support IPv6-only clients, or that is migrating off IPv4 address exhaustion, is the usual reason
+to turn dual-stack on. Source:
+https://kubernetes.io/docs/concepts/services-networking/dual-stack/[Kubernetes Docs -- IPv4/IPv6 dual-stack].
+
+== ClusterIP allocation
+
+[[clusterip-allocation]]
+Every `ClusterIP` Service (see xref:backend/kubernetes/services.adoc[Services]) needs a unique virtual IP from the
+Service CIDR, and `kube-apiserver` is what hands one out -- on `Service` creation, unless `spec.clusterIP` requests a
+specific address, in which case the API server allocates that exact one or rejects the request if it is already
+taken or outside the range. Two mechanisms exist:
+
+* The classic in-memory bitmap allocator, one per `kube-apiserver` replica, kept consistent only by all replicas
+  agreeing on the same static Service CIDR.
+* The newer, GA-since-1.31 *allocator backed by `IPAddress` and `ServiceCIDR` API objects*: each allocated ClusterIP
+  becomes its own cluster-scoped `IPAddress` object (`kubectl get ipaddresses` lists every one currently in use),
+  and the Service CIDR itself becomes a `ServiceCIDR` object that can be *resized*, or a second one added, without
+  restarting `kube-apiserver` -- something the static `--service-cluster-ip-range` flag could never do while the
+  cluster was live. `kubectl get servicecidrs` shows the ranges in effect and how many addresses each has
+  allocated.
+
+A fixed, small slice of the Service CIDR (by default the first 16 addresses of the primary range) is set aside for
+addresses an operator explicitly requests via `spec.clusterIP`, so a handful of well-known Services (a cluster's own
+DNS Service is the canonical example) can keep a stable, human-chosen address across cluster rebuilds, while the
+allocator hands out the rest dynamically. Source:
+https://kubernetes.io/docs/concepts/services-networking/cluster-ip-allocation/[Kubernetes Docs -- Service ClusterIP
+allocation].
+
+[[pod-networking]]
+image::kubernetes-pod-networking.svg[Pod-to-Pod traffic across two nodes over the CNI network with no NAT,width=760]
+
+== Service mesh
+
+[[service-mesh]]
+Everything above gets a packet from one Pod IP to another. A *service mesh* is an optional layer on top that
+observes and controls the traffic once it arrives, transparently to the application, by intercepting every
+in-cluster call rather than requiring the application to link a networking library:
+
+[cols="1,3",options="header"]
+|===
+| Capability | What the mesh adds
+
+| mTLS (mutual TLS)
+| Every Pod-to-Pod connection inside the mesh is automatically wrapped in mutual TLS -- each side proves its
+  identity with a short-lived certificate the mesh's own certificate authority issues and rotates -- with no change
+  to application code. This turns "the cluster network is trusted" into "every call is authenticated and
+  encrypted", which matters once xref:backend/kubernetes/network-policies.adoc[Network Policies] alone (IP- and
+  port-based) stop being enough of a security boundary.
+
+| Traffic management
+| Fine-grained routing decisions the Gateway API's own resources do not reach into the mesh for: weighted traffic
+  splitting between two versions of the same Service for a canary (complementing
+  xref:backend/kubernetes/gateway-api.adoc[the Gateway API]'s edge-facing canary, but applied to internal
+  service-to-service calls), automatic retries and per-call timeouts, and circuit breaking that stops sending
+  traffic to a backend that is failing before its readiness probe would notice.
+
+| Observability
+| Uniform, per-request metrics, distributed traces and access logs for *every* service-to-service call, collected
+  by the mesh itself rather than instrumented individually into each Bookshelf service.
+|===
+
+=== Sidecar vs ambient
+
+Two architectures deliver these capabilities, and they trade off differently:
+
+[cols="1,3",options="header"]
+|===
+| Model | How it intercepts traffic
+
+| Sidecar
+| A proxy container (Envoy, in Istio's case) is injected into *every* mesh-enrolled Pod as a native sidecar (see
+  xref:backend/kubernetes/pods.adoc[Pods]), and every inbound/outbound packet is transparently redirected through
+  it. Mature and the most feature-complete option, at the cost of one extra container -- and its own CPU and memory
+  footprint -- per Pod, multiplied across every replica.
+
+| Ambient
+| Mesh functionality moves out of the Pod entirely: a per-node `ztunnel` proxy (running once per node, not once per
+  Pod) handles mTLS and L4 routing for every Pod on that node, and an optional per-namespace waypoint proxy adds L7
+  policy only where it is actually needed. Removes the per-Pod sidecar overhead, at the cost of being the newer,
+  less battle-tested of the two paths.
+|===
+
+Istio (the most widely adopted mesh) supports both models side by side -- a namespace can run sidecar mode, ambient
+mode, or opt out of the mesh entirely, migrated one namespace at a time. Linkerd, by contrast, is sidecar-only by
+design, choosing a much smaller, purpose-built proxy (written in Rust) over Envoy's larger feature surface in
+exchange for a lighter footprint per sidecar. Neither model is specific to any one CNI plugin; a mesh runs on top of
+whichever CNI plugin the cluster already uses. Source: https://istio.io/latest/docs/concepts/security/[Istio Docs --
+Security] and https://istio.io/latest/docs/ops/deployment/architecture/[Istio Docs -- Architecture].
+
+=== Where a service mesh fits next to Network Policies and the Gateway API
+
+A service mesh is not a replacement for xref:backend/kubernetes/network-policies.adoc[Network Policies] (which
+control *whether* a connection is allowed to happen at all, at L3/L4) or xref:backend/kubernetes/gateway-api.adoc[the
+Gateway API] (which routes traffic *into* the cluster from outside). The three compose: a `NetworkPolicy` still
+decides which Pods may even attempt to connect, a Gateway still terminates external traffic at the cluster edge, and
+the mesh adds authenticated encryption and fine-grained control to whatever traffic those two already allow through
+-- most clusters running a mesh keep all three layers active rather than treating the mesh as a substitute for
+either. On AKS, the managed *Istio-based service mesh add-on* (see
+xref:cloud/azure/aks-microservices.adoc[Deploying Microservices to AKS]'s "Service-to-service traffic and the Istio
+service mesh add-on" section) runs Istio's control plane and sidecar injection as a supported cluster feature,
+without operating Istio's upgrade cadence by hand.
+
+For *Bookshelf*, adopting a mesh is worth the operational cost only once `catalog-api`, `reviews-api` and `web` grow
+past the two or three services this section models -- for the scenario as written, plain `NetworkPolicy` plus
+Gateway API TLS termination covers the same "who can reach whom, encrypted" ground with far less to run. Source:
+https://linkerd.io/2/reference/architecture/[Linkerd Docs -- Architecture].
+
+== References
+
+* https://kubernetes.io/docs/concepts/cluster-administration/networking/[Kubernetes Docs -- Cluster Networking]
+* https://kubernetes.io/docs/concepts/services-networking/dual-stack/[Kubernetes Docs -- IPv4/IPv6 dual-stack]
+* https://kubernetes.io/docs/concepts/services-networking/cluster-ip-allocation/[Kubernetes Docs -- Service
+  ClusterIP allocation]
+* https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/network-plugins/[Kubernetes Docs --
+  Network Plugins]
+* https://www.cni.dev/docs/spec/[CNI Spec]
+* https://www.tigera.io/project-calico/[Calico]
+* https://cilium.io/[Cilium]
+* https://github.com/flannel-io/flannel[Flannel]
+* https://istio.io/latest/docs/concepts/security/[Istio Docs -- Security]
+* https://istio.io/latest/docs/ops/deployment/architecture/[Istio Docs -- Architecture]
+* https://linkerd.io/2/reference/architecture/[Linkerd Docs -- Architecture]
+* https://learn.microsoft.com/azure/aks/istio-about[Microsoft Learn -- Istio-based service mesh add-on for AKS]
