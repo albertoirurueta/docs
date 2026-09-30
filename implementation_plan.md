@@ -216,12 +216,12 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 6 — Sub-section validation (Parallelizable: no — checks depend on all previous groups)
 
-- [ ] **Task 31. Static checks**: (a) no admonition blocks under `pages/ai/rag-systems/` and the partial contains only the
+- [x] **Task 31. Static checks**: (a) no admonition blocks under `pages/ai/rag-systems/` and the partial contains only the
   disclosure + bibliography pointer; (b) every page has `:description:`, `:keywords:`, the include, versions in its intro,
   `== References`; (c) every code block is followed by an official-docs link; (d) every source in the issue's bibliography
   is linked in `index.adoc`; (e) no `xref:` to non-existent pages (grep and check); (f) SVGs named `ai-rag-systems-*.svg`
   and readable in light/dark; (g) no book text/PDFs committed; (h) `.secrets` scan with the `iru-check-security` skill.
-- [ ] **Task 32. Run `npm run validate:mermaid` and `npx antora antora-playbook.yml`** (delegate via the
+- [x] **Task 32. Run `npm run validate:mermaid` and `npx antora antora-playbook.yml`** (delegate via the
   `iru-gate-runner` agent, or `/iru-build-docs`); fix every xref, AsciiDoc or Mermaid error or warning introduced by this
   sub-section and confirm the site renders the new pages (nav, images, PDF link, MathJax).
 
