@@ -116,44 +116,44 @@ The final integration PR (`feature/213-ai-section` → `main`, owned by #213) cl
 
 ### Group 2 — Build pages, part 1: architecture, ingestion, retrieval, conversation, answers, security (Parallelizable: yes — one new file per task; each task also creates its own figures; no shared files)
 
-- [ ] **Task 5. `production-rag-architecture.adoc`**: reference microservice architecture, stateless orchestrator with
+- [x] **Task 5. `production-rag-architecture.adoc`**: reference microservice architecture, stateless orchestrator with
   fan-out/gather, independent scaling tiers, latency budget with MathJax
   \( T \approx T_{retr} + T_{rerank} + T_{TTFT} + n_{out}\,T_{TPOT} \), DIY vs. RAG platforms, TCO, POC → production plan;
   SVG `ai-rag-systems-reference-architecture.svg`. Link `database/vector-rag/production-considerations.adoc`.
-- [ ] **Task 6. `document-parsing.adoc`**: PDF internals, parser ladder (pypdf/PyMuPDF → Docling/Unstructured → cloud OCR →
+- [x] **Task 6. `document-parsing.adoc`**: PDF internals, parser ladder (pypdf/PyMuPDF → Docling/Unstructured → cloud OCR →
   VLM fallback, cheapest first), structure as metadata, Tesseract OCR, Spring AI `TikaDocumentReader` /
   `PagePdfDocumentReader`, LangChain4j Tika/PDF parsers; Python + two Java stacks; link `document-ingestion-and-chunking`.
-- [ ] **Task 7. `multimodal-rag.adoc`**: tables (detect → extract → normalise → stitch), images (VLM summaries vs.
+- [x] **Task 7. `multimodal-rag.adoc`**: tables (detect → extract → normalise → stitch), images (VLM summaries vs.
   CLIP/SigLIP/ColPali embeddings), audio/video via transcription, visual citations, multimodal hallucination evaluation;
   Mermaid multimodal ingestion flow; three stacks where APIs exist (say so in prose where one stack lacks support).
-- [ ] **Task 8. `ingestion-pipelines-and-freshness.adoc`**: batch vs. streaming, idempotent restartable jobs, content
+- [x] **Task 8. `ingestion-pipelines-and-freshness.adoc`**: batch vs. streaming, idempotent restartable jobs, content
   hashes, CDC (Debezium → Kafka) re-indexing, deletes/tombstones, Presidio PII redaction, provenance hashes, Spring AI ETL
   (`DocumentReader` → `DocumentTransformer` → `DocumentWriter`), LangChain `RecordManager`/`index()` (`langchain-classic`),
   LangChain4j `EmbeddingStoreIngestor`; link `backend/messaging/*`.
-- [ ] **Task 9. `query-understanding-and-routing.adoc`**: rewriting/condensation, self-query filter extraction,
+- [x] **Task 9. `query-understanding-and-routing.adoc`**: rewriting/condensation, self-query filter extraction,
   decomposition, routing across vector/SQL/graph/tools (LLM and semantic routers), text-to-SQL with read-only safety and
   validation, Spring AI `RewriteQueryTransformer`/`MultiQueryExpander`/`QueryRouter`-style modular RAG, LangChain4j
   `QueryTransformer`/`QueryRouter`; Mermaid router diagram; link `retrieval-strategies`, `metadata-filtering`.
-- [ ] **Task 10. `advanced-indexing-patterns.adoc`**: hypothetical-question indexing, proposition/agentic chunking,
+- [x] **Task 10. `advanced-indexing-patterns.adoc`**: hypothetical-question indexing, proposition/agentic chunking,
   auto-merging parent/child, sentence-window, multi-vector, RAPTOR, contextual retrieval, late chunking; state which
   patterns are current in LangChain 1.x vs. `langchain-classic`; link vector-rag chunking pages.
-- [ ] **Task 11. `conversational-rag-and-memory.adoc`**: history-aware condensation, window vs. summary vs. long-term
+- [x] **Task 11. `conversational-rag-and-memory.adoc`**: history-aware condensation, window vs. summary vs. long-term
   memory, persistence (LangGraph Postgres checkpointer + store; Spring AI `MessageWindowChatMemory` +
   `JdbcChatMemoryRepository` with conversation ID from the authenticated user; LangChain4j `ChatMemoryProvider` +
   persistent `ChatMemoryStore`), multi-device sessions, retention/GDPR deletion, memory poisoning; Mermaid multi-turn
   sequence diagram; link `agent-memory-and-semantic-cache`, `ai/langchain/short-term-memory-and-checkpointers`,
   `ai/spring-ai/chat-memory*`.
-- [ ] **Task 12. `citations-and-grounding.adoc`**: chunk IDs/source metadata end-to-end, inline citation prompting,
+- [x] **Task 12. `citations-and-grounding.adoc`**: chunk IDs/source metadata end-to-end, inline citation prompting,
   structured `answer` + `citations[]`, citation verification, passage highlighting, UX rules (progress explanation,
   source control, feedback capture); three stacks; link `prompt-augmentation-and-generation`.
-- [ ] **Task 13. `hallucination-detection-and-correction.adoc`**: RAG vs. LLM hallucination, faithfulness by claim
+- [x] **Task 13. `hallucination-detection-and-correction.adoc`**: RAG vs. LLM hallucination, faithfulness by claim
   decomposition, LLM-as-judge vs. HHEM, blocking vs. async checks, regenerate/abstain, Spring AI `FactCheckingEvaluator` at
   runtime; MathJax for faithfulness score; link `ai/llm-foundations/hallucinations-and-limitations`.
-- [ ] **Task 14. `guardrails-and-prompt-injection.adoc`**: input/output guardrails (Llama Guard, ShieldGemma), indirect
+- [x] **Task 14. `guardrails-and-prompt-injection.adoc`**: input/output guardrails (Llama Guard, ShieldGemma), indirect
   injection through ingested documents, sanitising/delimiting context, tool allow-lists, LangChain guardrail middleware,
   Spring AI `SafeGuardAdvisor`, LangChain4j input/output guardrails; the AI Security sub-section named in prose only
   (does not exist yet); link `ai/langchain/guardrails-and-security`, `ai/spring-ai/security-and-guardrails`.
-- [ ] **Task 15. `access-control-and-privacy.adoc`**: document ACLs as metadata filters derived from caller identity
+- [x] **Task 15. `access-control-and-privacy.adoc`**: document ACLs as metadata filters derived from caller identity
   (never from the prompt), per-tenant indexes vs. shared-index filters, filter APIs (LangChain retriever `filter`, Spring
   AI `FILTER_EXPRESSION`, LangChain4j `Filter`), entity-aware redaction, encryption, audit trails, data residency and on-prem
   models; SVG `ai-rag-systems-identity-to-filter.svg`.
