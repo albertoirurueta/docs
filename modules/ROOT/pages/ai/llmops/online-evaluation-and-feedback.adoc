@@ -1,0 +1,588 @@
+= Online Evaluation and Feedback
+:description: Evaluating the DocsAssistant on live traffic -- asynchronous sampled judging with scores attached to traces, how many samples are enough, explicit and implicit feedback signals, selection and position biases and degenerate feedback loops, the evaluation flywheel that turns production failures into golden-set cases, and Bayesian bandits with Thompson sampling for choosing between prompt or model variants.
+:keywords: online evaluation, sampled judging, llm-as-a-judge, openevals, langfuse scores, create_score, user feedback, thumbs up, implicit feedback, regeneration rate, copy rate, selection bias, position bias, inverse propensity weighting, feedback loop, evaluation flywheel, golden set, multi-armed bandit, thompson sampling, beta distribution, regret, micrometer, pii, docsassistant
+:stem: latexmath
+
+include::partial$ai-llmops-disclaimer.adoc[]
+
+Written on 2026-10-01 against Langfuse Python SDK 4.16.0 (platform 4.49.0), `openevals` 0.2.0, Python 3.12 with NumPy,
+Spring AI 2.0.1 on Spring Boot 4.1.x with Java 21 and Micrometer; the full list is the
+xref:ai/llmops/index.adoc#_version_baseline[version baseline] on the landing page. The Langfuse scoring calls and the
+`openevals` judge were documented from the official documentation and README only and were not run against a live Langfuse
+instance or a judge model from this repository; the sampling, weighting and Thompson sampling code uses only NumPy and the
+standard library and is a self-contained sketch whose numbers are illustrative, not measurements. No vendor prices or
+benchmark figures are quoted.
+
+Offline evaluation (see xref:ai/llmops/evaluation-in-ci.adoc[Evaluation in CI]) answers "did this change make the golden set
+worse?". It cannot answer "is the answer quality of real traffic still acceptable?", because the golden set is a frozen
+sample of yesterday's questions. *Online evaluation* closes that gap by scoring a small fraction of live answers, and by
+collecting what users do with them. This page covers the four pieces and how they feed each other: sampled judging, feedback
+signals, the biases that make feedback misleading, and the flywheel that sends the interesting cases back into the golden
+set. It ends with Bayesian bandits, a principled way to compare prompt or model variants while serving traffic. The concepts
+of feedback as a noisy but immediate signal and of production data as the source of new evaluation cases are paraphrased from
+Huyen's _AI Engineering_ and Aryan's _LLMOps_ (see the xref:ai/llmops/index.adoc#_bibliography[bibliography]).
+
+== Online and offline evaluation compared
+
+[cols="2,3,3", options="header"]
+|===
+| Aspect | Offline (golden set) | Online (live traffic)
+
+| Inputs
+| Curated, versioned, reviewed by humans.
+| Whatever users actually ask, including questions nobody anticipated and adversarial input.
+
+| Reference answers
+| Available for many cases, so reference-based metrics work.
+| Usually absent, so reference-free judges and user signals are the only options.
+
+| When it runs
+| Before release, in CI.
+| After release, continuously, off the request path.
+
+| What it catches
+| Regressions caused by a change you made.
+| Drift, vendor model updates, new question types, and failures your set never covered.
+
+| Cost and risk
+| Bounded by the size of the set.
+| Proportional to the sampling rate; it handles real user text, so it carries privacy duties.
+|===
+
+Neither replaces the other. Offline gates keep releases safe; online evaluation keeps them honest after release and supplies
+the cases that the offline set needs next. The pages on
+xref:ai/llmops/drift-and-regression-monitoring.adoc[Drift and Regression Monitoring] consume the scores produced here.
+
+== Asynchronous sampled judging
+
+A judge is an LLM call, so it adds latency and cost. Two design rules follow:
+
+. *Never judge on the request path.* The user's answer is already streamed when the judge starts. The judge runs from a queue,
+  a background task or a scheduled batch, reading the stored trace.
+. *Sample, do not judge everything.* Choose a rate, usually a few percent of traffic, and oversample the slices where failures
+  are likely: answers with no citation, low retrieval scores, thumbs-down, long conversations, new tenants.
+
+The pipeline for the DocsAssistant is:
+
+[mermaid]
+....
+flowchart LR
+  U[User question] --> A[DocsAssistant ask]
+  A --> T[(Trace store<br/>Langfuse)]
+  A --> R[Answer streamed to user]
+  T --> S{Sampler}
+  S -->|random + stratified| Q[Judge queue]
+  Q --> J[Judge worker]
+  J -->|score on trace| T
+  R --> F[Feedback widget / implicit events]
+  F -->|score on trace| T
+  T --> G[Review queue]
+  G -->|labelled failures| H[Golden set]
+....
+
+=== How many samples
+
+Suppose the quantity of interest is the proportion latexmath:[p] of answers a judge rates as faithful. With latexmath:[n]
+independent sampled answers, the normal approximation to the binomial gives a confidence interval whose half-width is
+
+[stem]
+++++
+e = z_{1-\alpha/2}\sqrt{\frac{\hat p(1-\hat p)}{n}}
+++++
+
+Solving for the number of samples needed to estimate latexmath:[p] within an error latexmath:[e] gives
+
+[stem]
+++++
+n \ge \frac{z_{1-\alpha/2}^{2}\,\hat p(1-\hat p)}{e^{2}}
+++++
+
+The worst case is latexmath:[\hat p = 0.5]; with latexmath:[z = 1.96] (95 percent) and latexmath:[e = 0.03] it gives about
+1,070 judged answers per measurement window per slice. The consequence for sampling is arithmetic, not taste: the daily
+sampling rate is that number divided by the daily traffic of the slice, and a small tenant needs a higher rate than a large
+one to reach the same precision. Because the judge itself is imperfect, treat the interval as a lower bound on the
+uncertainty and calibrate the judge against human labels as described in
+xref:ai/llmops/llm-as-a-judge.adoc[LLM-as-a-Judge].
+
+=== A sampler
+
+Deterministic sampling by hashing the trace id keeps the choice reproducible and makes a retry sample the same traces.
+
+.sampler.py: stratified, reproducible sampling of traces for judging
+[source,python]
+----
+import hashlib
+
+BASE_RATE = 0.03  # share of ordinary traffic that is judged
+
+
+def _bucket(trace_id: str) -> float:
+    """Map a trace id to a stable number in [0, 1)."""
+    digest = hashlib.sha256(trace_id.encode()).digest()
+    return int.from_bytes(digest[:8], "big") / 2**64
+
+
+def sampling_rate(trace: dict) -> float:
+    """Oversample slices where failures are more likely.
+
+    Checks run from the highest rate down, so a trace that matches several
+    slices gets the highest rate among them.
+    """
+    if trace.get("user_feedback") == "down":
+        return 1.0        # always look at explicit complaints
+    if not trace.get("citations"):
+        return 0.5        # an answer without a citation is suspicious
+    if trace.get("top_retrieval_score", 1.0) < 0.35:
+        return 0.25       # weak retrieval
+    return BASE_RATE
+
+
+def should_judge(trace: dict) -> tuple[bool, float]:
+    rate = sampling_rate(trace)
+    return _bucket(trace["trace_id"]) < rate, rate
+----
+
+Source: the hashing uses the Python standard library, see https://docs.python.org/3/library/hashlib.html[hashlib: Secure hashes and message digests]; the sampling policy itself is a convention of this guide.
+
+The function returns the rate it used. Store it with the score: when you later compute an overall quality estimate from a
+stratified sample, each judged trace must be weighted by latexmath:[1/\pi_i], where latexmath:[\pi_i] is its inclusion
+probability, otherwise the oversampled suspicious slices make quality look worse than it is. This is the Horvitz-Thompson
+estimator:
+
+[stem]
+++++
+\hat{\mu} = \frac{1}{N}\sum_{i \in S} \frac{y_i}{\pi_i}
+++++
+
+where latexmath:[S] is the sampled set, latexmath:[N] the total number of traces in the window, and latexmath:[y_i] the judge
+score. The thresholds in the sampler are placeholders to tune against your own traffic.
+
+=== The judge worker and attaching scores
+
+The worker reads the trace, calls a judge, and writes the result back as a *score* on the same trace, so that dashboards,
+filters and the review queue all see it. `openevals` provides `create_llm_as_judge`, which takes a prompt and a model and
+returns an evaluator function; the library ships prebuilt prompts and the prompt may also be your own f-string with extra
+variables such as `context`.
+
+.judge_worker.py: judging a sampled trace and writing the score to Langfuse
+[source,python]
+----
+from langfuse import get_client
+from openevals.llm import create_llm_as_judge
+
+FAITHFULNESS_PROMPT = """
+You are checking a documentation assistant's answer against the passages it was given.
+
+<context>
+{context}
+</context>
+
+<question>
+{inputs}
+</question>
+
+<answer>
+{outputs}
+</answer>
+
+Is every claim in the answer supported by the context? Reply with a score of true or false and a one-sentence reason.
+"""
+
+faithfulness = create_llm_as_judge(
+    prompt=FAITHFULNESS_PROMPT,
+    model="openai:<judge-model-id>",  # a provider:model string; use a different model family than the one that answered
+)
+
+langfuse = get_client()
+
+
+def judge_trace(trace: dict, sampling_probability: float) -> None:
+    result = faithfulness(
+        inputs=trace["question"],
+        outputs=trace["answer"],
+        context="\n\n".join(trace["retrieved_passages"]),
+    )
+    langfuse.create_score(
+        name="online_faithfulness",
+        value=1.0 if result["score"] else 0.0,
+        trace_id=trace["trace_id"],
+        data_type="BOOLEAN",
+        comment=f"p={sampling_probability:.3f}; {result.get('comment', '')}",
+    )
+----
+
+The `openevals` pattern is documented in the https://github.com/langchain-ai/openevals[`openevals` README], and the scoring
+call in the https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk[Langfuse documentation on scores via the
+SDK], which lists `create_score` with the `name`, `value`, `trace_id`, `data_type` and `comment` parameters and describes
+boolean scores as 0 or 1. The model string is deliberately a placeholder: pin the real judge version, because an unpinned
+judge changes your metric when the vendor updates it (the same reason pages like
+xref:ai/llmops/drift-and-regression-monitoring.adoc[Drift and Regression Monitoring] pin and re-run).
+
+Langfuse can also run a judge for you as a managed evaluator over a sampled share of traces; check the current evaluator
+documentation if you prefer that to running your own worker. LangSmith has an equivalent online evaluator feature, covered in
+xref:ai/llmops/observability-platforms.adoc[Observability Platforms]. A worker you own is more work, but it lets you choose
+the sampler, keep the judge prompt in version control, and apply the redaction below.
+
+=== What the judge sees
+
+A sampled trace contains the question, the retrieved passages and the answer, which for a support or documentation tool can
+include names, email addresses, account identifiers and pasted logs. Before the trace reaches the judge provider, and before
+it is stored for review, apply the redaction used elsewhere in the pipeline (see
+xref:ai/llmops/data-operations.adoc[Data Operations]), keep retention short for sampled traces, and restrict who can open
+the review queue. If the judge is an external API, the sampled text leaves your boundary: that is a data-processing decision,
+not an implementation detail. The testing of whether a trace could leak other users' data, and the regulatory side of
+retaining conversation content, belong to the planned AI Security & Responsible AI sub-section.
+
+== Feedback signals
+
+Judges estimate quality; users are the ground truth for whether the answer helped. Signals come in two kinds.
+
+=== Explicit feedback
+
+Explicit feedback is something the user chose to give: a thumbs up or down, a star rating, a free-text comment, a "report an
+inaccurate answer" form. It is rare (most users never click), but each item is information-rich, especially a comment. Good
+widget design for the DocsAssistant:
+
+* One click for the rating, an optional text box after it, and a short list of reasons for a thumbs-down (wrong, outdated,
+  did not answer, too long, missing link).
+* Attach the rating to the *trace id* of the answer shown, not to the conversation, so you can find exactly what was
+  retrieved and generated.
+* Record the prompt, model and index versions on the trace so a rating can be traced to a release.
+
+.record_feedback.py: attaching a user rating to the answer's trace
+[source,python]
+----
+from langfuse import get_client
+
+langfuse = get_client()
+
+
+def record_rating(trace_id: str, thumbs_up: bool, reason: str | None, comment: str | None) -> None:
+    langfuse.create_score(
+        name="user_rating",
+        value=1.0 if thumbs_up else 0.0,
+        trace_id=trace_id,
+        data_type="BOOLEAN",
+        comment=comment,
+    )
+    if reason:
+        langfuse.create_score(
+            name="user_rating_reason",
+            value=reason,            # categorical: "wrong", "outdated", "did_not_answer", ...
+            trace_id=trace_id,
+            data_type="CATEGORICAL",
+        )
+----
+
+The calls follow the same Langfuse
+https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk[scores via the SDK] page, which lists boolean,
+categorical, numeric and text score types. Free-text comments are user-written and may contain personal data or pasted
+secrets; treat them with the same redaction and retention as the traces.
+
+The same feedback can be counted as a metric for dashboards and alerts. In a Spring AI service, Micrometer is the natural
+channel (see xref:ai/spring-ai/observability.adoc[Spring AI Observability]):
+
+.FeedbackMetrics.java: a Micrometer counter per rating and prompt version
+[source,java]
+----
+import io.micrometer.core.instrument.MeterRegistry;
+import org.springframework.stereotype.Component;
+
+@Component
+public class FeedbackMetrics {
+
+    private final MeterRegistry registry;
+
+    public FeedbackMetrics(MeterRegistry registry) {
+        this.registry = registry;
+    }
+
+    public void record(boolean thumbsUp, String promptVersion, String channel) {
+        registry.counter("docsassistant.feedback",
+                "rating", thumbsUp ? "up" : "down",
+                "prompt_version", promptVersion,
+                "channel", channel)
+            .increment();
+    }
+}
+----
+
+This uses the `MeterRegistry.counter(name, tags...)` API described in the
+https://docs.micrometer.io/micrometer/reference/concepts/counters.html[Micrometer counters documentation]. Keep tag values
+low-cardinality (version names, channel names), never a user id or a trace id, otherwise the metric store grows without bound;
+the high-cardinality detail belongs on the trace, as explained on
+xref:ai/llmops/metrics-dashboards-and-alerting.adoc[Metrics, Dashboards and Alerting].
+
+=== Implicit feedback
+
+Implicit feedback is what users do without being asked. It is far more plentiful than ratings and far more ambiguous.
+
+[cols="2,3,3", options="header"]
+|===
+| Signal | Usually means | Why it can mislead
+
+| Copy of the answer or of a code block
+| The content was useful enough to reuse.
+| A user may copy a wrong answer to paste it into a bug report.
+
+| Click on a cited source
+| The user trusts or wants to verify the answer.
+| Also a sign that the answer was insufficient and the user went to the source.
+
+| Regeneration or "try again"
+| The answer was unsatisfying.
+| Some users regenerate out of curiosity or to compare.
+
+| Immediate rephrase of the same question
+| The first answer missed.
+| Conversational follow-ups can look like rephrases.
+
+| Edit of the user's own message
+| The model misunderstood.
+| The user may simply have changed their mind.
+
+| Abandonment (no further action)
+| Either solved or given up.
+| The two cases are indistinguishable without another signal.
+
+| Escalation to a human or a search
+| The assistant failed.
+| Also happens for tasks the assistant was never meant to do.
+
+| Dwell time
+| Reading time.
+| Long can mean engaged or confused.
+|===
+
+Treat each implicit signal as a *weak, biased label*, not as a score. Three practical rules:
+
+. Log the raw events (copy, click, regenerate, rephrase) on the trace with timestamps; derive rates later, because the
+  interpretation will change as you learn.
+. Validate a signal against something stronger before trusting it: measure how often regeneration co-occurs with a thumbs-down
+  or with a low judge score. A signal that does not correlate with either is noise for your product.
+. Combine them. A rephrase within thirty seconds plus no citation click plus a low judge score is a much stronger indicator of
+  failure than any one of them.
+
+The conversational channels (chat widgets, messaging) change which signals exist: a message platform may expose reactions but
+no copy event, and a voice call has interruption rate instead. The channel pages in this guide discuss each; the point here is
+to record the channel on the trace so that signals are compared within a channel.
+
+== Biases and degenerate feedback loops
+
+Feedback is not a random sample of experience, and optimising it blindly can make the product worse.
+
+*Selection bias.* The users who rate are the very pleased and the very annoyed; most answers get no rating. The average of
+the ratings you have is not the average of the experience you delivered. If the probability that an answer is rated is
+latexmath:[\pi_i], estimate it from covariates (channel, answer length, whether it was the first question) and weight each
+rating by latexmath:[1/\pi_i], exactly as in the sampling estimator above. This is *inverse propensity weighting*. It corrects
+only for the covariates you model, so keep an unweighted number next to it and distrust large corrections, because a rare
+rating gets a very large weight.
+
+*Position and presentation bias.* Users click what is shown first and what is easy to click. If the widget puts the
+thumbs-up first, or only appears after a long answer is fully streamed, the signal reflects the interface. Randomise or
+fix the layout, and compare only across identical interfaces.
+
+*Verbosity and style bias.* Longer, more confident and more polite answers get better ratings from humans and from LLM
+judges, regardless of correctness. A model or prompt tuned to maximise thumbs-up drifts towards flattering and padded
+answers. Track answer length and correctness-style judge scores next to the rating so that the drift is visible.
+
+*Survivorship and novelty bias.* Users who got bad answers early stop coming; a new variant gets an initial boost because it
+is different. Evaluate over a time window long enough to pass the novelty effect, and keep cohorts of new and returning users
+separate.
+
+*Degenerate feedback loops.* A loop appears when the system's output decides which data you collect next:
+
+* If you retrain, re-rank or select prompts using only thumbs-up examples, you keep what users already accepted and never see
+  what they would have preferred; diversity collapses.
+* If a retrieval re-ranker is trained on clicks, items shown first receive clicks because they were shown first, and are
+  pushed up further.
+* If an LLM judge scores outputs and the same model family writes and judges, the judge's preferences become the target and
+  the system optimises for the judge (the self-preference bias discussed in
+  xref:ai/llmops/llm-as-a-judge.adoc[LLM-as-a-Judge]).
+* If synthetic questions generated by a model are used to evaluate and then to tune that model, the evaluation no longer
+  measures anything independent.
+
+Mitigations are the same in all four: keep a small *holdout* of random, human-labelled traffic that is never used for
+tuning; log the exploration (which variant, which ranking position) so propensities can be computed; reserve a fraction of
+traffic for exploration (the bandit below does this in a principled way); and review the data before it becomes training or
+evaluation material.
+
+== The evaluation flywheel
+
+The most valuable output of online evaluation is not a dashboard but a growing golden set. The flywheel is a routine:
+
+. *Detect.* Candidates are traces with a thumbs-down, a low judge score, a negative implicit pattern, or an alert from drift
+  monitoring.
+. *Triage.* A person reviews a batch each week in an annotation queue (Langfuse, LangSmith and MLflow all provide queues; see
+  xref:ai/llmops/observability-platforms.adoc[Observability Platforms]), assigns a cause (retrieval miss, outdated page,
+  hallucination, bad refusal, out of scope) and writes or approves the correct answer.
+. *Convert.* The reviewed trace becomes a golden-set case: the question, the expected answer or the expected source page,
+  the failure category, and a link to the originating trace. Deduplicate against existing cases and strip personal data
+  before the case enters a repository.
+. *Version and gate.* The case is added in a new version of the set (see
+  xref:ai/llmops/building-eval-sets.adoc[Building Eval Sets]) and from then on every change must pass it, via
+  xref:ai/llmops/evaluation-in-ci.adoc[Evaluation in CI].
+. *Fix and verify.* The fix (prompt, chunking, a missing document) is verified against the new case and the full set before
+  release.
+. *Calibrate.* A sample of the human-reviewed traces is also used to measure agreement between the online judge and humans,
+  so the online scores stay interpretable.
+
+[source,text]
+----
+production trace -> detect -> human triage -> golden-set case -> CI gate -> fix -> release -> production trace
+----
+
+Two cautions keep the flywheel healthy. Do not add only failures: also add a share of successes and of random traffic, or the
+set becomes a catalogue of past bugs and its pass rate stops being representative. And keep a *frozen* subset that is never
+touched, so a long-term trend line is comparable across years. Both points complement the coverage guidance in the eval-set
+page.
+
+== Bayesian bandits and Thompson sampling
+
+Sometimes you do not want a one-off A/B test (see xref:ai/llmops/comparative-evaluation-and-arenas.adoc[Comparative
+Evaluation and Arenas] and xref:ai/llmops/deployment-and-release-patterns.adoc[Deployment and Release Patterns]) but a system
+that shifts traffic towards the better variant while still learning. That is the *multi-armed bandit* problem: there are
+latexmath:[K] arms (say three prompt variants), each pull returns a reward (the answer was rated helpful or not), and the goal
+is to maximise total reward while learning which arm is best.
+
+With a binary reward, model arm latexmath:[k] as having an unknown success probability latexmath:[\theta_k]. Start with a
+Beta prior, which is the conjugate prior for a Bernoulli outcome:
+
+[stem]
+++++
+\theta_k \sim \mathrm{Beta}(\alpha_k, \beta_k), \qquad \alpha_k=\beta_k=1 \text{ (uniform prior)}
+++++
+
+After observing latexmath:[s_k] successes and latexmath:[f_k] failures on arm latexmath:[k], the posterior is again a Beta
+distribution:
+
+[stem]
+++++
+\theta_k \mid \text{data} \sim \mathrm{Beta}(\alpha_k + s_k,\; \beta_k + f_k)
+++++
+
+*Thompson sampling* chooses an arm with the probability that it is the best one. At each request, draw one sample
+latexmath:[\tilde{\theta}_k] from every arm's posterior and pull the arm with the largest draw:
+
+[stem]
+++++
+a_t = \arg\max_{k} \tilde{\theta}_k, \qquad \tilde{\theta}_k \sim \mathrm{Beta}(\alpha_k + s_k,\; \beta_k + f_k)
+++++
+
+Arms with little data have wide posteriors and are sometimes drawn high, so they are explored; arms that are clearly worse
+have narrow, low posteriors and are drawn rarely. Exploration therefore decays automatically as evidence accumulates, with no
+tuned exploration rate. The quantity it minimises is the cumulative *regret*, the expected reward lost against always playing
+the best arm:
+
+[stem]
+++++
+R_T = T\,\theta^{*} - \sum_{t=1}^{T} \theta_{a_t}, \qquad \theta^{*}=\max_k \theta_k
+++++
+
+The theory for Thompson sampling on Bernoulli bandits shows regret that grows only logarithmically with the number of
+requests, which is the reason it is the usual default; see the references.
+
+.thompson.py: Thompson sampling over three DocsAssistant prompt variants
+[source,python]
+----
+import numpy as np
+
+rng = np.random.default_rng(seed=7)
+
+
+class BetaBandit:
+    def __init__(self, arms: list[str], alpha0: float = 1.0, beta0: float = 1.0):
+        self.arms = arms
+        self.alpha = np.full(len(arms), alpha0)
+        self.beta = np.full(len(arms), beta0)
+
+    def choose(self) -> int:
+        draws = rng.beta(self.alpha, self.beta)   # one posterior sample per arm
+        return int(np.argmax(draws))
+
+    def update(self, arm: int, reward: bool) -> None:
+        if reward:
+            self.alpha[arm] += 1
+        else:
+            self.beta[arm] += 1
+
+    def prob_best(self, n: int = 20_000) -> np.ndarray:
+        """Monte Carlo estimate of P(arm is the best)."""
+        draws = rng.beta(self.alpha, self.beta, size=(n, len(self.arms)))
+        wins = np.bincount(draws.argmax(axis=1), minlength=len(self.arms))
+        return wins / n
+
+
+# Simulation: true (unknown to the bandit) helpfulness rates of three prompts.
+true_rates = [0.62, 0.68, 0.55]
+bandit = BetaBandit(["prompt-v12", "prompt-v13", "prompt-v13-concise"])
+for _ in range(5_000):
+    arm = bandit.choose()
+    reward = rng.random() < true_rates[arm]
+    bandit.update(arm, reward)
+
+print(dict(zip(bandit.arms, bandit.prob_best().round(3))))
+print("pulls:", (bandit.alpha + bandit.beta - 2).astype(int))
+----
+
+The algorithm is the standard Beta-Bernoulli Thompson sampling described in the references (Russo et al., _A Tutorial on
+Thompson Sampling_); the sketch uses only the NumPy `Generator.beta` and `argmax` functions
+(https://numpy.org/doc/stable/reference/random/generated/numpy.random.Generator.beta.html[NumPy documentation]). Run
+repeatedly, it concentrates most pulls on the second prompt while still occasionally trying the others. In production the
+reward arrives later than the decision (the user rates minutes afterwards), so the update is driven by the event stream, not by
+the request handler, and the bandit state is persisted outside the process.
+
+Rules for using a bandit on an LLM application:
+
+* *The reward must be a good one.* A bandit optimises exactly what it is given. Rewarding raw thumbs-up inherits every bias
+  above, and the bandit will find the verbosity and flattery that maximise it. Use a composite reward (rating, plus a judge
+  score for correctness, minus a penalty for guardrail triggers) and keep a guardrail metric that must not regress.
+* *Constrain the arms.* Only variants that passed the offline gate in CI may enter the bandit; the bandit chooses between
+  acceptable candidates, it does not replace the gate.
+* *Reward delay and sparse feedback.* If only two percent of answers are rated, posteriors move slowly. Use the judge score
+  as a denser reward, or accept a longer learning period.
+* *Non-stationarity.* Traffic changes. To forget old data, apply a discount factor to the counts (multiply latexmath:[\alpha]
+  and latexmath:[\beta] by a number slightly below 1 on each update) or use a sliding window.
+* *Log propensities.* Store which arm was chosen and the probability with which it was chosen; without them you cannot
+  analyse the results later with the weighting from the bias section.
+* *Stop when it is decided.* When the probability that one arm is best is high enough for your risk tolerance, promote it
+  through the normal release path described in
+  xref:ai/llmops/deployment-and-release-patterns.adoc[Deployment and Release Patterns] and retire the bandit.
+
+A bandit also complicates incident analysis, since two users asking the same question receive different prompts. Put the arm
+name on the trace as an attribute so that a bad answer can be tied to the variant that produced it.
+
+== Putting it together for the DocsAssistant
+
+. Sampler keeps three percent of ordinary traffic and every thumbs-down, and oversamples uncited and weak-retrieval answers,
+  storing the inclusion probability.
+. A judge worker running off a queue scores faithfulness and writes the score to the trace; PII is redacted first.
+. The widget writes `user_rating` and a reason; implicit events (copy, source click, regenerate, rephrase) are logged raw.
+. A weekly job lists thumbs-down, low-judge and negative-pattern traces for review; confirmed failures become new golden-set
+  cases in the next set version.
+. Two candidate prompts that passed CI compete in a Thompson sampling bandit with a composite reward and a guardrail; the
+  winner is promoted and the bandit is retired.
+. Dashboards show the weighted online quality estimate with its interval next to the offline pass rate, so a divergence
+  between the two is visible and triggers the investigation steps in
+  xref:ai/llmops/drift-and-regression-monitoring.adoc[Drift and Regression Monitoring].
+
+For where this sits in the maturity model, see the xref:ai/llmops/index.adoc[landing page]; sampled online evaluation and a
+feedback flywheel are the practices that distinguish the optimised level from the managed one. The earlier RAG-specific
+treatment of measuring at scale is in xref:ai/rag-systems/evaluation-at-scale.adoc[Evaluation at Scale], and the LangChain and
+Spring AI evaluation pages show the framework APIs for the judges themselves:
+xref:ai/langchain/evaluation.adoc[LangChain Evaluation] and xref:ai/spring-ai/evaluation.adoc[Spring AI Evaluation].
+
+== References
+
+* https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk[Langfuse: Scores via the SDK]
+* https://langfuse.com/docs[Langfuse documentation]
+* https://github.com/langchain-ai/openevals[openevals (README)]
+* https://docs.langchain.com/langsmith/evaluate-llm-application[LangSmith: Evaluate an LLM application]
+* https://mlflow.org/docs/latest/genai/[MLflow GenAI documentation]
+* https://docs.spring.io/spring-ai/reference/api/testing.html[Spring AI: Evaluation testing]
+* https://docs.micrometer.io/micrometer/reference/concepts/counters.html[Micrometer: Counters]
+* https://numpy.org/doc/stable/reference/random/generated/numpy.random.Generator.beta.html[NumPy: Generator.beta]
+* https://arxiv.org/abs/1707.02038[Russo et al., _A Tutorial on Thompson Sampling_]
+* https://arxiv.org/abs/1111.1797[Agrawal and Goyal, _Analysis of Thompson Sampling for the Multi-armed Bandit Problem_]
+* https://arxiv.org/abs/2306.05685[Zheng et al., _Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena_]
+* https://arxiv.org/abs/2404.12272[Shankar et al., _Who Validates the Validators?_]
