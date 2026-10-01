@@ -1,0 +1,259 @@
+= Quantization for Inference
+:description: Numeric formats for serving LLMs (FP32, BF16, FP8, INT8, INT4, NF4), the scale/zero-point quantization formula, GGUF quant types and importance matrices, GPTQ, AWQ and FP8 checkpoints for GPU servers (AutoAWQ's move into llm-compressor), quality vs. size trade-offs and KV-cache quantization.
+:keywords: quantization, llm quantization, fp32, bf16, fp16, fp8, int8, int4, nf4, normalfloat, qlora, scale and zero point, gguf, q8_0, q6_k, q5_k_m, q4_k_m, iq quants, i-quants, k-quants, importance matrix, imatrix, llama-quantize, gptq, awq, autoawq, llm-compressor, compressed-tensors, bitsandbytes, mxfp4, kv cache quantization, perplexity, kl divergence
+:stem: latexmath
+
+include::partial$ai-local-llms-disclaimer.adoc[]
+
+This page was written against llama.cpp v0.5.0 (`llama-quantize`, `llama-imatrix`, `llama serve`), vLLM 0.30.0,
+llm-compressor 0.14.0 and Ollama 0.34.4, as checked on 2026-09-28 (see the
+xref:ai/local-llms/index.adoc[Running LLMs Locally] baseline). AutoAWQ is deprecated -- its last release is v0.2.9,
+and its README says the vLLM project has adopted it into llm-compressor. The memory arithmetic behind "why
+quantize" is on xref:ai/local-llms/hardware-sizing.adoc[Hardware Sizing].
+
+Quantization stores weights (and optionally activations and the KV cache) in fewer bits than they were trained in.
+It is the single most important lever for running models locally: it makes a model *fit* (see the sizing table)
+and makes decode *faster*, because decode is bound by how many bytes have to be read per token.
+
+== Numeric formats
+
+[cols="1,1,3",options="header"]
+|===
+| Format | Bits | Where it is used
+
+| FP32 | 32 | Training master weights; never used to serve an LLM locally.
+| BF16 | 16 | 8-bit exponent (same range as FP32), 7-bit mantissa. The usual release format of open-weight models.
+| FP16 | 16 | 5-bit exponent, 10-bit mantissa: more precision, less range than BF16.
+| FP8 (E4M3 / E5M2) | 8 | Weights and activations on recent data-centre GPUs; vLLM, SGLang and NIM serve FP8 checkpoints
+  natively.
+| INT8 | 8 | Integer weights (and activations in W8A8 schemes) with a per-channel or per-group scale.
+| INT4 | 4 | Weight-only schemes such as GPTQ and AWQ (W4A16: 4-bit weights, 16-bit activations).
+| NF4 | 4 | *NormalFloat*: a 4-bit data type whose 16 levels are quantiles of a normal distribution, introduced with
+  QLoRA; used by bitsandbytes.
+| MXFP4 / NVFP4 | 4 | Micro-scaled 4-bit floats with a shared scale per small block; `gpt-oss` ships its MoE
+  weights in MXFP4.
+|===
+
+The "16-bit" row is what the vendors publish; everything below it is something you download pre-quantized (GGUF,
+AWQ, GPTQ, FP8 repositories on the Hub) or produce yourself with the tools below.
+
+== The quantization formula
+
+Affine (asymmetric) quantization maps a real value stem:[x] to a stem:[k]-bit integer stem:[q] with a *scale*
+stem:[s] and a *zero point* stem:[z]:
+
+[stem]
+++++
+q = \mathrm{round}\!\left(\frac{x}{s}\right) + z,
+\qquad
+\hat{x} = s\,(q - z)
+++++
+
+For a block of values with minimum stem:[x_{min}] and maximum stem:[x_{max}]:
+
+[stem]
+++++
+s = \frac{x_{max} - x_{min}}{2^{k} - 1},
+\qquad
+z = \mathrm{round}\!\left(-\frac{x_{min}}{s}\right)
+++++
+
+*Symmetric* quantization fixes stem:[z = 0] and uses stem:[s = \max|x| / (2^{k-1} - 1)]. The error
+stem:[|x - \hat{x}|] is at most stem:[s/2] per value, so smaller blocks (a scale per 32 or 64 weights, as in
+GGUF and GPTQ groups) mean smaller scales and less error, at the cost of storing more scales -- which is why GGUF
+`Q4_K_M` averages about 4.9 bits per weight rather than 4.
+
+NF4 replaces the uniform grid with the 16 quantiles stem:[c_j] of a standard normal distribution, rescaled to
+stem:[\lbrack -1, 1 \rbrack], and stores one absmax scale per block. Each weight is mapped to the nearest level:
+
+[stem]
+++++
+q = \arg\min_{j} \left| \frac{x}{\max_{block}|x|} - c_j \right|
+++++
+
+Because trained weights are roughly normally distributed, NF4 spends its 16 levels where the weights actually are.
+
+A tiny NumPy illustration of the affine formula on one block:
+
+[source,python]
+----
+import numpy as np
+
+x = np.array([-0.82, -0.10, 0.03, 0.47, 1.21], dtype=np.float32)
+k = 4
+s = (x.max() - x.min()) / (2**k - 1)
+z = np.round(-x.min() / s)
+q = np.clip(np.round(x / s) + z, 0, 2**k - 1).astype(np.uint8)
+x_hat = s * (q.astype(np.float32) - z)
+print(q, x_hat, np.abs(x - x_hat).max() <= s / 2 + 1e-6)
+----
+
+The formula and the NF4 construction follow https://arxiv.org/abs/2305.14314[Dettmers et al. (QLoRA)].
+
+== GGUF quant types and importance matrices
+
+*GGUF* is llama.cpp's single-file format: weights, tokenizer, chat template and metadata together. It is what
+Ollama, LM Studio, Jan, Docker Model Runner and llama.cpp itself load. Its quant types form a ladder:
+
+[cols="1,1,3",options="header"]
+|===
+| Type | Bits per weight (Llama-3.1-8B) | Typical use
+
+| `Q8_0` | 8.50 | Near-lossless; when memory allows, and for small models.
+| `Q6_K` | 6.56 | Very close to 16-bit quality at 40 % of the size.
+| `Q5_K_M` | 5.70 | A good compromise for 8B-30B models on a GPU with headroom.
+| `Q4_K_M` | 4.89 | *The default choice* -- the llama.cpp `-hf` default and the quant most Hub repositories lead with.
+| `IQ4_XS`, `IQ3_M`, `IQ2_M`... | 4.46 / 3.76 / 2.93 | *I-quants*: lattice-based codebooks for very low bit rates; best made with an
+  importance matrix.
+|===
+
+The bits-per-weight column is the value the llama.cpp quantize README reports for Llama-3.1-8B, a property of the
+format rather than a benchmark. `K` quants mix precisions per tensor (`_S` / `_M` / `_L` = small / medium /
+large share of higher-precision tensors).
+
+An *importance matrix* (`imatrix`) records which weights matter most for a calibration text, so the quantizer
+spends its precision there. It helps every type and is close to essential for the I-quants. Producing a GGUF
+yourself is three steps -- convert, compute the imatrix, quantize:
+
+[source,shell]
+----
+# 1. convert a Hugging Face checkpoint to a 16-bit GGUF
+python convert_hf_to_gguf.py --outfile model-bf16.gguf --outtype bf16 --remote Qwen/Qwen3.6-27B
+
+# 2. compute an importance matrix from calibration text
+./build/bin/llama-imatrix -m model-bf16.gguf -f calibration-data.txt -o imatrix.gguf -ngl 99
+
+# 3. quantize to Q4_K_M using it
+./build/bin/llama-quantize --imatrix imatrix.gguf model-bf16.gguf model-Q4_K_M.gguf Q4_K_M
+----
+
+See the https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md[llama.cpp quantize README]
+and the https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md[imatrix README]. Most of the
+time you do not need to quantize at all: download a ready-made quant by tag, for example
+`ollama pull hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M` (see
+https://huggingface.co/docs/hub/ollama[Use Ollama with any GGUF model on the Hugging Face Hub]). Converting Hub
+checkpoints and publishing your own quants is covered in
+xref:ai/hugging-face/conversion-and-quantization.adoc[Conversion & Quantization]; the Hub's own page on the format is https://huggingface.co/docs/hub/gguf[GGUF on the Hugging Face Hub].
+
+== GPTQ, AWQ and FP8 for GPU servers
+
+GPU servers (vLLM, SGLang, NIM) generally do not use GGUF -- vLLM's GGUF support is experimental and now lives in a
+separate plugin -- but load Hugging Face checkpoints quantized in formats with fast GPU kernels:
+
+* *GPTQ* -- one-shot, layer-by-layer quantization that uses approximate second-order information to compensate
+  the rounding error of each weight on the remaining ones (https://arxiv.org/abs/2210.17323[Frantar et al.]).
+* *AWQ* -- activation-aware weight quantization: protects the small fraction of weight channels that see large
+  activations by scaling them before rounding (https://arxiv.org/abs/2306.00978[Lin et al.]).
+* *FP8* -- 8-bit float weights and activations, near-lossless on hardware with FP8 tensor cores.
+
+Serving a pre-quantized checkpoint needs no flag -- vLLM reads the quantization config from the repository:
+
+[source,shell]
+----
+vllm serve RedHatAI/GLM-5.2-NVFP4
+----
+
+vLLM can also quantize a 16-bit checkpoint *online* at load time:
+
+[source,shell]
+----
+vllm serve meta-llama/Llama-3.1-8B --quantization fp8_per_block
+----
+
+See https://docs.vllm.ai/en/latest/features/quantization/[vLLM -- Quantization]. To *produce* a GPTQ, AWQ or FP8
+checkpoint, use llm-compressor -- the project that adopted AutoAWQ. Its `oneshot` API applies a recipe and saves a
+`compressed-tensors` checkpoint that vLLM loads directly:
+
+[source,python]
+----
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import QuantizationModifier
+
+MODEL_ID = "Qwen/Qwen3-30B-A3B"
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+# FP8 weights (block size 128), activations quantized dynamically at inference time
+recipe = QuantizationModifier(targets="Linear", scheme="FP8_BLOCK", ignore=["lm_head", "re:.*mlp.gate$"])
+oneshot(model=model, recipe=recipe)
+
+model.save_pretrained("Qwen3-30B-A3B-FP8-BLOCK")
+tokenizer.save_pretrained("Qwen3-30B-A3B-FP8-BLOCK")
+----
+
+See https://github.com/vllm-project/llm-compressor[llm-compressor] (which also ships GPTQ and AWQ recipes) and
+the deprecation note in https://github.com/casper-hansen/AutoAWQ[AutoAWQ]. For NF4, vLLM can quantize in flight
+with bitsandbytes (`--quantization bitsandbytes`), which is convenient for experiments but slower than the formats
+above.
+
+== Quality vs. size trade-offs
+
+The loss from quantization is measured, not guessed. The llama.cpp tools report *perplexity* and *KL divergence*
+against the 16-bit model (`llama-perplexity`), and task evaluations tell you whether *your* workload notices.
+Qualitatively, and without quoting benchmark numbers:
+
+* *8 bits* (`Q8_0`, FP8, INT8) is effectively lossless for most models and tasks.
+* *5-6 bits* (`Q5_K_M`, `Q6_K`) is very close; hard to tell apart in chat use.
+* *4 bits* (`Q4_K_M`, AWQ, GPTQ INT4) is the practical sweet spot; small, measurable loss that grows on long
+  reasoning chains, code and non-English text.
+* *Below 4 bits* (I-quants `IQ3_*`, `IQ2_*`) loses visibly on small models; on very large models it can still
+  beat a smaller model at higher precision in the same memory.
+* *Small models suffer more*: an 8B model loses more at 4 bits than a 70B does. Given a fixed memory budget, a
+  bigger model at 4 bits usually beats a smaller one at 8 bits -- measure it on your own task.
+
+To compare two quants of the same model on your own text, run the perplexity tool on both:
+
+[source,shell]
+----
+./build/bin/llama-perplexity -m model-Q4_K_M.gguf -f my-eval-text.txt -ngl 99
+./build/bin/llama-perplexity -m model-Q8_0.gguf   -f my-eval-text.txt -ngl 99
+----
+
+The llama.cpp https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md[quantize README]
+describes perplexity and KL divergence as the accuracy measures for its quants.
+
+== KV-cache quantization
+
+Weights are fixed; the KV cache grows with every token. On long contexts it can rival the weights (see the sizing
+table), so quantizing it is the next lever. Every engine supports it:
+
+[source,shell]
+----
+# llama.cpp: 8-bit K and V cache (f16 is the default)
+llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF -c 65536 --cache-type-k q8_0 --cache-type-v q8_0
+
+# Ollama: global setting on the server; needs Flash Attention (automatic where supported)
+OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve
+
+# vLLM: FP8 KV cache
+vllm serve Qwen/Qwen3.6-27B --kv-cache-dtype fp8
+
+# MLX-LM: 4-bit KV cache (disables batching)
+mlx_lm.server --model mlx-community/Mistral-7B-Instruct-v0.3-4bit --kv-bits 4
+----
+
+Ollama's FAQ describes `q8_0` as using about half the memory of `f16` with a very small loss, and `q4_0` as a
+quarter with a more noticeable loss at long contexts; models with a high GQA ratio are more sensitive. See the
+https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp server README],
+https://docs.ollama.com/faq[Ollama -- FAQ],
+https://docs.vllm.ai/en/latest/features/quantization/[vLLM -- Quantization] (quantized KV cache) and
+https://github.com/ml-explore/mlx-lm[mlx-lm].
+
+== References
+
+* https://github.com/ggml-org/llama.cpp/blob/master/tools/quantize/README.md[llama.cpp -- quantize README]
+* https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/README.md[llama.cpp -- imatrix README]
+* https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md[llama.cpp -- server README]
+* https://huggingface.co/docs/hub/gguf[Hugging Face -- GGUF]
+* https://huggingface.co/docs/hub/ollama[Hugging Face -- Use Ollama with any GGUF model on the Hub]
+* https://docs.vllm.ai/en/latest/features/quantization/[vLLM -- Quantization]
+* https://github.com/vllm-project/llm-compressor[llm-compressor]
+* https://github.com/casper-hansen/AutoAWQ[AutoAWQ (deprecated)]
+* https://docs.ollama.com/faq[Ollama -- FAQ]
+* https://github.com/ml-explore/mlx-lm[mlx-lm]
+* https://arxiv.org/abs/2305.14314[Dettmers et al. -- QLoRA: Efficient Finetuning of Quantized LLMs]
+* https://arxiv.org/abs/2210.17323[Frantar et al. -- GPTQ: Accurate Post-Training Quantization for Generative
+  Pre-trained Transformers]
+* https://arxiv.org/abs/2306.00978[Lin et al. -- AWQ: Activation-aware Weight Quantization for LLM Compression and
+  Acceleration]

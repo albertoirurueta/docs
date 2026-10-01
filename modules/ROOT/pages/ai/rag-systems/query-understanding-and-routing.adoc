@@ -1,0 +1,508 @@
+= Query Understanding & Routing
+:description: Understanding the question before retrieving -- rewriting and condensation, self-query metadata-filter extraction that never overrides the ACL filter, decomposition into sub-questions, routing across vector store, SQL, graph and tools with LLM and semantic routers, and text-to-SQL with read-only execution and validation, in LangChain, Spring AI modular RAG and LangChain4j.
+:keywords: query understanding, query rewriting, query condensation, standalone question, self-query, metadata filter extraction, SelfQueryRetriever, query decomposition, sub-questions, query routing, llm router, semantic router, route exemplars, text-to-sql, sqlglot, read-only sql, sql validation, statement_timeout, RewriteQueryTransformer, CompressionQueryTransformer, MultiQueryExpander, DocumentRetriever, modular rag, QueryTransformer, CompressingQueryTransformer, LanguageModelQueryRouter, with_structured_output, docsassistant
+:stem: latexmath
+
+include::partial$ai-rag-systems-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against `langchain` 1.4.3, `langchain-core` 1.6.6, `langchain-classic` 1.0.8 and
+`sqlglot` 30.21.0 on Python 3.12, Spring AI 2.0.1 (`spring-ai-rag`) and LangChain4j 1.20.2 (see the
+xref:ai/rag-systems/index.adoc#_version_baseline[version baseline]). The semantic router, the filter merge and the SQL
+validator were run against the released packages with fake embeddings and hand-written queries; the model-driven
+functions and the Java classes were checked against the released packages (the Java compiled) but not run against a
+model.
+
+Users do not write search queries. They write "and what about the sparse one?", "compare the 4.1 and 4.2 release notes
+on security", "how many pages mention OAuth in the backend section?". Embedding such a sentence as-is and taking the
+five nearest chunks fails in predictable ways: the follow-up has no content words, the comparison needs two retrievals,
+and the count is not a similarity question at all. Query understanding rewrites, splits and routes the question *before*
+retrieval. xref:database/vector-rag/retrieval-strategies.adoc[Retrieval Strategies] introduces the basic forms --
+rewrite, multi-query, HyDE, history compression, routing across stores and self-query -- and
+xref:database/vector-rag/metadata-filtering.adoc[Metadata Filtering] the filter syntax. This page covers what a
+production service adds on top: when to skip each step, filters that can never widen access, decomposition, a semantic
+router in front of the LLM router, and text-to-SQL that is safe to run.
+
+[mermaid]
+....
+flowchart LR
+  Q[User message + history] --> C[Condense to standalone query]
+  C --> F[Extract metadata filters]
+  F --> ACL[AND with ACL filter from identity]
+  ACL --> R{Router}
+  R -->|conceptual question| V[Vector + keyword retrieval]
+  R -->|counts, dates, tables| S[Text-to-SQL, read-only]
+  R -->|relationships| G[Graph retriever, Cypher]
+  R -->|compound question| D[Decompose into sub-questions]
+  R -->|out of scope| X[Polite refusal]
+  D --> V
+  V --> A[Rerank and answer]
+  S --> A
+  G --> A
+....
+
+== Rewriting and condensation
+
+*Condensation* turns a follow-up plus the conversation history into a standalone query: "and what about the sparse
+one?" after a question about the matrix solver becomes "How does the sparse matrix solver in Irurueta Algebra 4.2
+handle convergence?". *Rewriting* turns a chatty question into a search-shaped one: shorter, with the key terms and
+without pleasantries. Both are one cheap model call, and both should be *skipped* when they are not needed (no history,
+already short), because they add latency before the first retrieval. The condensation step is part of the memory design
+in xref:ai/rag-systems/conversational-rag-and-memory.adoc[Conversational RAG & Memory].
+
+Spring AI ships both as `QueryTransformer` implementations for its modular RAG advisor: `CompressionQueryTransformer`
+condenses history plus query, `RewriteQueryTransformer` rewrites for a target search system, and
+`TranslationQueryTransformer` translates to the language of the corpus. They run in order, before the expander and the
+retriever:
+
+.QueryUnderstandingConfig.java -- condense, rewrite, then retrieve (Java, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.rag.routing;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
+import org.springframework.ai.rag.preretrieval.query.transformation.CompressionQueryTransformer;
+import org.springframework.ai.rag.preretrieval.query.transformation.RewriteQueryTransformer;
+import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+
+@Configuration
+public class QueryUnderstandingConfig {
+
+    @Bean
+    RetrievalAugmentationAdvisor understandingAdvisor(ChatClient.Builder builder,
+            @Qualifier("routingDocumentRetriever") DocumentRetriever routingRetriever) {
+        // a small, fast model is enough for these steps; clone() keeps the main client's defaults untouched
+        ChatClient.Builder small = builder.clone();
+        return RetrievalAugmentationAdvisor.builder()
+                .queryTransformers(
+                        CompressionQueryTransformer.builder().chatClientBuilder(small).build(),
+                        RewriteQueryTransformer.builder().chatClientBuilder(small)
+                                .targetSearchSystem("technical documentation search").build())
+                .documentRetriever(routingRetriever)      // the router defined further down
+                .build();
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html#_pre_retrieval[Spring AI --
+Retrieval Augmented Generation: pre-retrieval].
+
+LangChain4j's `CompressingQueryTransformer` does the same inside a `DefaultRetrievalAugmentor`, using the chat memory of
+the AI service as history; see the retrieval augmentor at the end of this page.
+
+== Self-query: extracting metadata filters
+
+Many questions contain a filter: "in the *4.2* release notes", "in the *backend* section", "anything *since June*".
+Turning that into a metadata filter shrinks the candidate set and fixes the classic failure where the nearest chunk
+comes from the wrong version. The *self-query* pattern asks a model for a structured filter, validates it against the
+allowed fields and values, and combines it with the similarity search. LangChain's `SelfQueryRetriever` (now in
+`langchain-classic`) packages the pattern; with structured output it is a few lines and easier to constrain:
+
+.docsassistant/retrieval/self_query.py -- filters from the question, ANDed with the ACL filter (Python, `langchain` 1.4.3)
+[source,python]
+----
+import os
+from typing import Literal
+
+from langchain.chat_models import init_chat_model
+from pydantic import BaseModel, Field
+
+Component = Literal["algebra", "statistics", "sorting", "backend", "database", "ai", "vector-rag"]
+
+
+class SearchPlan(BaseModel):
+    """A search query plus optional filters taken from the user's question."""
+    query: str = Field(description="The question rewritten as a short search query, without the filter words")
+    component: Component | None = Field(None, description="Only if the user names a section or library")
+    version: str | None = Field(None, pattern=r"^\d+\.\d+$", description="Only if the user names a version")
+
+
+planner = init_chat_model(os.environ["ROUTER_MODEL"], temperature=0).with_structured_output(SearchPlan)
+
+
+def plan(question: str) -> SearchPlan:
+    return planner.invoke(
+        "Extract a search plan. Use a filter only when the user explicitly names it.\n\nQuestion: " + question)
+
+
+def to_filter(p: SearchPlan, readable_acls: list[str]) -> dict:
+    """PGVector filter: the ACL clause always comes from identity and is always present."""
+    clauses: list[dict] = [{"acl": {"$in": readable_acls}}]
+    if p.component:
+        clauses.append({"component": {"$eq": p.component}})
+    if p.version:
+        clauses.append({"version": {"$eq": p.version}})
+    return {"$and": clauses}
+----
+
+Source: https://docs.langchain.com/oss/python/langchain/structured-output[LangChain -- Structured output] and
+https://docs.langchain.com/oss/python/integrations/vectorstores/pgvector[LangChain -- PGVector] (metadata filtering).
+
+Two rules keep self-query safe. First, the extracted filter is *narrowing only*: it is ANDed with the ACL filter derived
+from the caller's verified identity, never used instead of it and never allowed to name the ACL field (see
+xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]). Second, constrain the values with an
+enumeration or pattern, as the `Literal` and `pattern` above do; a free-text filter value that matches nothing silently
+returns an empty result. When a filtered search returns nothing, retry once without the model-extracted filters (but
+still with the ACL filter) and say so in the answer.
+
+== Decomposition
+
+"Compare the security changes in the 4.1 and 4.2 release notes" needs evidence from two places; one embedding of the
+whole sentence lands between them. *Decomposition* asks a model for independent sub-questions, retrieves for each
+(concurrently, as in xref:ai/rag-systems/production-rag-architecture.adoc#_a_stateless_orchestrator_with_fan_out_and_gather[the
+orchestrator]), and answers from the union. It is related to multi-query expansion, which generates *paraphrases* of
+one question; decomposition generates *different* questions:
+
+.docsassistant/retrieval/decompose.py -- sub-questions with a hard cap (Python, `langchain` 1.4.3)
+[source,python]
+----
+import os
+
+from langchain.chat_models import init_chat_model
+from pydantic import BaseModel, Field
+
+
+class SubQuestions(BaseModel):
+    questions: list[str] = Field(min_length=1, max_length=4,
+                                 description="Self-contained sub-questions; a single item if no split is needed")
+
+
+decomposer = init_chat_model(os.environ["ROUTER_MODEL"], temperature=0).with_structured_output(SubQuestions)
+
+
+def decompose(question: str) -> list[str]:
+    result = decomposer.invoke(
+        "Split the question into the smallest set of self-contained sub-questions needed to answer it. "
+        "Do not split simple questions.\n\nQuestion: " + question)
+    return result.questions
+----
+
+Source: https://docs.langchain.com/oss/python/langchain/structured-output[LangChain -- Structured output].
+
+In Spring AI the same step is a custom `QueryExpander` (the interface `MultiQueryExpander` implements): return the
+sub-questions as a `List<Query>` and the advisor retrieves them in parallel. In LangChain4j it is a custom
+`QueryTransformer`, whose `transform(Query)` returns a `Collection<Query>`.
+
+== Routing across vector store, SQL, graph and tools
+
+Not every question is a similarity question. DocsAssistant has four back ends, and a *router* chooses among them:
+
+[cols="1,2,2", options="header"]
+|===
+| Route | Typical question | Back end
+
+| `docs`
+| "How do I configure HNSW parameters?"
+| Vector plus keyword retrieval over chunks.
+
+| `sql`
+| "How many pages in the backend section were updated this month?"
+| Text-to-SQL over the `documents` catalogue (read-only, below).
+
+| `graph`
+| "Which components depend on the sorting library?"
+| Graph retrievers over Neo4j (xref:ai/rag-systems/text2cypher-and-graph-retrievers.adoc[Text2Cypher & Graph Retrievers]).
+
+| `none`
+| "Write me a poem about Kafka."
+| No retrieval: a polite scope message.
+|===
+
+There are two kinds of routers, and production systems often chain them: a *semantic router* first (no model call; a
+few milliseconds), and an *LLM router* only when the semantic router is unsure.
+
+A semantic router embeds a handful of exemplar questions per route once, then assigns a new question to the route whose
+exemplars are most similar, if the best similarity clears a threshold stem:[\theta]:
+
+[stem]
+++++
+\text{route}(q) = \begin{cases}
+\arg\max_r \max_{e \in E_r} \cos(\mathbf{q}, \mathbf{e}) & \text{if } \max_r \max_{e \in E_r} \cos(\mathbf{q}, \mathbf{e}) \ge \theta \\
+\text{fallback (LLM router)} & \text{otherwise}
+\end{cases}
+++++
+
+.docsassistant/retrieval/router.py -- a semantic router with an LLM fallback (Python, `langchain` 1.4.3)
+[source,python]
+----
+import math
+import os
+from typing import Literal
+
+from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
+from pydantic import BaseModel
+
+RouteName = Literal["docs", "sql", "graph", "none"]
+
+EXEMPLARS: dict[str, list[str]] = {
+    "docs": ["How do I configure the solver?", "What does ef_search control?", "Explain OAuth refresh tokens"],
+    "sql": ["How many pages were updated this month?", "List the ten newest pages in the backend section"],
+    "graph": ["Which components depend on sorting?", "What concepts connect Kafka and CDC?"],
+    "none": ["Write a poem", "What is the weather tomorrow?"],
+}
+
+
+def _cos(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    return dot / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b)))
+
+
+class Route(BaseModel):
+    route: RouteName
+
+
+class Router:
+    def __init__(self, embeddings, llm=None, threshold: float = 0.78):
+        self.embeddings = embeddings
+        self.llm = llm.with_structured_output(Route) if llm else None
+        self.threshold = threshold
+        self.vectors = {r: embeddings.embed_documents(qs) for r, qs in EXEMPLARS.items()}
+
+    def route(self, question: str) -> RouteName:
+        q = self.embeddings.embed_query(question)
+        best_route, best = max(((r, max(_cos(q, v) for v in vs)) for r, vs in self.vectors.items()),
+                               key=lambda pair: pair[1])
+        if best >= self.threshold or self.llm is None:
+            return best_route
+        return self.llm.invoke(
+            "Choose the back end for this question: docs (explanations), sql (counts and lists over the page "
+            "catalogue), graph (dependencies and relationships) or none (out of scope).\n\n" + question).route
+
+
+router = Router(init_embeddings(os.environ["EMBEDDING_MODEL"]),
+                init_chat_model(os.environ["ROUTER_MODEL"], temperature=0))
+----
+
+Source: https://docs.langchain.com/oss/python/langchain/structured-output[LangChain -- Structured output] and
+https://reference.langchain.com/python/langchain/embeddings/base/init_embeddings[LangChain reference -- init_embeddings].
+
+Tune stem:[\theta] on labelled questions from the golden set: too low and ambiguous questions are forced into a route, too
+high and every question pays for the LLM fallback. Log the chosen route and the similarity on the request span
+(xref:ai/rag-systems/observability-and-tracing.adoc[Observability & Tracing]) so that routing errors can be found
+later.
+
+Spring AI 2.0.1 has no `QueryRouter` type (the name appears in some older articles). Routing in Spring AI's modular RAG
+is a `DocumentRetriever` that delegates to other retrievers; the advisor does not need to know:
+
+.RoutingDocumentRetriever.java -- a router as a DocumentRetriever (Java, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.rag.routing;
+
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.rag.Query;
+import org.springframework.ai.rag.retrieval.search.DocumentRetriever;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.stereotype.Component;
+
+@Component
+public class RoutingDocumentRetriever implements DocumentRetriever {
+
+    enum RouteName { DOCS, SQL, GRAPH, NONE }
+
+    record Route(RouteName route) {
+    }
+
+    private final ChatClient router;
+    private final Map<RouteName, DocumentRetriever> backends;
+
+    public RoutingDocumentRetriever(ChatClient.Builder builder,
+                                    @Qualifier("docsRetriever") DocumentRetriever docsRetriever,
+                                    @Qualifier("sqlRetriever") DocumentRetriever sqlRetriever,
+                                    @Qualifier("graphRetriever") DocumentRetriever graphRetriever) {
+        this.router = builder.clone().build();
+        this.backends = Map.of(RouteName.DOCS, docsRetriever, RouteName.SQL, sqlRetriever,
+                RouteName.GRAPH, graphRetriever);
+    }
+
+    @Override
+    public List<Document> retrieve(Query query) {
+        Route choice = router.prompt()
+                .system("Choose the back end: DOCS (explanations), SQL (counts and lists over the page catalogue), "
+                        + "GRAPH (dependencies and relationships) or NONE (out of scope).")
+                .user(query.text())
+                .call()
+                .entity(Route.class);
+        DocumentRetriever backend = choice == null ? null : backends.get(choice.route());
+        return backend == null ? List.of() : backend.retrieve(query);
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html#_retrieval[Spring AI --
+Retrieval Augmented Generation: retrieval] and
+https://docs.spring.io/spring-ai/reference/api/structured-output-converter.html[Spring AI -- Structured Output].
+
+With an empty result and `ContextualQueryAugmenter` configured with `allowEmptyContext(false)`, the advisor answers
+with its "outside my knowledge base" template instead of letting the model improvise -- the right behaviour for the
+`NONE` route.
+
+LangChain4j has a router built in. `LanguageModelQueryRouter` shows the model a description of each `ContentRetriever`
+and routes to one or several of them; the fallback strategy decides what happens when the model's answer cannot be
+parsed:
+
+.RoutedAssistant.java -- condensation plus an LLM router (Java, LangChain4j 1.20.2)
+[source,java]
+----
+package com.example.docsassistant.l4j.routing;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.rag.DefaultRetrievalAugmentor;
+import dev.langchain4j.rag.content.retriever.ContentRetriever;
+import dev.langchain4j.rag.query.router.LanguageModelQueryRouter;
+import dev.langchain4j.rag.query.transformer.CompressingQueryTransformer;
+import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.MemoryId;
+import dev.langchain4j.service.UserMessage;
+
+public final class RoutedAssistant {
+
+    public interface DocsAssistant {
+        String ask(@MemoryId String conversationId, @UserMessage String question);
+    }
+
+    private RoutedAssistant() {
+    }
+
+    public static DocsAssistant create(ChatModel chatModel, ChatModel smallModel, ContentRetriever docs,
+                                       ContentRetriever catalogueSql, ContentRetriever graph) {
+        Map<ContentRetriever, String> routes = new LinkedHashMap<>();
+        routes.put(docs, "Explanations and how-to answers from the documentation pages");
+        routes.put(catalogueSql, "Counts, lists and dates about pages in the documentation catalogue");
+        routes.put(graph, "Dependencies and relationships between components and concepts");
+
+        return AiServices.builder(DocsAssistant.class)
+                .chatModel(chatModel)
+                .chatMemoryProvider(id -> MessageWindowChatMemory.withMaxMessages(20))
+                .retrievalAugmentor(DefaultRetrievalAugmentor.builder()
+                        .queryTransformer(new CompressingQueryTransformer(smallModel))   // uses the chat memory
+                        .queryRouter(LanguageModelQueryRouter.builder()
+                                .chatModel(smallModel)
+                                .retrieverToDescription(routes)
+                                .fallbackStrategy(LanguageModelQueryRouter.FallbackStrategy.ROUTE_TO_ALL)
+                                .build())
+                        .build())
+                .build();
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/tutorials/rag/[LangChain4j -- RAG] (Query Transformer, Query Router).
+
+`ROUTE_TO_ALL` is the safe fallback for recall; `DO_NOT_ROUTE` is the safe fallback for cost and for out-of-scope
+questions. The in-memory chat memory here is for brevity; persistent memory is on
+xref:ai/rag-systems/conversational-rag-and-memory.adoc[Conversational RAG & Memory].
+
+== Text-to-SQL with read-only safety
+
+Questions about counts, lists and dates are answered exactly by SQL over structured data and badly by similarity
+search over prose. Text-to-SQL lets a model write the query -- and a model-written query is untrusted input that runs
+against a database. Four layers make it safe, and the first one is not optional:
+
+. *Database permissions.* Execute as a role that can only `SELECT` from an allow-listed set of views (never the base
+  tables with personal data), in a read-only transaction, with a `statement_timeout` and a row limit. Even a perfect
+  validator is a second line of defence.
+. *Schema injection, not schema discovery.* Give the model the DDL and a few example rows of the allowed views, plus a
+  handful of question/SQL examples; it never sees the rest of the schema.
+. *Validation before execution.* Parse the SQL, reject anything that is not a single `SELECT`, reject tables outside the
+  allow-list (schema as well as name) and functions outside a small allow-list, and add a `LIMIT` if missing.
+. *Row-level security.* When rows carry ACLs, enforce them in the database (PostgreSQL row-level security with the
+  caller's groups in a session variable), not in the prompt.
+
+.docsassistant/retrieval/text_to_sql.py -- validate, then run read-only (Python, `sqlglot` 30.21.0)
+[source,python]
+----
+import sqlglot
+from sqlglot import exp
+
+ALLOWED_SCHEMA = "catalogue"                                       # the schema that holds the views
+ALLOWED_TABLES = {"page_catalogue", "component_catalogue"}          # views, not base tables
+# connectives and a few harmless functions; anything else -- including every function sqlglot does not know
+# (exp.Anonymous), such as pg_sleep, dblink_exec or set_config -- is rejected
+ALLOWED_FUNCTIONS = {exp.And, exp.Or, exp.Not, exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max, exp.Lower, exp.Upper,
+                     exp.Coalesce, exp.Cast, exp.Case, exp.If, exp.CurrentDate, exp.DateTrunc, exp.Extract}
+
+
+class UnsafeSql(ValueError):
+    pass
+
+
+def validate(sql: str, max_rows: int = 200) -> str:
+    statements = sqlglot.parse(sql, read="postgres")
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        raise UnsafeSql("Only a single SELECT statement is allowed")
+    tree = statements[0]
+    if any(isinstance(node, (exp.Insert, exp.Update, exp.Delete, exp.Drop, exp.Create, exp.Command))
+           for node in tree.walk()):
+        raise UnsafeSql("Data-modifying statements are not allowed")
+    functions = {f.name if isinstance(f, exp.Anonymous) else f.sql_name()
+                 for f in tree.find_all(exp.Func) if type(f) not in ALLOWED_FUNCTIONS}
+    if functions:
+        raise UnsafeSql(f"Functions not allowed: {sorted(functions)}")
+    ctes = {cte.alias_or_name for cte in tree.find_all(exp.CTE)}
+    if any(t.catalog or t.db not in ("", ALLOWED_SCHEMA) for t in tree.find_all(exp.Table)):
+        raise UnsafeSql(f"Only tables in the {ALLOWED_SCHEMA} schema are allowed")
+    tables = {t.name for t in tree.find_all(exp.Table)} - ctes
+    if not tables <= ALLOWED_TABLES:
+        raise UnsafeSql(f"Tables not allowed: {sorted(tables - ALLOWED_TABLES)}")
+    if tree.args.get("limit") is None:
+        tree = tree.limit(max_rows)
+    return tree.sql(dialect="postgres")
+
+
+def run_read_only(conn, sql: str) -> list[tuple]:
+    """conn is a psycopg connection opened as the read-only text2sql role."""
+    with conn.transaction():
+        conn.execute("SET TRANSACTION READ ONLY")
+        conn.execute("SET LOCAL statement_timeout = '2s'")
+        return conn.execute(validate(sql)).fetchall()
+----
+
+Source: https://sqlglot.com/sqlglot.html[sqlglot documentation],
+https://www.postgresql.org/docs/current/sql-set-transaction.html[PostgreSQL -- SET TRANSACTION] and
+https://www.postgresql.org/docs/current/ddl-rowsecurity.html[PostgreSQL -- Row Security Policies].
+
+The table check compares the schema as well as the name, so `other_schema.page_catalogue` is rejected; give the
+read-only role a `search_path` of only the `catalogue` schema so that unqualified names resolve there too. The function
+check matters as much as the table check: a single `SELECT` can still call `pg_sleep`, `set_config` or `dblink_exec`,
+so only a few aggregates, casts and date functions are accepted.
+
+The model's side is ordinary structured output: a prompt with the view DDL and examples returns `{"sql": ...}`, the
+validator runs, and on a validation or database error the error message goes back to the model once for a corrected
+query. Return both the rows and the executed SQL to the generator and to the client, so the answer can cite the query
+as its source. Libraries such as Vanna (used in Polzer's cookbook) and LangChain's SQL toolkit package these steps; the
+safety layers above apply to them unchanged.
+
+On the JVM, run the model-written query through `JdbcTemplate` inside a `@Transactional(readOnly = true)` method, on a
+`DataSource` that connects as the read-only role; Spring's read-only flag sets the JDBC connection read-only, and
+PostgreSQL then rejects writes. LangChain4j's experimental `langchain4j-experimental-sql` module provides a
+`SqlDatabaseContentRetriever` that generates and runs SQL as a `ContentRetriever`; the same database-permission and
+validation rules apply to it.
+
+Query transformation, routing (including the LLM query router across vector store, SQL and calculator), decomposition
+and text-to-SQL follow the concepts of Oshin and Campos, _Learning LangChain_ (Chapters 2 and 3), and Polzer, _RAG with
+Python Cookbook_ (Chapters 7 and 11), paraphrased; see the xref:ai/rag-systems/index.adoc#_bibliography[bibliography].
+
+== References
+
+* https://docs.langchain.com/oss/python/langchain/retrieval[LangChain -- Retrieval]
+* https://docs.langchain.com/oss/python/langchain/structured-output[LangChain -- Structured output]
+* https://reference.langchain.com/python/langchain_classic/retrievers/[LangChain reference -- langchain_classic retrievers] (`SelfQueryRetriever`)
+* https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI -- Retrieval Augmented Generation]
+* https://docs.spring.io/spring-ai/reference/api/structured-output-converter.html[Spring AI -- Structured Output]
+* https://docs.langchain4j.dev/tutorials/rag/[LangChain4j -- RAG]
+* https://sqlglot.com/sqlglot.html[sqlglot]
+* https://www.postgresql.org/docs/current/ddl-rowsecurity.html[PostgreSQL -- Row Security Policies]
+* https://arxiv.org/abs/2212.10496[Gao et al., Precise Zero-Shot Dense Retrieval without Relevance Labels (HyDE)]

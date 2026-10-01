@@ -1,0 +1,555 @@
+= Python Backends
+:description: Serving Hugging Face models from Python backends with FastAPI -- loading models once in lifespan, keeping the event loop free with a threadpool or worker process, micro-batching, streaming with Server-Sent Events, the DocsAssistant ASR, TTS, vision and LLM endpoints, ONNX Runtime sessions and execution providers, text-embeddings-inference as a sidecar, and GPU and concurrency pitfalls.
+:keywords: fastapi, uvicorn, lifespan, app.state, threadpool, run_in_threadpool, event loop blocking, micro-batching, asyncio queue, batch_size, streaming, server-sent events, StreamingResponse, faster-whisper, kokoro, siglip 2, smolvlm, llama-cpp-python, transformers serve, onnx runtime, InferenceSession, execution providers, CUDAExecutionProvider, CoreMLExecutionProvider, text-embeddings-inference, tei, httpx, gpu, gil, backpressure, workers
+
+include::partial$ai-hugging-face-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against Python 3.12, `fastapi` 0.142.1, `uvicorn` 0.54.0, `transformers` 5.17.0,
+`faster-whisper` 1.2.1, `kokoro` 0.9.4 (which needs Python below 3.13), `llama-cpp-python` 0.3.35 and
+`onnxruntime` 1.30.0. It turns the models from the rest of this sub-section into an HTTP service. The running scenario is
+*DocsAssistant goes offline*: one backend that transcribes a spoken question, answers it with a small local LLM,
+speaks the answer and classifies or describes a screenshot, with no call to a hosted API. The FastAPI framework itself
+(routing, validation, dependency injection, testing) is covered by the Python FastAPI section of this documentation
+once it is published; this page only adds what is specific to *serving models*. Python's threading and `asyncio`
+model is explained in xref:programming-languages/python/concurrency-and-async.adoc[Concurrency and Async]. Serving an
+LLM to many users is a different problem, treated in xref:ai/local-llms/running-local-llms-in-production.adoc[Running
+Local LLMs in Production]. The Spring Boot equivalent of this page is
+xref:ai/hugging-face/java-and-spring-boot.adoc[Java and Spring Boot].
+
+== Architecture at a glance
+
+A model-serving backend has one job that ordinary web code does not: it owns a large, slow-to-load, non-trivially
+concurrent object. The rules that follow from that are few. Load each model once, when the process starts. Never run
+inference on the event loop. Bound the amount of work in flight. Put models that need their own scaling (embeddings)
+behind their own service.
+
+.Request flow of the DocsAssistant backend, including the embeddings sidecar
+[mermaid]
+....
+flowchart LR
+    C["Client app"] -->|"HTTP"| API["FastAPI / uvicorn<br/>event loop"]
+    API -->|"def endpoint or run_in_threadpool"| TP["Threadpool"]
+    API -->|"run_in_executor"| PP["ProcessPoolExecutor<br/>or worker service"]
+    TP --> ASR["faster-whisper<br/>WhisperModel"]
+    TP --> TTS["Kokoro KPipeline"]
+    TP --> VIS["transformers pipeline<br/>SigLIP 2 / SmolVLM"]
+    TP --> LLM["llama-cpp-python<br/>Llama + lock"]
+    PP --> ORT["ONNX Runtime<br/>InferenceSession"]
+    API -->|"httpx"| TEI["TEI container<br/>/embed"]
+    Q["asyncio.Queue<br/>micro-batcher"] --> VIS
+    API --> Q
+....
+
+Reference: https://fastapi.tiangolo.com/async/[FastAPI -- Concurrency and async / await].
+
+== Load once in lifespan
+
+Loading a model takes seconds to minutes and gigabytes of memory, so it belongs in the application's *lifespan*: code
+before the `yield` runs once before the server accepts requests, code after it runs at shutdown. Keeping the models on
+`app.state` makes them reachable from every endpoint through `request.app.state` without module-level globals, and
+makes them easy to replace in tests. If the load fails, the process fails to start, which is what an orchestrator's
+readiness check wants.
+
+.Loading the four DocsAssistant models once in lifespan
+[source,python]
+----
+from contextlib import asynccontextmanager
+from threading import Lock
+
+from fastapi import FastAPI
+from faster_whisper import WhisperModel
+from kokoro import KPipeline
+from llama_cpp import Llama
+from transformers import pipeline
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Runs once per worker process, before the first request
+    app.state.asr = WhisperModel("turbo", device="cpu", compute_type="int8", num_workers=2)
+    app.state.tts = KPipeline(lang_code="a")
+    app.state.vision = pipeline(
+        task="zero-shot-image-classification",
+        model="google/siglip2-base-patch16-224",
+    )
+    app.state.llm = Llama.from_pretrained(
+        repo_id="Qwen/Qwen3-1.7B-GGUF",
+        filename="*Q8_0.gguf",
+        n_ctx=4096,
+        verbose=False,
+    )
+    app.state.llm_lock = Lock()   # one llama.cpp context serves one generation at a time
+    yield
+    app.state.llm.close()         # release native memory; the other models are freed with the process
+
+
+app = FastAPI(title="DocsAssistant offline", lifespan=lifespan)
+----
+
+Reference: https://fastapi.tiangolo.com/advanced/events/[FastAPI -- Lifespan Events]. The model cards and options are in
+xref:ai/hugging-face/speech-models.adoc[Speech Models], xref:ai/hugging-face/vision-models.adoc[Vision Models] and
+xref:ai/hugging-face/small-llms-and-embeddings.adoc[Small LLMs and Embeddings]; `Llama.from_pretrained` is described in
+xref:ai/local-llms/llama-cpp.adoc[llama.cpp]. Downloads happen on first start, so bake the files into the image or
+mount a cache volume if the host has no network at start-up.
+
+== Keep the event loop free
+
+FastAPI runs on an `asyncio` event loop: one thread that interleaves every `async def` endpoint. A model forward pass
+is ordinary blocking code, so calling it directly inside an `async def` endpoint freezes the loop for its whole
+duration. During that time no other request is read, no health check answers and no client is served, even if the
+model itself is multi-threaded native code. The symptom is that latency under concurrency is the *sum* of the
+inference times and that `/health` times out during a long request.
+
+There are three remedies, in increasing isolation:
+
+* *Declare the endpoint with plain `def`.* FastAPI runs it in a threadpool (AnyIO worker threads, 40 by default), so
+  the loop stays free. This is the simplest option and the one used in the snippets below.
+* *Keep `async def` and call `run_in_threadpool`* (or `anyio.to_thread.run_sync`) around the blocking call, when the
+  endpoint also awaits other things such as `httpx` calls.
+* *Move inference to another process*, with a `ProcessPoolExecutor` driven by `loop.run_in_executor` or with a separate
+  worker service behind a queue. Processes are not limited by the GIL and a crash in native code cannot take the
+  API down, but the model must be loaded in each worker and inputs and outputs must be pickled across the boundary.
+
+Threads are usually enough for model serving, because PyTorch, CTranslate2, llama.cpp and ONNX Runtime release the
+GIL inside their native kernels. The Python code around them (pre-processing, tokenization, post-processing) does hold
+it, which is why CPU-heavy glue code scales better in processes.
+
+.Keeping an async endpoint responsive with run_in_threadpool, and the process-pool alternative
+[source,python]
+----
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
+
+from fastapi import Request
+from starlette.concurrency import run_in_threadpool
+
+
+@app.post("/classify-threadpool")
+async def classify(request: Request, payload: dict):
+    vision = request.app.state.vision
+    # The pipeline call blocks, so it runs on a worker thread
+    return await run_in_threadpool(
+        vision, payload["image_path"], candidate_labels=payload["labels"]
+    )
+
+
+# Process-based variant: the worker function must be importable and load its own model
+pool = ProcessPoolExecutor(max_workers=2)
+
+
+@app.post("/classify-in-process")
+async def classify_in_process(payload: dict):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(pool, worker_classify, payload)   # worker_classify defined in worker.py
+----
+
+Reference: https://fastapi.tiangolo.com/async/[FastAPI -- Concurrency and async / await] and
+https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor[Python -- ProcessPoolExecutor].
+
+== Batching
+
+A GPU (or a vectorised CPU kernel) processes a batch of inputs in barely more time than one input, so throughput
+improves if requests that arrive close together are merged. There are two levels.
+
+*Inside a pipeline*, `batch_size` controls how many items of one call are stacked together. It helps when a single
+request carries many items, for example ten screenshots, and it is not free: padding wastes compute on uneven inputs
+and an out-of-memory error on a large batch is easy to hit, so measure with your own data.
+
+*Across requests*, you need a *micro-batcher*: endpoints put their input and a future on an `asyncio.Queue`, and one
+background task collects up to `MAX_BATCH` items or waits at most `MAX_WAIT` seconds, runs the model once in the
+threadpool and resolves each future. The queue is bounded, so a burst is rejected with HTTP 503 instead of growing
+memory without limit.
+
+.A micro-batcher for the vision pipeline with a bounded queue
+[source,python]
+----
+import asyncio
+
+from fastapi import HTTPException
+
+MAX_BATCH, MAX_WAIT = 8, 0.02   # items, seconds
+
+
+class MicroBatcher:
+    def __init__(self, vision, labels):
+        self.vision, self.labels = vision, labels
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=64)   # backpressure
+
+    async def submit(self, image):
+        fut = asyncio.get_running_loop().create_future()
+        try:
+            self.queue.put_nowait((image, fut))
+        except asyncio.QueueFull:
+            raise HTTPException(status_code=503, detail="busy, retry later")
+        return await fut
+
+    async def run(self):   # started once from lifespan with asyncio.create_task
+        while True:
+            items = [await self.queue.get()]
+            deadline = asyncio.get_running_loop().time() + MAX_WAIT
+            while len(items) < MAX_BATCH:
+                timeout = deadline - asyncio.get_running_loop().time()
+                if timeout <= 0:
+                    break
+                try:
+                    items.append(await asyncio.wait_for(self.queue.get(), timeout))
+                except asyncio.TimeoutError:
+                    break
+            images = [img for img, _ in items]
+            try:
+                results = await asyncio.to_thread(
+                    self.vision, images, candidate_labels=self.labels, batch_size=MAX_BATCH
+                )
+                for (_, fut), res in zip(items, results):
+                    fut.set_result(res)
+            except Exception as exc:   # fail every waiter, never leave a future pending
+                for _, fut in items:
+                    fut.set_exception(exc)
+----
+
+Start it in `lifespan` with `asyncio.create_task(batcher.run())` and cancel the task after the `yield`. Reference:
+https://huggingface.co/docs/transformers/main/en/main_classes/pipelines#pipeline-batching[Transformers -- Pipeline
+batching] and https://docs.python.org/3/library/asyncio-queue.html[Python -- asyncio queues]. For LLMs, do not build
+this yourself: llama.cpp's server and vLLM implement continuous batching, which is far more efficient than
+request-level batching (see xref:ai/local-llms/vllm-and-sglang.adoc[vLLM and SGLang]).
+
+== Streaming results
+
+Generative models produce output incrementally, and users perceive latency as *time to first token*, not total time.
+FastAPI's `StreamingResponse` sends each item of an iterator as soon as it is produced. With the media type
+`text/event-stream` the body becomes *Server-Sent Events* (SSE), which browsers read with `EventSource` and which the
+OpenAI-style clients also use. A plain `def` generator passed to `StreamingResponse` is iterated in the threadpool, so
+a blocking generator does not block the loop.
+
+Segment-by-segment speech recognition is the same pattern: `WhisperModel.transcribe` returns a lazy generator of
+segments, so you can emit each one as it is decoded. The LLM endpoint in the next section uses the token variant.
+
+.Streaming ASR segments as Server-Sent Events
+[source,python]
+----
+import json
+from fastapi import UploadFile
+from fastapi.responses import StreamingResponse
+
+
+@app.post("/asr/stream")
+def transcribe_stream(request: Request, audio: UploadFile):
+    model = request.app.state.asr
+
+    def events():
+        segments, info = model.transcribe(audio.file, beam_size=5, vad_filter=True)
+        yield f"event: info\ndata: {json.dumps({'language': info.language})}\n\n"
+        for seg in segments:   # the model decodes while we iterate
+            yield f"data: {json.dumps({'start': seg.start, 'end': seg.end, 'text': seg.text})}\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+----
+
+Reference: https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse[FastAPI -- StreamingResponse] and
+https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG -- Server-sent events]. Uploads need the
+`python-multipart` package. Put a reverse proxy in front with response buffering disabled, or the stream arrives in
+one piece.
+
+== The DocsAssistant endpoints
+
+The four endpoints below share the `lifespan` above. They are plain `def` endpoints so FastAPI runs them in the
+threadpool, and each returns the simplest format a client can consume.
+
+=== ASR: faster-whisper
+
+`WhisperModel` (CTranslate2) is the fastest Whisper runtime on CPU and GPU. `num_workers` in the constructor lets
+several Python threads call `transcribe` in parallel, which matches the threadpool, at the price of extra memory. The
+model size, `compute_type` and language behaviour are described in xref:ai/hugging-face/speech-models.adoc[Speech Models].
+
+.POST /asr: a spoken question in, text out
+[source,python]
+----
+@app.post("/asr")
+def asr(request: Request, audio: UploadFile):
+    segments, info = request.app.state.asr.transcribe(audio.file, beam_size=5, vad_filter=True)
+    text = " ".join(seg.text.strip() for seg in segments)   # iterating runs the decoding
+    return {"language": info.language, "text": text}
+----
+
+Reference: https://github.com/SYSTRAN/faster-whisper[faster-whisper repository].
+
+=== TTS: Kokoro, returned as WAV
+
+`KPipeline` is a generator of `(graphemes, phonemes, audio)` tuples, one per text segment, at 24 kHz. To return a
+single file the endpoint concatenates the segments and writes them into an in-memory WAV. For a lower time to first
+audio, stream each segment instead (chunked WAV or raw PCM) as in the streaming section.
+
+.POST /tts: text in, audio/wav out
+[source,python]
+----
+import io
+
+import numpy as np
+import soundfile as sf
+from fastapi import Response
+from pydantic import BaseModel
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    voice: str = "af_heart"
+
+
+@app.post("/tts")
+def tts(request: Request, body: SpeakRequest):
+    parts = [
+        np.asarray(audio)
+        for _, _, audio in request.app.state.tts(body.text, voice=body.voice)
+    ]
+    buf = io.BytesIO()
+    sf.write(buf, np.concatenate(parts), 24000, format="WAV")
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+----
+
+Reference: https://github.com/hexgrad/kokoro[Kokoro repository] and
+https://python-soundfile.readthedocs.io/en/latest/[python-soundfile]. Kokoro needs the `espeak-ng` system package
+in the container image.
+
+=== Vision: a transformers pipeline
+
+Zero-shot classification with SigLIP 2 (`google/siglip2-base-patch16-224`, Apache-2.0) answers "which of my
+categories is this screenshot?" without training. For a free-form description, swap the pipeline for
+`image-text-to-text` with `HuggingFaceTB/SmolVLM-256M-Instruct` (Apache-2.0); the call shape is in
+xref:ai/hugging-face/transformers-pipelines.adoc[Transformers Pipelines] and the model choices in
+xref:ai/hugging-face/vision-models.adoc[Vision Models].
+
+.POST /vision/classify: a screenshot and candidate labels in, scored labels out
+[source,python]
+----
+from typing import Annotated
+
+from fastapi import Form
+from PIL import Image
+
+
+@app.post("/vision/classify")
+def classify_screenshot(
+    request: Request,
+    image: UploadFile,
+    labels: Annotated[str, Form()] = "error dialog,code editor,settings page,chart",
+):
+    pil = Image.open(image.file).convert("RGB")
+    result = request.app.state.vision(pil, candidate_labels=labels.split(","))
+    return result   # list of {"label", "score"}, best first
+----
+
+Reference: https://huggingface.co/docs/transformers/main/en/main_classes/pipelines#transformers.ZeroShotImageClassificationPipeline[Transformers -- ZeroShotImageClassificationPipeline].
+Validate uploads: limit the body size and the image dimensions at the proxy or with a dependency, because a decompression
+bomb is an easy denial of service.
+
+=== LLM: llama-cpp-python
+
+`Llama.create_chat_completion(stream=True)` returns an iterator of OpenAI-shaped chunks whose `delta` holds the next
+piece of text. One `Llama` object owns one context, so concurrent generations on it must be serialised; the lock created
+in `lifespan` does that, and requests queue on it. If you need real concurrency, run the llama.cpp server (several
+slots with continuous batching) and proxy to it, or use `transformers serve` below.
+
+.POST /chat: streaming the answer token by token
+[source,python]
+----
+class ChatRequest(BaseModel):
+    question: str
+
+
+@app.post("/chat")
+def chat(request: Request, body: ChatRequest):
+    llm, lock = request.app.state.llm, request.app.state.llm_lock
+
+    def tokens():
+        with lock:
+            stream = llm.create_chat_completion(
+                messages=[{"role": "user", "content": body.question}],
+                max_tokens=256,
+                stream=True,
+            )
+            for chunk in stream:
+                piece = chunk["choices"][0]["delta"].get("content")
+                if piece:
+                    yield f"data: {json.dumps({'token': piece})}\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(tokens(), media_type="text/event-stream")
+----
+
+Reference: https://llama-cpp-python.readthedocs.io/en/latest/api-reference/[llama-cpp-python -- API reference]; the GGUF
+files and quantization levels are explained in xref:ai/hugging-face/conversion-and-quantization.adoc[Conversion and
+Quantization]. A client that disconnects does not always stop generation, so also cap `max_tokens`.
+
+=== Alternative: transformers serve
+
+If you would rather not write the endpoint, `transformers serve` exposes a Hub model as an OpenAI-compatible server
+(`/v1/chat/completions`, `/v1/audio/transcriptions`, `/v1/models` and more), and FastAPI can proxy to it or the client
+can call it directly. The documentation positions it for evaluation, experiments and moderate load; for heavy traffic
+it points to vLLM or SGLang. The default address is `http://localhost:8000`, and the server has no authentication.
+Details are in xref:ai/hugging-face/transformers-pipelines.adoc[Transformers Pipelines].
+
+.Running transformers serve and calling it like any OpenAI endpoint
+[source,bash]
+----
+pip install "transformers[serving]"
+transformers serve Qwen/Qwen3-0.6B --continuous-batching
+
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-0.6B", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+----
+
+Reference: https://huggingface.co/docs/transformers/main/en/serve-cli/serving[Transformers -- Serve CLI].
+
+== ONNX Runtime sessions and execution providers
+
+When a model is available as ONNX (see xref:ai/hugging-face/model-formats.adoc[Model Formats]), ONNX Runtime runs it
+without PyTorch, which gives a much smaller image and faster start-up. An `InferenceSession` loads the graph, optimises
+it and binds it to *execution providers* (EPs): back ends such as `CPUExecutionProvider`, `CUDAExecutionProvider`,
+`CoreMLExecutionProvider` (Apple), `DmlExecutionProvider` (DirectML on Windows) or `OpenVINOExecutionProvider`. The
+`providers` list is ordered by precedence: each node runs on the first provider that supports it, falling back to the
+next, so always end the list with the CPU provider. `get_providers()` tells you what was really registered, which
+matters because a missing CUDA library silently leaves you on CPU.
+
+`SessionOptions` holds the tuning: `intra_op_num_threads` (threads inside one operator), `inter_op_num_threads`
+(threads across operators) and `graph_optimization_level`. Install exactly one of the `onnxruntime` and
+`onnxruntime-gpu` packages per environment.
+
+Create the session once, in `lifespan`, like any other model. ONNX Runtime's guidance is that concurrent calls to
+`run` on one session are supported, so one shared session is the normal design and you do not need a session per thread.
+The Python API page does not spell this out, so confirm it for your build and EP with a load test before relying on
+it, and keep one set of input arrays per call.
+
+.One shared ONNX Runtime session with ordered providers and explicit thread limits
+[source,python]
+----
+import numpy as np
+import onnxruntime as ort
+
+opts = ort.SessionOptions()
+opts.intra_op_num_threads = 4      # cap threads; leave cores for the API and other models
+opts.inter_op_num_threads = 1
+opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+session = ort.InferenceSession(
+    "model.onnx",
+    sess_options=opts,
+    providers=["CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"],
+)
+print(session.get_providers())     # check which ones were actually registered
+
+outputs = session.run(None, {"input_ids": np.array([[101, 2023, 102]], dtype=np.int64)})
+----
+
+Providers that are not built into the installed wheel are skipped with a warning, so the same list works on a laptop and
+on a GPU server. Reference: https://onnxruntime.ai/docs/api/python/api_summary.html[ONNX Runtime -- Python API] and
+https://onnxruntime.ai/docs/execution-providers/[ONNX Runtime -- Execution Providers].
+
+== Embeddings with text-embeddings-inference
+
+Embedding models are tiny compared with LLMs but are called constantly, often in bursts during indexing. Hugging Face's
+*text-embeddings-inference* (TEI) is a Rust server with token-based dynamic batching for embedding and re-ranker
+models, which makes it a natural *sidecar* container: it scales, restarts and is sized independently of the Python
+API, and the API stays free of PyTorch for this job. It serves `/embed` (native) and, in the documentation's examples,
+an OpenAI-compatible `/v1/embeddings`. Model choices are in
+xref:ai/hugging-face/small-llms-and-embeddings.adoc[Small LLMs and Embeddings].
+
+.Starting a TEI sidecar on CPU with a model cache volume
+[source,bash]
+----
+model=BAAI/bge-small-en-v1.5      # MIT licence
+volume=$PWD/tei-data              # weights are cached here between runs
+
+docker run -p 127.0.0.1:8080:80 -v $volume:/data --pull always \
+  -e HF_TOKEN \
+  ghcr.io/huggingface/text-embeddings-inference:cpu-1.9 --model-id $model
+
+# NVIDIA GPU: add --gpus all and use the cuda-1.9 tag from the quick tour
+----
+
+The image tag encodes the hardware target (`cpu-…`, `cuda-…` and architecture-specific variants) and the TEI
+version. The `1.9` used here comes from the current quick tour; check the README's image table for the tag that matches
+your hardware before pinning it. `-e HF_TOKEN` forwards your token from the environment and is only needed for gated or
+private models. Publishing the port on `127.0.0.1` keeps it off the network, which matters because TEI has no
+authentication by default. Reference: https://huggingface.co/docs/text-embeddings-inference/quick_tour[TEI -- Quick Tour].
+
+FastAPI calls the sidecar with an `httpx.AsyncClient` created once in `lifespan`, so connections are pooled and the
+call is truly asynchronous (no threadpool needed). Set an explicit timeout.
+
+.Calling TEI from FastAPI with a shared httpx client
+[source,python]
+----
+import httpx
+
+# in lifespan, before yield:
+#   app.state.tei = httpx.AsyncClient(base_url="http://tei:80", timeout=httpx.Timeout(10.0))
+# after yield: await app.state.tei.aclose()
+
+
+@app.post("/embed")
+async def embed(request: Request, texts: list[str]):
+    resp = await request.app.state.tei.post("/embed", json={"inputs": texts})
+    resp.raise_for_status()
+    return {"embeddings": resp.json()}   # one vector per input text
+----
+
+Send lists of texts rather than one request per text: TEI batches within a request and across requests. The OpenAI
+route `/v1/embeddings` lets the OpenAI SDK or Spring AI talk to the same container. References:
+https://www.python-httpx.org/async/[HTTPX -- Async support] and
+https://github.com/huggingface/text-embeddings-inference[text-embeddings-inference repository]. The retrieval side is in
+xref:database/vector-rag/generating-embeddings-in-practice.adoc[Generating Embeddings in Practice].
+
+== GPU and concurrency pitfalls
+
+Most production incidents with model backends come from a short list of mistakes.
+
+* *Several uvicorn workers, several copies of the model.* `uvicorn --workers 4` starts four processes and each runs
+  `lifespan`, so memory is multiplied by four, and on one GPU the copies compete for VRAM. For a large model, use one
+  worker and threads, or one process per GPU, and scale out with containers behind a load balancer.
+* *CUDA and fork.* CUDA cannot be re-initialised in a forked child that inherited an initialised parent. Use the
+  `spawn` start method for multiprocessing (for example `multiprocessing.get_context("spawn")` passed to the
+  `ProcessPoolExecutor`) and load the model inside the worker, never in the parent before forking.
+* *The GIL.* Native kernels release it, Python glue does not. If profiling shows one core at 100 percent while the
+  GPU idles, the tokenization or post-processing is the bottleneck: move it to processes or batch it.
+* *Loading a model per request.* Constructing a pipeline inside an endpoint costs seconds and gigabytes each time and
+  can exhaust memory under concurrency. Load in `lifespan` only.
+* *Thread oversubscription.* PyTorch, OpenMP, CTranslate2 and ONNX Runtime each start their own thread pools. With
+  several concurrent requests, total threads far exceed cores and throughput collapses. Set `OMP_NUM_THREADS`,
+  `torch.set_num_threads`, `intra_op_num_threads` and the `cpu_threads` argument of `WhisperModel` so that
+  (concurrent requests) times (threads per request) stays at or below the core count.
+* *Unbounded queues.* An unbounded queue turns overload into growing memory and latency instead of a clear error. Bound
+  the queue, return HTTP 503 or 429 when full, and limit concurrency with a semaphore or a fixed-size pool.
+* *No timeouts.* Give clients, `httpx` calls and the server a deadline, and cap `max_tokens`, image size and audio
+  duration so a single request cannot occupy a worker for minutes.
+* *Binding 0.0.0.0 has no auth.* `uvicorn --host 0.0.0.0` and the model servers above accept anything from the
+  network. Keep them on localhost or a private network, and put authentication and TLS in a reverse proxy or
+  gateway, as in xref:ai/local-llms/llm-gateways.adoc[LLM Gateways].
+* *Untrusted model code.* Only set `trust_remote_code=True` for repositories you have read, and prefer safetensors over
+  pickle checkpoints, which can run code on load (see xref:ai/hugging-face/model-formats.adoc[Model Formats]).
+
+Reference: https://www.uvicorn.org/deployment/[Uvicorn -- Deployment] and
+https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods[Python -- multiprocessing start methods].
+
+== References
+
+* https://fastapi.tiangolo.com/async/[FastAPI -- Concurrency and async / await]
+* https://fastapi.tiangolo.com/advanced/events/[FastAPI -- Lifespan Events]
+* https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse[FastAPI -- StreamingResponse]
+* https://www.uvicorn.org/deployment/[Uvicorn -- Deployment]
+* https://docs.python.org/3/library/concurrent.futures.html#processpoolexecutor[Python -- ProcessPoolExecutor]
+* https://docs.python.org/3/library/asyncio-queue.html[Python -- asyncio queues]
+* https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods[Python -- multiprocessing start methods]
+* https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG -- Server-sent events]
+* https://huggingface.co/docs/transformers/main/en/main_classes/pipelines#pipeline-batching[Transformers -- Pipeline batching]
+* https://huggingface.co/docs/transformers/main/en/main_classes/pipelines#transformers.ZeroShotImageClassificationPipeline[Transformers -- ZeroShotImageClassificationPipeline]
+* https://huggingface.co/docs/transformers/main/en/serve-cli/serving[Transformers -- Serve CLI]
+* https://github.com/SYSTRAN/faster-whisper[faster-whisper repository]
+* https://github.com/hexgrad/kokoro[Kokoro repository]
+* https://python-soundfile.readthedocs.io/en/latest/[python-soundfile]
+* https://llama-cpp-python.readthedocs.io/en/latest/api-reference/[llama-cpp-python -- API reference]
+* https://onnxruntime.ai/docs/api/python/api_summary.html[ONNX Runtime -- Python API]
+* https://onnxruntime.ai/docs/execution-providers/[ONNX Runtime -- Execution Providers]
+* https://huggingface.co/docs/text-embeddings-inference/quick_tour[Text Embeddings Inference -- Quick Tour]
+* https://github.com/huggingface/text-embeddings-inference[text-embeddings-inference repository]
+* https://www.python-httpx.org/async/[HTTPX -- Async support]

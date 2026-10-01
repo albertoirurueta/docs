@@ -1,0 +1,781 @@
+= Serving RAG as an API
+:description: Exposing a RAG system to applications and websites -- the /v1/ask contract (question, conversationId, filters to answer, citations, usage, traceId), an OpenAPI definition with a streamed response, server-sent events with FastAPI EventSourceResponse, Spring Flux<ServerSentEvent> from ChatClient.stream() and LangChain4j TokenStream, a WebSocket variant, asynchronous ingestion endpoints with job status, idempotency keys, OAuth2 and JWT, rate limiting, versioning, CORS and a minimal browser widget.
+:keywords: rag api, /v1/ask, api contract, openapi, openapi 3.2, text/event-stream, itemSchema, server-sent events, sse, EventSourceResponse, ServerSentEvent, astream, Flux, ServerSentEvent, ChatClient.stream, TokenStream, SseEmitter, websocket, async ingestion, 202 accepted, job status, idempotency key, oauth2, jwt, bearer token, resource server, rate limiting, 429, retry-after, api versioning, deprecation, sunset, cors, browser widget, fetch streaming, docsassistant
+
+include::partial$ai-rag-systems-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against FastAPI 0.142.2, `langchain` 1.4.3, `langgraph` 1.2.12 and `redis` (redis-py)
+on Python 3.12, Spring AI 2.0.1 on Spring Boot 4.1.1 (Spring MVC, Spring Security's OAuth 2.0 resource server), and
+LangChain4j 1.20.2 (see the xref:ai/rag-systems/index.adoc#_version_baseline[version baseline]). The FastAPI application
+(SSE route, WebSocket route and idempotency helper) was run in process with FastAPI's `TestClient`, a scripted agent and
+`fakeredis` in place of Redis; the event stream shown below is its real output. The Java classes were compiled against
+the released jars and were not run.
+
+Everything so far has been a library call. Applications, websites and other teams need a *service*: a stable HTTP
+contract that streams, authenticates, rate-limits, versions and documents itself. The streaming mechanics of each
+framework are covered in xref:ai/langchain/streaming.adoc[LangChain: Streaming] and
+xref:ai/spring-ai/streaming-and-reactive.adoc[Spring AI: Streaming & Reactive], and REST API design in general in
+xref:backend/springboot/rest-apis.adoc[Spring Boot: REST APIs]; this page designs DocsAssistant's public API on top of
+them. Chat channels (Slack, Teams, email) are covered in the
+xref:ai/conversational-channels/index.adoc[Conversational Channels] sub-section of this guide, which consumes this API; the MCP exposure of the same retriever is on
+xref:ai/rag-systems/rag-behind-mcp.adoc[RAG Behind MCP].
+
+== The contract
+
+`POST /v1/ask` takes a question and returns an answer with citations, either as one JSON document
+(`Accept: application/json`) or as a stream of server-sent events (`Accept: text/event-stream`).
+
+[cols="1,1,3", options="header"]
+|===
+| Field | Type | Meaning
+
+3+| *Request*
+
+| `question`
+| string, 1 to 4 000 characters
+| The user's message.
+
+| `conversationId`
+| string, optional
+| An existing conversation of the caller; omitted for a new one (the response returns the new ID).
+
+| `filters`
+| object, optional
+| Narrowing filters the UI offers: `component`, `version`, `sources[]`. Never ACLs; those come from the token.
+
+3+| *Response*
+
+| `answer`
+| string
+| The answer with `[n]` citation markers.
+
+| `citations`
+| array
+| `{marker, chunkId, title, url, quote, start, end, page}`, resolved and verified server-side
+  (xref:ai/rag-systems/citations-and-grounding.adoc[Citations & Grounding]).
+
+| `usage`
+| object
+| `{inputTokens, outputTokens, costUsd}` for the request.
+
+| `traceId`
+| string
+| The OpenTelemetry trace ID, for support and for attaching feedback (xref:ai/rag-systems/observability-and-tracing.adoc[Observability & Tracing]).
+
+| `conversationId`, `grounded`
+| string, boolean
+| The conversation used; whether the grounding checks passed.
+|===
+
+Errors use RFC 9457 problem details (`application/problem+json`) with a stable `type` URI: `rate-limited`,
+`conversation-not-found`, `question-too-long`, `blocked-by-policy`. Once a stream has started, errors are sent as an
+`error` event instead, because the HTTP status is already 200.
+
+== The OpenAPI definition
+
+OpenAPI 3.2 can describe a streamed response item by item: for `text/event-stream`, `itemSchema` gives the schema of one
+event. FastAPI generates the JSON side from the Pydantic models; the streamed side is worth writing down explicitly:
+
+.openapi.yaml -- the /v1/ask operation (abridged)
+[source,yaml]
+----
+openapi: 3.2.0
+info: {title: DocsAssistant API, version: 1.4.0}
+paths:
+  /v1/ask:
+    post:
+      operationId: ask
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: Idempotency-Key, in: header, required: false, schema: {type: string, maxLength: 64}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AskRequest'}
+      responses:
+        '200':
+          description: The answer, whole or streamed
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AskResponse'}
+            text/event-stream:
+              itemSchema:
+                type: object
+                required: [event, data]
+                properties:
+                  event: {type: string, enum: [status, token, citations, grounding, done, error]}
+                  data: {type: string, contentMediaType: application/json}
+                  id: {type: string}
+        '401': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/Problem'}
+components:
+  securitySchemes:
+    bearerAuth: {type: http, scheme: bearer, bearerFormat: JWT}
+----
+
+Source: https://spec.openapis.org/oas/v3.2.0.html[OpenAPI Specification 3.2.0] (Media Type Object, `itemSchema`,
+sequential media types).
+
+== Server-sent events
+
+SSE is the right default for streaming answers to browsers and apps: it is plain HTTP, passes through proxies and load
+balancers, reconnects automatically, and is one-directional, which matches "question in, answer out". DocsAssistant
+emits six event types:
+
+[cols="1,3", options="header"]
+|===
+| Event | Payload
+
+| `status`
+| `{"stage": "retrieving" \| "reading" \| "writing", "detail": ...}` -- progress before the first token.
+
+| `token`
+| `{"text": "..."}` -- the next piece of the answer.
+
+| `citations`
+| The resolved and verified citations, once the answer is complete.
+
+| `grounding`
+| `{"grounded": true, "flagged": [...]}` -- the trailing verdict of the grounding check.
+
+| `done`
+| `{"conversationId": ..., "traceId": ..., "usage": {...}}` -- closes the turn.
+
+| `error`
+| `{"type": "..."}` -- a problem type, never a stack trace.
+|===
+
+=== FastAPI with `EventSourceResponse`
+
+FastAPI's `fastapi.sse` module turns an async generator into an SSE response: declare
+`response_class=EventSourceResponse` and `yield` `ServerSentEvent` objects. The agent is the persistent one from
+xref:ai/rag-systems/conversational-rag-and-memory.adoc#_persisting_conversations_in_langgraph[Conversational RAG &
+Memory], and the caller comes from the token as on
+xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]:
+
+.docsassistant/api.py -- /v1/ask with JSON and SSE responses (Python, FastAPI 0.142.2)
+[source,python]
+----
+import json
+import re
+from collections.abc import AsyncIterable
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from langchain_core.messages import AIMessage, ToolMessage
+from opentelemetry import trace
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic.alias_generators import to_camel
+
+from docsassistant.agent import open_agent, thread_id
+from docsassistant.conversations import conversations          # ownership table: create(), owns()
+from docsassistant.security import Caller, caller_from_token
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with open_agent() as agent:                          # async checkpointer and store on one pool
+        app.state.agent = agent
+        yield
+
+
+app = FastAPI(title="DocsAssistant API", version="1.4.0", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["https://albertoirurueta.github.io"],
+                   allow_methods=["POST", "GET"], allow_headers=["Authorization", "Content-Type", "Idempotency-Key"])
+bearer = HTTPBearer(auto_error=False)
+
+
+class Camel(BaseModel):
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+
+class Filters(Camel):
+    component: str | None = None
+    version: str | None = None
+
+
+class AskRequest(Camel):
+    question: str = Field(min_length=1, max_length=4000)
+    conversation_id: str | None = None
+    filters: Filters | None = None        # narrowing only; merged with the ACL filter as on Access Control & Privacy
+
+
+def current_caller(creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]) -> Caller:
+    if creds is None:                                         # no anonymous access: bearerAuth is required
+        raise HTTPException(status_code=401, detail="missing token", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        return caller_from_token(creds.credentials)
+    except Exception:
+        raise HTTPException(status_code=401, detail="invalid token", headers={"WWW-Authenticate": "Bearer"})
+
+
+def resolve_conversation(caller: Caller, conversation_id: str | None) -> str:
+    if conversation_id is None:
+        return conversations.create(caller.user_id)
+    if not conversations.owns(caller.user_id, conversation_id):
+        raise HTTPException(status_code=404, detail="conversation-not-found")    # same answer for foreign IDs
+    return conversation_id
+
+
+def owned_conversation(req: AskRequest, caller: Annotated[Caller, Depends(current_caller)]) -> str:
+    """A dependency, so that a 401 or 404 is returned before the stream starts."""
+    return resolve_conversation(caller, req.conversation_id)
+
+
+@app.post("/v1/ask", response_class=EventSourceResponse)
+async def ask_stream(req: AskRequest, request: Request, caller: Annotated[Caller, Depends(current_caller)],
+                     conversation_id: Annotated[str, Depends(owned_conversation)]) -> AsyncIterable[ServerSentEvent]:
+    agent = request.app.state.agent
+    trace_id = format(trace.get_current_span().get_span_context().trace_id, "032x")
+    config = {"configurable": {"thread_id": thread_id(caller.user_id, conversation_id)}}
+    passages: dict[str, dict] = {}
+    answer: list[str] = []
+    yield ServerSentEvent(event="status", data={"stage": "retrieving"})
+    try:
+        async for part in agent.astream({"messages": [{"role": "user", "content": req.question}]}, config,
+                                        context=caller, stream_mode=["messages", "updates"], version="v2"):
+            if part["type"] == "messages":
+                chunk, _ = part["data"]
+                if isinstance(chunk, AIMessage) and chunk.text:
+                    answer.append(chunk.text)
+                    yield ServerSentEvent(event="token", data={"text": chunk.text})
+            elif part["type"] == "updates" and "tools" in part["data"]:
+                for msg in part["data"]["tools"]["messages"]:
+                    if isinstance(msg, ToolMessage):
+                        for p in json.loads(msg.text):
+                            passages[p["chunk_id"]] = p
+                yield ServerSentEvent(event="status", data={"stage": "writing", "passages": len(passages)})
+        cited = [cid for cid in dict.fromkeys(re.findall(r"\[(c\d+)\]", "".join(answer))) if cid in passages]
+        yield ServerSentEvent(event="citations", data=[{"marker": i + 1, "chunkId": cid,
+                                                        "source": passages[cid]["source"]}
+                                                       for i, cid in enumerate(cited)])
+        yield ServerSentEvent(event="done", data={"conversationId": conversation_id, "traceId": trace_id})
+    except Exception as exc:                                  # the status is already 200: report as an event
+        yield ServerSentEvent(event="error", data={"type": type(exc).__name__})
+----
+
+Source: https://fastapi.tiangolo.com/tutorial/server-sent-events/[FastAPI -- Server-Sent Events],
+https://docs.langchain.com/oss/python/langchain/streaming[LangChain -- Streaming] and
+https://fastapi.tiangolo.com/tutorial/cors/[FastAPI -- CORS].
+
+The stream the route produced for "What is ef_search?" in that run, with a scripted model that cited one retrieved
+passage (`c1`) and one passage it was never given (`c9`):
+
+[source,text]
+----
+event: status
+data: {"stage": "retrieving"}
+
+event: status
+data: {"stage": "writing", "passages": 1}
+
+event: token
+data: {"text": "ef_search sets the candidate list size [c1]. Not [c9]."}
+
+event: citations
+data: [{"marker": 1, "chunkId": "c1", "source": "vector-rag/ann-indexes"}]
+
+event: done
+data: {"conversationId": "conv1", "traceId": "00000000000000000000000000000000"}
+----
+
+The fabricated `c9` is dropped from `citations`; the trace ID is all zeros because no OpenTelemetry SDK was configured
+in the test. Everything that can fail with an HTTP status -- the token, the conversation ownership -- runs in dependencies, which
+FastAPI resolves before the first byte of the stream; an exception raised inside the generator can only become an
+`error` event. The citation step here only keeps IDs that were really retrieved; the full verification with quotes and spans from
+xref:ai/rag-systems/citations-and-grounding.adoc#_verifying_citations[Citations & Grounding] slots in at the same place,
+followed by the `grounding` event. For clients that want a single JSON document, a second route (or content
+negotiation on `Accept`) runs `agent.ainvoke` and returns an `AskResponse` model. Keep the SSE connection alive through
+proxies by sending a comment line (`ServerSentEvent(comment="keep-alive")`) every 15 seconds while the model thinks.
+
+=== Spring: `Flux<ServerSentEvent>` from `ChatClient.stream()`
+
+With Spring MVC, a controller method can return a Reactor `Flux`; `ServerSentEvent` controls the event name. The
+identity comes from the resource server's `Jwt`, and the memory key and ACL filter are built from it as on the previous
+pages:
+
+.AskController.java -- SSE from ChatClient.stream() (Java, Spring AI 2.0.1, Spring MVC)
+[source,java]
+----
+package com.example.docsassistant.rag.api;
+
+import java.util.Map;
+import java.util.UUID;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.rag.retrieval.search.VectorStoreDocumentRetriever;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.http.MediaType;
+import org.springframework.http.codec.ServerSentEvent;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+import reactor.core.publisher.Flux;
+
+@RestController
+@RequestMapping("/v1")
+public class AskController {
+
+    public record AskRequest(String question, String conversationId) {
+    }
+
+    private final ChatClient chatClient;          // built with memory and RAG advisors
+
+    public AskController(ChatClient docsChatClient) {
+        this.chatClient = docsChatClient;
+    }
+
+    @PostMapping(path = "/ask", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<ServerSentEvent<Object>> ask(@RequestBody AskRequest req, @AuthenticationPrincipal Jwt jwt) {
+        String conversationId = req.conversationId() != null ? req.conversationId() : UUID.randomUUID().toString();
+        var acl = new FilterExpressionBuilder().in("acl", readableAcls(jwt)).build();
+
+        Flux<ServerSentEvent<Object>> tokens = chatClient.prompt()
+                .user(req.question())
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, jwt.getSubject() + ":" + conversationId)
+                        .param(VectorStoreDocumentRetriever.FILTER_EXPRESSION, acl))
+                .stream()
+                .content()
+                .map(text -> ServerSentEvent.<Object>builder(Map.of("text", text)).event("token").build());
+
+        return Flux.concat(
+                        Flux.just(ServerSentEvent.<Object>builder(Map.of("stage", "retrieving")).event("status").build()),
+                        tokens,
+                        Flux.just(ServerSentEvent.<Object>builder(Map.of("conversationId", conversationId))
+                                .event("done").build()))
+                .onErrorResume(e -> Flux.just(ServerSentEvent.<Object>builder(Map.of("type", e.getClass().getSimpleName()))
+                        .event("error").build()));
+    }
+
+    private static Object[] readableAcls(Jwt jwt) {
+        // the policy from Access Control & Privacy
+        return com.example.docsassistant.rag.acl.AclAwareAskService.readableAcls(jwt).toArray();
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/chatclient.html[Spring AI -- ChatClient API] (streaming
+responses) and
+https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html#mvc-ann-async-reactive-types[Spring
+Framework -- Reactive return values in Spring MVC].
+
+Ownership of the `conversationId` must be checked exactly as in the Python version before it is used; the check is
+omitted here for length (see
+xref:ai/rag-systems/conversational-rag-and-memory.adoc#_persisting_conversations_in_spring_ai[Conversational RAG &
+Memory]). To emit citations at the end, stream `chatClientResponse()` instead of `content()`: the last element's
+`ChatResponse` metadata carries the retrieved documents under `RetrievalAugmentationAdvisor.DOCUMENT_CONTEXT`.
+
+=== LangChain4j: `TokenStream` to `SseEmitter`
+
+A LangChain4j AI service method that returns `TokenStream` calls back for retrieved content, partial responses and
+completion. In a Spring MVC controller the callbacks write to an `SseEmitter`:
+
+.StreamingAskController.java -- TokenStream callbacks as SSE events (Java, LangChain4j 1.20.2, Spring MVC)
+[source,java]
+----
+package com.example.docsassistant.l4j.api;
+
+import java.io.IOException;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import com.example.docsassistant.rag.acl.AclAwareAskService;
+import dev.langchain4j.invocation.InvocationParameters;
+import dev.langchain4j.service.MemoryId;
+import dev.langchain4j.service.TokenStream;
+import dev.langchain4j.service.UserMessage;
+import org.springframework.http.HttpStatus;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+@RestController
+public class StreamingAskController {
+
+    public interface StreamingDocsAssistant {
+        TokenStream ask(@MemoryId String memoryKey, @UserMessage String question, InvocationParameters caller);
+    }
+
+    public record AskRequest(String question, String conversationId) {
+    }
+
+    public interface Conversations {                  // the ownership table, like conversations in the Python API
+        void register(String userId, String conversationId);
+
+        boolean isOwner(String userId, String conversationId);
+    }
+
+    private final StreamingDocsAssistant assistant;   // AiServices with a StreamingChatModel
+    private final Conversations conversations;
+
+    public StreamingAskController(StreamingDocsAssistant assistant, Conversations conversations) {
+        this.assistant = assistant;
+        this.conversations = conversations;
+    }
+
+    @PostMapping("/v1/ask/l4j")
+    public SseEmitter ask(@RequestBody AskRequest req, @AuthenticationPrincipal Jwt jwt) {
+        String conversationId = ownedConversation(jwt.getSubject(), req.conversationId());
+        SseEmitter emitter = new SseEmitter(120_000L);
+        List<String> readable = AclAwareAskService.readableAcls(jwt);   // the policy from Access Control & Privacy
+        assistant.ask(jwt.getSubject() + ":" + conversationId, req.question(),
+                        InvocationParameters.from("readableAcls", readable))
+                .onRetrieved(contents -> send(emitter, "status", Map.of("stage", "writing", "passages", contents.size())))
+                .onPartialResponse(text -> send(emitter, "token", Map.of("text", text)))
+                .onCompleteResponse(response -> {
+                    send(emitter, "done", Map.of("conversationId", conversationId));
+                    emitter.complete();
+                })
+                .onError(error -> {
+                    send(emitter, "error", Map.of("type", error.getClass().getSimpleName()));
+                    emitter.complete();
+                })
+                .start();
+        return emitter;
+    }
+
+    private String ownedConversation(String userId, String requested) {
+        if (requested == null) {
+            String created = UUID.randomUUID().toString();
+            conversations.register(userId, created);
+            return created;
+        }
+        if (!conversations.isOwner(userId, requested)) {           // same answer for foreign and unknown IDs
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "conversation-not-found");
+        }
+        return requested;
+    }
+
+    private static void send(SseEmitter emitter, String event, Object data) {
+        try {
+            emitter.send(SseEmitter.event().name(event).data(data));
+        } catch (IOException clientGone) {
+            emitter.completeWithError(clientGone);
+        }
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/tutorials/response-streaming/[LangChain4j -- Response Streaming] and
+https://docs.langchain4j.dev/tutorials/ai-services/#streaming[LangChain4j -- AI Services (streaming)].
+
+The conversation ID is resolved before the emitter is returned, so a foreign ID is a plain `404`, not an `error`
+event: a missing ID gets a new UUID registered to the caller, and a client-supplied one must belong to the caller
+before it becomes part of the memory key. The readable ACLs come from the same `readableAcls(jwt)` policy as the
+Spring AI controller.
+
+== A WebSocket variant
+
+WebSockets are worth their extra complexity when the client needs to talk *while* the server streams: cancelling a
+generation, sending the next question without waiting, or voice and typing indicators. The protocol is a small set of
+JSON messages over one connection; authentication happens once, at connect time (a token in the first message, or a
+short-lived ticket in the URL, because browsers cannot set an `Authorization` header on WebSocket connections):
+
+.docsassistant/ws.py -- ask and cancel over a WebSocket (Python, FastAPI 0.142.2)
+[source,python]
+----
+import asyncio
+
+from fastapi import HTTPException, WebSocket, WebSocketDisconnect, WebSocketException, status
+from langchain_core.messages import AIMessage
+
+from docsassistant.agent import thread_id
+from docsassistant.api import app, resolve_conversation
+from docsassistant.security import caller_from_token
+
+
+@app.websocket("/v1/ws")
+async def ws_ask(ws: WebSocket):
+    await ws.accept()
+    hello = await ws.receive_json()                                  # {"type": "auth", "token": "..."}
+    try:
+        caller = await asyncio.to_thread(caller_from_token, hello.get("token"))   # JWKS lookup off the event loop
+    except Exception:
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="invalid token")
+    agent = ws.app.state.agent                                       # opened by the API's lifespan
+    running: asyncio.Task | None = None
+
+    async def answer(question: str, conversation_id: str):
+        config = {"configurable": {"thread_id": thread_id(caller.user_id, conversation_id)}}
+        async for part in agent.astream({"messages": [{"role": "user", "content": question}]}, config,
+                                        context=caller, stream_mode="messages", version="v2"):
+            chunk, _ = part["data"]
+            if isinstance(chunk, AIMessage) and chunk.text:
+                await ws.send_json({"type": "token", "text": chunk.text})
+        await ws.send_json({"type": "done", "conversationId": conversation_id})
+
+    try:
+        while True:
+            msg = await ws.receive_json()
+            if msg["type"] == "ask":
+                try:
+                    conversation_id = resolve_conversation(caller, msg.get("conversationId"))
+                except HTTPException as exc:                         # a foreign or unknown conversation ID
+                    await ws.send_json({"type": "error", "error": exc.detail})
+                    continue
+                if running and not running.done():
+                    running.cancel()
+                running = asyncio.create_task(answer(msg["question"], conversation_id))
+            elif msg["type"] == "cancel" and running:
+                running.cancel()
+                await ws.send_json({"type": "cancelled"})
+    except WebSocketDisconnect:
+        if running:
+            running.cancel()                                         # stop paying for tokens nobody will read
+----
+
+Source: https://fastapi.tiangolo.com/advanced/websockets/[FastAPI -- WebSockets] and
+https://www.rfc-editor.org/rfc/rfc6455[RFC 6455].
+
+An invalid or missing token closes the connection with code `1008` (policy violation): the handler raises
+`WebSocketException`, which FastAPI turns into a close frame even after `accept()`. An unknown conversation ID is
+answered with an `error` message and the connection stays open; `resolve_conversation` raises `HTTPException`, which
+cannot become an HTTP response once the connection is a WebSocket, so the handler catches it.
+
+Cancelling the task stops the model stream, which matters for cost: an abandoned SSE request should do the same, by
+checking `await request.is_disconnected()` or relying on the server cancelling the generator when the client goes away.
+In Spring, the equivalent is a `WebSocketHandler` (see
+https://docs.spring.io/spring-framework/reference/web/websocket.html[Spring Framework -- WebSockets]) that disposes the
+`Flux` subscription on cancel.
+
+== Asynchronous ingestion endpoints
+
+Uploading a document for indexing is slow and must not hold a request open. The endpoint accepts the document, stores
+it, enqueues a job and answers `202 Accepted` with the job's location; the client polls the job (or subscribes to a
+webhook or an SSE job stream):
+
+[cols="1,2,2", options="header"]
+|===
+| Call | Response | Notes
+
+| `POST /v1/documents` (multipart, `Idempotency-Key`)
+| `202 Accepted`, `Location: /v1/jobs/\{jobId}`, body `{"jobId", "status": "queued"}`
+| The ACL of the new document comes from the uploader's rights and an explicit, validated `acl` field.
+
+| `GET /v1/jobs/\{jobId}`
+| `200` with `{"status": "queued" \| "parsing" \| "embedding" \| "indexed" \| "failed", "error", "chunks"}`
+| Backed by the job ledger of xref:ai/rag-systems/ingestion-pipelines-and-freshness.adoc#_idempotent_restartable_jobs[Ingestion Pipelines & Freshness].
+
+| `DELETE /v1/documents/\{documentId}`
+| `202 Accepted` with a job
+| Deletes chunks, graph nodes and cache entries asynchronously.
+|===
+
+== Idempotency keys
+
+Mobile clients retry. A retried `POST /v1/documents` must not index the document twice, and a retried `POST /v1/ask`
+should not pay for the answer twice. The client sends an `Idempotency-Key` header (a UUID per logical operation); the
+server remembers the key with the response for a limited time and replays it for a repeat. A key reused with a
+*different* body is an error (`422`):
+
+.docsassistant/idempotency.py -- replay responses for repeated keys (Python, redis-py)
+[source,python]
+----
+import hashlib
+import json
+import os
+
+import redis.asyncio as redis
+from fastapi import HTTPException
+
+store = redis.Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+TTL_S = 24 * 3600
+
+
+async def run_once(user_id: str, key: str, body: dict, handler) -> dict:
+    """Execute handler(body) at most once per (user, key); replay the stored result afterwards."""
+    fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    slot = f"idem:{user_id}:{key}"
+    claimed = await store.set(slot, json.dumps({"state": "running", "fp": fingerprint}), nx=True, ex=TTL_S)
+    if not claimed:
+        record = json.loads(await store.get(slot))
+        if record["fp"] != fingerprint:
+            raise HTTPException(status_code=422, detail="Idempotency-Key reused with a different request")
+        if record["state"] == "running":
+            raise HTTPException(status_code=409, detail="The original request is still in progress")
+        return record["response"]
+    try:
+        response = await handler(body)
+    except Exception:
+        await store.delete(slot)                     # release the claim so that a retry can run the request
+        raise
+    await store.set(slot, json.dumps({"state": "done", "fp": fingerprint, "response": response}), ex=TTL_S)
+    return response
+----
+
+Source: https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/[IETF -- The Idempotency-Key HTTP
+Header Field] and https://redis.io/docs/latest/commands/set/[Redis -- SET] (`NX`, `EX`).
+
+A failed request does not keep the key: the handler's exception deletes the `running` claim, so a retry with the same
+key runs again instead of getting `409` for 24 hours. Scope keys by user, as above, so one client cannot replay another's response. For streamed answers, store the final
+answer and replay it as a short stream.
+
+== Authentication with OAuth 2.0 and JWT
+
+The API is an OAuth 2.0 *resource server*: clients obtain access tokens from the organisation's identity provider
+(authorization code with PKCE for the web widget and mobile apps, client credentials for services) and send them as
+bearer tokens. The server validates signature, issuer, audience and expiry, and reads the subject and groups. In
+Python that is the `caller_from_token` dependency above; in Spring Boot it is configuration plus a security filter
+chain:
+
+.SecurityConfig.java -- resource server, CORS and per-path rules (Java, Spring Boot 4.1.1)
+[source,java]
+----
+package com.example.docsassistant.rag.api;
+
+import java.util.List;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+@Configuration
+public class SecurityConfig {
+
+    // application.yaml: spring.security.oauth2.resourceserver.jwt.issuer-uri and .audiences
+    @Bean
+    SecurityFilterChain api(HttpSecurity http) throws Exception {
+        return http
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers("/actuator/health/**").permitAll()
+                        .requestMatchers("/v1/documents/**").hasAuthority("SCOPE_docs.write")
+                        .requestMatchers("/v1/**").authenticated()
+                        .anyRequest().denyAll())
+                .oauth2ResourceServer(oauth -> oauth.jwt(Customizer.withDefaults()))
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .csrf(csrf -> csrf.disable())            // stateless bearer tokens, no cookies
+                .cors(Customizer.withDefaults())
+                .build();
+    }
+
+    @Bean
+    CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration cors = new CorsConfiguration();
+        cors.setAllowedOrigins(List.of("https://albertoirurueta.github.io"));
+        cors.setAllowedMethods(List.of("GET", "POST"));
+        cors.setAllowedHeaders(List.of("Authorization", "Content-Type", "Idempotency-Key", "Last-Event-ID"));
+        cors.setMaxAge(3600L);
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/v1/**", cors);
+        return source;
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html[Spring Security --
+OAuth 2.0 Resource Server JWT] and https://docs.spring.io/spring-security/reference/servlet/integrations/cors.html[Spring
+Security -- CORS].
+
+The flows, token types and hardening advice are in xref:backend/oauth/index.adoc[OAuth], in particular
+xref:backend/oauth/browser-based-apps.adoc[Browser-Based Apps] for the widget and
+xref:backend/oauth/access-and-refresh-tokens.adoc[Access and Refresh Tokens].
+
+== Rate limiting
+
+A RAG request costs real money, so rate limits protect the budget as much as the service. Limit on two axes: requests
+per user per minute (abuse and runaway clients) and *tokens* per user or tenant per day (cost). Enforce the first at the
+API gateway where possible; enforce the second in the service, where token usage is known after each call. Answer
+`429 Too Many Requests` with a `Retry-After` header and a problem-details body, and expose the remaining budget in
+response headers so well-behaved clients can slow down. A token bucket per user in Redis is the usual implementation;
+the Redis patterns (counters with expiry, Lua scripts for atomic buckets) are in
+xref:database/redis/use-cases-and-patterns.adoc[Redis Use Cases and Patterns].
+
+== Versioning
+
+Version the path (`/v1/ask`) and treat the contract as public. Within a version, changes are additive only: new
+optional request fields, new response fields, new SSE event types that clients ignore when unknown (document that
+rule). Breaking changes -- a renamed field, a changed citation schema -- go to `/v2`, and `/v1` announces its end with
+the `Deprecation` and `Sunset` response headers. Model and prompt changes are *not* API versions, but they change
+answers: record the model and prompt version in the trace and the `done` event, so clients and support can tell which
+behaviour produced an answer.
+
+== A minimal browser widget
+
+The browser's `EventSource` only supports `GET` without custom headers, so a `POST` with a bearer token reads the
+stream with `fetch` and a small SSE parser. The widget below renders tokens as they arrive and citations at the end;
+the token comes from the page's OAuth client (see xref:backend/oauth/browser-based-apps.adoc[Browser-Based Apps]):
+
+.docs-assistant-widget.js -- consuming the SSE stream from a web page (JavaScript)
+[source,javascript]
+----
+export async function ask(question, { token, conversationId, onToken, onStatus, onCitations, onDone, signal }) {
+  const res = await fetch("https://api.example.org/v1/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ question, conversationId }),
+    signal,                                            // AbortController: the user pressed "stop"
+  });
+  if (!res.ok) throw new Error((await res.json()).type ?? res.status);
+
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    let end;
+    while ((end = buffer.indexOf("\n\n")) >= 0) {       // one SSE event per blank-line-terminated block
+      const block = buffer.slice(0, end);
+      buffer = buffer.slice(end + 2);
+      const event = /^event: (.*)$/m.exec(block)?.[1] ?? "message";
+      const data = block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("\n");
+      if (!data) continue;                              // comments and keep-alives
+      const payload = JSON.parse(data);
+      if (event === "token") onToken(payload.text);
+      else if (event === "status") onStatus?.(payload);
+      else if (event === "citations") onCitations?.(payload);
+      else if (event === "done") onDone?.(payload);
+      else if (event === "error") throw new Error(payload.type);
+    }
+  }
+}
+----
+
+Source: https://html.spec.whatwg.org/multipage/server-sent-events.html[HTML Living Standard -- Server-sent events]
+(event stream format) and https://developer.mozilla.org/docs/Web/API/Streams_API/Using_readable_streams[MDN -- Using
+readable streams].
+
+Render the answer text as text, never as HTML: model output is untrusted, and inserting it with `innerHTML` turns a
+prompt injection into cross-site scripting. Build citation links from the server's `citations` payload only.
+
+The API and SSE design on this page is written from the official FastAPI, Spring and LangChain4j documentation; the
+books consulted for this sub-section do not cover REST, FastAPI or SSE serving (Polzer's cookbook stops at a Streamlit
+UI), as noted on the xref:ai/rag-systems/index.adoc#_where_the_books_are_out_of_date[landing page].
+
+== References
+
+* https://fastapi.tiangolo.com/tutorial/server-sent-events/[FastAPI -- Server-Sent Events]
+* https://fastapi.tiangolo.com/advanced/custom-response/[FastAPI -- Custom Response]
+* https://fastapi.tiangolo.com/advanced/websockets/[FastAPI -- WebSockets]
+* https://fastapi.tiangolo.com/tutorial/cors/[FastAPI -- CORS]
+* https://docs.langchain.com/oss/python/langchain/streaming[LangChain -- Streaming]
+* https://docs.spring.io/spring-ai/reference/api/chatclient.html[Spring AI -- ChatClient API]
+* https://docs.spring.io/spring-security/reference/servlet/oauth2/resource-server/jwt.html[Spring Security -- OAuth 2.0 Resource Server JWT]
+* https://docs.langchain4j.dev/tutorials/response-streaming/[LangChain4j -- Response Streaming]
+* https://spec.openapis.org/oas/v3.2.0.html[OpenAPI Specification 3.2.0]
+* https://html.spec.whatwg.org/multipage/server-sent-events.html[HTML Living Standard -- Server-sent events]
+* https://www.rfc-editor.org/rfc/rfc6455[RFC 6455 -- The WebSocket Protocol]
+* https://www.rfc-editor.org/rfc/rfc9457[RFC 9457 -- Problem Details for HTTP APIs]
+* https://www.rfc-editor.org/rfc/rfc6750[RFC 6750 -- OAuth 2.0 Bearer Token Usage]
+* https://datatracker.ietf.org/doc/draft-ietf-httpapi-idempotency-key-header/[IETF -- The Idempotency-Key HTTP Header Field]
+* https://www.rfc-editor.org/rfc/rfc8594[RFC 8594 -- The Sunset HTTP Header Field]
