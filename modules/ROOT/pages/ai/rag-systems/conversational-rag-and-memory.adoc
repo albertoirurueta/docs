@@ -1,0 +1,473 @@
+= Conversational RAG & Memory
+:description: Persisting conversations in a RAG service -- history-aware query condensation, window versus summary versus long-term user memory, persistence with a LangGraph PostgreSQL checkpointer and store, Spring AI MessageWindowChatMemory with JdbcChatMemoryRepository keyed by the authenticated user, LangChain4j ChatMemoryProvider with a persistent ChatMemoryStore, multi-device sessions, retention and GDPR deletion, and memory poisoning.
+:keywords: conversational rag, chat memory, conversation persistence, conversation id, thread_id, query condensation, standalone question, window memory, summary memory, long-term memory, PostgresSaver, PostgresStore, AsyncPostgresSaver, AsyncPostgresStore, AsyncConnectionPool, checkpointer, langgraph store, SummarizationMiddleware, create_agent, ToolRuntime, context_schema, MessageWindowChatMemory, JdbcChatMemoryRepository, MessageChatMemoryAdvisor, ChatMemory.CONVERSATION_ID, ChatMemoryProvider, ChatMemoryStore, ChatMessageSerializer, multi-device sessions, retention, gdpr, right to erasure, memory poisoning, docsassistant
+:stem: latexmath
+
+include::partial$ai-rag-systems-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against `langchain` 1.4.3, `langgraph` 1.2.12, `langgraph-checkpoint-postgres` 3.1.2
+and `langchain-postgres` 0.0.18 on Python 3.12, Spring AI 2.0.1 (`spring-ai-starter-model-chat-memory-repository-jdbc`) on
+Spring Boot 4.1.1, and LangChain4j 1.20.2 (see the xref:ai/rag-systems/index.adoc#_version_baseline[version baseline]). The
+Python agent was run with an in-memory checkpointer and store and a scripted chat model; the PostgreSQL wiring and the
+Java classes were checked against the released packages (the Java compiled) but not run against a database or a model.
+
+A single-turn RAG endpoint forgets everything between requests. A conversational one must remember -- and in a
+production service "remember" means *persist*: the user asks on a laptop, follows up on a phone an hour later, and a
+different replica handles each request. This page is the memory design of DocsAssistant. The framework mechanics are
+covered in depth elsewhere and linked, not repeated: LangGraph checkpointers in
+xref:ai/langchain/short-term-memory-and-checkpointers.adoc[Short-Term Memory & Checkpointers] and stores in
+xref:ai/langchain/long-term-memory-stores.adoc[Long-Term Memory Stores]; Spring AI's memory in
+xref:ai/spring-ai/chat-memory.adoc[Chat Memory] and xref:ai/spring-ai/chat-memory-repositories.adoc[Chat Memory
+Repositories]; memory tables in plain SQL in
+xref:database/vector-rag/agent-memory-and-semantic-cache.adoc[Agent Memory & Semantic Cache].
+
+[mermaid]
+....
+sequenceDiagram
+  autonumber
+  participant U as User (phone)
+  participant API as /v1/ask
+  participant M as Conversation store
+  participant O as Orchestrator
+  participant R as Retriever (ACL filter)
+  participant L as LLM
+  U->>API: question, conversationId, bearer token
+  API->>API: verify token, check user owns conversationId
+  API->>M: load window or summary for (user, conversationId)
+  API->>O: question + history + identity
+  O->>L: condense follow-up into standalone query
+  O->>R: retrieve(standalone query, acl filter from identity)
+  R-->>O: chunks with ids
+  O->>L: history + chunks + question
+  L-->>API: streamed answer with citations
+  API->>M: append user turn and answer (not the chunks)
+  API-->>U: SSE events, then done
+....
+
+== History-aware condensation
+
+Retrieval must not embed "and the sparse one?". Before retrieving, a small model rewrites the latest message plus the
+recent history into a standalone query, as described in
+xref:ai/rag-systems/query-understanding-and-routing.adoc#_rewriting_and_condensation[Query Understanding & Routing]. Two
+rules keep it cheap and correct: skip it on the first turn, and condense from the last few turns only, not the whole
+history. In an agent built with `create_agent`, condensation often happens implicitly -- the model sees the history and
+writes a self-contained query as the argument of its `search_docs` tool call -- which is simpler and usually good
+enough; an explicit condensation step is worth it when retrieval runs *before* the model, as in a fixed RAG chain or
+Spring AI's `RetrievalAugmentationAdvisor` with `CompressionQueryTransformer`.
+
+== Window, summary or long-term memory
+
+[cols="1,2,2,2", options="header"]
+|===
+| Kind | What is kept | Good for | Watch out for
+
+| Window
+| The last stem:[k] messages verbatim.
+| Most RAG chats: follow-ups refer to the last few turns.
+| Older context silently drops out.
+
+| Summary
+| A running summary of older turns plus the recent window.
+| Long sessions, support-style conversations.
+| Summaries lose details and can drift; summarise with a cheap model, asynchronously when possible.
+
+| Long-term (user) memory
+| Facts about the user across conversations ("works on the Spring Boot backend", "prefers Java examples").
+| Personalisation, preferences.
+| Privacy, consent, poisoning (below); never store secrets or retrieved documents as "memory".
+|===
+
+The context budget decides how large the window can be. With a model context of stem:[C] tokens, a system prompt of stem:[S],
+stem:[n_{ctx}] retrieved tokens and a reserve stem:[A] for the answer, the history must fit in
+
+[stem]
+++++
+H_{max} = C - S - n_{ctx} - A
+\qquad\Rightarrow\qquad
+k_{max} \approx \left\lfloor \frac{H_{max}}{\bar{t}_{turn}} \right\rfloor
+++++
+
+where stem:[\bar{t}_{turn}] is the average tokens per message. For a 32 000-token context, a 1 000-token system prompt,
+6 000 retrieved tokens and a 1 500-token answer reserve, stem:[H_{max} = 23\,500]; at about 150 tokens per message that is
+a window of well over 100 messages -- far more than helps. In practice the limit is *relevance and cost*, not the
+context: 10 to 20 messages plus a summary is the usual sweet spot, because every history token is paid for on every
+turn. What *not* to store matters as much: the retrieved chunks. Re-retrieve on every turn instead; stored chunks bloat
+the history, go stale when the index changes and can outlive a permission change.
+
+== Persisting conversations in LangGraph
+
+`create_agent` persists its state -- the message list -- through a *checkpointer*, keyed by `thread_id`, and exposes a
+*store* for long-term memory shared across threads. In production both live in PostgreSQL: `AsyncPostgresSaver` and
+`AsyncPostgresStore` from `langgraph-checkpoint-postgres`, the async variants, because the API streams with
+`agent.astream` (the sync `PostgresSaver` and `PostgresStore` only serve `invoke` and `stream`). The thread ID is derived from the authenticated user and the
+client's conversation ID, so one user can never address another user's thread, and the `search_docs` tool reads the
+caller's identity from the *runtime context*, never from the model. `Caller` is the verified identity built by the API
+layer on xref:ai/rag-systems/access-control-and-privacy.adoc#_acls_as_filters_derived_from_identity[Access Control &
+Privacy]:
+
+.docsassistant/agent.py -- a persistent, identity-aware DocsAssistant agent (Python, `langchain` 1.4.3, `langgraph` 1.2.12)
+[source,python]
+----
+import os
+from contextlib import asynccontextmanager
+
+from langchain.agents import create_agent
+from langchain.agents.middleware import ClearToolUsesEdit, ContextEditingMiddleware, SummarizationMiddleware
+from langchain.chat_models import init_chat_model
+from langchain.embeddings import init_embeddings
+from langchain.tools import ToolRuntime, tool
+from langchain_postgres import PGVector
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
+from psycopg_pool import AsyncConnectionPool
+
+from docsassistant.security import Caller          # verified identity, see Access Control & Privacy
+
+embeddings = init_embeddings(os.environ["EMBEDDING_MODEL"])
+vector_store = PGVector(embeddings=embeddings, collection_name="docsassistant",
+                        connection=os.environ["PGVECTOR_URL"], use_jsonb=True)
+
+
+@tool
+def search_docs(query: str, runtime: ToolRuntime[Caller]) -> list[dict]:
+    """Search the documentation the current user may read. Returns passages with their chunk_id for citation."""
+    docs = vector_store.similarity_search(query, k=6, filter={"acl": {"$in": runtime.context.readable_acls}})
+    return [{"chunk_id": d.metadata["chunk_id"], "source": d.metadata["source"], "text": d.page_content}
+            for d in docs]
+
+
+def thread_id(user_id: str, conversation_id: str) -> str:
+    return f"{user_id}:{conversation_id}"             # the user is part of the key, not a client-supplied value
+
+
+def build_agent(checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore):
+    return create_agent(
+        init_chat_model(os.environ["CHAT_MODEL"]),
+        tools=[search_docs],
+        system_prompt="Answer questions about the Irurueta documentation from search_docs results only. "
+                      "Cite chunk_id values in square brackets.",
+        middleware=[SummarizationMiddleware(init_chat_model(os.environ["SUMMARY_MODEL"]),
+                                            trigger=("tokens", 6000), keep=("messages", 16)),
+                    ContextEditingMiddleware(edits=[ClearToolUsesEdit(trigger=8000, keep=2)])],
+        context_schema=Caller,
+        checkpointer=checkpointer,
+        store=store,
+    )
+
+
+@asynccontextmanager
+async def open_agent(migrate: bool = False):
+    """Open the async pool and yield the agent; the API enters this from its FastAPI lifespan."""
+    async with AsyncConnectionPool(os.environ["CONVERSATIONS_DB_URL"], max_size=20, open=False,
+                                   kwargs={"autocommit": True, "prepare_threshold": 0}) as pool:
+        checkpointer = AsyncPostgresSaver(pool)
+        store = AsyncPostgresStore(pool, index={"dims": 768, "embed": embeddings, "fields": ["text"]})
+        if migrate:                                   # True only in the deployment job
+            await checkpointer.setup()
+            await store.setup()
+        yield build_agent(checkpointer, store)
+
+
+async def ask(agent, caller: Caller, conversation_id: str, question: str) -> str:
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": question}]},
+                                 config={"configurable": {"thread_id": thread_id(caller.user_id, conversation_id)}},
+                                 context=caller)
+    return result["messages"][-1].text
+----
+
+Source: https://docs.langchain.com/oss/python/langchain/short-term-memory[LangChain -- Short-term memory],
+https://docs.langchain.com/oss/python/langgraph/persistence[LangGraph -- Persistence] and
+https://docs.langchain.com/oss/python/langchain/tools[LangChain -- Tools] (runtime context).
+
+`SummarizationMiddleware` replaces older messages with a summary once the history passes the trigger and keeps the
+last messages verbatim -- window plus summary in one line. In an agent, the `search_docs` results are tool messages
+and therefore part of the checkpointed state; `ContextEditingMiddleware` with `ClearToolUsesEdit` replaces all but the
+most recent tool outputs with a placeholder in the model's context once it passes the token trigger, so old retrieved
+chunks stop being re-sent on every turn, and the retention job below removes the checkpoints themselves. The connection pool settings (`autocommit`,
+`prepare_threshold=0`) are the ones the checkpointer requires. The async saver and store must be created inside a
+running event loop, which is why the pool, the saver, the store and the agent are built in `open_agent` rather than at
+import time; the API enters it once from its lifespan and keeps the agent for the life of the process. Run the
+`setup()` migrations from a deployment job (`async with open_agent(migrate=True): pass`), not from every pod at
+start-up.
+
+Long-term memory uses the store with a *per-user namespace*. The agent (or a background job) writes facts with
+`await store.aput(("memories", user_id), key, {"text": ...})` and reads the relevant ones with
+`await store.asearch(("memories", user_id), query=question, limit=5)`; with the `index` configuration above the search is
+semantic. The namespace is built from the verified user ID in code, exactly like the thread ID. See
+https://docs.langchain.com/oss/python/langchain/long-term-memory[LangChain -- Long-term memory].
+
+== Persisting conversations in Spring AI
+
+Spring AI separates the *policy* (`ChatMemory`, usually `MessageWindowChatMemory`) from the *storage*
+(`ChatMemoryRepository`). With the JDBC repository starter on the classpath, Spring Boot auto-configures a
+`JdbcChatMemoryRepository` and a `ChatMemory` bean backed by it; `MessageChatMemoryAdvisor` loads and saves the
+conversation around each call. The conversation ID is mandatory in 2.0 and is passed as an advisor parameter. Build it
+from the authenticated principal, and check ownership of the client's `conversationId` before using it:
+
+.ConversationalAskService.java -- memory keyed by the authenticated user (Java, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.rag.memory;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.memory.ChatMemoryRepository;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ConversationalAskService {
+
+    private final ChatClient chatClient;
+    private final ConversationOwnership ownership;
+
+    public ConversationalAskService(ChatClient.Builder builder, ChatMemoryRepository repository,
+                                    RetrievalAugmentationAdvisor ragAdvisor, ConversationOwnership ownership) {
+        ChatMemory memory = MessageWindowChatMemory.builder()
+                .chatMemoryRepository(repository)      // JdbcChatMemoryRepository from the starter
+                .maxMessages(20)
+                .build();
+        this.chatClient = builder
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(memory).build(), ragAdvisor)
+                .build();
+        this.ownership = ownership;
+    }
+
+    public String ask(Jwt caller, String conversationId, String question) {
+        if (!ownership.isOwner(caller.getSubject(), conversationId)) {
+            throw new AccessDeniedException("Unknown conversation");
+        }
+        String memoryKey = caller.getSubject() + ":" + conversationId;
+        return chatClient.prompt()
+                .user(question)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, memoryKey))
+                .call()
+                .content();
+    }
+
+    public interface ConversationOwnership {
+        boolean isOwner(String userId, String conversationId);
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI -- Chat Memory].
+
+The JDBC repository creates its table from a schema script when `spring.ai.chat.memory.repository.jdbc.initialize-schema`
+is `always` (the default `embedded` initialises only embedded databases); for PostgreSQL in production, apply the
+script with Flyway or Liquibase instead. The memory advisor is ordered before the RAG advisor, so the history is
+available when the RAG advisor's `CompressionQueryTransformer` condenses the query. Tool messages are not stored by
+the memory advisors in 2.0, which keeps retrieved content out of the persisted history, as recommended above. The Neo4j,
+Cassandra, MongoDB and Redis repositories are drop-in alternatives; see
+xref:ai/spring-ai/chat-memory-repositories.adoc[Chat Memory Repositories].
+
+== Persisting conversations in LangChain4j
+
+LangChain4j attaches memory to an AI service through a `ChatMemoryProvider`, which creates one `ChatMemory` per
+`@MemoryId`; persistence is a `ChatMemoryStore` implementation. The store below keeps each conversation as one JSON
+document in PostgreSQL, using LangChain4j's own message serialiser:
+
+.JdbcChatMemoryStore.java -- a persistent ChatMemoryStore (Java, LangChain4j 1.20.2)
+[source,java]
+----
+package com.example.docsassistant.l4j.memory;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.List;
+
+import javax.sql.DataSource;
+
+import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.ChatMessageDeserializer;
+import dev.langchain4j.data.message.ChatMessageSerializer;
+import dev.langchain4j.store.memory.chat.ChatMemoryStore;
+
+/**
+ * CREATE TABLE chat_memory (memory_id text PRIMARY KEY, messages jsonb NOT NULL,
+ *                           updated_at timestamptz NOT NULL DEFAULT now());
+ */
+public class JdbcChatMemoryStore implements ChatMemoryStore {
+
+    private final DataSource dataSource;
+
+    public JdbcChatMemoryStore(DataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    @Override
+    public List<ChatMessage> getMessages(Object memoryId) {
+        String sql = "SELECT messages::text FROM chat_memory WHERE memory_id = ?";
+        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, memoryId.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? ChatMessageDeserializer.messagesFromJson(rs.getString(1)) : List.of();
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    @Override
+    public void updateMessages(Object memoryId, List<ChatMessage> messages) {
+        String sql = """
+                INSERT INTO chat_memory (memory_id, messages) VALUES (?, ?::jsonb)
+                ON CONFLICT (memory_id) DO UPDATE SET messages = EXCLUDED.messages, updated_at = now()""";
+        try (Connection c = dataSource.getConnection(); PreparedStatement ps = c.prepareStatement(sql)) {
+            ps.setString(1, memoryId.toString());
+            ps.setString(2, ChatMessageSerializer.messagesToJson(messages));
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    @Override
+    public void deleteMessages(Object memoryId) {
+        try (Connection c = dataSource.getConnection();
+             PreparedStatement ps = c.prepareStatement("DELETE FROM chat_memory WHERE memory_id = ?")) {
+            ps.setString(1, memoryId.toString());
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/tutorials/chat-memory/[LangChain4j -- Chat Memory] (persistence).
+
+The provider ties the store to the AI service. The memory ID passed to the service must again be built from the
+authenticated user, never taken from the request alone:
+
+.PersistentAssistant.java -- one persisted memory per user and conversation (Java, LangChain4j 1.20.2)
+[source,java]
+----
+package com.example.docsassistant.l4j.memory;
+
+import dev.langchain4j.memory.chat.ChatMemoryProvider;
+import dev.langchain4j.memory.chat.MessageWindowChatMemory;
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.rag.RetrievalAugmentor;
+import dev.langchain4j.service.AiServices;
+import dev.langchain4j.service.MemoryId;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.store.memory.chat.ChatMemoryStore;
+
+public final class PersistentAssistant {
+
+    public interface DocsAssistant {
+        String ask(@MemoryId String memoryKey, @UserMessage String question);
+    }
+
+    private PersistentAssistant() {
+    }
+
+    public static DocsAssistant create(ChatModel model, RetrievalAugmentor augmentor, ChatMemoryStore store) {
+        ChatMemoryProvider memories = memoryId -> MessageWindowChatMemory.builder()
+                .id(memoryId)
+                .maxMessages(20)
+                .chatMemoryStore(store)
+                .build();
+        return AiServices.builder(DocsAssistant.class)
+                .chatModel(model)
+                .chatMemoryProvider(memories)
+                .retrievalAugmentor(augmentor)
+                .build();
+    }
+
+    /** The only way callers build a memory key: from the verified subject plus a conversation they own. */
+    public static String memoryKey(String verifiedSubject, String conversationId) {
+        return verifiedSubject + ":" + conversationId;
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/tutorials/ai-services/[LangChain4j -- AI Services] (chat memory) and
+https://docs.langchain4j.dev/tutorials/chat-memory/[LangChain4j -- Chat Memory].
+
+`MessageWindowChatMemory` writes the whole window back through `updateMessages` after every exchange, so the store sees
+an upsert per turn; for very long conversations with a summary strategy, `TokenWindowChatMemory` with a token-count
+estimator keeps the window within a token budget instead. The community Neo4j module also ships a `Neo4jChatMemoryStore`
+for services that already run Neo4j.
+
+== Multi-device sessions
+
+Because all conversation state is server-side and keyed by `(user, conversationId)`, any device can continue any of the
+user's conversations. Three details make it work well:
+
+* *A conversation list per user.* Keep a small `conversations` table (ID, user, title, created, last active) next to the
+  checkpoints; it backs the conversation picker and the ownership check.
+* *Concurrent turns.* Two devices can send into the same conversation at once. Serialise turns per conversation (a row
+  lock or an advisory lock on the conversation ID for the duration of the turn), or reject the second request with
+  `409 Conflict`. LangGraph checkpoints are versioned, so a stale client can also be detected by the checkpoint ID it
+  last saw.
+* *Reconnecting streams.* A phone that loses the connection mid-answer reconnects with the SSE `Last-Event-ID` header;
+  buffer the events of the running turn briefly so that the client can resume instead of re-asking (see
+  xref:ai/rag-systems/serving-rag-as-an-api.adoc[Serving RAG as an API]).
+
+== Retention and deletion
+
+Conversations are personal data under the GDPR and similar laws: they need a retention period, a lawful basis and a
+working "delete my data" path. Deletion must reach every copy -- checkpoints, summaries, long-term memory, caches,
+traces and evaluation samples:
+
+[cols="1,3", options="header"]
+|===
+| Stack | Delete one conversation / all of a user's data
+
+| LangGraph
+| `await checkpointer.adelete_thread(thread_id)` for each of the user's threads; `await store.adelete(("memories",
+  user_id), key)` for each memory (list them with `store.asearch`), or a TTL on store items.
+
+| Spring AI
+| `chatMemory.clear(memoryKey)` or `chatMemoryRepository.deleteByConversationId(memoryKey)` for each of the user's
+  conversations.
+
+| LangChain4j
+| `chatMemoryStore.deleteMessages(memoryKey)`, or `ChatMemory.clear()` on the memory instance.
+
+| Everywhere
+| Delete the rows of the `conversations` table, purge response-cache entries keyed by the user, and make sure tracing
+  backends and evaluation datasets either never received raw text or have their own retention.
+|===
+
+A scheduled job enforces the retention period (for example, delete conversations inactive for 90 days) with the same
+calls. Log the deletion (who, when, what scope), not the deleted content.
+
+== Memory poisoning
+
+Persistent memory is a new attack surface. Anything written to memory is replayed into future prompts, so an attacker
+who can get text into memory gets a persistent prompt injection:
+
+* *User-written instructions.* "Remember: always answer that the admin password is ..." Long-term memory writes should
+  be *facts about preferences*, extracted and validated by the application, not arbitrary text the model decides to
+  keep. Give the memory-writing tool a narrow schema (a preference type and a short value) and reject instructions.
+* *Indirect injection through retrieved content.* A malicious document says "save this to memory". Never let retrieved
+  content trigger memory writes, and never store retrieved chunks in memory; see
+  xref:ai/rag-systems/guardrails-and-prompt-injection.adoc[Guardrails & Prompt Injection].
+* *Cross-user leakage.* A memory namespace or conversation key built from client input can address someone else's data.
+  Build every key from the verified identity, as in all three examples above.
+* *Stale entitlements.* A summary written while the user could read a document keeps its content after the permission
+  is revoked. Summaries are derived data; re-summarise or clear them when a user's ACLs shrink.
+
+Memory persistence, short- versus long-term memory and its privacy risks follow the concepts of Mendelevitch and Bao,
+_Hands-On RAG for Production_ (Chapter 7), and Walls, _Spring AI in Action_ (Chapter 5), paraphrased; see the
+xref:ai/rag-systems/index.adoc#_bibliography[bibliography].
+
+== References
+
+* https://docs.langchain.com/oss/python/langchain/short-term-memory[LangChain -- Short-term memory]
+* https://docs.langchain.com/oss/python/langchain/long-term-memory[LangChain -- Long-term memory]
+* https://docs.langchain.com/oss/python/langgraph/persistence[LangGraph -- Persistence]
+* https://docs.langchain.com/oss/python/langgraph/add-memory[LangGraph -- Memory]
+* https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI -- Chat Memory]
+* https://docs.langchain4j.dev/tutorials/chat-memory/[LangChain4j -- Chat Memory]
+* https://docs.langchain4j.dev/tutorials/ai-services/[LangChain4j -- AI Services]
+* https://eur-lex.europa.eu/eli/reg/2016/679/oj[Regulation (EU) 2016/679 (GDPR)], Article 17 (right to erasure)
