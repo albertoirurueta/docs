@@ -81,6 +81,44 @@ batched inference, where throughput matters and latency does not. The DocsAssist
 regression runs (see xref:ai/llmops/drift-and-regression-monitoring.adoc[Drift and Regression Monitoring]) and sampled online
 judging to batch paths and keeps the interactive path for answers.
 
+With a hosted batch endpoint the job is a JSONL file of ordinary requests, each with a `custom_id` used to match results,
+uploaded and submitted in two calls. The example uses the OpenAI Python SDK; other providers' batch endpoints follow the same
+file-in, file-out shape with their own field names.
+
+[source,python]
+----
+import json
+import os
+
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+MODEL = os.environ["BATCH_MODEL"]  # placeholder: your approved model id
+
+with open("golden.jsonl", encoding="utf-8") as src, open("batch_input.jsonl", "w", encoding="utf-8") as dst:
+    for line in src:
+        item = json.loads(line)
+        dst.write(json.dumps({
+            "custom_id": item["id"],                       # results come back unordered: match on this
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {"model": MODEL, "messages": [{"role": "user", "content": item["question"]}], "max_tokens": 800},
+        }) + "\n")
+
+batch_file = client.files.create(file=open("batch_input.jsonl", "rb"), purpose="batch")
+batch = client.batches.create(
+    input_file_id=batch_file.id,
+    endpoint="/v1/chat/completions",
+    completion_window="24h",
+    metadata={"job": "docsassistant-nightly-eval"},
+)
+print(batch.id)  # poll client.batches.retrieve(batch.id); read client.files.content(<output_file_id>) when done
+----
+
+Source: https://developers.openai.com/api/docs/guides/batch[OpenAI: Batch API guide]. The self-hosted equivalent is vLLM's
+offline `LLM.generate` over a list of prompts, described in https://docs.vllm.ai/en/latest/serving/offline_inference.html[vLLM:
+Offline Inference].
+
 == Routing and cascades
 
 Not every question needs the largest model. Two patterns reduce cost:
@@ -97,12 +135,59 @@ The expected cost of a two-stage cascade is
 \mathbb{E}[C] = C_{small} + q\,C_{large}
 ++++
 
-where latexmath:[q] is the fraction escalated; the cascade saves money only when latexmath:[q\,C_{large} < (1-q)\,C_{large} - C_{small}], which is
-to say when the small model succeeds often enough to pay for the extra attempts. Measure latexmath:[q] and the quality of the accepted
+where latexmath:[q] is the fraction escalated and latexmath:[C_{small}], latexmath:[C_{large}] are the average costs of one call to each
+model. The alternative is to send everything to the large model at latexmath:[C_{large}] per request, so the cascade saves money
+only when latexmath:[C_{small} + q\,C_{large} < C_{large}], that is
+
+[stem]
+++++
+C_{small} < (1-q)\,C_{large}
+++++
+
+Every request pays for the small attempt, but only the latexmath:[1-q] share that the small model answers acceptably avoids the
+large call; the small model's cost must be covered by those avoided calls. A cheap small model with a high escalation rate can
+cost more than no cascade at all, and the margin shrinks to nothing as latexmath:[q] approaches 1. Measure latexmath:[q] and the quality of the accepted
 small-model answers on the golden set before enabling it; routing quality is itself something to evaluate (see
 xref:ai/llmops/building-eval-sets.adoc[Building Eval Sets]). The routing and fallback mechanics of the gateway are in
 xref:ai/llmops/deployment-and-release-patterns.adoc[Deployment and Release Patterns], and the RAG-specific query routing is in
 xref:ai/rag-systems/query-understanding-and-routing.adoc[Query Understanding and Routing].
+
+A gateway router handles the model groups and the error fallbacks; the quality-based escalation of a cascade is application
+logic, because LiteLLM's `fallbacks` fire on errors (rate limits, provider failures), not on a weak answer.
+
+[source,python]
+----
+import os
+
+from litellm import Router
+
+router = Router(
+    model_list=[
+        {"model_name": "docs-small",
+         "litellm_params": {"model": os.environ["SMALL_MODEL"], "api_key": os.environ["SMALL_MODEL_API_KEY"]}},
+        {"model_name": "docs-large",
+         "litellm_params": {"model": os.environ["LARGE_MODEL"], "api_key": os.environ["LARGE_MODEL_API_KEY"]}},
+    ],
+    fallbacks=[{"docs-small": ["docs-large"]}],   # on errors only
+)
+
+
+def acceptable(answer: str, retrieval_score: float) -> bool:
+    """Cheap confidence check: cites a source and retrieval was confident. Tune on the golden set."""
+    return "[source:" in answer and retrieval_score >= 0.5
+
+
+def cascade(messages: list[dict], retrieval_score: float) -> tuple[str, str]:
+    draft = router.completion(model="docs-small", messages=messages).choices[0].message.content
+    if acceptable(draft, retrieval_score):
+        return draft, "docs-small"
+    final = router.completion(model="docs-large", messages=messages).choices[0].message.content
+    return final, "docs-large"   # log which tier answered: the share of "docs-large" is q
+----
+
+Source: https://docs.litellm.ai/docs/routing[LiteLLM: Router] and https://docs.litellm.ai/docs/proxy/reliability[LiteLLM:
+Fallbacks]. The model ids come from the environment, and the threshold in `acceptable` is a placeholder to tune on labelled
+data.
 
 == Context trimming
 
@@ -114,7 +199,41 @@ Levers, in the order they are usually applied:
 . *Strip boilerplate* from passages (navigation, repeated headers) at ingestion time.
 . *Cap output length* with a maximum-token setting sized to the longest legitimate answer.
 
-Each cut is a hypothesis about quality, so each goes through the evaluation gate. The retrieval and caching trade-offs are
+A trimmer that enforces a token budget keeps the highest-ranked passages and the newest turns that fit, counting tokens with
+the tokenizer of the target model family (here `tiktoken`; use your model's own tokenizer when it differs):
+
+[source,python]
+----
+import tiktoken
+
+ENC = tiktoken.get_encoding("o200k_base")   # pick the encoding that matches your model
+
+
+def n_tokens(text: str) -> int:
+    return len(ENC.encode(text))
+
+
+def trim_context(passages: list[tuple[float, str]], history: list[dict], budget: int, k: int = 4) -> tuple[list[str], list[dict]]:
+    """Top-k passages by rerank score, then as much recent history as the remaining budget allows."""
+    kept_passages, used = [], 0
+    for _, text in sorted(passages, key=lambda p: p[0], reverse=True)[:k]:
+        cost = n_tokens(text)
+        if used + cost > budget:
+            break
+        kept_passages.append(text)
+        used += cost
+    kept_history = []
+    for turn in reversed(history):          # newest first
+        cost = n_tokens(turn["content"])
+        if used + cost > budget:
+            break
+        kept_history.insert(0, turn)
+        used += cost
+    return kept_passages, kept_history
+----
+
+Source: https://github.com/openai/tiktoken[tiktoken README] (`get_encoding`, `encode`). Each cut is a hypothesis about
+quality, so each goes through the evaluation gate. The retrieval and caching trade-offs are
 covered in more depth in xref:ai/rag-systems/caching-latency-and-cost.adoc[Caching, Latency and Cost] and in
 xref:database/vector-rag/production-considerations.adoc[Production Considerations for Vector Search and RAG].
 
@@ -126,6 +245,53 @@ answer to a question that is similar but not equivalent ("How do I enable X in v
 cache needs a similarity threshold tuned on labelled pairs, a time-to-live, invalidation when the corpus changes, and a
 partition key (tenant, product version, language) so answers never cross a boundary. Measure the false-hit rate with the judge
 on sampled hits, and keep tenant-specific or personal answers out of the cache.
+
+The lookup below shows the three controls together: the partition key scopes every entry, the threshold decides a hit, and the
+time-to-live expires stale answers. `embed` is whatever embedding call the application already uses for retrieval; vectors are
+normalised so the dot product is the cosine similarity.
+
+[source,python]
+----
+import time
+
+import numpy as np
+
+THRESHOLD = 0.92        # placeholder: tune on labelled equivalent / non-equivalent question pairs
+TTL_SECONDS = 24 * 3600
+
+
+class SemanticCache:
+    def __init__(self, embed):
+        self.embed = embed
+        self.entries: dict[tuple, list[tuple[np.ndarray, str, float]]] = {}
+
+    def _vector(self, text: str) -> np.ndarray:
+        v = np.asarray(self.embed(text), dtype=np.float32)
+        return v / np.linalg.norm(v)
+
+    def get(self, question: str, tenant: str, docs_version: str, lang: str) -> str | None:
+        key = (tenant, docs_version, lang)                  # never match across a partition
+        now, q = time.time(), self._vector(question)
+        live = [e for e in self.entries.get(key, []) if now - e[2] < TTL_SECONDS]
+        self.entries[key] = live
+        if not live:
+            return None
+        sims = np.array([float(vec @ q) for vec, _, _ in live])
+        best = int(sims.argmax())
+        return live[best][1] if sims[best] >= THRESHOLD else None
+
+    def put(self, question: str, answer: str, tenant: str, docs_version: str, lang: str) -> None:
+        self.entries.setdefault((tenant, docs_version, lang), []).append((self._vector(question), answer, time.time()))
+
+    def invalidate(self, docs_version: str) -> None:
+        """Call on a corpus rebuild: drop every partition for that documentation version."""
+        self.entries = {k: v for k, v in self.entries.items() if k[1] != docs_version}
+----
+
+Source: https://numpy.org/doc/stable/reference/generated/numpy.linalg.norm.html[NumPy: numpy.linalg.norm]. In production
+the same lookup runs against a vector store; LiteLLM documents a `redis-semantic` cache type with `similarity_threshold` and
+`ttl` settings in https://docs.litellm.ai/docs/caching/all_caches[LiteLLM: Caching]. Check how that cache scopes its entries
+before relying on it for the tenant and version partition shown here.
 
 == Gateway budgets and quotas
 
@@ -252,6 +418,12 @@ runbook (see xref:ai/llmops/operational-governance.adoc[Operational Governance])
 * https://docs.litellm.ai/docs/proxy/virtual_keys[LiteLLM: Virtual Keys]
 * https://docs.litellm.ai/docs/proxy/users[LiteLLM: Budgets and rate limits]
 * https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html[vLLM: Automatic Prefix Caching]
+* https://developers.openai.com/api/docs/guides/batch[OpenAI: Batch API guide]
+* https://docs.vllm.ai/en/latest/serving/offline_inference.html[vLLM: Offline Inference]
+* https://docs.litellm.ai/docs/routing[LiteLLM: Router]
+* https://docs.litellm.ai/docs/proxy/reliability[LiteLLM: Fallbacks]
+* https://github.com/openai/tiktoken[tiktoken]
+* https://docs.litellm.ai/docs/caching/all_caches[LiteLLM: Caching]
 * https://langfuse.com/docs/observability/features/token-and-cost-tracking[Langfuse: Token and cost tracking]
 * https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/[Prometheus: Alerting rules]
 * https://opentelemetry.io/docs/specs/semconv/gen-ai/[OpenTelemetry: Semantic conventions for generative AI]
