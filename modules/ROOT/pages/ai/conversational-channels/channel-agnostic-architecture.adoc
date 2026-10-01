@@ -1,0 +1,677 @@
+= Channel-Agnostic Architecture
+:description: Designing one DocsAssistant core behind many chat channels -- the core-plus-adapters (hexagonal) pattern, the ask(conversationId, userId, text) contract yielding token, citation and done events in Python (LangChain create_agent) and Java (Spring AI ChatClient), identity and conversation-state mapping, streaming capability negotiation, rich-content rendering of citations, human handoff, rate limits and fan-in, idempotent webhook handling, async jobs for slow answers and multi-tenancy.
+:keywords: channel-agnostic architecture, hexagonal architecture, ports and adapters, channel adapter, ask conversationId userId text, token citation done events, identity mapping, conversation state mapping, thread_id, ConversationId, streaming capability negotiation, message edits, typing indicator, chunked messages, citation cards, human handoff, escalation, rate limits, fan-in, idempotent webhook, dedupe, async jobs, slow answers, multi-tenancy, tenant isolation, create_agent, ChatClient, RetrievalAugmentationAdvisor, DOCUMENT_CONTEXT, docsassistant
+
+include::partial$ai-conversational-channels-disclaimer.adoc[]
+
+This page was written on 2026-10-01 against `langchain` 1.4.3, `langgraph` 1.2.12 and `langgraph-checkpoint-postgres`
+3.1.2 on Python 3.12, and Spring AI 2.0.1 on Spring Boot 4.1.1 with Java 21 (see the
+xref:ai/conversational-channels/index.adoc#_version_baseline[version baseline]). The code below is illustrative: it is
+written from the official documentation of each library and is not compiled or run by this repository, and the
+framework calls it relies on were not exercised here. The patterns (dedupe keys, retry behaviour, capability tables) are
+design guidance, and the platform-specific numbers they depend on live on the page of each channel.
+
+The RAG Systems sub-section ends with an assistant that can be called as a service. Putting that assistant behind a
+second, third and fifteenth channel is where a product usually starts to rot: each new integration copies the
+retrieval call, re-invents conversation IDs and sprinkles `if channel == "teams"` through the answer logic. This page
+describes the structure that keeps the answer logic in one place and every channel quirk in a small, replaceable
+adapter. It is the foundation for every other page in this sub-section.
+
+== The core-plus-adapters pattern
+
+The pattern is the *hexagonal architecture* (ports and adapters). The *core* knows how to answer a question from the
+documentation for a given user in a given conversation. It does not know whether the question arrived over a WebSocket,
+a Teams activity or a WhatsApp webhook. Each *adapter* translates between one channel's protocol and the core's single
+port. DocsAssistant's port is:
+
+[source,text]
+----
+ask(conversationId, userId, text) -> stream of { token | citation | done }
+----
+
+[mermaid]
+----
+flowchart LR
+    subgraph Channels["Channels"]
+        W["Web / SSE client"]
+        T["Microsoft Teams"]
+        WA["WhatsApp Business"]
+        S["Slack / Telegram / Google Chat"]
+        X["XMPP / WebRTC / RCS / iMessage"]
+    end
+    subgraph Adapters["Channel adapters (one per channel)"]
+        A1["Verify signature, dedupe, ack fast"]
+        A2["Map channel user and thread to userId and conversationId"]
+        A3["Negotiate streaming, render citations"]
+    end
+    subgraph Core["Channel-agnostic core"]
+        C1["ask(conversationId, userId, text)"]
+        C2["Agent: retriever tool and memory"]
+        C3["Access control filter from userId"]
+    end
+    W --> A1
+    T --> A1
+    WA --> A1
+    S --> A1
+    X --> A1
+    A1 --> A2 --> C1
+    C1 --> C2
+    C2 --> C3
+    C1 -. "token, citation, done events" .-> A3
+    A3 -. "native format" .-> Channels
+    A2 <--> ID[("Identity and thread map")]
+    C2 <--> MEM[("Conversation state")]
+    C1 --> ESC["Handoff port"]
+    ESC --> HUMAN["Human agent queue"]
+----
+
+What belongs where:
+
+[cols="1,2,2", options="header"]
+|===
+| Concern | Core | Adapter
+
+| Retrieval, prompts, tools
+| Owns all of it. The core is what the xref:ai/rag-systems/production-rag-architecture.adoc[RAG architecture] describes.
+| Never touches it.
+
+| Identity
+| Receives an already-verified `userId` and derives ACL filters from it (see
+  xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]).
+| Verifies the channel's signature or token and turns the channel identity into a `userId`.
+
+| Conversation state
+| Memory is keyed by `conversationId` (the checkpointer or `ChatMemory`).
+| Decides what one conversation means on its channel: a DM, a thread, a room.
+
+| Output
+| Emits typed events, never markup.
+| Turns events into text, edits, cards or whole messages with the channel's limits.
+
+| Delivery guarantees
+| Idempotent per turn when given the same idempotency key.
+| Verifies, dedupes and acknowledges within the channel's deadline.
+|===
+
+The test of a good split is deletion: removing an adapter must not require touching the core, and a new channel must
+need no new branch in the core. Everything below is a consequence of keeping the port that narrow.
+
+== The core in Python: LangChain `create_agent`
+
+The Python core wraps the agent from
+xref:ai/rag-systems/conversational-rag-and-memory.adoc[Conversational RAG & Memory] (a `create_agent` with a
+`search_docs` retriever tool, an `AsyncPostgresSaver` checkpointer and a `Caller` runtime context) and turns its
+streamed output into the three event types. It reuses `thread_id` and `build_agent` from that page rather than
+duplicating them.
+
+.docsassistant/core.py -- the channel-agnostic port (Python, `langchain` 1.4.3, `langgraph` 1.2.12)
+[source,python]
+----
+import json
+import re
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+
+from langchain_core.messages import AIMessage, ToolMessage
+
+from docsassistant.agent import thread_id           # f"{user_id}:{conversation_id}", see Conversational RAG & Memory
+from docsassistant.security import Caller, caller_for  # verified identity -> ACLs, see Access Control & Privacy
+
+
+@dataclass(frozen=True)
+class Token:
+    text: str
+
+
+@dataclass(frozen=True)
+class Citation:
+    marker: int
+    chunk_id: str
+    title: str
+    url: str
+
+
+@dataclass(frozen=True)
+class Done:
+    conversation_id: str
+    answer: str
+    citations: list[Citation] = field(default_factory=list)
+
+
+Event = Token | Citation | Done
+
+
+class DocsAssistantCore:
+    def __init__(self, agent):
+        self._agent = agent                           # create_agent(...) built once at start-up
+
+    async def ask(self, conversation_id: str, user_id: str, text: str) -> AsyncIterator[Event]:
+        caller: Caller = await caller_for(user_id)    # ACLs come from the user, never from the channel
+        config = {"configurable": {"thread_id": thread_id(user_id, conversation_id)}}
+        passages: dict[str, dict] = {}
+        answer: list[str] = []
+        async for part in self._agent.astream({"messages": [{"role": "user", "content": text}]}, config,
+                                              context=caller, stream_mode=["messages", "updates"], version="v2"):
+            if part["type"] == "messages":
+                chunk, _meta = part["data"]
+                if isinstance(chunk, AIMessage) and chunk.text:
+                    answer.append(chunk.text)
+                    yield Token(chunk.text)
+            elif part["type"] == "updates" and "tools" in part["data"]:
+                for msg in part["data"]["tools"]["messages"]:
+                    if isinstance(msg, ToolMessage):
+                        for p in json.loads(msg.text):
+                            passages[p["chunk_id"]] = p
+        full = "".join(answer)
+        cited_ids = [c for c in dict.fromkeys(re.findall(r"\[(c\d+)\]", full)) if c in passages]
+        citations = [Citation(i + 1, cid, passages[cid]["title"], passages[cid]["source"])
+                     for i, cid in enumerate(cited_ids)]
+        for citation in citations:
+            yield citation
+        yield Done(conversation_id, full, citations)
+----
+
+Source: https://docs.langchain.com/oss/python/langchain/streaming[LangChain -- Streaming] and
+https://docs.langchain.com/oss/python/langchain/short-term-memory[LangChain -- Short-term memory].
+
+Three details matter for channels. First, the core yields citations only after the answer is complete, because a marker
+such as `[c3]` is only meaningful once the model has finished writing and the cited IDs have been checked against what
+was really retrieved (the verification itself is described in
+xref:ai/rag-systems/citations-and-grounding.adoc[Citations & Grounding]). Second, `Done` repeats the whole answer and the
+citation list, so a channel that cannot stream can ignore the earlier events and render once. Third, the event types
+are plain data: tests for the core need no HTTP, and a scripted agent replaces the model in adapter tests.
+
+== The core in Java: Spring AI `ChatClient`
+
+The Java core exposes the same port as a `Flux`. The `ChatClient` is the one built with the memory and RAG advisors in
+the RAG Systems pages; the conversation key is the same `userId:conversationId` composite as in Python, although each stack keeps its own memory store.
+
+.AssistantCore.java -- the channel-agnostic port (Java 21, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.core;
+
+import java.util.List;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.rag.advisor.RetrievalAugmentationAdvisor;
+import org.springframework.ai.rag.retrieval.search.VectorStoreDocumentRetriever;
+import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+
+public sealed interface CoreEvent {
+
+    record Token(String text) implements CoreEvent {
+    }
+
+    record Citation(int marker, String chunkId, String title, String url) implements CoreEvent {
+    }
+
+    record Done(String conversationId) implements CoreEvent {
+    }
+}
+
+@Service
+class AssistantCore {
+
+    private final ChatClient chatClient;                  // built with MessageChatMemoryAdvisor + RAG advisor
+    private final AclResolver acls;                       // userId -> readable ACL tags
+
+    AssistantCore(ChatClient docsChatClient, AclResolver acls) {
+        this.chatClient = docsChatClient;
+        this.acls = acls;
+    }
+
+    public Flux<CoreEvent> ask(String conversationId, String userId, String text) {
+        var filter = new FilterExpressionBuilder().in("acl", acls.readableBy(userId).toArray()).build();
+
+        Flux<org.springframework.ai.chat.client.ChatClientResponse> stream = chatClient.prompt()
+                .user(text)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, userId + ":" + conversationId)
+                        .param(VectorStoreDocumentRetriever.FILTER_EXPRESSION, filter))
+                .stream()
+                .chatClientResponse()
+                .share();
+
+        Flux<CoreEvent> tokens = stream
+                .mapNotNull(r -> r.chatResponse() == null || r.chatResponse().getResult() == null
+                        ? null : r.chatResponse().getResult().getOutput().getText())
+                .filter(s -> !s.isEmpty())
+                .map(CoreEvent.Token::new);
+
+        Flux<CoreEvent> tail = stream.last().flatMapMany(last -> {
+            List<Document> docs = last.chatResponse() == null ? List.of()
+                    : last.chatResponse().getMetadata().getOrDefault(RetrievalAugmentationAdvisor.DOCUMENT_CONTEXT,
+                            List.of());
+            List<CoreEvent> out = new java.util.ArrayList<>();
+            int marker = 1;
+            for (Document d : docs) {                      // order = marker; see Citations & Grounding to verify
+                out.add(new CoreEvent.Citation(marker++, d.getId(),
+                        String.valueOf(d.getMetadata().get("title")), String.valueOf(d.getMetadata().get("source"))));
+            }
+            out.add(new CoreEvent.Done(conversationId));
+            return Flux.fromIterable(out);
+        });
+
+        return Flux.concat(tokens, tail);
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/chatclient.html[Spring AI -- ChatClient API],
+https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI -- Chat Memory] and
+https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI -- Retrieval Augmented
+Generation].
+
+The imports and the exact accessors of `ChatClientResponse` and `ChatResponseMetadata` should be checked against the
+Spring AI 2.0.1 Javadoc: this snippet was written from the reference documentation and the existing
+xref:ai/rag-systems/citations-and-grounding.adoc[Citations & Grounding] page, not compiled. One honest difference from
+the Python core is that the Java version emits every retrieved document as a citation, while the Python one keeps only
+the documents the model actually cited with a marker; to match it, parse the markers from the concatenated tokens (or
+ask the model for structured output as in Citations & Grounding) before emitting `Citation` events. The `.share()` call
+is needed because the stream is subscribed to twice, once for tokens and once for the final element; a core that
+buffers the whole answer would avoid it.
+
+The two cores deliberately emit the same three event types. An adapter written against `Token | Citation | Done` does
+not care which stack produced them, which is also what allows the channel pages to show a Python adapter and a Java
+adapter for the same channel.
+
+== Identity mapping
+
+Every channel has its own notion of *who is speaking*, and none of them is your user ID.
+
+[cols="1,2,2", options="header"]
+|===
+| Channel family | Channel identity | How the adapter gets a `userId`
+
+| Your own web or mobile API
+| OAuth2 / OIDC subject (`sub`) in a bearer token
+| The token's `sub` is the `userId` (see xref:backend/oauth/flows-overview.adoc[OAuth flows overview]).
+
+| Teams, Slack, Google Chat
+| Workspace-scoped user ID plus tenant or workspace ID, optionally the Entra or Google identity
+| Look up the workspace identity in an identity link table; prefer an SSO claim (email, object ID) over display names.
+
+| WhatsApp, RCS, iMessage
+| A phone number or an opaque per-business customer ID
+| Treat the number as a *weak* identity; link it to an account through a verification step before exposing internal documents.
+
+| Telegram, XMPP
+| A numeric user ID or a bare JID
+| Same as above: a bot sees an identifier, not an authenticated employee.
+|===
+
+Two rules keep this safe. The first is that a channel identity is *claimed* until the adapter has proved it, by
+verifying the platform signature on the webhook or the token on the socket, and the proof must happen before any
+`userId` is produced. The second is that the mapping lives in a table owned by the adapters, not in the core:
+
+[source,text]
+----
+channel_identity(tenant_id, channel, channel_user_id)  ->  user_id, trust_level, linked_at
+----
+
+A `trust_level` such as `anonymous`, `phone-verified` or `sso-linked` lets the core decide which ACL tags a caller
+may use. An anonymous WhatsApp contact might only read public documentation; the same person after linking a company
+account may read internal material. The ACL mechanics are on
+xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy]; the channel's contribution is to make
+sure the `userId` handed to the core is never weaker than what was proved.
+
+== Conversation-state mapping
+
+The core only understands a `conversationId`. Channels have richer units, and the adapter chooses which one maps to a
+conversation:
+
+[cols="1,2,2", options="header"]
+|===
+| Channel | Natural unit | Typical `conversationId`
+
+| Web SSE API, widget
+| A chat session the client creates
+| A server-generated UUID returned to the client.
+
+| Teams, Slack, Google Chat
+| A channel thread, or a 1:1 chat
+| `<tenant>:<channel_id>:<thread_ts>` for threads; the 1:1 conversation ID for direct messages.
+
+| WhatsApp, RCS, iMessage, Telegram DMs
+| One endless chat per user
+| `<channel>:<user>:<period>`: a new conversation after a quiet period or on an explicit `/new` command.
+
+| XMPP MUC, group chats
+| A room
+| The room JID, with `userId` still per participant, so the ACL follows the asker rather than the room.
+|===
+
+The Python core builds `thread_id` as `userId:conversationId`, and the Spring core builds the same composite for
+`ChatMemory.CONVERSATION_ID`, so an adapter cannot read another user's history by guessing a conversation ID; the
+user is part of the key. The detailed memory design, retention and erasure are in
+xref:ai/rag-systems/conversational-rag-and-memory.adoc[Conversational RAG & Memory].
+
+Group conversations raise a design question the web API never meets: whose context is it? Mixing several people's
+questions into one history is convenient and leaks content between users with different permissions. The safe default
+is that the history is shared (it is the same thread) but retrieval is filtered by the *current asker's* ACLs and the
+adapter never replays a previous participant's retrieved passages to someone who could not read them; for strictly
+confidential material, key the conversation per user even inside a shared room.
+
+== Streaming capability negotiation
+
+Channels differ most in how a long answer can reach the user, so the adapter declares what its channel can do and the
+same renderer then picks a strategy. Four strategies cover the twelve channels in the
+xref:ai/conversational-channels/index.adoc[channel matrix]:
+
+[cols="1,2,2,2", options="header"]
+|===
+| Strategy | What the user sees | Typical channels | Cost for the adapter
+
+| Native streaming
+| Tokens appear as they arrive
+| SSE, WebSocket, WebRTC data channel, chat widgets; some platforms offer a first-class streaming message
+| Forward `Token` events; handle cancellation.
+
+| Message edits
+| One message that grows through repeated edits
+| Slack, Telegram, Teams, Google Chat, XMPP (message correction)
+| Throttle edits to stay under the platform's rate limits; the final edit carries citations.
+
+| Typing indicator, then one message
+| A "typing" state while the answer is prepared, then the whole answer
+| WhatsApp, RCS, iMessage and others without edits
+| Refresh the indicator while waiting; send once on `Done`.
+
+| Chunked messages
+| Several consecutive messages
+| Any channel with a hard text limit
+| Split on sentence or paragraph boundaries and keep the order.
+|===
+
+Which of these a given platform really supports, and the current limits, changes with platform releases; each channel
+page states what it found on the date it was written. A good adapter does not hard-code the choice per platform in the
+renderer: it publishes a small capability record.
+
+.docsassistant/adapters/capabilities.py -- capability negotiation and a throttled edit renderer (Python)
+[source,python]
+----
+import time
+from dataclasses import dataclass
+from typing import Protocol
+
+from docsassistant.core import Citation, Done, Event, Token
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    native_stream: bool = False
+    can_edit: bool = False
+    typing_indicator: bool = False
+    max_chars: int = 4000
+    min_edit_interval_s: float = 1.0     # from the platform's documented rate limits, read at build time
+    rich_citations: bool = False         # cards or buttons; otherwise plain links in text
+
+
+class ChannelSender(Protocol):
+    async def send(self, text: str) -> str: ...                    # returns a message id
+    async def edit(self, message_id: str, text: str) -> None: ...
+    async def typing(self) -> None: ...
+    async def send_citations(self, citations: list[Citation]) -> None: ...
+
+
+async def render(events, sender: ChannelSender, caps: Capabilities) -> None:
+    buffer: list[str] = []
+    message_id: str | None = None
+    last_edit = 0.0
+    citations: list[Citation] = []
+    async for event in events:
+        if isinstance(event, Token):
+            buffer.append(event.text)
+            now = time.monotonic()
+            if caps.can_edit and now - last_edit >= caps.min_edit_interval_s:
+                text = "".join(buffer)[: caps.max_chars]
+                message_id = await _send_or_edit(sender, message_id, text)
+                last_edit = now
+            elif not caps.can_edit and caps.typing_indicator and now - last_edit >= 4.0:
+                await sender.typing()
+                last_edit = now
+        elif isinstance(event, Citation):
+            citations.append(event)
+        elif isinstance(event, Done):
+            final = event.answer
+            chunks = [final[i:i + caps.max_chars] for i in range(0, len(final), caps.max_chars)] or [""]
+            if caps.can_edit:
+                message_id = await _send_or_edit(sender, message_id, chunks[0])
+                for extra in chunks[1:]:
+                    await sender.send(extra)
+            else:
+                for chunk in chunks:
+                    await sender.send(chunk)
+            if citations:
+                await sender.send_citations(citations)
+
+
+async def _send_or_edit(sender: ChannelSender, message_id: str | None, text: str) -> str:
+    if message_id is None:
+        return await sender.send(text)
+    await sender.edit(message_id, text)
+    return message_id
+----
+
+Source: design pattern; the platform limits that fill `Capabilities` come from each platform's own documentation, linked
+from the channel pages (for example https://docs.slack.dev/[Slack developer docs] and
+https://core.telegram.org/bots/api[Telegram Bot API]).
+
+Real renderers need more than this sketch: a native-stream branch that forwards tokens as they come and handles a client
+that went away (see xref:ai/langchain/streaming.adoc[LangChain: Streaming] and
+xref:ai/spring-ai/streaming-and-reactive.adoc[Spring AI: Streaming & Reactive]), and markup conversion that does not cut
+a code fence or a link in half when it splits at `max_chars`. The key property is that the capability record is *data*:
+a test can run the same event list through three records and assert three behaviours.
+
+== Rich-content rendering: citations as cards and links
+
+Citations are the one piece of structure every channel wants to show differently. The core hands over `Citation`
+events with a marker, a title and a URL; the adapter decides the presentation:
+
+[cols="1,3", options="header"]
+|===
+| Capability | Rendering
+
+| Cards or buttons
+| A card per source with a title and an "Open" button (an Adaptive Card in Teams, Block Kit in Slack, a card message in Google Chat, quick-reply or list elements where the channel offers them).
+
+| Rich text with links
+| The answer text with `[1]`, `[2]` markers, followed by a "Sources" list of linked titles.
+
+| Plain text only
+| The markers plus a numbered list of URLs, kept short. A phone number in a messaging app cannot hover over a footnote, so put the title next to the URL.
+|===
+
+Whatever the form, keep three rules from xref:ai/rag-systems/citations-and-grounding.adoc[Citations & Grounding]: only
+show sources that were actually retrieved and cited, link to a stable URL (not a signed URL that expires in minutes),
+and make the link respect the reader's own permissions rather than leaking the existence of a restricted document.
+Cards cost the user a tap and cost the adapter a template; on narrow channels, a numbered list of three links is
+usually the better trade-off than five cards.
+
+== Human handoff and escalation
+
+A RAG assistant that cannot answer should stop pretending. The core signals this with a *handoff port* rather than
+an event the user sees:
+
+[source,text]
+----
+handoff(conversationId, userId, reason, transcript) -> ticket reference
+----
+
+Typical triggers are an explicit request ("talk to a person"), repeated unhelpful answers or negative feedback, a
+retrieval step that found nothing above the confidence threshold, and a topic the policy sends to humans. The core
+raises the trigger; the adapter delivers it in the channel's idiom: create a ticket or a live-chat conversation in the
+support tool, post the transcript and a link to the conversation, and tell the user what will happen next and roughly
+when. While a human owns the conversation, the adapter should stop forwarding messages to the assistant (or at least
+mark them as human-owned), otherwise the bot and the person talk over each other. The design questions around who
+resumes the conversation afterwards are covered by
+xref:ai/agents/human-in-the-loop.adoc[Human in the Loop] and the interface side by
+xref:ai/agents/agent-ux.adoc[Agent UX]. Some platforms define their own handover mechanism between a bot and a human
+inbox; where one exists, the channel page names it.
+
+== Rate limits and fan-in
+
+Channels fail in two directions. *Fan-out* limits are the platform's: a token-per-second edit loop will hit a
+per-chat or per-workspace limit long before the model slows down, and the throttling in the renderer above exists for
+that reason. *Fan-in* is the opposite: many conversations, from many channels and tenants, converge on one model
+endpoint and one vector store, and a burst on one channel can starve all the others.
+
+Three controls keep that in check:
+
+* *Per-caller limits at the adapter*, before the core is called: tokens or requests per `userId` and per channel, with
+  a friendly "please wait" message instead of a raw error. The HTTP-level pattern (429 with `Retry-After`) is in
+  xref:ai/rag-systems/serving-rag-as-an-api.adoc[Serving RAG as an API].
+* *A bounded concurrency gate in front of the core*, so that at most N asks per tenant run at once and the rest queue
+  briefly or are told to retry. A semaphore keyed by tenant is enough for a single process; use a shared limiter
+  (Redis, or the API gateway) for many instances.
+* *Cost caps*, expressed in model tokens per tenant per day, enforced in the core where the usage is known; see
+  xref:ai/rag-systems/caching-latency-and-cost.adoc[Caching, Latency & Cost].
+
+For a rough capacity estimate, if each tenant's users produce \(\lambda\) questions per second and one answer holds a
+model slot for \(S\) seconds on average, the expected number of concurrent answers is \(L = \lambda S\)
+(Little's law). With 20 questions per second and an 8-second average answer, the core needs room for about 160
+concurrent generations, which is more than most model quotas give a single tenant. Size the gate from this number, not
+from the number of connected users.
+
+== Idempotent webhook handling
+
+Webhook-based channels (WhatsApp, Slack events, Teams, Telegram webhooks, Google Chat) deliver at least once. If your
+endpoint is slow or returns an error, the platform retries, and an assistant that answers every delivery will answer
+twice or ten times. The adapter therefore follows a fixed sequence:
+
+. *Verify* the request (signature or token) and reject it if invalid, before reading any content.
+. *Dedupe* on the platform's event or message ID with an atomic "set if absent" in a shared store, with an expiry
+  longer than the platform's retry window. If the key already exists, acknowledge and stop.
+. *Acknowledge fast*: return success within the platform's deadline, then do the slow work in the background.
+. *Process* the turn and send the reply; make the send itself idempotent where the platform supports a client-supplied
+  key, and otherwise record the reply's message ID against the inbound ID.
+
+.docsassistant/adapters/webhook.py -- verify, dedupe, acknowledge, process in the background (Python, FastAPI)
+[source,python]
+----
+import os
+
+import redis.asyncio as redis
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+
+from docsassistant.adapters.verify import verify_signature       # one function per platform, see the channel pages
+
+app = FastAPI()
+store = redis.from_url(os.environ["REDIS_URL"])
+DEDUPE_TTL_S = 24 * 3600
+
+
+@app.post("/channels/{channel}/events")
+async def receive(channel: str, request: Request, background: BackgroundTasks):
+    body = await request.body()
+    if not verify_signature(channel, request.headers, body, secret=os.environ[f"{channel.upper()}_SIGNING_SECRET"]):
+        raise HTTPException(status_code=401)
+    event = parse_event(channel, body)                            # channel-specific: ID, user, thread, text
+    first_time = await store.set(f"seen:{channel}:{event.event_id}", "1", nx=True, ex=DEDUPE_TTL_S)
+    if first_time:
+        background.add_task(handle_turn, channel, event)         # slow work after the response is sent
+    return {"ok": True}                                           # duplicates are acknowledged too
+----
+
+Source: https://redis.io/docs/latest/commands/set/[Redis -- SET] (`NX`, `EX`) and
+https://fastapi.tiangolo.com/tutorial/background-tasks/[FastAPI -- Background Tasks].
+
+`parse_event` and `handle_turn` are the channel-specific parts and are left as stubs in the sketch. A background task
+in the web process dies with the process, so it is a reasonable choice only for short work; for anything that may
+outlive a deploy, enqueue the event instead (next section). In Java the same shape is a controller that verifies,
+performs `SETNX` through Spring Data Redis's `setIfAbsent` with a timeout, and hands the event to an `@Async` method or
+a queue listener. Because redelivery can also happen *after* a successful reply (a lost acknowledgement), the dedupe
+key must be written *before* processing starts, which means a crash between the two loses the turn; if that matters,
+store a state (`received`, `done`) instead of a flag and let a sweeper retry the `received` ones.
+
+== Async jobs for slow answers
+
+Retrieval plus generation can take longer than the acknowledgement window of a webhook or the patience of a user. The
+architecture answers with a job, not with a longer timeout:
+
+[source,text]
+----
+webhook -> verify + dedupe + enqueue(turn)  -> 200 immediately
+worker  -> core.ask(...)                    -> render to the channel (edits, typing, final message)
+----
+
+The queue decouples the channel's deadline from the model's latency, lets workers scale on their own, and makes
+retries explicit (a failed turn is re-queued, not re-delivered by the platform). A few details make this behave in
+production:
+
+* The first visible reaction should happen within a second or two: a typing indicator, an "On it" reaction, or an
+  edited placeholder. Channels without these still allow a short acknowledgement message for long turns.
+* A job carries `(tenant, channel, event_id, conversationId, userId, text, reply_target)` and nothing secret; the worker
+  re-fetches tokens or credentials from the secret store when it sends the reply (see
+  xref:cloud/azure/key-vault-and-secrets.adoc[Key Vault & Secrets] for one way to hold them).
+* Long jobs need a *deadline and a fallback*: after, say, two minutes the worker sends a short apology and offers
+  the human handoff instead of leaving the user waiting.
+* If the platform lets the bot message the user proactively only inside a window after the last user message, the worker
+  must check that window before replying late; the channel pages record these windows with their dates.
+
+Queue technology is not the point: a managed queue, a Redis stream or a Postgres-backed table all work. The broader
+messaging patterns are covered in xref:backend/messaging/protocols.adoc[Messaging protocols], and deployment options
+for the workers in xref:cloud/azure/container-apps.adoc[Azure Container Apps] among others.
+
+== Multi-tenancy
+
+Serving several organisations (or several workspaces of one) from one deployment multiplies the places where data can
+leak. Carry a `tenantId` from the first byte of the webhook to the last byte of the reply, and make it a mandatory part
+of every key and every query:
+
+[cols="1,3", options="header"]
+|===
+| Layer | Tenant rule
+
+| Adapter routing
+| The platform's tenant or workspace ID (a Slack team ID, a Teams tenant ID, a WhatsApp business number) selects the tenant record, which holds that tenant's secrets, limits and configuration.
+
+| Identity and threads
+| Include the tenant in `channel_identity` and in the `conversationId`. The same channel user ID may exist in two workspaces and must never collide.
+
+| Core and retrieval
+| Either a per-tenant index or a shared index filtered by a tenant tag; see "Per-tenant indexes or shared-index filters" in xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy].
+
+| Memory
+| Prefix thread keys with the tenant, and give the retention job a per-tenant policy.
+
+| Limits and cost
+| Per-tenant quotas at the concurrency gate and in the cost cap, so one tenant cannot consume the shared model quota.
+
+| Observability
+| Tag every trace and log with the tenant ID, and never log message text for a tenant that has not agreed to it.
+|===
+
+Credentials deserve special care: each tenant that installs the assistant in its own Slack workspace or Teams tenant
+yields its own token, which belongs in a secret store, not in a table column in clear text. The resulting trust
+boundary is the same one drawn on xref:ai/rag-systems/access-control-and-privacy.adoc[Access Control & Privacy], extended
+to the channel edge.
+
+== Putting it together
+
+For one WhatsApp-style turn the full path is: webhook arrives, the adapter verifies the signature, dedupes the message ID,
+returns 200 and enqueues; a worker maps the sender to `userId` and `conversationId`, calls `core.ask(...)`, renders the
+`Token` events with the "typing, then one message" strategy, sends citations as a short list of links, and records the
+reply ID. For a Teams turn only the verification, mapping and rendering differ. When the next channel is added, the work
+is one adapter and one capability record; the retrieval, memory, access control and cost logic stay where the RAG
+Systems pages put them.
+
+The next pages build adapters on this skeleton, starting with the streaming APIs you host yourself
+(xref:ai/conversational-channels/streaming-chat-apis.adoc[Streaming Chat APIs]) and ending with the operational view
+across all channels (xref:ai/conversational-channels/operating-chat-channels.adoc[Operating Chat Channels]).
+
+== References
+
+* https://docs.langchain.com/oss/python/langchain/agents[LangChain -- Agents]
+* https://docs.langchain.com/oss/python/langchain/streaming[LangChain -- Streaming]
+* https://docs.langchain.com/oss/python/langgraph/persistence[LangGraph -- Persistence]
+* https://docs.spring.io/spring-ai/reference/api/chatclient.html[Spring AI -- ChatClient API]
+* https://docs.spring.io/spring-ai/reference/api/chat-memory.html[Spring AI -- Chat Memory]
+* https://docs.spring.io/spring-ai/reference/api/retrieval-augmented-generation.html[Spring AI -- Retrieval Augmented Generation]
+* https://fastapi.tiangolo.com/tutorial/background-tasks/[FastAPI -- Background Tasks]
+* https://redis.io/docs/latest/commands/set/[Redis -- SET]
+* https://projectreactor.io/docs/core/release/reference/[Project Reactor -- Reference Guide]
