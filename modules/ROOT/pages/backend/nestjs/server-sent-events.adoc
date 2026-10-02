@@ -1,0 +1,602 @@
+= Server-Sent Events
+:description: Server-Sent Events in NestJS: the @Sse() decorator returning Observable<MessageEvent>, the event fields (data, type, id, retry, comment), keep-alive comments, Last-Event-ID replay, client disconnects, finalize, async handlers and the 11.2 @SseSignal() AbortSignal, errors before and after the first event, guards and interceptors, Express and Fastify behaviour, the Bookshelf live-reviews feed and SSE versus WebSockets.
+:keywords: NestJS, Server-Sent Events, SSE, @Sse, @SseSignal, MessageEvent, Observable, RxJS, EventSource, text/event-stream, AbortSignal, finalize, Last-Event-ID, keep-alive, WebSockets, Express 5, Fastify 5, live feed, Bookshelf
+
+include::partial$nestjs-disclaimer.adoc[]
+
+This page is written against NestJS 12.1 (npm `@nestjs/core` 12.1.2), Node.js 20.19+ or 22.12+, TypeScript 6, RxJS 7.8,
+Express 5.2 and Fastify 5.12, all checked on 2026-10-02. Server-Sent Events (SSE) is a one-way push channel over plain
+HTTP: the client opens a request, the server keeps the response open with `Content-Type: text/event-stream` and writes
+small text blocks whenever something happens. Nest turns an RxJS `Observable` into that stream with a single decorator.
+This page builds the live "new review" feed of the _Bookshelf_ running scenario, then covers what happens when the client
+goes away, which is the part that is easy to get wrong. The snippets target a NestJS 12.1.2 project (ESM, Vitest): the
+streaming tests use a real HTTP `listen()` on an ephemeral port, read the body with `fetch()` and abort the request to
+simulate a disconnect, and behave the same on the Express and the Fastify adapter. A browser-side `EventSource` client
+is shown as well, and `curl` output is shown for the raw wire format. Controllers and routing are covered in
+xref:backend/nestjs/controllers-and-routing.adoc[Controllers and Routing]; the other long-lived channel is
+xref:backend/nestjs/websockets.adoc[WebSockets].
+
+[#basics]
+== `@Sse()` and `Observable<MessageEvent>`
+
+Annotate a controller route handler with `@Sse()` (from `@nestjs/common`) and return an `Observable` of
+`MessageEvent` objects (an interface also exported by `@nestjs/common`, not the DOM type of the same name). Each value the
+observable emits is written to the response as one SSE block. `Observable`, `interval` and `map` come from `rxjs`.
+
+[source,typescript]
+----
+import { Controller, MessageEvent, Sse } from '@nestjs/common';
+import { Observable, interval, map } from 'rxjs';
+
+@Controller()
+export class TickController {
+  @Sse('sse')
+  sse(): Observable<MessageEvent> {
+    return interval(1000).pipe(map(() => ({ data: { hello: 'world' } })));
+  }
+}
+----
+Source: https://docs.nestjs.com/http/server-sent-events#usage[NestJS: Server-Sent Events - Usage]
+
+`@Sse(path)` registers a `GET` route (the path is relative to the controller prefix, like `@Get()`), so it takes part in
+routing, versioning and the global prefix exactly as any other handler. The handler must return an `Observable` or, for
+an async handler, a `Promise` that resolves to one; anything else is rejected with
+`You must return an Observable stream to use Server-Sent Events (SSE).`
+
+The `MessageEvent` interface mirrors the fields of the SSE specification:
+
+[source,typescript]
+----
+export interface MessageEvent {
+  data?: string | object;
+  id?: string;
+  type?: string;
+  retry?: number;
+  comment?: string;
+}
+----
+Source: https://docs.nestjs.com/http/server-sent-events#usage[NestJS: Server-Sent Events - Usage]
+
+[cols="1,3",options="header"]
+|===
+| Field | What Nest writes on the wire
+| `data`
+| One or more `data:` lines. An object is serialized with `JSON.stringify`; a string containing newlines becomes several `data:` lines. It must be a string or an object, so a bare number is a type error: wrap it (`data: String(n)` or `data: { n }`).
+| `type`
+| The SSE `event:` field. The browser dispatches an event with that name; without it a generic `message` event fires.
+| `id`
+| The `id:` field, remembered by the client as its last event id. When you do not set it, Nest assigns an incrementing id per connection (`1`, `2`, ...).
+| `retry`
+| The `retry:` field: reconnection delay in milliseconds suggested to the client.
+| `comment`
+| A comment line (`: text`) that `EventSource` clients ignore. A message with only a `comment` gets no automatic id, which makes it a keep-alive.
+|===
+
+Newlines in `type`, `id` and `retry` are stripped, so a value taken from user input cannot inject extra fields.
+
+[#feed]
+== The Bookshelf live-reviews feed
+
+The scenario: a book page shows reviews as they are posted. A `ReviewsService` keeps a `Subject` of created reviews and
+exposes a per-book stream. Using a `Subject` here is the simplest in-process bus; with several application instances the
+events would arrive through Redis or a message broker instead (see
+xref:backend/nestjs/events-scheduling-and-queues.adoc[Events, Scheduling and Queues]).
+
+.reviews.service.ts
+[source,typescript]
+----
+import { Injectable, MessageEvent } from '@nestjs/common';
+import { Observable, Subject, filter, finalize, interval, map, merge } from 'rxjs';
+
+export interface Review {
+  id: number;
+  bookId: number;
+  rating: number;
+  text: string;
+}
+
+@Injectable()
+export class ReviewsService {
+  private readonly created$ = new Subject<Review>();
+  private readonly history: Review[] = [];
+  private nextId = 1;
+  activeStreams = 0; // open SSE subscriptions, handy for tests and metrics
+
+  add(bookId: number, rating: number, text: string): Review {
+    const review = { id: this.nextId++, bookId, rating, text };
+    this.history.push(review);
+    this.created$.next(review);
+    return review;
+  }
+
+  stream(bookId: number, lastEventId?: number, heartbeatMs = 15_000): Observable<MessageEvent> {
+    // Reviews the client missed while it was disconnected (see Reconnection).
+    const missed = this.history.filter(
+      (r) => r.bookId === bookId && r.id > (lastEventId ?? Number.MAX_SAFE_INTEGER),
+    );
+    const replay$ = new Observable<Review>((subscriber) => {
+      missed.forEach((r) => subscriber.next(r));
+      subscriber.complete();
+    });
+    const reviews$ = merge(replay$, this.created$.pipe(filter((r) => r.bookId === bookId))).pipe(
+      map((r): MessageEvent => ({ id: String(r.id), type: 'review.created', data: r })),
+    );
+    // A comment-only event keeps proxies from closing an idle connection.
+    const heartbeat$ = interval(heartbeatMs).pipe(
+      map((): MessageEvent => ({ comment: 'keep-alive' })),
+    );
+
+    this.activeStreams++;
+    return merge(reviews$, heartbeat$).pipe(finalize(() => this.activeStreams--));
+  }
+}
+----
+
+.reviews.controller.ts
+[source,typescript]
+----
+import {
+  Body, Controller, Headers, MessageEvent, Param, ParseIntPipe, Post, Sse,
+} from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { ReviewsService } from './reviews.service.js';
+
+@Controller('books/:bookId/reviews')
+export class ReviewsController {
+  constructor(private readonly reviews: ReviewsService) {}
+
+  @Post()
+  create(
+    @Param('bookId', ParseIntPipe) bookId: number,
+    @Body() body: { rating: number; text: string },
+  ) {
+    return this.reviews.add(bookId, body.rating, body.text);
+  }
+
+  // GET /books/7/reviews/stream
+  @Sse('stream')
+  stream(
+    @Param('bookId', ParseIntPipe) bookId: number,
+    @Headers('last-event-id') lastEventId?: string,
+  ): Observable<MessageEvent> {
+    return this.reviews.stream(bookId, lastEventId ? Number(lastEventId) : undefined);
+  }
+}
+----
+Source: https://docs.nestjs.com/http/server-sent-events#usage[NestJS: Server-Sent Events - Usage]
+
+The route uses the ordinary pipeline pieces: `ParseIntPipe` validates the path parameter and `@Headers()` reads the
+`Last-Event-ID` header (see
+xref:backend/nestjs/pipes-and-validation.adoc[Pipes and Validation]). With one client listening on book 7, a review for
+book 8 and two reviews for book 7 posted, `curl` shows the raw response. Note the blank line that starts the body: Nest
+writes it right after the headers so the client sees the stream open before the first event.
+
+[source,bash]
+----
+curl -sN -i 'http://localhost:3000/books/7/reviews/stream'
+----
+
+[source,http]
+----
+HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Connection: keep-alive
+Cache-Control: private, no-cache, no-store, must-revalidate, max-age=0, no-transform
+Pragma: no-cache
+Expire: 0
+X-Accel-Buffering: no
+Transfer-Encoding: chunked
+
+
+event: review.created
+id: 1
+data: {"id":1,"bookId":7,"rating":5,"text":"Great"}
+
+: keep-alive
+
+----
+
+The headers matter in production. `Cache-Control` and `X-Accel-Buffering: no` ask caches and nginx not to buffer the
+stream, and `Connection: keep-alive` is omitted automatically on HTTP/2, where it is forbidden. Nest also turns off the
+socket idle timeout for the request, so a quiet stream is not cut by the Node.js server. A reverse proxy or compression
+layer in front of the app can still buffer or time out the response; configure it for the route (see
+xref:backend/nestjs/mvc-static-files-and-compression.adoc[MVC, Static Files and Compression]).
+
+.Output: events for book 7 only, in order, with the Nest-assigned `type` and `id`
+[source,text]
+----
+event: review.created
+id: 1
+data: {"id":1,"bookId":7,"rating":5,"text":"Great"}
+
+event: review.created
+id: 3
+data: {"id":3,"bookId":7,"rating":4,"text":"Good"}
+----
+
+[#client]
+== Consuming the stream with `EventSource`
+
+In the browser the `EventSource` API connects, parses the blocks and reconnects automatically. A named `type` is received
+with `addEventListener`; `onmessage` only receives events that have no `event:` field.
+
+[source,javascript]
+----
+const es = new EventSource('/books/7/reviews/stream');
+
+es.addEventListener('review.created', (e) => {
+  const review = JSON.parse(e.data);
+  console.log(e.lastEventId, review.rating, review.text);
+});
+
+es.onerror = () => {
+  // EventSource retries by itself; close() stops it for good.
+};
+
+// leaving the page or the component:
+es.close();
+----
+Source: https://docs.nestjs.com/http/server-sent-events#usage[NestJS: Server-Sent Events - Usage]
+
+Run in Node.js 24 (with `--experimental-eventsource`) against the feed above, the client printed
+`{"type":"review.created","lastEventId":"1","data":{"id":1,"bookId":7,"rating":5,"text":"Great"}}` and the server-side
+subscription count went back to zero once `close()` was called.
+
+`EventSource` only issues `GET` requests and cannot set custom headers, so a bearer token cannot be attached. Authenticate
+the stream with a cookie (see xref:backend/nestjs/cookies-and-sessions.adoc[Cookies and Sessions]) or with a
+short-lived token in the URL, and remember that URLs end up in logs. For `POST` bodies or headers use a
+`fetch()`-based streaming client instead. Over HTTP/1.1, browsers also limit the number of connections per host (six),
+which is shared by every tab; HTTP/2 multiplexes streams and removes the practical limit.
+
+[#reconnection]
+== Reconnection and `Last-Event-ID`
+
+When the connection drops, `EventSource` reconnects after the `retry` delay and sends the last `id` it saw in a
+`Last-Event-ID` header. Nest does nothing with that header by itself: the id counter it assigns restarts from `1` on each
+new connection, so a feed that wants to resume should set explicit ids, as the `ReviewsService` above does with the
+review id, and replay what the client missed. The page's service replays only when the header is present, then continues
+live. Reconnecting with `Last-Event-ID: 1` after review 2 (book 8) and review 3 (book 7) were posted:
+
+[source,bash]
+----
+curl -sN -H 'Last-Event-ID: 1' 'http://localhost:3000/books/7/reviews/stream?heartbeat=30'
+----
+
+.Output: the missed review is replayed first, then the live stream continues
+[source,text]
+----
+event: review.created
+id: 3
+data: {"id":3,"bookId":7,"rating":4,"text":"Good"}
+
+: keep-alive
+----
+
+A real feed would keep the history in a store with a bounded window (or ask the database for rows after the id) rather than
+in memory, and must decide what to do when the requested id is older than the retained window, typically by sending a
+`refresh` event that tells the client to reload the list. The `heartbeat` query parameter in the test is a testing aid,
+not something to expose.
+
+Source: https://docs.nestjs.com/http/server-sent-events#usage[NestJS: Server-Sent Events - Usage]
+
+[#disconnect]
+== Client disconnects
+
+When the client closes the connection (`eventSource.close()`, closing the tab, a network failure), Nest unsubscribes from
+the observable it returned. That stops the stream and runs the observable's teardown, which clears the `interval`
+timer in the first example and the `Subject` subscription in the feed. To run your own cleanup, use RxJS `finalize()`,
+which fires on completion, error or unsubscription, so it also covers the disconnect. The `ReviewsService` above uses it to
+keep `activeStreams` accurate.
+
+[source,typescript]
+----
+@Sse('sse')
+sse(): Observable<MessageEvent> {
+  return interval(1000).pipe(
+    map(() => ({ data: { hello: 'world' } })),
+    finalize(() => console.log('Client disconnected')),
+  );
+}
+----
+Source: https://docs.nestjs.com/http/server-sent-events#client-disconnection[NestJS: Server-Sent Events - Client disconnection]
+
+With a real listening server: one `fetch()` stream is open (`activeStreams` is `1`), the test aborts the request
+with an `AbortController`, and the counter returns to `0` shortly afterwards, on Express and on Fastify alike.
+
+[#signal]
+== Async handlers and `@SseSignal()` (11.2)
+
+An `@Sse()` handler may be `async` and return `Promise<Observable<MessageEvent>>`. That is common when the stream needs
+expensive setup before the first event: opening a database cursor, a model session, or authorizing against a downstream
+service. It opens a gap that `finalize()` cannot close. If the client disconnects while the promise is still resolving,
+Nest never subscribes to the observable that is eventually returned (it will not start a producer whose consumer has
+gone), so the observable's teardown never runs and whatever the setup allocated leaks.
+
+Nest 11.2 added the `@SseSignal()` parameter decorator for this. It injects an `AbortSignal` tied to the SSE response, so
+the handler can check it after the setup await and release the resource itself. The test below uses a `SlowSession`
+standing in for the cursor.
+
+.slow-session.ts
+[source,typescript]
+----
+import { Injectable } from '@nestjs/common';
+
+@Injectable()
+export class ResourceProbe {
+  opened = 0;
+  closed = 0;
+  subscribed = 0;
+}
+
+/** Stand-in for a database cursor or model session. */
+export class SlowSession {
+  private isClosed = false;
+  private constructor(private readonly probe: ResourceProbe) {}
+
+  static async open(probe: ResourceProbe, ms: number): Promise<SlowSession> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+    probe.opened++;
+    return new SlowSession(probe);
+  }
+
+  async close(): Promise<void> {
+    if (this.isClosed) return; // idempotent: abort and teardown may both run
+    this.isClosed = true;
+    this.probe.closed++;
+  }
+}
+----
+
+.setup.controller.ts
+[source,typescript]
+----
+import { Controller, MessageEvent, Sse, SseSignal } from '@nestjs/common';
+import { EMPTY, Observable } from 'rxjs';
+import { ResourceProbe, SlowSession } from './slow-session.js';
+
+@Controller('setup')
+export class SetupController {
+  constructor(private readonly probe: ResourceProbe) {}
+
+  @Sse('stream')
+  async stream(@SseSignal() signal: AbortSignal): Promise<Observable<MessageEvent>> {
+    const session = await SlowSession.open(this.probe, 200);
+
+    if (signal.aborted) {
+      // The client left during setup. Nest will never subscribe to the
+      // Observable below, so release the resource here.
+      await session.close();
+      return EMPTY;
+    }
+
+    return new Observable<MessageEvent>((subscriber) => {
+      const timer = setInterval(() => subscriber.next({ data: 'tick' }), 50);
+      const onAbort = () => subscriber.complete();
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      return () => {
+        clearInterval(timer);
+        signal.removeEventListener('abort', onAbort);
+        void session.close();
+      };
+    });
+  }
+}
+----
+Source: https://docs.nestjs.com/http/server-sent-events#client-disconnection[NestJS: Server-Sent Events - Client disconnection]
+
+[mermaid]
+....
+sequenceDiagram
+  participant C as Client
+  participant N as Nest SSE route
+  participant H as Async handler
+  C->>N: GET /setup/stream
+  N->>H: call handler with @SseSignal()
+  H->>H: await session setup (200 ms)
+  C--xN: disconnect after 50 ms
+  N->>N: abort the signal, mark the consumer gone
+  H->>H: setup finishes, signal.aborted is true
+  H->>H: session.close() then return EMPTY
+  Note over N,H: the Observable is never subscribed, so only the handler can release the session
+....
+
+In the test, on both adapters, the client aborts 50 ms into the 200 ms setup, and afterwards the probe reads
+`opened: 1, closed: 1, subscribed: 0`. The session was released by the handler, and the producer never started. In the
+normal case (client stays) `subscribed` becomes `1`, ticks arrive, and after the client aborts `closed` increases by one
+exactly once even though both the `abort` listener and the teardown function ran. That is why the docs warn that cleanup
+wired to the `abort` event may run alongside the observable's teardown and must be idempotent.
+
+[#signal-lifetime]
+== Signal lifetime
+
+The signal represents the lifetime of the SSE _response_, not only the connection. It aborts when the stream ends for any
+reason: the client disconnected, the observable completed, or the observable errored. That makes it a single cleanup hook
+for the whole request. Tie a resource to it once and it is released on every exit path, for example an upstream `fetch()`
+(`fetch(url, { signal })`) that is cancelled when the response ends, however it ends.
+
+Because the signal also aborts on normal completion, `signal.aborted` is only a "did the client go away?" check
+_during setup_, before the observable is returned: at that point the stream cannot have completed, so an aborted signal
+unambiguously means a disconnect. After that, treat the `abort` event as "the response is over". A finite stream shows the
+completion case:
+
+[source,typescript]
+----
+@Sse('finite')
+finite(@SseSignal() signal: AbortSignal): Observable<MessageEvent> {
+  signal.addEventListener('abort', () => this.probe.aborts++, { once: true });
+  return new Observable<MessageEvent>((subscriber) => {
+    subscriber.next({ data: 'one' });
+    subscriber.next({ data: 'two' });
+    subscriber.complete();
+  });
+}
+----
+Source: https://docs.nestjs.com/http/server-sent-events#signal-lifetime[NestJS: Server-Sent Events - Signal lifetime]
+
+.Output: the body of the finite stream, and the abort counter after the response ended
+[source,text]
+----
+id: 1
+data: one
+
+id: 2
+data: two
+
+(probe.aborts === 1)
+----
+
+Inside a producer the signal can also end the stream when the client leaves, as the `onAbort` listener in the previous
+example does by completing the subscriber. `@SseSignal()` is only populated on `@Sse()` routes; on any other handler it
+resolves to `undefined`. It behaves the same on Express and Fastify, which the tests confirmed.
+
+[#errors]
+== Errors, guards and interceptors
+
+SSE routes go through the normal request pipeline, with one twist: the status line and headers are written lazily, as
+soon as the first event (or the next event-loop turn) allows. The practical rules, which hold on both adapters:
+
+* **Guards and pipes run before the stream opens**, so a guard that throws produces an ordinary JSON `403`
+  with `Content-Type: application/json`, not an event stream. Authorize in a guard, not inside the observable (see
+  xref:backend/nestjs/guards.adoc[Guards]).
+* **An error thrown synchronously, before anything has been written**, is handled by the exception filters like any
+  other: `throwError(() => new ForbiddenException('too early'))` produced `403` with
+  `{"message":"too early","error":"Forbidden","statusCode":403}`. An error that happens a moment later, after Nest has
+  already committed the `200` and the headers, can no longer change the status.
+* **An error after the stream has started** is delivered in-band: Nest writes an `error` event whose data is the error
+  message and ends the response. The client sees `200` and then:
++
+[source,text]
+----
+id: 1
+data: hello
+
+event: error
+id: 2
+data: upstream broke
+----
++
+The browser's `EventSource` treats an event named `error` as an ordinary named event, separate from its `onerror`
+callback, so a client that wants to show a message must listen for it explicitly.
+* **Interceptors** wrap the stream: `next.handle()` returns the same observable, so RxJS operators such as `finalize()` and
+  `tap()` can observe it. The interceptor's `finalize()` ran when the test aborted the client, which makes it a good place
+  for metrics such as an open-streams gauge (see xref:backend/nestjs/interceptors.adoc[Interceptors]).
+
+[source,typescript]
+----
+@Injectable()
+export class StreamAuditInterceptor implements NestInterceptor {
+  constructor(private readonly probe: ResourceProbe) {}
+
+  intercept(_ctx: ExecutionContext, next: CallHandler): Observable<unknown> {
+    this.probe.audited++;
+    // finalize runs on completion, error and client disconnect alike.
+    return next.handle().pipe(finalize(() => this.probe.auditEnded++));
+  }
+}
+
+@Controller('audit')
+@UseInterceptors(StreamAuditInterceptor)
+export class AuditController {
+  @Sse('stream')
+  stream(): Observable<MessageEvent> {
+    return interval(30).pipe(map((n): MessageEvent => ({ data: `tick ${n}` })));
+  }
+}
+----
+Source: https://docs.nestjs.com/interceptors[NestJS: Interceptors]
+
+A guard that always rejects, used to check the first rule:
+
+[source,typescript]
+----
+@Injectable()
+export class FeedGuard implements CanActivate {
+  canActivate(): boolean {
+    throw new ForbiddenException('feed is private');
+  }
+}
+
+@Controller('errors')
+export class ErrorsController {
+  @UseGuards(FeedGuard)
+  @Sse('guarded')
+  guarded(): Observable<MessageEvent> {
+    return of({ data: 'never reached' });
+  }
+}
+----
+Source: https://docs.nestjs.com/guards[NestJS: Guards]
+
+Where these pieces sit in the pipeline is shown in
+xref:backend/nestjs/request-lifecycle.adoc[Request Lifecycle], and the error side in
+xref:backend/nestjs/exception-filters-and-error-handling.adoc[Exception Filters and Error Handling].
+
+[#platforms]
+== Express and Fastify
+
+`@Sse()` works the same on both platform adapters; the whole page's test suite runs unchanged on
+`@nestjs/platform-express` and `@nestjs/platform-fastify`, including the headers, the keep-alive comments, replay,
+the signal and the error cases. The only visible difference is the `x-powered-by: Express` header Express adds. Details of
+the adapters are in xref:backend/nestjs/fastify-and-http-platforms.adoc[Fastify and HTTP Platforms]. Whichever adapter
+you use, a long-lived stream holds a connection open, so plan for it in deployments and in graceful shutdown (see
+xref:backend/nestjs/lifecycle-events-and-shutdown.adoc[Lifecycle Events and Shutdown]): the tests here close each
+stream from the client side before calling `app.close()`.
+
+[#vs-websockets]
+== SSE versus WebSockets
+
+Both push data to the browser; they differ in direction, protocol and what you have to build yourself.
+
+[cols="2,3,3",options="header"]
+|===
+| | Server-Sent Events | WebSockets
+| Direction | Server to client only; the client sends separate HTTP requests | Full duplex on one connection
+| Protocol | Plain HTTP (`text/event-stream`), works with ordinary proxies, HTTP/2, cookies and the usual guards | Upgrade to the WebSocket protocol; needs proxy support and its own gateway pipeline
+| Reconnection | Built into `EventSource`, with `Last-Event-ID` | Library-level (Socket.IO) or hand-written
+| Payload | Text only (JSON in `data`) | Text and binary
+| Nest building blocks | `@Sse()` and RxJS, no extra package | `@WebSocketGateway()`, `@SubscribeMessage()`, an adapter (`@nestjs/platform-socket.io` or `@nestjs/platform-ws`)
+| Fits Bookshelf | The live-reviews feed, notifications, progress of an import | The per-book chat room, where members also send messages
+|===
+
+A rule of thumb: if only the server talks, choose SSE; it is simpler to deploy and secure. If the client also streams
+messages, or you need binary frames, choose WebSockets (see xref:backend/nestjs/websockets.adoc[WebSockets]). GraphQL
+subscriptions are a third option when the feed should be part of the schema (see
+xref:backend/nestjs/graphql-subscriptions-security-and-plugins.adoc[GraphQL Subscriptions, Security and Plugins]).
+
+[#changes]
+== What changed recently, and where older material is outdated
+
+* **Nest 11.2 added `@SseSignal()`** and the lifetime semantics described above. Material written before 11.2, including
+  tutorials and books that teach `finalize()` as the only teardown, does not cover the leak when a client disconnects
+  during an async handler's setup.
+* The `MessageEvent` interface carries `type`, `comment` and `retry` alongside `data` and `id`; examples that only show
+  `data` miss named events and keep-alive comments.
+* Since the 12.0 restructure of the documentation, SSE lives under `/http/server-sent-events`; older links under
+  `/techniques/server-sent-events` are stale.
+* Express 5 and Fastify 5 are the supported platforms in Nest 12; nothing in the examples depends on Express-specific
+  objects, and none of the handlers injects the response object: returning the observable is all that is needed.
+
+Source: https://docs.nestjs.com/http/server-sent-events[NestJS: Server-Sent Events]
+
+[#pitfalls]
+== Pitfalls
+
+* Forgetting teardown: a producer that uses `setInterval`, an event emitter or a database listener must clean up in the
+  observable's teardown function; Nest only unsubscribes, it cannot know what you started.
+* Putting authorization inside the observable: do it in a guard, so rejected clients get a real status code.
+* A long silence with no heartbeat: proxies close idle connections (often after 60 seconds); emit a `comment` event
+  periodically.
+* Compression or buffering in front of the route delaying events: test through the real proxy.
+* One shared `Subject` for everything: filter per client (the book id above) so a client never receives another
+  tenant's events.
+* Emitting numbers as `data`: use a string or an object.
+
+[#references]
+== References
+
+* https://docs.nestjs.com/http/server-sent-events[NestJS: Server-Sent Events]
+* https://docs.nestjs.com/interceptors[NestJS: Interceptors]
+* https://docs.nestjs.com/guards[NestJS: Guards]
+* https://github.com/nestjs/nest/releases/tag/v11.2.0[NestJS release v11.2.0 (SSE signal)]
+* https://github.com/nestjs/nest/tree/master/sample/28-sse[NestJS sample 28-sse]
