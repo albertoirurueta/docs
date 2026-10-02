@@ -1,0 +1,408 @@
+= Deployment Patterns
+:description: Deploying a RAG service -- containers for the Python and Spring services, Cloud Run, ECS, AKS and Kubernetes, GPU inference services, secrets, blue/green and canary rollouts of prompts and models, initial versus incremental loads, and disaster recovery and backups for the vector store, the graph and the conversation store.
+:keywords: rag deployment, containers, dockerfile, fastapi docker, spring boot image, kubernetes, deployment, hpa, cloud run, amazon ecs, aks, azure container apps, gpu inference, vllm, nvidia nim, secrets, external secrets, key vault, blue/green, canary, prompt rollout, model rollout, config version, initial load, incremental load, kubernetes job, cronjob, disaster recovery, backups, rpo, rto, pgvector backup, neo4j backup, docsassistant
+
+include::partial$ai-rag-systems-disclaimer.adoc[]
+
+This page was written on 2026-09-30 against FastAPI 0.142.2 on Python 3.12, Spring AI 2.0.1 on Spring Boot 4.1.1 with Java
+21, LangChain4j 1.20.2, and current Kubernetes, Google Cloud Run, Amazon ECS and Azure documentation (see the
+xref:ai/rag-systems/index.adoc#_version_baseline[version baseline]). The rollout-bucket functions were run on generated
+user IDs in Python and in Java, and assigned the same buckets (about 10 per cent of 20 000 users to a 10 per cent
+candidate); the Java classes were compiled against the released jars; the Dockerfile and manifests were not built or
+deployed.
+
+DocsAssistant is now several deployable units: the API with its MCP endpoint, the ingestion workers, the stores, and
+the model endpoints. This page is about running them: packaging, the platform, the separate GPU tier, secrets, how to
+change prompts and models safely, how to load the index the first time and keep it current, and how to recover when
+something is lost. Container fundamentals are in xref:backend/docker/index.adoc[Docker] (in particular
+xref:backend/docker/image-best-practices-and-security.adoc[Image Best Practices and Security] and
+xref:backend/docker/java-and-spring-boot-images.adoc[Java and Spring Boot Images]); local and self-hosted models in
+production are in xref:ai/local-llms/running-local-llms-in-production.adoc[Running Local LLMs in Production]; and the
+Spring AI side of deployment in xref:ai/spring-ai/production-and-deployment.adoc[Spring AI: Production & Deployment].
+
+[mermaid]
+....
+flowchart TB
+  subgraph Cluster
+    API["docsassistant-api (Deployment, HPA on in-flight streams)"]
+    ING["ingestion-worker (Deployment, scaled on topic lag)"]
+    LOAD["initial-load (Job) / reconcile (CronJob)"]
+  end
+  subgraph GPU["GPU tier"]
+    LLM["LLM server (vLLM / NIM) or hosted API"]
+    EMB["Embedding + reranker service"]
+  end
+  subgraph Managed["Managed services"]
+    PG[(PostgreSQL + pgvector)]
+    NEO[(Neo4j)]
+    RED[(Redis)]
+    KAF[(Kafka)]
+    SEC[Secrets manager]
+  end
+  API --> LLM
+  API --> EMB
+  API --> PG
+  API --> NEO
+  API --> RED
+  ING --> EMB
+  ING --> PG
+  ING --> NEO
+  KAF --> ING
+  LOAD --> ING
+  SEC -.-> API
+  SEC -.-> ING
+....
+
+== Containers
+
+The Python service is a small image: slim base, dependencies installed from a lock file in a separate layer, a non-root
+user, and Uvicorn behind the platform's load balancer:
+
+.Dockerfile -- the FastAPI service
+[source,dockerfile]
+----
+FROM python:3.12-slim AS base
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+
+FROM base AS deps
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
+
+FROM base
+COPY --from=deps /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=deps /usr/local/bin/uvicorn /usr/local/bin/uvicorn
+COPY docsassistant ./docsassistant
+RUN useradd --uid 10001 --no-create-home app
+USER 10001
+EXPOSE 8000
+# one worker per container; scale with replicas. --timeout-graceful-shutdown lets open SSE streams finish.
+CMD ["uvicorn", "docsassistant.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--timeout-graceful-shutdown", "30"]
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI -- FastAPI in Containers] and
+https://docs.docker.com/build/building/best-practices/[Docker -- Building best practices].
+
+The Spring Boot service is built with `mvn spring-boot:build-image` (Cloud Native Buildpacks) or a layered-jar
+Dockerfile, as on xref:backend/docker/java-and-spring-boot-images.adoc[Java and Spring Boot Images]; with virtual threads
+enabled (`spring.threads.virtual.enabled=true`) one instance holds many concurrent streams. Heavy parsing dependencies
+(Docling's models, Tesseract) belong in the *ingestion* image only, which keeps the API image small and its cold start
+fast.
+
+== Choosing the platform
+
+[cols="1,2,2", options="header"]
+|===
+| Platform | Fits | Watch out for
+
+| Google Cloud Run
+| The API and MCP endpoint (stateless, request-scaled), Cloud Run jobs for loads, GPU instances for small models.
+| Request timeouts for long streams (configure the maximum), concurrency per instance, minimum instances to avoid cold
+  starts.
+
+| Amazon ECS (Fargate or EC2)
+| Containers without running Kubernetes; EC2 capacity providers for GPU tasks.
+| Load balancer idle timeouts for SSE; task sizing.
+
+| Azure Container Apps / AKS
+| Container Apps for the API and KEDA-scaled workers; AKS when you need GPU node pools and full control
+  (see xref:cloud/azure/container-apps.adoc[Container Apps] and xref:cloud/azure/aks-clusters.adoc[AKS Clusters]).
+| Ingress timeouts; workload identity for secrets.
+
+| Kubernetes (any)
+| Everything in one place: Deployments, Jobs, CronJobs, GPU node pools, HPA and KEDA.
+| You run it; see xref:backend/docker/orchestration-swarm-and-kubernetes.adoc[Orchestration: Swarm and Kubernetes].
+|===
+
+Two settings bite every RAG deployment: *idle and request timeouts* along the path (load balancer, ingress, platform),
+which must exceed the longest answer stream, and *graceful shutdown*, which must let in-flight streams finish before a pod
+is killed during a rollout.
+
+.k8s/api.yaml -- the API Deployment (Kubernetes)
+[source,yaml]
+----
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: docsassistant-api}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: docsassistant-api}}
+  template:
+    metadata: {labels: {app: docsassistant-api, track: stable}}
+    spec:
+      terminationGracePeriodSeconds: 45           # longer than the longest stream
+      containers:
+        - name: api
+          image: registry.example.org/docsassistant-api:1.4.0
+          ports: [{containerPort: 8000}]
+          envFrom:
+            - configMapRef: {name: docsassistant-config}      # CHAT_MODEL, EMBEDDING_MODEL, CONFIG_VERSION
+            - secretRef: {name: docsassistant-secrets}         # synced from the secrets manager
+          readinessProbe: {httpGet: {path: /healthz/ready, port: 8000}, periodSeconds: 5}
+          livenessProbe: {httpGet: {path: /healthz/live, port: 8000}, periodSeconds: 10}
+          resources:
+            requests: {cpu: "500m", memory: 512Mi}
+            limits: {memory: 1Gi}
+----
+
+Source: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/[Kubernetes -- Deployments] and
+https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/[Kubernetes -- Container Lifecycle Hooks].
+
+Scale the API on in-flight streams or request concurrency (a custom metric through the HPA or KEDA), not on CPU: a
+streaming RAG API spends most of its time waiting on the model.
+
+== GPU inference services
+
+Self-hosted models run as their own service, on GPU nodes, behind an OpenAI-compatible API: vLLM or SGLang for the
+generator (xref:ai/local-llms/vllm-and-sglang.adoc[vLLM & SGLang]), NVIDIA NIM containers
+(xref:ai/local-llms/nvidia-nim.adoc[NVIDIA NIM]), and a small service for the embedding model and the cross-encoder
+reranker. Keeping them separate lets the API tier scale on CPU and the GPU tier on tokens per second and queue time, and
+lets several applications share the GPUs. The application only sees a base URL and a model name from configuration;
+switching between a self-hosted model and a hosted API is a configuration change. Route through a gateway for
+fallbacks, quotas and per-team keys (xref:ai/local-llms/llm-gateways.adoc[LLM Gateways]).
+
+The client side should be explicit about timeouts and retries, because model endpoints fail differently from databases:
+
+.ModelClients.java -- configuration-driven model clients with timeouts and retries (Java, LangChain4j 1.20.2)
+[source,java]
+----
+package com.example.docsassistant.l4j.deploy;
+
+import java.time.Duration;
+
+import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.ollama.OllamaChatModel;
+
+public final class ModelClients {
+
+    private ModelClients() {
+    }
+
+    /** Base URL and model name come from the environment (ConfigMap); nothing is hard-coded. */
+    public static ChatModel chatModel() {
+        return OllamaChatModel.builder()
+                .maxRetries(2)
+                .baseUrl(System.getenv("LLM_BASE_URL"))
+                .modelName(System.getenv("CHAT_MODEL"))
+                .timeout(Duration.ofSeconds(60))
+                .build();
+    }
+}
+----
+
+Source: https://docs.langchain4j.dev/integrations/language-models/ollama/[LangChain4j -- Ollama].
+
+In Spring AI the same is properties (`spring.ai.ollama.base-url`, `spring.ai.ollama.chat.model`, the retry properties
+under `spring.ai.retry.*`) bound from environment variables; see
+xref:ai/spring-ai/production-and-deployment.adoc[Spring AI: Production & Deployment].
+
+== Secrets
+
+API keys for hosted models, database passwords, the Neo4j credentials, OAuth client secrets and signing keys never live
+in images, repositories or ConfigMaps:
+
+* Store them in a secrets manager (Azure Key Vault, AWS Secrets Manager, Google Secret Manager, HashiCorp Vault) and
+  project them into the pod at runtime -- with the External Secrets Operator or the Secrets Store CSI driver on
+  Kubernetes, or the platform's native integration on Cloud Run, ECS and Container Apps (see
+  xref:cloud/azure/key-vault-and-secrets.adoc[Key Vault and Secrets]).
+* Prefer *workload identity* (a managed identity or IAM role for the pod) over static credentials wherever the target
+  supports it: PostgreSQL, object storage and many model APIs do.
+* Give each component its own credentials with least privilege: the API gets read-only database and graph users, the
+  ingestion worker gets write access, the text-to-Cypher and text-to-SQL paths get the dedicated read-only roles of
+  xref:ai/rag-systems/text2cypher-and-graph-retrievers.adoc[Text2Cypher & Graph Retrievers].
+* Rotate on a schedule and on every suspected leak; applications must re-read secrets without a rebuild.
+* Keep secrets out of traces and logs; the redaction settings of
+  xref:ai/rag-systems/observability-and-tracing.adoc[Observability & Tracing] apply to headers too.
+* Scan the repository and images for leaked secrets in CI.
+
+== Blue/green prompt and model rollouts
+
+Prompts, model versions, retrieval settings and the embedding model are *configuration* that changes behaviour as much
+as code does. Version them together as one `config_version` (for example `p7-m3-r2`: prompt set 7, model mapping 3,
+retrieval settings 2), record it on every trace and answer, and roll it out like code:
+
+* *Blue/green* for changes that must switch atomically: deploy the green configuration alongside blue, run the golden
+  set against green (xref:ai/rag-systems/evaluation-at-scale.adoc#_ci_regression_gates[CI regression gates]), switch
+  traffic, keep blue ready for an instant rollback.
+* *Canary or A/B* for changes whose effect is uncertain: route a small, stable share of *users* to the challenger
+  configuration and compare outcomes
+  (xref:ai/rag-systems/evaluation-at-scale.adoc#_champion_and_challenger_ab_tests[champion and challenger]).
+* *Embedding model changes are migrations*, not rollouts: the new vectors do not live in the old space. Build a shadow
+  index, backfill it, evaluate it, then switch reads (see
+  xref:database/vector-rag/generating-embeddings-in-practice.adoc[Generating Embeddings in Practice]).
+
+User-stable bucketing is a hash of the user ID compared with the rollout percentage, so a user does not flip between
+configurations mid-conversation:
+
+.docsassistant/rollout.py -- user-stable assignment to a configuration (Python)
+[source,python]
+----
+import hashlib
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Rollout:
+    stable: str            # e.g. "p7-m3-r2"
+    candidate: str         # e.g. "p8-m3-r2"
+    candidate_percent: float
+
+
+def config_for(user_id: str, rollout: Rollout) -> str:
+    bucket = int(hashlib.sha256(f"{rollout.candidate}:{user_id}".encode()).hexdigest()[:8], 16) % 10_000
+    return rollout.candidate if bucket < rollout.candidate_percent * 100 else rollout.stable
+----
+
+Source: https://docs.python.org/3/library/hashlib.html[Python -- hashlib].
+
+Salting the hash with the candidate version gives every experiment a fresh, independent split. The same function in
+Spring selects between two `ChatClient` beans built with different prompts and models:
+
+.RolloutChatClients.java -- stable or candidate configuration per user (Java, Spring AI 2.0.1)
+[source,java]
+----
+package com.example.docsassistant.rag.deploy;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.HexFormat;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+@Component
+public class RolloutChatClients {
+
+    private final ChatClient stable;
+    private final ChatClient candidate;
+    private final String candidateVersion;
+    private final double candidatePercent;
+
+    public RolloutChatClients(@Qualifier("stableChatClient") ChatClient stable,
+                              @Qualifier("candidateChatClient") ChatClient candidate,
+                              @Value("${docsassistant.rollout.candidate-version}") String candidateVersion,
+                              @Value("${docsassistant.rollout.candidate-percent:0}") double candidatePercent) {
+        this.stable = stable;
+        this.candidate = candidate;
+        this.candidateVersion = candidateVersion;
+        this.candidatePercent = candidatePercent;
+    }
+
+    public ChatClient forUser(String userId) {
+        return bucket(candidateVersion + ":" + userId) < candidatePercent * 100 ? candidate : stable;
+    }
+
+    static int bucket(String key) {
+        try {
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(key.getBytes(StandardCharsets.UTF_8));
+            return (int) (Long.parseLong(HexFormat.of().formatHex(digest, 0, 4), 16) % 10_000);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-ai/reference/api/chatclient.html[Spring AI -- ChatClient API] (several clients) and
+https://docs.spring.io/spring-boot/reference/features/external-config.html[Spring Boot -- Externalized Configuration].
+
+The Java bucket takes the first four bytes of the digest, which equals the first eight hexadecimal characters used by
+the Python version, so both services assign a user to the same arm.
+
+== Initial and incremental loads
+
+The first load of a corpus and the steady trickle of changes are different workloads and should be different jobs:
+
+[cols="1,2,2", options="header"]
+|===
+| | Initial (or re-embedding) load | Incremental load
+
+| Trigger
+| A new environment, a new embedding model, a new parser version.
+| CDC events, webhooks, a periodic reconciliation.
+
+| Shape
+| A batch Job with many parallel workers over a work queue of documents; GPU embedding in large batches.
+| Long-running workers consuming the change topic (xref:ai/rag-systems/ingestion-pipelines-and-freshness.adoc[Ingestion
+  Pipelines & Freshness]).
+
+| Target
+| A *new* index (and graph database) built on the side, switched in when complete and evaluated.
+| The live index, per document, idempotently.
+
+| Throttling
+| Protect the model endpoints and the database with rate limits; schedule off-peak.
+| Small, steady; must not starve the query path.
+|===
+
+On Kubernetes the initial load is a `Job` with `parallelism` and a work queue, the reconciliation a `CronJob`; on Cloud
+Run, Cloud Run jobs with task parallelism; on ECS, scheduled tasks. For the graph, an initial load is also the time to
+use Neo4j's bulk import tools rather than transactional `MERGE`
+(xref:database/neo4j/importing-data.adoc[Importing Data]); incremental updates then use `MERGE`, as on
+xref:ai/rag-systems/graphrag-and-knowledge-graph-construction.adoc#_incremental_updates_cdc_merge_and_tombstoning[GraphRAG
+& Knowledge Graph Construction].
+
+== Disaster recovery and backups
+
+Everything in a RAG system is derived from the sources -- except the parts that are not. Classify the stores by how they
+can be recovered:
+
+[cols="1,2,1,1", options="header"]
+|===
+| Store | Recovery | Typical RPO | Typical RTO
+
+| Sources (CMS, repositories, originals in object storage)
+| Their own backups and versioning; the root of everything.
+| Minutes
+| Hours
+
+| Conversation store, feedback, audit log
+| Database backups with point-in-time recovery; *not* derivable.
+| Minutes
+| Hour
+
+| Vector index (pgvector)
+| Database backups (PITR) for fast recovery; re-ingestion from sources as the fallback.
+| Hours
+| Hours (restore) or days (re-embed)
+
+| Knowledge graph (Neo4j)
+| Online backups (`neo4j-admin database backup`) for fast recovery; rebuild from sources as the fallback.
+| Hours
+| Hours (restore) or days (re-extract)
+
+| Caches (Redis)
+| None needed; start empty.
+| --
+| Minutes
+|===
+
+The fallback column is why the ingestion pipeline must be able to rebuild everything from scratch: test a full rebuild
+in a staging environment on a schedule, and measure how long it takes and what it costs (model calls for re-embedding
+and re-extraction), because that is the true RTO if backups fail. Back up the *configuration* too -- prompts, schemas,
+the golden set, the rollout state -- and keep the embedding model version with the index backup, since a restored index
+is useless without the model that produced it. The PostgreSQL side is covered in
+xref:database/vector-rag/production-considerations.adoc[Production Considerations] and the Neo4j side in
+xref:database/neo4j/clustering-and-multi-database.adoc[Clustering and Multi-Database].
+
+Deployment options, initial versus incremental graph loads and Cloud Run deployment follow the concepts of Mendelevitch
+and Bao, _Hands-On RAG for Production_ (Chapter 5), Anthapu and Agarwal, _Building Neo4j-Powered Applications with LLMs_
+(Chapter 12), and Polzer, _RAG with Python Cookbook_ (Chapter 11, Docker and AWS ECS), paraphrased; see the
+xref:ai/rag-systems/index.adoc#_bibliography[bibliography].
+
+== References
+
+* https://fastapi.tiangolo.com/deployment/docker/[FastAPI -- FastAPI in Containers]
+* https://docs.docker.com/build/building/best-practices/[Docker -- Building best practices]
+* https://kubernetes.io/docs/home/[Kubernetes documentation]
+* https://cloud.google.com/run/docs[Google Cloud Run documentation]
+* https://docs.aws.amazon.com/ecs/[Amazon ECS documentation]
+* https://learn.microsoft.com/azure/aks/[Azure Kubernetes Service documentation]
+* https://docs.langchain4j.dev/integrations/language-models/ollama/[LangChain4j -- Ollama]
+* https://docs.spring.io/spring-boot/reference/features/external-config.html[Spring Boot -- Externalized Configuration]
+* https://neo4j.com/docs/operations-manual/current/backup-restore/[Neo4j Operations Manual -- Backup and restore]
+* https://www.postgresql.org/docs/current/continuous-archiving.html[PostgreSQL -- Continuous Archiving and Point-in-Time Recovery]

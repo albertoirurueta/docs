@@ -1,0 +1,671 @@
+= Serving at Scale
+:description: Running the DocsAssistant model tier in production with vLLM and SGLang -- continuous batching, prefix caching, KV-cache sizing, tensor, pipeline and data parallelism, disaggregated prefill and decode, autoscaling on queue depth and KV-cache utilisation, KServe and Kubernetes manifests, the status of TGI, definitions of TTFT, TPOT, goodput and MBU, and an async streaming load-test harness in Python that measures instead of quoting numbers.
+:keywords: serving at scale, vllm, sglang, kserve, tgi, text generation inference, continuous batching, prefix caching, radixattention, kv cache, kv cache sizing, tensor parallelism, pipeline parallelism, data parallelism, disaggregated prefill, ttft, tpot, itl, goodput, mbu, model bandwidth utilisation, autoscaling, keda, queue depth, kubernetes, load test, asyncio, httpx, server-sent events, prometheus, docsassistant
+:stem: latexmath
+
+include::partial$ai-llmops-disclaimer.adoc[]
+
+Written on 2026-10-01 against vLLM 0.30.0, SGLang 0.5.21, KServe 0.21.0 and Python 3.12 with `httpx` and `numpy`; the full list is
+the xref:ai/llmops/index.adoc#_version_baseline[version baseline] on the landing page. vLLM, SGLang and KServe could not be
+started in the environment where this page was written, so every command, manifest and flag below was written from the
+official documentation linked after it and was *not run*, and the load-test harness was not executed against a live server.
+Metric names and command-line flags in these engines change between releases, so each name is a starting point to confirm
+against `/metrics` and `--help` on the version you deploy. For the same reason the page quotes no throughput, latency or price
+figures: it gives the definitions and a harness, and the numbers have to come from your hardware, your model and your traffic.
+
+The DocsAssistant in the running scenario calls an OpenAI-compatible endpoint behind a gateway
+(xref:ai/llmops/deployment-and-release-patterns.adoc[Deployment and Release Patterns]). This page is about what sits behind that
+endpoint when you host the model yourself: how to run it, how to size it, how to scale it, and how to measure it. Installing
+and using the engines is covered in xref:ai/local-llms/vllm-and-sglang.adoc[vLLM and SGLang], the single-host operational
+checklist is on xref:ai/local-llms/running-local-llms-in-production.adoc[Running Local LLMs in Production], and the kernel and
+quantisation techniques are in xref:ai/local-llms/inference-optimization.adoc[Inference Optimization]. Huyen's _AI Engineering_
+and Aryan's _LLMOps_ both treat inference optimisation and latency/throughput trade-offs as an operations concern; the engine
+flags and metric names here are taken from the current documentation, because the books pre-date these releases.
+
+== Why LLM serving is not ordinary web serving
+
+A conventional request handler does a bounded amount of work and returns. An LLM request has two phases with different
+bottlenecks, and an unbounded second phase:
+
+. *Prefill* processes the whole prompt in one pass. It is mostly compute-bound, and its cost grows with prompt length.
+. *Decode* generates one token per step, each step reading the model weights and the request's cached keys and values from
+  GPU memory. It is mostly memory-bandwidth-bound, and it lasts as long as the answer.
+
+The consequences shape everything below: a request occupies GPU memory for as long as it streams, request length is not known in
+advance, and a single long prompt can stall the short ones queued behind it. Capacity therefore depends on memory and on
+scheduling at least as much as on raw compute.
+
+== Run the engine as a service
+
+Both engines expose an OpenAI-compatible HTTP server, so the gateway and the application do not change when you swap one for
+the other.
+
+.vLLM: a production-shaped launch for the DocsAssistant chat model
+[source,shell]
+----
+export VLLM_API_KEY="${DOCSASSISTANT_VLLM_KEY}"   # injected by the orchestrator, never committed
+
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --served-model-name docsassistant-chat \
+  --max-model-len 16384 \
+  --gpu-memory-utilization 0.90 \
+  --max-num-seqs 128 \
+  --enable-prefix-caching \
+  --host 0.0.0.0 --port 8000
+----
+
+Source: https://docs.vllm.ai/en/stable/serving/openai_compatible_server/[vLLM -- OpenAI-compatible server] and
+https://docs.vllm.ai/en/stable/configuration/engine_args/[vLLM -- Engine arguments]. Recent vLLM releases enable prefix caching
+by default; the explicit flag is harmless and documents the intent. The four flags that matter most for capacity are:
+
+[cols="2,4", options="header"]
+|===
+| Flag | What it controls
+
+| `--max-model-len`
+| The longest prompt-plus-output a request may have. It bounds the worst-case KV memory per request, so lowering it from the
+  model's maximum is the cheapest way to fit more concurrent requests.
+
+| `--gpu-memory-utilization`
+| The fraction of GPU memory the engine may claim for weights, activations and KV cache. What remains after the weights is the
+  KV-cache pool.
+
+| `--max-num-seqs`
+| The cap on sequences scheduled in one step. It is the upper bound on concurrency inside one replica.
+
+| `--max-num-batched-tokens`
+| The token budget per scheduler step. It trades prefill throughput against how long a decode step can be delayed by a
+  prefill.
+|===
+
+SGLang is launched with its own server module and takes equivalent options.
+
+.SGLang: the same model behind an OpenAI-compatible endpoint
+[source,shell]
+----
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --served-model-name docsassistant-chat \
+  --context-length 16384 \
+  --host 0.0.0.0 --port 30000 \
+  --enable-metrics
+----
+
+Source: https://docs.sglang.io/[SGLang documentation] (server arguments and the OpenAI-compatible APIs pages). The flag names
+were read from that documentation and not run; confirm them with `python -m sglang.launch_server --help` for the installed
+version. SGLang's distinguishing feature is RadixAttention, a radix-tree cache of prefixes across requests, described in
+xref:ai/local-llms/vllm-and-sglang.adoc[vLLM and SGLang] and in the Zheng et al. paper listed in the references.
+
+== Continuous batching
+
+Static batching waits for a group of requests, runs them together and returns when the longest one finishes, so short answers
+wait for long ones and the GPU idles in the gaps. *Continuous batching* (also called iteration-level scheduling) re-forms the
+batch at every decode step: a finished sequence leaves immediately and a waiting request joins, with its prefill interleaved.
+Both vLLM and SGLang do this by default; there is no flag to turn on. What you control is the budget it works within:
+
+* More allowed sequences (`--max-num-seqs`) raises throughput until KV memory or compute saturates, and raises per-request latency
+  as each step does more work.
+* A larger per-step token budget lets prefill finish sooner and so improves time to first token, at the cost of longer pauses
+  in the streams that are already decoding. Chunked prefill, which both engines support, splits a long prompt across steps to
+  soften that pause.
+
+The practical rule is to treat the batch limits as the knob that moves you along the latency/throughput curve, and to pick the
+point from your load-test results and your latency objectives, not from a default.
+
+== Prefix caching and the DocsAssistant prompt
+
+Every DocsAssistant request starts with the same system prompt and, for many requests, the same retrieved passages for popular
+documentation pages. Automatic prefix caching stores the KV blocks of previously seen prompt prefixes and reuses them when a new
+request starts with the same tokens, so prefill for the shared part is skipped. Two operational consequences follow:
+
+. *Put stable content first.* The system prompt and tool definitions go at the start; the retrieved passages and the user's
+  question go last. A timestamp or a request id near the top of the prompt makes every prefix unique and defeats the cache.
+. *Measure the hit rate, do not assume it.* The engines export prefix-cache queries and hits as metrics; compare them before
+  and after a prompt change. The prompt-ordering advice is the same one the hosted providers give for their own prompt
+  caching, covered on xref:ai/rag-systems/caching-latency-and-cost.adoc[Caching, Latency and Cost].
+
+When several replicas run behind a load balancer, a plain round-robin scatters the same prefix across replicas and lowers each
+one's hit rate. Prefix-aware or session-affinity routing recovers it; whether to build that is a decision to take with the
+measured hit rate in hand.
+
+Source: https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/[vLLM -- Automatic prefix caching].
+
+== Sizing the KV cache
+
+The KV cache stores, for every token of every in-flight sequence, a key vector and a value vector in every layer. For a
+transformer with latexmath:[L] layers, latexmath:[n_{kv}] key/value heads, head dimension latexmath:[d_{head}] and
+latexmath:[b] bytes per element, the cache per token is
+
+[latexmath]
+++++
+M_{token} = 2 \cdot L \cdot n_{kv} \cdot d_{head} \cdot b
+++++
+
+where the factor 2 counts keys and values. For latexmath:[S] concurrent sequences with an average of latexmath:[T] tokens each
+(prompt plus generated so far), the pool must hold
+
+[latexmath]
+++++
+M_{KV} \approx S \cdot T \cdot M_{token}
+++++
+
+and the number of sequences a replica can hold is the pool divided by that per-sequence footprint:
+
+[latexmath]
+++++
+S_{max} \approx \frac{ \gamma \cdot M_{GPU} - M_{weights} - M_{act} }{ T \cdot M_{token} }
+++++
+
+where latexmath:[\gamma] is the `--gpu-memory-utilization` fraction, latexmath:[M_{GPU}] the device memory,
+latexmath:[M_{weights}] the weight size (which quantisation reduces) and latexmath:[M_{act}] the activation and framework
+overhead. Grouped-query attention is why latexmath:[n_{kv}] is smaller than the number of attention heads, and why it is the
+number to read from the model configuration. Quantising the cache (for example `--kv-cache-dtype fp8` in vLLM) shrinks
+latexmath:[b]. Reading the architecture values is mechanical:
+
+.size_kv.py: per-token KV bytes and a concurrency estimate from a model's config.json
+[source,python]
+----
+import json
+import sys
+from pathlib import Path
+
+
+def kv_bytes_per_token(config: dict, bytes_per_element: int = 2) -> int:
+    layers = config["num_hidden_layers"]
+    kv_heads = config.get("num_key_value_heads", config["num_attention_heads"])
+    head_dim = config.get("head_dim") or config["hidden_size"] // config["num_attention_heads"]
+    return 2 * layers * kv_heads * head_dim * bytes_per_element
+
+
+def max_sequences(pool_bytes: float, tokens_per_sequence: int, per_token: int) -> int:
+    return int(pool_bytes // (tokens_per_sequence * per_token))
+
+
+if __name__ == "__main__":
+    config = json.loads(Path(sys.argv[1]).read_text())
+    per_token = kv_bytes_per_token(config)
+    print(f"KV cache per token: {per_token} bytes")
+    # The pool size comes from the engine's startup log, not from this script.
+    pool_gib = float(sys.argv[2])
+    tokens = int(sys.argv[3])
+    print(f"Sequences of {tokens} tokens in a {pool_gib} GiB pool:",
+          max_sequences(pool_gib * 2**30, tokens, per_token))
+----
+
+Source: the field names (`num_hidden_layers`, `num_key_value_heads`, `head_dim`) follow the Hugging Face Transformers model
+configuration, https://huggingface.co/docs/transformers/main_classes/configuration[Transformers -- Configuration]; the cache
+layout is described in https://docs.vllm.ai/en/stable/design/paged_attention/[vLLM -- Paged Attention]. The engine reports the
+actual KV pool size and the number of tokens it can hold in its startup log, which is the authoritative value; use the script
+to reason about what changes if you alter the context length, the cache dtype or the model, and to check the engine's number
+for plausibility. Models with sliding-window or hybrid attention layers need fewer cache entries than this formula gives, so
+treat it as an upper bound for those architectures.
+
+== Parallelism: tensor, pipeline, data
+
+A single replica fits on one GPU until the weights plus a useful KV pool do not. The three ways of using more devices answer
+different problems:
+
+[cols="1,3,3", options="header"]
+|===
+| Strategy | What it splits | When to reach for it
+
+| Tensor parallelism
+| Each layer's matrices across the GPUs of one node (`--tensor-parallel-size`).
+| The model does not fit on one GPU, or you need more KV pool. It communicates on every layer, so it wants a fast interconnect
+  and is normally kept within a node.
+
+| Pipeline parallelism
+| Consecutive groups of layers across GPUs or nodes (`--pipeline-parallel-size`).
+| The model does not fit on one node, or the interconnect between GPUs is slow. It communicates less often but can leave
+  devices idle between stages.
+
+| Data parallelism
+| Whole copies of the model, each serving different requests.
+| The model fits, and you need more throughput or availability. It is the simplest and the one to prefer first.
+|===
+
+.vLLM: a larger model split across the GPUs of one node (each replica runs this same command)
+[source,shell]
+----
+vllm serve meta-llama/Llama-3.3-70B-Instruct \
+  --served-model-name docsassistant-chat-large \
+  --tensor-parallel-size 4 \
+  --max-model-len 16384
+----
+
+Source: https://docs.vllm.ai/en/stable/serving/parallelism_scaling/[vLLM -- Parallelism and scaling]. That page also documents
+pipeline, data and expert parallelism and multi-node launches; the exact flags for the data-parallel mode in a single server
+are version dependent, so the DocsAssistant uses the more conventional alternative: several independent replicas behind the
+gateway or a Kubernetes `Service`, each started with the same command. The rule of thumb is to use the smallest tensor-parallel
+degree that fits the model with a useful KV pool, then add throughput with replicas.
+
+== Disaggregated prefill and decode
+
+Because prefill is compute-heavy and decode is bandwidth-heavy, running both on the same GPUs makes each interfere with the
+other: a long prefill delays the decode steps of streaming users, which shows up as jitter in the time between tokens.
+*Disaggregated serving* dedicates one pool of workers to prefill and another to decode and transfers the KV cache between them,
+so each pool can be sized and tuned independently and the two latency measures are decoupled.
+
+vLLM documents a disaggregated-prefill feature and SGLang documents a prefill/decode disaggregation mode; both rely on a
+KV-transfer connector and, in their documentation, are presented as evolving features. The extra moving parts are real: a
+transfer fabric between the pools, a router that sends each request to a prefill worker and then a decode worker, and two sets
+of capacity to monitor. For the DocsAssistant, whose prompts are moderate and whose answers are short, a single pool with
+chunked prefill is the sensible default; disaggregation is worth evaluating when long prompts (large retrieved contexts) and
+strict inter-token latency coexist and your load test shows the interference. It is a reason to test, not a recommendation.
+
+Source: https://docs.vllm.ai/en/latest/features/disagg_prefill/[vLLM -- Disaggregated prefilling] and the SGLang documentation
+for prefill/decode disaggregation at https://docs.sglang.io/[docs.sglang.io]; the DistServe paper in the references explains
+the motivation.
+
+== Metrics that define the objectives
+
+Four definitions are used throughout this section. Let a request arrive at time latexmath:[t_0], emit its first token at
+latexmath:[t_1] and its last token at latexmath:[t_N], having produced latexmath:[N] output tokens.
+
+*Time to first token* is the delay the user waits before anything appears:
+
+[latexmath]
+++++
+\mathrm{TTFT} = t_1 - t_0
+++++
+
+It includes queueing, any gateway overhead, the prefill, and the first decode step. *Time per output token* is the average gap
+between tokens after the first:
+
+[latexmath]
+++++
+\mathrm{TPOT} = \frac{t_N - t_1}{N - 1}, \qquad N > 1
+++++
+
+Streaming read speed for a person is roughly latexmath:[1/\mathrm{TPOT}] tokens per second, and end-to-end latency is
+latexmath:[\mathrm{TTFT} + (N-1)\,\mathrm{TPOT}]. Some tools call the per-gap sample *inter-token latency* (ITL) and
+the per-request average TPOT; state which one you plot.
+
+*Goodput* is the rate of requests that meet their service-level objective, not the raw request rate. With latexmath:[R] total
+requests over a window of latexmath:[W] seconds and objectives latexmath:[\tau_{TTFT}] and latexmath:[\tau_{TPOT}]:
+
+[latexmath]
+++++
+\mathrm{goodput} = \frac{1}{W}\sum_{i=1}^{R} \mathbb{1}\!\left[\mathrm{TTFT}_i \le \tau_{TTFT} \;\wedge\; \mathrm{TPOT}_i \le \tau_{TPOT}\right]
+++++
+
+Raw throughput always rises with load until the system saturates; goodput rises and then falls as queues push requests past
+their objectives, which is why it is the number to size capacity by. The goodput formulation comes from the DistServe paper.
+
+*Model bandwidth utilisation* (MBU) says how close decode comes to the hardware limit. Each decode step must read the weights
+and the active KV cache, so the achieved bandwidth is the bytes read per token times the token rate, and
+
+[latexmath]
+++++
+\mathrm{MBU} = \frac{ (M_{weights} + M_{KV,\,read}) \cdot r_{tok} }{ B_{peak} }
+++++
+
+where latexmath:[r_{tok}] is the decode steps per second of the replica and latexmath:[B_{peak}] the device's peak memory
+bandwidth from its datasheet. A low MBU in decode points to overhead (scheduling, small batches, communication) rather than the
+chip; a value near 1 means the replica is bandwidth-limited and only more devices, a smaller or quantised model, or a
+smaller cache will help. The definition is the one used in Databricks' inference-performance writing and in Huyen's
+_AI Engineering_ discussion of utilisation; the exact accounting of latexmath:[M_{KV,\,read}] is an approximation.
+
+Source: https://arxiv.org/abs/2401.09670[Zhong et al. -- DistServe] for goodput; the vLLM and SGLang metrics documentation for the
+names that feed these quantities.
+
+== Metrics the engines export
+
+Both engines serve Prometheus text at `/metrics`. The signals that matter for scaling and alerting are:
+
+[cols="2,3", options="header"]
+|===
+| Signal | Why it matters
+
+| Requests waiting
+| The queue depth. Rising means demand exceeds capacity at the current scale; this is the earliest saturation sign.
+
+| Requests running
+| The batch size. Together with the waiting count it says whether you are at `--max-num-seqs`.
+
+| KV-cache utilisation
+| The fraction of the KV pool in use. Near 1, the scheduler preempts or stops admitting requests and TTFT climbs.
+
+| Time to first token, per-token latency and end-to-end latency histograms
+| The user-visible objectives, as histograms so that percentiles can be computed.
+
+| Prefix-cache queries and hits
+| The hit rate, which tells you whether prompt ordering is working.
+
+| Token counters (prompt and generation)
+| Throughput, and the input for cost attribution in xref:ai/llmops/cost-management.adoc[Cost Management].
+|===
+
+The metric names in vLLM carry a `vllm:` prefix (for example `vllm:num_requests_waiting` and the KV-cache usage gauge) and have
+been renamed across releases, notably for the KV-cache usage and per-token latency histograms; check the names in the
+`/metrics` output of your version before writing rules. Dashboards and alert rules built on these signals, together with the
+golden signals for the whole application, are the subject of
+xref:ai/llmops/metrics-dashboards-and-alerting.adoc[Metrics, Dashboards and Alerting]; the basics of scraping and recording rules
+are in xref:database/prometheus/instrumenting-applications.adoc[Instrumenting Applications].
+
+Source: https://docs.vllm.ai/en/stable/usage/metrics/[vLLM -- Metrics] and the SGLang production-metrics page in
+https://docs.sglang.io/[its documentation].
+
+== Autoscaling on queue depth and KV-cache utilisation
+
+CPU utilisation is a poor scaling signal for a GPU-bound engine: the process looks busy long before it is saturated, and GPU
+utilisation as reported by the driver stays high even when the batch is small. Two engine-level signals are better:
+
+. *Queue depth* (requests waiting). A sustained non-zero queue means requests are waiting for capacity. It reacts quickly
+  and is easy to reason about: add a replica when the waiting count per replica stays above a threshold for a minute or two.
+. *KV-cache utilisation.* A pool above a high fraction means new requests will soon be preempted or queued. It is a leading
+  indicator for long-context traffic, where the queue stays empty until memory is suddenly exhausted.
+
+Scale-up must be fast and scale-down slow. A new replica has to start a container, schedule onto a GPU node, download or mount
+the weights and load them, which takes minutes, so scale on a leading signal, keep a floor of warm replicas, and use a long
+stabilisation window before scaling down so a pause in traffic does not discard capacity you will need again. The following
+KEDA object scales a vLLM `Deployment` on both signals; it assumes Prometheus already scrapes the engine.
+
+.docsassistant-vllm-scaledobject.yaml: scale on queue depth and KV-cache utilisation
+[source,yaml]
+----
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: docsassistant-vllm
+  namespace: docsassistant
+spec:
+  scaleTargetRef:
+    name: docsassistant-vllm
+  minReplicaCount: 2
+  maxReplicaCount: 8
+  cooldownPeriod: 600
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        query: avg(vllm:num_requests_waiting{namespace="docsassistant"})
+        threshold: "4"
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        # Confirm the KV-cache usage metric name on /metrics for your vLLM version.
+        query: max(vllm:kv_cache_usage_perc{namespace="docsassistant"})
+        threshold: "0.8"
+----
+
+Source: https://keda.sh/docs/latest/scalers/prometheus/[KEDA -- Prometheus scaler] and
+https://keda.sh/docs/latest/concepts/scaling-deployments/[KEDA -- Scaling Deployments]. The thresholds are placeholders to be
+set from the knee of your own load-test curve. The Kubernetes HorizontalPodAutoscaler with an external-metrics adapter can
+express the same rule if you do not run KEDA; see
+https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/[Kubernetes -- Horizontal Pod Autoscaling].
+
+== Kubernetes and KServe
+
+On plain Kubernetes the engine is a `Deployment` with a GPU resource request, a persistent volume for the model cache and a
+readiness probe on `/health`; the manifest is in xref:ai/local-llms/vllm-and-sglang.adoc#_docker_and_kubernetes[the Docker and
+Kubernetes section of vLLM and SGLang]. Three additions matter once you scale beyond one replica:
+
+* *Warm start.* Model loading dominates start-up time. Put the weights on a shared read-only volume or a pre-pulled image
+  instead of downloading from a hub on every start, and give the readiness probe a generous initial delay.
+* *Disruption and rollout.* A `PodDisruptionBudget` and a rollout strategy that never removes the last ready replica keep the
+  tier available during node drains and image updates.
+* *Scheduling.* Use node selectors or taints for GPU nodes so that unrelated workloads do not take them.
+
+KServe adds a standard Kubernetes API for model serving: an `InferenceService` that bundles the runtime, the model location,
+scaling and revision handling. Its Hugging Face serving runtime can use vLLM as its backend and exposes an OpenAI-compatible
+interface.
+
+.KServe InferenceService using the Hugging Face runtime with the vLLM backend
+[source,yaml]
+----
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: docsassistant-chat
+  namespace: docsassistant
+spec:
+  predictor:
+    minReplicas: 2
+    maxReplicas: 8
+    model:
+      modelFormat:
+        name: huggingface
+      args:
+        - --model_name=docsassistant-chat
+        - --model_id=meta-llama/Llama-3.1-8B-Instruct
+        - --backend=vllm
+      env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: token
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+----
+
+Source: https://kserve.github.io/website/latest/modelserving/v1beta1/llm/huggingface/[KServe -- Hugging Face runtime] and
+https://kserve.github.io/website/[KServe documentation]. The field layout was read from those pages for KServe 0.21 and not
+applied to a cluster. KServe also documents newer resources aimed specifically at LLM serving, including autoscaling on
+engine metrics, so check the current pages for your version before choosing between the generic `InferenceService` and a
+dedicated LLM resource. Its value is the uniform API, canary traffic splitting between revisions (which pairs with
+xref:ai/llmops/deployment-and-release-patterns.adoc[Deployment and Release Patterns]) and integration with the cluster's
+autoscaling; if you already run one `Deployment` per model and a gateway in front, KServe is optional.
+
+== Text Generation Inference
+
+Hugging Face Text Generation Inference was the other widely used open-source server. As of this page's date its repository
+states that the project is in *maintenance mode*, with the last release being 3.3.7 (December 2025). Existing deployments keep
+working and there is no urgency to migrate a stable one, but new deployments should start on vLLM or SGLang, and any
+architecture decision that assumed TGI's feature roadmap should be revisited. Books that predate this status, including parts of
+_LLMOps_, present TGI as a default choice; read those passages as describing the state of the art at the time of writing.
+
+Source: https://github.com/huggingface/text-generation-inference[Text Generation Inference repository].
+
+== A load-test harness that measures TTFT and TPOT
+
+An HTTP load tester that reports only requests per second is blind to the thing users feel, because a streaming response
+spends most of its life after the first byte. The harness below drives an OpenAI-compatible endpoint with streaming requests,
+records TTFT and TPOT per request, and computes percentiles and goodput. It supports two load models: *closed loop* (a fixed
+number of concurrent users, each sending the next request when the previous finishes) and *open loop* (requests arrive at a
+given rate regardless of how fast the server answers, which is how real traffic behaves and the only way to see a queue form).
+
+.loadtest.py: async streaming load test for an OpenAI-compatible endpoint
+[source,python]
+----
+import argparse
+import asyncio
+import json
+import os
+import random
+import time
+from dataclasses import dataclass
+
+import httpx
+import numpy as np
+
+BASE_URL = os.environ.get("LLM_BASE_URL", "http://localhost:8000/v1")
+API_KEY = os.environ["LLM_API_KEY"]  # injected by the environment, never hard-coded
+MODEL = os.environ.get("LLM_MODEL", "docsassistant-chat")
+
+
+@dataclass
+class Sample:
+    ok: bool
+    ttft: float = float("nan")
+    tpot: float = float("nan")
+    e2e: float = float("nan")
+    output_tokens: int = 0
+
+
+async def one_request(client: httpx.AsyncClient, prompt: str, max_tokens: int) -> Sample:
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    start = time.perf_counter()
+    first = last = None
+    chunks = 0
+    completion_tokens = None
+    try:
+        async with client.stream("POST", f"{BASE_URL}/chat/completions", json=body, headers=headers) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                payload = line[len("data: "):]
+                if payload == "[DONE]":
+                    break
+                event = json.loads(payload)
+                if event.get("usage"):
+                    completion_tokens = event["usage"]["completion_tokens"]
+                choices = event.get("choices") or []
+                if choices and choices[0].get("delta", {}).get("content"):
+                    now = time.perf_counter()
+                    first = first or now
+                    last = now
+                    chunks += 1
+    except (httpx.HTTPError, json.JSONDecodeError):
+        return Sample(ok=False)
+    if first is None:
+        return Sample(ok=False)
+    n = completion_tokens if completion_tokens is not None else chunks
+    tpot = (last - first) / (n - 1) if n > 1 else float("nan")
+    return Sample(ok=True, ttft=first - start, tpot=tpot, e2e=last - start, output_tokens=n)
+
+
+async def closed_loop(prompts, users, duration, max_tokens):
+    deadline = time.perf_counter() + duration
+    samples: list[Sample] = []
+    limits = httpx.Limits(max_connections=users + 8)
+    async with httpx.AsyncClient(timeout=None, limits=limits) as client:
+        async def user():
+            while time.perf_counter() < deadline:
+                samples.append(await one_request(client, random.choice(prompts), max_tokens))
+        await asyncio.gather(*(user() for _ in range(users)))
+    return samples
+
+
+async def open_loop(prompts, rate, duration, max_tokens):
+    samples: list[Sample] = []
+    tasks = []
+    limits = httpx.Limits(max_connections=None)
+    async with httpx.AsyncClient(timeout=None, limits=limits) as client:
+        end = time.perf_counter() + duration
+        while time.perf_counter() < end:
+            tasks.append(asyncio.create_task(one_request(client, random.choice(prompts), max_tokens)))
+            await asyncio.sleep(random.expovariate(rate))  # Poisson arrivals
+        samples = await asyncio.gather(*tasks)
+    return list(samples)
+
+
+def report(samples, duration, slo_ttft, slo_tpot):
+    good = [s for s in samples if s.ok]
+    print(f"requests: {len(samples)}  failed: {len(samples) - len(good)}")
+    if not good:
+        return
+    for name, values in (("TTFT", [s.ttft for s in good]),
+                         ("TPOT", [s.tpot for s in good if s.tpot == s.tpot]),
+                         ("E2E", [s.e2e for s in good])):
+        p50, p95, p99 = np.percentile(values, [50, 95, 99])
+        print(f"{name:5s} p50={p50:.3f}s p95={p95:.3f}s p99={p99:.3f}s")
+    meeting = sum(1 for s in good if s.ttft <= slo_ttft and (s.tpot != s.tpot or s.tpot <= slo_tpot))
+    print(f"output tokens/s: {sum(s.output_tokens for s in good) / duration:.1f}")
+    print(f"goodput (req/s meeting SLO): {meeting / duration:.2f}")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--prompts", required=True, help="JSONL file with one {\"prompt\": ...} per line")
+    ap.add_argument("--mode", choices=["closed", "open"], default="open")
+    ap.add_argument("--users", type=int, default=16)
+    ap.add_argument("--rate", type=float, default=2.0, help="requests per second (open loop)")
+    ap.add_argument("--duration", type=float, default=120.0)
+    ap.add_argument("--max-tokens", type=int, default=256)
+    ap.add_argument("--slo-ttft", type=float, default=1.0)
+    ap.add_argument("--slo-tpot", type=float, default=0.05)
+    args = ap.parse_args()
+    with open(args.prompts) as f:
+        prompts = [json.loads(line)["prompt"] for line in f if line.strip()]
+    run = (closed_loop(prompts, args.users, args.duration, args.max_tokens) if args.mode == "closed"
+           else open_loop(prompts, args.rate, args.duration, args.max_tokens))
+    report(asyncio.run(run), args.duration, args.slo_ttft, args.slo_tpot)
+----
+
+Source: https://platform.openai.com/docs/api-reference/chat/create[OpenAI -- Chat Completions] for the `stream` and
+`stream_options.include_usage` fields, which vLLM and SGLang implement in their compatible servers
+(https://docs.vllm.ai/en/stable/serving/openai_compatible_server/[vLLM -- OpenAI-compatible server]);
+https://www.python-httpx.org/async/[HTTPX -- Async support] for streaming. The harness is the DocsAssistant's own and was not
+run. The default objectives in the arguments are placeholders, not recommendations.
+
+How to use it so that the result means something:
+
+. *Use representative prompts.* Build the JSONL file from sampled, anonymised DocsAssistant traffic, including the retrieved
+  context, so that prompt length and prefix sharing match production. Synthetic short prompts overstate throughput and hide the
+  effect of long contexts.
+. *Warm up, then measure.* Discard the first minute; the first requests pay for cache fills and kernel compilation.
+. *Sweep the load.* Run open-loop at increasing rates and plot goodput, TTFT percentiles and the engine's queue depth against
+  the rate. The knee, where TTFT percentiles turn upward and the queue stops draining, is the capacity of one replica at your
+  objectives. Closed-loop runs find the concurrency at which a fixed user population saturates the engine.
+. *Isolate the variable.* Change one thing between sweeps (context length, batch limits, quantisation, parallelism, prefix
+  caching) and keep the hardware and prompts fixed.
+. *Watch the server while you test.* Scrape the engine's `/metrics` during the run and read KV-cache utilisation and preemption
+  counts; a client-side latency rise that coincides with a full KV pool has a different fix from one that coincides with an
+  empty queue.
+. *Keep it off production.* Run against a dedicated environment, and cap the spend if the target is a paid endpoint.
+
+Ready-made tools cover the same ground with more options: the benchmark command shipped with vLLM, and GuideLLM, which sweeps
+load levels automatically. The harness above is useful because you can read it, extend it to send the DocsAssistant's tool-call
+or multi-turn patterns, and run it in CI against a staging endpoint. For load-testing the Spring Boot application that sits in
+front of the model, with thread pools and connection limits as the subject, see
+xref:backend/springboot/performance-testing-jmeter.adoc[Performance Testing with JMeter]; its tools do not measure TTFT or
+TPOT natively, which is why this page uses a streaming-aware client.
+
+Source: https://docs.vllm.ai/en/stable/benchmarking/cli/[vLLM -- Benchmark CLI] and https://github.com/vllm-project/guidellm[GuideLLM].
+
+== Operating the tier
+
+A short list of practices that follow from the above:
+
+* *Set a latency objective per user-facing path* in terms of TTFT and TPOT, and size by goodput at that objective, with
+  headroom for a replica loss.
+* *Cap request size at the edge.* Enforce maximum prompt tokens and maximum output tokens in the gateway so that one request
+  cannot occupy a disproportionate share of the KV pool.
+* *Re-run the sweep on every change* of engine version, model, quantisation or prompt shape. A faster engine release and a
+  longer system prompt can cancel out, and only a measurement tells you which.
+* *Alert on the leading signals,* queue depth and KV-cache utilisation, before the lagging ones, latency and error rate, as
+  described in xref:ai/llmops/metrics-dashboards-and-alerting.adoc[Metrics, Dashboards and Alerting].
+* *Track cost per token from utilisation.* An idle GPU costs the same as a busy one, so the cost of a self-hosted token depends
+  on how full you keep the replicas; the accounting is in xref:ai/llmops/cost-management.adoc[Cost Management].
+* *Plan the fallback.* When the tier is saturated or down, the gateway routes to a hosted model or returns a graceful
+  degradation, as set out in xref:ai/llmops/deployment-and-release-patterns.adoc[Deployment and Release Patterns].
+* *Secure the endpoint.* Keep the engine on a private network, require the API key, and keep keys in the orchestrator's secret
+  store; the security guidance of each engine is linked in the references. Threat modelling for model endpoints belongs to
+  xref:ai/security/index.adoc[AI Security & Responsible AI], a separate sub-section.
+
+== References
+
+* https://docs.vllm.ai/en/stable/[vLLM documentation]
+* https://docs.vllm.ai/en/stable/serving/openai_compatible_server/[vLLM -- OpenAI-compatible server]
+* https://docs.vllm.ai/en/stable/configuration/engine_args/[vLLM -- Engine arguments]
+* https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/[vLLM -- Automatic prefix caching]
+* https://docs.vllm.ai/en/stable/design/paged_attention/[vLLM -- Paged Attention]
+* https://docs.vllm.ai/en/stable/serving/parallelism_scaling/[vLLM -- Parallelism and scaling]
+* https://docs.vllm.ai/en/latest/features/disagg_prefill/[vLLM -- Disaggregated prefilling]
+* https://docs.vllm.ai/en/stable/usage/metrics/[vLLM -- Metrics]
+* https://docs.vllm.ai/en/stable/benchmarking/cli/[vLLM -- Benchmark CLI]
+* https://docs.vllm.ai/en/stable/usage/security/[vLLM -- Security]
+* https://docs.sglang.io/[SGLang documentation]
+* https://github.com/vllm-project/guidellm[GuideLLM]
+* https://kserve.github.io/website/[KServe documentation]
+* https://kserve.github.io/website/latest/modelserving/v1beta1/llm/huggingface/[KServe -- Hugging Face runtime]
+* https://keda.sh/docs/latest/scalers/prometheus/[KEDA -- Prometheus scaler]
+* https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/[Kubernetes -- Horizontal Pod Autoscaling]
+* https://github.com/huggingface/text-generation-inference[Text Generation Inference (maintenance mode)]
+* https://huggingface.co/docs/transformers/main_classes/configuration[Transformers -- Configuration]
+* https://platform.openai.com/docs/api-reference/chat/create[OpenAI -- Chat Completions API reference]
+* https://www.python-httpx.org/async/[HTTPX -- Async support]
+* https://arxiv.org/abs/2309.06180[Kwon et al. -- Efficient Memory Management for Large Language Model Serving with PagedAttention]
+* https://arxiv.org/abs/2312.07104[Zheng et al. -- SGLang: Efficient Execution of Structured Language Model Programs]
+* https://arxiv.org/abs/2401.09670[Zhong et al. -- DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving]

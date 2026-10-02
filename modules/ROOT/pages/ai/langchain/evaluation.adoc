@@ -1,0 +1,944 @@
+= Evaluation
+:description: How to evaluate a LangChain 1.x agent with LangSmith datasets and evaluate(), openevals LLM-as-judge evaluators, agentevals trajectory evaluation, online evaluators, the LangSmith pytest plugin and regression experiments, applied to DocsAssistant and run locally without an account.
+:keywords: evaluation, langsmith evaluate, datasets, examples, experiments, evaluators, openevals, create_llm_as_judge, agentevals, trajectory match, create_trajectory_match_evaluator, create_trajectory_llm_as_judge, LLM-as-judge, online evaluators, pytest.mark.langsmith, LANGSMITH_TEST_SUITE, LANGSMITH_TEST_TRACKING, regression experiment, upload_results, num_repetitions, DocsAssistant
+:stem: latexmath
+
+include::partial$ai-langchain-disclaimer.adoc[]
+
+This page was written against `langsmith` 0.14.1, `openevals` 0.2.0, `agentevals` 0.0.9, `langchain` 1.4.3,
+`langchain-core` 1.6.5 and `langgraph` 1.2.12 on Python 3.12 with pytest 9.1.1, as verified on 2026-09-29. The
+running example is *DocsAssistant*, which answers questions over this site's documentation using Ollama's
+`llama3.1:8b` chat model and the `nomic-embed-text` embedding model over the pgvector store built in
+xref:database/vector-rag/integrating-with-langchain.adoc[Integrating with LangChain]. Neither Ollama nor a LangSmith
+account was available while the snippets were checked, so every output shown here was produced by running the code
+against the real packages with a scripted fake chat model (the agent under test) and a scripted fake judge model, and
+with results kept local (`upload_results=False`, tracking off). What that means for each feature is summarised in
+<<what-ran-where>>.
+
+An agent that "seems to work" after a few manual questions is a hypothesis, not a result. Evaluation turns it into a
+measurement: a fixed set of questions with known-good answers, scores computed the same way every time, and a
+comparison between the version you have and the version you are about to ship. The framework-neutral method -- what to
+measure for agents, how to build datasets, how to think about regression suites -- is on
+xref:ai/agents/agent-evaluation.adoc[Agent Evaluation], and the retrieval side (recall@k, MRR, faithfulness) on
+xref:database/vector-rag/evaluating-rag-systems.adoc[Evaluating RAG Systems]. This page is the LangChain tooling for
+that method: LangSmith's datasets and `evaluate`, the `openevals` and `agentevals` packages, online evaluators, and
+the pytest plugin. Tracing, which every LangSmith feature builds on, is introduced in
+xref:ai/langchain/observability-with-langsmith.adoc[Observability with LangSmith].
+
+== The evaluation loop
+
+LangSmith models evaluation with four nouns. A *dataset* is a set of *examples*, each with `inputs`, optional
+reference `outputs` and optional `metadata`. A *target* is the function under test: it takes one example's inputs and
+returns outputs. An *evaluator* is a function that scores the target's outputs (using the inputs and reference outputs
+when it needs them) and returns feedback. Running the target over the dataset and applying the evaluators produces an
+*experiment*, and experiments are what you compare. *Offline* evaluation does this before shipping, on curated
+examples with reference outputs; *online* evaluation applies evaluators to sampled production traces, which have no
+reference outputs, so the evaluators must be reference-free. See
+https://docs.langchain.com/langsmith/evaluation-concepts[LangSmith -- Evaluation concepts].
+
+.The evaluation loop: offline experiments before shipping, online evaluators after
+[mermaid]
+....
+flowchart LR
+  subgraph Offline["Offline: before shipping"]
+    D["Dataset of examples"] --> E["evaluate(target, data, evaluators)"]
+    E --> X["Experiment"]
+    X --> C{"Better than the baseline?"}
+    C -->|"no"| F["Change prompt, tools or model"]
+    F --> E
+  end
+  subgraph Online["Online: after shipping"]
+    P["Production traces"] --> S["Filter and sample"]
+    S --> O["Online evaluator"]
+    O --> FB["Feedback scores"]
+  end
+  C -->|"yes"| P
+  FB -->|"failures become examples"| D
+....
+
+The two halves feed each other: offline scores tell you whether a change is safe to release, online scores tell you
+whether the release is behaving, and the production failures the online evaluators find become the next examples in
+the dataset. Everything below follows the diagram from left to right, on DocsAssistant.
+
+== A repeatable target: two scripted DocsAssistants
+
+An evaluation needs a target that behaves the same way every time the page is built, and a *change* whose effect the
+evaluators can detect. The fake chat model from xref:ai/langchain/agents-with-create-agent.adoc[Agents with
+create_agent] replays scripted messages, and the `search_docs` tool returns canned sections keyed by the query:
+
+.`fake.py` -- a scripted chat model and a stub `search_docs` tool
+[source,python]
+----
+from langchain.agents import create_agent
+from langchain.tools import tool
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+
+
+class ScriptedChat(GenericFakeChatModel):
+    """Replays scripted AIMessages and tolerates bind_tools()."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+PAGES = {
+    "ef_search": "ann-indexes.adoc :: HNSW :: ef_search sets how many candidates HNSW explores per query; higher values raise recall and latency.",
+    "index": "postgresql-pgvector.adoc :: Indexes :: pgvector offers HNSW and IVFFlat indexes.",
+}
+
+
+@tool
+def search_docs(query: str) -> str:
+    """Search the documentation site and return matching sections."""
+    return next((text for key, text in PAGES.items() if key in query), "No matching sections.")
+
+
+def call(name: str, **args) -> AIMessage:
+    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": "call_1", "type": "tool_call"}])
+
+
+def docs_assistant(*script: AIMessage):
+    """A DocsAssistant whose 'model' replays `script`."""
+    return create_agent(ScriptedChat(messages=iter(script)), tools=[search_docs],
+                        system_prompt="You are DocsAssistant. Answer only from search_docs results.")
+----
+
+The two agents differ the way a real prompt change would. The *baseline* searches for the two in-scope questions and
+refuses the out-of-scope one without touching a tool. The *candidate* answers the pgvector question from memory (and
+gets it partly wrong) and searches for the weather in Madrid, which is wasted work. `make_target` turns either script
+set into a target function, and `tracing_context(enabled=False)` keeps the agent's inner LangChain runs out of any
+tracing client (with the SDK versions above they otherwise tried to reach the API from inside `evaluate`, even with
+results kept local):
+
+.`agents_under_test.py` -- baseline and candidate, and the target function
+[source,python]
+----
+"""Two DocsAssistant versions, scripted so the runs are repeatable without Ollama."""
+from langchain_core.messages import AIMessage
+
+from langsmith import tracing_context
+
+from fake import call, docs_assistant
+
+# baseline: searches for in-scope questions, refuses the out-of-scope one without a tool call
+BASELINE = {
+    "What does ef_search control in HNSW?": [
+        call("search_docs", query="HNSW ef_search"),
+        AIMessage("ef_search sets how many candidates HNSW explores per query; higher values raise recall and latency."),
+    ],
+    "Which index types does pgvector offer?": [
+        call("search_docs", query="pgvector index types"),
+        AIMessage("pgvector offers HNSW and IVFFlat indexes."),
+    ],
+    "What's the weather in Madrid?": [AIMessage("I can only answer questions about this site's documentation.")],
+}
+
+# candidate: a prompt change that makes the agent answer the second question from memory and search for the third
+CANDIDATE = {
+    **BASELINE,
+    "Which index types does pgvector offer?": [AIMessage("pgvector offers HNSW indexes.")],
+    "What's the weather in Madrid?": [
+        call("search_docs", query="weather Madrid"),
+        AIMessage("I can only answer questions about this site's documentation."),
+    ],
+}
+
+
+def make_target(scripts: dict):
+    def target(inputs: dict) -> dict:
+        agent = docs_assistant(*scripts[inputs["question"]])
+        with tracing_context(enabled=False):   # keep the agent's inner LangChain runs local too
+            result = agent.invoke({"messages": [{"role": "user", "content": inputs["question"]}]})
+        return {"answer": result["messages"][-1].content, "messages": result["messages"]}
+    return target
+----
+
+For a real run the target builds the agent once with `create_agent("ollama:llama3.1:8b", tools=[...])` and calls
+`agent.invoke(...)` for each example; nothing else on this page changes. See
+https://docs.langchain.com/langsmith/define-target-function[LangSmith -- Define a target function] and
+https://docs.langchain.com/langsmith/evaluate-graph[LangSmith -- Evaluate a graph].
+
+== Datasets
+
+A dataset is where "the agent got this wrong once" becomes "the agent must get this right every time". DocsAssistant's
+golden set has three examples, one per category from
+xref:ai/agents/agent-evaluation.adoc[Agent Evaluation]: a concept question, a how-to question, and an out-of-scope
+request the agent must decline. Each example carries the reference answer and the tools a good run calls, plus
+`metadata` to slice results by category later:
+
+.`dataset.py` -- the golden set in the shape LangSmith stores
+[source,python]
+----
+"""The DocsAssistant golden set: 3 cases, in the shape LangSmith stores (inputs / outputs / metadata)."""
+EXAMPLES = [
+    {
+        "inputs": {"question": "What does ef_search control in HNSW?"},
+        "outputs": {
+            "answer": "ef_search sets how many candidates HNSW explores per query; higher values raise recall and latency.",
+            "tools": ["search_docs"],
+        },
+        "metadata": {"category": "concept"},
+    },
+    {
+        "inputs": {"question": "Which index types does pgvector offer?"},
+        "outputs": {"answer": "pgvector offers HNSW and IVFFlat indexes.", "tools": ["search_docs"]},
+        "metadata": {"category": "how-to"},
+    },
+    {
+        "inputs": {"question": "What's the weather in Madrid?"},
+        "outputs": {"answer": "I can only answer questions about this site's documentation.", "tools": []},
+        "metadata": {"category": "out-of-scope"},
+    },
+]
+
+
+def as_examples():
+    """Example objects for local runs; against a LangSmith dataset you pass its name to evaluate() instead."""
+    import datetime as dt
+    import uuid
+
+    from langsmith.schemas import Example
+
+    now = dt.datetime.now(dt.timezone.utc)
+    return [Example(id=uuid.uuid4(), created_at=now, **e) for e in EXAMPLES]
+----
+
+Creating it in LangSmith is two calls -- `create_dataset` and a bulk `create_examples`, both from the SDK's `Client`,
+which reads the `LANGSMITH_API_KEY` environment variable. This snippet needs an account, so it was checked against
+the installed signatures but not run:
+
+.Creating the dataset in LangSmith (not run: needs an account)
+[source,python]
+----
+from langsmith import Client
+
+from dataset import EXAMPLES
+
+client = Client()   # reads LANGSMITH_API_KEY from the environment
+dataset = client.create_dataset(dataset_name="docsassistant-golden",
+                                description="DocsAssistant golden questions: concept, how-to, out of scope")
+client.create_examples(dataset_id=dataset.id, examples=EXAMPLES)
+----
+
+Examples can also carry a `split` label to group them, can be added from real traces, and can be edited or curated in
+the UI. See
+https://docs.langchain.com/langsmith/manage-datasets-programmatically[LangSmith -- Manage datasets programmatically]
+and https://docs.langchain.com/langsmith/manage-datasets[LangSmith -- Manage datasets]. For local runs the same
+examples are wrapped as `Example` objects; `as_examples()` at the end of `dataset.py` does that, and it is the only
+difference from passing the dataset's name.
+
+== Running evaluate
+
+`evaluate` takes the target, the data, a list of evaluators and options, runs the target once per example and applies
+the evaluators to each output. An evaluator is any function whose parameters are drawn from `inputs`, `outputs`,
+`reference_outputs` (and `run` / `example` when it needs them), returning a boolean, a number or a dictionary with
+`key` and `score`; the function name becomes the feedback key. Two code evaluators are enough to start: is the answer
+what the reference says, and did the agent call exactly the tools it should have?
+
+.`run_evaluate.py` -- two code evaluators over both versions
+[source,python]
+----
+from langsmith import evaluate
+
+from agents_under_test import BASELINE, CANDIDATE, make_target
+from dataset import as_examples
+
+
+def correct(inputs: dict, outputs: dict, reference_outputs: dict) -> bool:
+    return outputs["answer"] == reference_outputs["answer"]
+
+
+def tools_called(outputs: dict) -> list[str]:
+    return [c["name"] for m in outputs["messages"] if m.type == "ai" for c in m.tool_calls]
+
+
+def right_tools(outputs: dict, reference_outputs: dict) -> bool:
+    return tools_called(outputs) == reference_outputs["tools"]
+
+
+for name, scripts in (("baseline", BASELINE), ("candidate", CANDIDATE)):
+    experiment = evaluate(make_target(scripts), data=as_examples(), evaluators=[correct, right_tools],
+                          experiment_prefix=f"docsassistant-{name}", upload_results=False)
+    print(name)
+    for row in experiment:
+        feedback = {e.key: e.score for e in row["evaluation_results"]["results"]}
+        print("  ", row["example"].inputs["question"][:40].ljust(42), feedback)
+----
+
+.Output
+[source,text]
+----
+baseline
+   What does ef_search control in HNSW?       {'correct': True, 'right_tools': True}
+   Which index types does pgvector offer?     {'correct': True, 'right_tools': True}
+   What's the weather in Madrid?              {'correct': True, 'right_tools': True}
+candidate
+   What does ef_search control in HNSW?       {'correct': True, 'right_tools': True}
+   Which index types does pgvector offer?     {'correct': False, 'right_tools': False}
+   What's the weather in Madrid?              {'correct': True, 'right_tools': False}
+----
+
+`upload_results=False` runs the target and the evaluators exactly as usual but records nothing in LangSmith, which is
+how these snippets ran without an account; the SDK still prints a progress line and marks the parameter as beta. Drop
+it, pass the dataset's name as `data`, and the same call creates an experiment in LangSmith that you compare in the
+UI. `experiment_prefix`, `description`, `metadata`, `max_concurrency` and `num_repetitions` are the options you reach
+for first; `aevaluate` is the async twin. The baseline passes everything and the candidate fails two of three cases,
+one on answer and tools and one on tools alone -- the second is a wasted search that an answer-only check would have
+missed. See https://docs.langchain.com/langsmith/evaluate-llm-application[LangSmith -- How to evaluate agents] and
+https://docs.langchain.com/langsmith/local[LangSmith -- Run an evaluation locally].
+
+The equivalent upload run, with the real agent, is the same call against a dataset name (not run: needs an account
+and Ollama):
+
+.Uploading an experiment (not run)
+[source,python]
+----
+experiment = client.evaluate(
+    make_target(...),                 # a target built around create_agent("ollama:llama3.1:8b", ...)
+    data="docsassistant-golden",
+    evaluators=[correct, right_tools],
+    experiment_prefix="docsassistant-candidate",
+    description="Shorter system prompt",
+    max_concurrency=4,
+    metadata={"prompt": "v2"},
+)
+----
+
+== LLM-as-judge with openevals
+
+String equality is a poor test for free-text answers: "HNSW and IVFFlat" and "IVFFlat and HNSW" are the same answer.
+The `openevals` package ships prebuilt evaluators, including `create_llm_as_judge`, which formats a prompt with the
+example's inputs, outputs and reference outputs, asks a judge model for a structured verdict (a `score` plus optional
+`reasoning`) and returns it as feedback under the `feedback_key` you choose. It also ships ready-made prompts,
+including `CORRECTNESS_PROMPT`, `CONCISENESS_PROMPT`, `HALLUCINATION_PROMPT`, `RAG_GROUNDEDNESS_PROMPT`,
+`RAG_HELPFULNESS_PROMPT` and `RAG_RETRIEVAL_RELEVANCE_PROMPT` in `openevals.prompts`. The judge is given either as a
+model string such as `"openai:o3-mini"` (the form the docs use) in the `model` parameter, or as a LangChain chat model
+or an OpenAI client in the `judge` parameter. The small
+`ScriptedJudge` below is a chat model whose `with_structured_output` applies a rule to the prompt text instead of
+calling an LLM, so the plumbing can be run offline; the rules live in `judges.py`:
+
+.`scripted_judge.py` and `judges.py` -- a rule-based stand-in for the judge model
+[source,python]
+----
+from typing import Callable
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.runnables import RunnableLambda
+
+
+class ScriptedJudge(BaseChatModel):
+    """Stands in for the judge model (llama3.1:8b in DocsAssistant): the verdict comes from a rule, not a model."""
+
+    rule: Callable[[str], tuple[bool, str]]   # prompt text -> (score, reasoning)
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted-judge"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        raise NotImplementedError("openevals and agentevals only call with_structured_output()")
+
+    def with_structured_output(self, schema, **kwargs):
+        def verdict(messages):
+            score, reasoning = self.rule(messages[-1]["content"])
+            return {"reasoning": reasoning, "score": score}
+        return RunnableLambda(verdict)
+----
+
+.judges.py -- the rules behind the scripted judge
+[source,python]
+----
+import re
+
+from scripted_judge import ScriptedJudge
+
+
+def _tag(text: str, tag: str) -> str:
+    return re.search(rf"<{tag}>\n?(.*?)\n?</{tag}>", text, re.S).group(1).strip().lower()
+
+
+def _same_answer(prompt: str):
+    ok = _tag(prompt, "reference_outputs").rstrip(".") in _tag(prompt, "output")
+    return ok, "matches the reference" if ok else "differs from the reference"
+
+
+def _same_tools(prompt: str):
+    count = lambda t: _tag(prompt, t).count("search_docs")
+    ok = count("trajectory") == count("reference_trajectory")
+    return ok, "same tool use as the reference" if ok else "different tool use than the reference"
+
+
+def _grounded(prompt: str):
+    context, answer = _tag(prompt, "context"), _tag(prompt, "outputs")
+    words = [w.strip(".;,") for w in answer.split() if len(w) > 3]
+    ok = answer.startswith("i can only") or (bool(context) and sum(w in context for w in words) / len(words) >= 0.6)
+    return ok, "supported by the context" if ok else "claims beyond the context"
+
+
+ANSWER_JUDGE = ScriptedJudge(rule=_same_answer)
+TRAJECTORY_JUDGE = ScriptedJudge(rule=_same_tools)
+GROUNDEDNESS_JUDGE = ScriptedJudge(rule=_grounded)
+----
+
+The first script uses `exact_match` and the judge directly, on the pgvector answer and on a partial version of it:
+
+.`run_openevals_basic.py`
+[source,python]
+----
+from openevals import exact_match
+from openevals.llm import create_llm_as_judge
+from openevals.prompts import CORRECTNESS_PROMPT
+
+from judges import ANSWER_JUDGE
+
+print(exact_match(outputs={"answer": "HNSW"}, reference_outputs={"answer": "HNSW"}))
+
+correctness = create_llm_as_judge(prompt=CORRECTNESS_PROMPT, feedback_key="correctness", judge=ANSWER_JUDGE)
+question = "Which index types does pgvector offer?"
+reference = "pgvector offers HNSW and IVFFlat indexes."
+for answer in (reference, "pgvector offers HNSW indexes."):
+    print(correctness(inputs=question, outputs=answer, reference_outputs=reference))
+----
+
+.Output
+[source,text]
+----
+{'key': 'exact_match', 'score': True, 'comment': None, 'metadata': None}
+{'key': 'correctness', 'score': True, 'comment': 'matches the reference', 'metadata': None}
+{'key': 'correctness', 'score': False, 'comment': 'differs from the reference', 'metadata': None}
+----
+
+Every openevals evaluator returns a dictionary with `key`, `score` and `comment` (the judge's reasoning), which is
+exactly what `evaluate` accepts. Inside an experiment the target's output is a dictionary, so a thin wrapper picks the
+right fields. The groundedness prompt has a `\{context}` variable; extra keyword arguments to the evaluator fill
+prompt variables, so DocsAssistant passes the tool results the agent actually saw:
+
+.`evaluators.py` -- correctness and groundedness as openevals judges
+[source,python]
+----
+from openevals.llm import create_llm_as_judge
+from openevals.prompts import CORRECTNESS_PROMPT, RAG_GROUNDEDNESS_PROMPT
+
+from judges import ANSWER_JUDGE, GROUNDEDNESS_JUDGE
+
+# In DocsAssistant: model="ollama:llama3.1:8b" (a model string) instead of judge=... -- here a scripted judge keeps the run offline.
+_correctness = create_llm_as_judge(prompt=CORRECTNESS_PROMPT, feedback_key="correctness", judge=ANSWER_JUDGE)
+_grounded = create_llm_as_judge(prompt=RAG_GROUNDEDNESS_PROMPT, feedback_key="groundedness", judge=GROUNDEDNESS_JUDGE)
+
+
+def correctness(inputs: dict, outputs: dict, reference_outputs: dict):
+    return _correctness(inputs=inputs["question"], outputs=outputs["answer"],
+                        reference_outputs=reference_outputs["answer"])
+
+
+def groundedness(inputs: dict, outputs: dict):
+    context = "\n".join(m.content for m in outputs["messages"] if m.type == "tool")
+    return _grounded(context=context, outputs=outputs["answer"])   # extra kwargs fill {context}
+----
+
+.`run_llm_judge.py`
+[source,python]
+----
+from langsmith import evaluate
+
+from agents_under_test import BASELINE, CANDIDATE, make_target
+from dataset import as_examples
+from evaluators import correctness, groundedness
+
+for name, scripts in (("baseline", BASELINE), ("candidate", CANDIDATE)):
+    experiment = evaluate(make_target(scripts), data=as_examples(), evaluators=[correctness, groundedness],
+                          experiment_prefix=name, upload_results=False, disable_evaluator_tracing=True)
+    print(name)
+    for row in experiment:
+        verdicts = [(e.key, e.score, e.comment) for e in row["evaluation_results"]["results"]]
+        print("  ", row["example"].inputs["question"][:38].ljust(40), verdicts)
+----
+
+.Output
+[source,text]
+----
+baseline
+   What does ef_search control in HNSW?     [('correctness', True, 'matches the reference'), ('groundedness', True, 'supported by the context')]
+   Which index types does pgvector offer?   [('correctness', True, 'matches the reference'), ('groundedness', True, 'supported by the context')]
+   What's the weather in Madrid?            [('correctness', True, 'matches the reference'), ('groundedness', True, 'supported by the context')]
+candidate
+   What does ef_search control in HNSW?     [('correctness', True, 'matches the reference'), ('groundedness', True, 'supported by the context')]
+   Which index types does pgvector offer?   [('correctness', False, 'differs from the reference'), ('groundedness', False, 'claims beyond the context')]
+   What's the weather in Madrid?            [('correctness', True, 'matches the reference'), ('groundedness', True, 'supported by the context')]
+----
+
+`disable_evaluator_tracing=True` stops the SDK from tracing the evaluators themselves; without an account it avoids
+an authentication error logged at the end of the run, and with one you would normally leave it off so a surprising
+verdict can be opened as a trace. The candidate's from-memory answer fails on both counts: it disagrees with the
+reference and it is not supported by anything the agent retrieved. In production you replace the scripted judge with
+a real model, for example `judge=init_chat_model("ollama:llama3.1:8b")` or `model="ollama:llama3.1:8b"`, and you treat its scores
+with the caution described in
+xref:database/vector-rag/evaluating-rag-systems.adoc#_llm_as_a_judge_and_its_biases[LLM-as-a-judge and its biases]:
+small local models are weak and biased judges, so calibrate them against a handful of human-labelled examples before
+trusting a trend. LangSmith also documents improving a judge with human corrections and few-shot examples; see
+https://docs.langchain.com/langsmith/improve-judge-evaluator-feedback[LangSmith -- Improve LLM-as-judge evaluators using human feedback].
+See https://docs.langchain.com/langsmith/openevals[LangSmith -- Run evals with the openevals package] and the
+https://github.com/langchain-ai/openevals[openevals repository].
+
+== Trajectory evaluation with agentevals
+
+A correct final answer can hide a bad path: an extra tool call costs money and latency, and a skipped call means the
+answer came from the model's memory. The `agentevals` package scores the *trajectory* -- the list of messages,
+including tool calls -- in two ways. `create_trajectory_match_evaluator` compares it with a reference trajectory
+deterministically, in one of four modes; `create_trajectory_llm_as_judge` asks a judge model to grade it against a
+rubric, optionally with a reference.
+
+[cols="1,3,3"]
+|===
+| Mode | Passes when | Use it for
+
+| `strict`
+| The same messages and tool calls, in the same order (message content may differ)
+| A workflow with a required sequence, such as "search, then answer"
+
+| `unordered`
+| The same tool calls, in any order
+| Independent lookups where order does not matter
+
+| `subset`
+| The agent calls only tools that appear in the reference (no extras)
+| Efficiency: catching wasted calls
+
+| `superset`
+| The agent calls at least the reference's tools (extras allowed)
+| Minimum required actions: "it must at least search"
+|===
+
+`tool_args_match_mode` controls whether tool-call arguments are compared: `exact` (the default), `ignore`,
+`subset` or `superset`, and `tool_args_match_overrides` sets the mode or a custom comparison function per tool. The
+DocsAssistant reference trajectories are generated from the dataset's `tools` list, and query strings are ignored
+because a model words its search query differently on every run:
+
+.`trajectories.py` -- match and judge evaluators over the dataset's reference tools
+[source,python]
+----
+from agentevals.trajectory.llm import create_trajectory_llm_as_judge
+from agentevals.trajectory.match import create_trajectory_match_evaluator
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+from judges import TRAJECTORY_JUDGE
+
+
+def reference_trajectory(question: str, answer: str, tools: list[str]) -> list:
+    """The messages a good run produces: one tool call per expected tool, then the answer."""
+    messages = [HumanMessage(question)]
+    for i, name in enumerate(tools):
+        messages.append(AIMessage("", tool_calls=[{"name": name, "args": {}, "id": f"ref_{i}", "type": "tool_call"}]))
+        messages.append(ToolMessage("(any result)", tool_call_id=f"ref_{i}"))
+    return [*messages, AIMessage(answer)]
+
+
+strict = create_trajectory_match_evaluator(trajectory_match_mode="strict", tool_args_match_mode="ignore")
+superset = create_trajectory_match_evaluator(trajectory_match_mode="superset", tool_args_match_mode="ignore")
+subset = create_trajectory_match_evaluator(trajectory_match_mode="subset", tool_args_match_mode="ignore")
+judge = create_trajectory_llm_as_judge(feedback_key="trajectory_accuracy", judge=TRAJECTORY_JUDGE)
+
+
+def _run(evaluator, inputs: dict, outputs: dict, reference_outputs: dict):
+    reference = reference_trajectory(inputs["question"], reference_outputs["answer"], reference_outputs["tools"])
+    return evaluator(outputs=outputs["messages"], reference_outputs=reference)
+
+
+def trajectory_strict(inputs, outputs, reference_outputs):
+    return _run(strict, inputs, outputs, reference_outputs)
+
+
+def trajectory_superset(inputs, outputs, reference_outputs):
+    return _run(superset, inputs, outputs, reference_outputs)
+
+
+def trajectory_subset(inputs, outputs, reference_outputs):
+    return _run(subset, inputs, outputs, reference_outputs)
+
+
+def trajectory_judge(inputs, outputs, reference_outputs):
+    return _run(judge, inputs, outputs, reference_outputs)
+----
+
+.`run_trajectory.py`
+[source,python]
+----
+from langsmith import evaluate
+
+import trajectories as t
+from agents_under_test import BASELINE, CANDIDATE, make_target
+from dataset import as_examples
+
+EVALUATORS = [t.trajectory_strict, t.trajectory_superset, t.trajectory_subset, t.trajectory_judge]
+
+for name, scripts in (("baseline", BASELINE), ("candidate", CANDIDATE)):
+    experiment = evaluate(make_target(scripts), data=as_examples(), evaluators=EVALUATORS,
+                          experiment_prefix=name, upload_results=False, disable_evaluator_tracing=True)
+    print(name)
+    for row in experiment:
+        scores = {e.key.removeprefix("trajectory_"): e.score for e in row["evaluation_results"]["results"]}
+        print("  ", row["example"].inputs["question"][:32].ljust(34), scores)
+----
+
+.Output
+[source,text]
+----
+baseline
+   What does ef_search control in H   {'strict_match': True, 'superset_match': True, 'subset_match': True, 'accuracy': True}
+   Which index types does pgvector    {'strict_match': True, 'superset_match': True, 'subset_match': True, 'accuracy': True}
+   What's the weather in Madrid?      {'strict_match': True, 'superset_match': True, 'subset_match': True, 'accuracy': True}
+candidate
+   What does ef_search control in H   {'strict_match': True, 'superset_match': True, 'subset_match': True, 'accuracy': True}
+   Which index types does pgvector    {'strict_match': False, 'superset_match': False, 'subset_match': True, 'accuracy': False}
+   What's the weather in Madrid?      {'strict_match': False, 'superset_match': True, 'subset_match': False, 'accuracy': False}
+----
+
+The modes disagree in informative ways. On the pgvector question the candidate skipped the search, so `subset` still
+passes (no extra tools) while `strict` and `superset` fail (a required tool is missing). On the weather question it
+searched when it should not have, so `superset` passes and `subset` and `strict` fail. A wasted call and a skipped
+call are different bugs, and one number cannot tell them apart. `trajectory_accuracy`, from the trajectory judge,
+is the rubric-based score; with a real model the judge can also accept a reasonable alternative path that the
+deterministic modes would reject. Because it is an LLM call it costs tokens and varies, so use the deterministic
+modes for anything a CI job must fail on. See
+https://docs.langchain.com/langsmith/trajectory-evals[LangSmith -- Trajectory evaluations] and the
+https://github.com/langchain-ai/agentevals[agentevals repository]; the conceptual side (tool-call accuracy,
+step-level checks) is in xref:ai/agents/agent-evaluation.adoc#_trajectory_evaluation[Agent Evaluation].
+
+== Regression experiments on DocsAssistant
+
+A regression experiment answers one question: did this change make anything worse that used to work? The recipe is to
+run the *baseline* and the *candidate* on the same dataset with the same evaluators, and compare per metric. With
+\(N\) examples, \(R\) repetitions and score \(s_{m,i,r}\) for metric \(m\), example \(i\) and repetition \(r\), the
+metric's mean is
+
+[stem]
+++++
+\bar{s}_m = \frac{1}{N R} \sum_{i=1}^{N} \sum_{r=1}^{R} s_{m,i,r}
+++++
+
+and the candidate regresses on metric \(m\) when
+
+[stem]
+++++
+\Delta_m = \bar{s}_m^{\text{cand}} - \bar{s}_m^{\text{base}} < -\varepsilon
+++++
+
+where \(\varepsilon\) is the drop you are willing to tolerate (0.05 below). Boolean scores are averaged as 0 and 1, so a
+mean is a pass rate. The script below runs both versions with `num_repetitions=3`, averages each metric and exits
+non-zero on a regression, which is what makes it usable as a CI gate:
+
+.`regression.py` -- baseline vs. candidate, failing on a regression
+[source,python]
+----
+"""Run baseline and candidate on the golden set and fail if the candidate regresses."""
+import sys
+from collections import defaultdict
+
+from langsmith import evaluate
+
+import trajectories as t
+from agents_under_test import BASELINE, CANDIDATE, make_target
+from dataset import as_examples
+from evaluators import correctness, groundedness
+
+EVALUATORS = [correctness, groundedness, t.trajectory_strict]
+
+
+def run(name: str, scripts: dict) -> dict[str, float]:
+    experiment = evaluate(make_target(scripts), data=as_examples(), evaluators=EVALUATORS,
+                          experiment_prefix=name, num_repetitions=3,
+                          metadata={"prompt": name}, upload_results=False, disable_evaluator_tracing=True)
+    scores = defaultdict(list)
+    for row in experiment:
+        for result in row["evaluation_results"]["results"]:
+            scores[result.key].append(float(result.score))
+    return {key: sum(v) / len(v) for key, v in scores.items()}
+
+
+if __name__ == "__main__":
+    base, cand = run("baseline", BASELINE), run("candidate", CANDIDATE)
+    print(f"{'metric':<28}{'baseline':>9}{'candidate':>10}{'delta':>8}")
+    regressed = []
+    for key in base:
+        delta = cand[key] - base[key]
+        print(f"{key:<28}{base[key]:>9.2f}{cand[key]:>10.2f}{delta:>+8.2f}")
+        if delta < -0.05:
+            regressed.append(key)
+    if regressed:
+        sys.exit(f"regression on: {', '.join(regressed)}")
+----
+
+.Output (exit status 1)
+[source,text]
+----
+metric                       baseline candidate   delta
+correctness                      1.00      0.67   -0.33
+groundedness                     1.00      0.67   -0.33
+trajectory_strict_match          1.00      0.33   -0.67
+regression on: correctness, groundedness, trajectory_strict_match
+----
+
+Repetitions matter with a real model, because its answers vary from run to run: averaging over \(R\) samples per
+example reduces sampling noise, and LangSmith lets you view each repetition's output under its example. They do nothing about
+example count, though. The uncertainty of a pass rate stem:[\hat{p}] measured on \(n\) independent examples is about
+
+[stem]
+++++
+\mathrm{SE}(\hat{p}) = \sqrt{\frac{\hat{p}(1 - \hat{p})}{n}}
+++++
+
+so stem:[\hat{p} = 2/3] on the three examples above has stem:[\mathrm{SE} \approx 0.27]: a real golden set needs dozens of
+examples per category before a 0.05 threshold means anything. (The scripted agent is deterministic, so
+its three repetitions are identical; they are there to show the option.)
+
+In LangSmith itself, the comparison is a view rather than a script. Select the two experiments on the dataset and the
+comparison view highlights regressions and improvements against the baseline; the same page describes benchmarking,
+unit tests, regression tests and backtesting as the offline patterns. A *summary evaluator*
+(`summary_evaluators=[...]`) receives the lists of all outputs and reference outputs and returns one experiment-level
+score, such as F1 or an overall pass rate, which is the right shape for metrics that are not a per-example average. It
+ran in the checks for this page, but the local result object does not expose it publicly, so the gate above averages
+the per-example scores itself. Evaluators can also be bound to a dataset in the UI, so that every new experiment
+gets them automatically. See
+https://docs.langchain.com/langsmith/evaluation-types[LangSmith -- Evaluation types],
+https://docs.langchain.com/langsmith/compare-experiment-results[LangSmith -- Compare experiment results],
+https://docs.langchain.com/langsmith/summary[LangSmith -- Summary evaluators],
+https://docs.langchain.com/langsmith/repetition[LangSmith -- Evaluate with repetitions],
+https://docs.langchain.com/langsmith/read-local-experiment-results[LangSmith -- Read experiment results locally] and
+https://docs.langchain.com/langsmith/bind-evaluator-to-dataset[LangSmith -- Automatically run evaluators on experiments].
+
+== The pytest plugin
+
+`evaluate` treats every example the same way. When each case needs its own assertions, or you already have a pytest
+suite and want to add LangSmith tracking, the plugin is a better fit: it ships with the `langsmith` package (as a
+pytest plugin registered on install; the `langsmith[pytest]` extra adds rich output and test caching) and activates
+on the `@pytest.mark.langsmith` marker. Each marked test becomes a dataset example, each run of the suite an
+experiment, and pass or fail is logged under the `pass` feedback key. `langsmith.testing` provides `log_inputs`,
+`log_outputs`, `log_reference_outputs`, `log_feedback` and the `trace_feedback` context manager, and
+`langsmith.expect` provides assertions that are also logged as scores:
+
+.`tests/test_docsassistant.py` -- DocsAssistant cases as pytest tests
+[source,python]
+----
+import os
+
+import pytest
+from langsmith import expect
+from langsmith import testing as t
+
+from agents_under_test import BASELINE, CANDIDATE, make_target
+from dataset import EXAMPLES
+from evaluators import correctness
+
+TARGET = make_target(CANDIDATE if os.environ.get("DOCS_ASSISTANT") == "candidate" else BASELINE)
+CASES = [(e["inputs"]["question"], e["outputs"]) for e in EXAMPLES]
+
+
+@pytest.mark.langsmith(output_keys=["reference"])
+@pytest.mark.parametrize("question, reference", CASES)
+def test_answer_matches_reference(question, reference):
+    outputs = TARGET({"question": question})
+    t.log_outputs({"answer": outputs["answer"]})
+    result = correctness({"question": question}, outputs, reference)      # judge verdict -> feedback
+    t.log_feedback(key=result["key"], score=result["score"])
+    assert result["score"]
+
+
+@pytest.mark.langsmith
+def test_out_of_scope_question_uses_no_tool():
+    outputs = TARGET({"question": "What's the weather in Madrid?"})
+    t.log_outputs({"answer": outputs["answer"]})
+    expect(len(outputs["messages"])).to_equal(2)                            # human message + refusal
+    expect(outputs["answer"]).to_contain("documentation")
+----
+
+`output_keys=["reference"]` marks the parametrized argument `reference` as the example's reference outputs rather than
+its inputs. `LANGSMITH_TEST_TRACKING=false` runs the suite as plain pytest with nothing sent to LangSmith, which is
+how it ran here:
+
+.Baseline
+[source,bash]
+----
+LANGSMITH_TEST_TRACKING=false python -m pytest tests -q
+----
+
+.Output
+[source,text]
+----
+....                                                                     [100%]
+4 passed in 0.34s
+----
+
+.Candidate
+[source,bash]
+----
+DOCS_ASSISTANT=candidate LANGSMITH_TEST_TRACKING=false python -m pytest tests -q --tb=no
+----
+
+.Output
+[source,text]
+----
+.F.F                                                                     [100%]
+=========================== short test summary info ============================
+FAILED tests/test_docsassistant.py::test_answer_matches_reference[Which index types does pgvector offer?-reference1]
+FAILED tests/test_docsassistant.py::test_out_of_scope_question_uses_no_tool
+2 failed, 2 passed in 0.36s
+----
+
+The candidate fails the pgvector answer and the out-of-scope test, and passes the rest: the same regression
+`evaluate` found, now as red tests in a CI job. Set `LANGSMITH_TEST_TRACKING` back to its default (and provide
+`LANGSMITH_API_KEY` from the CI secret store) to record the run. The environment variables that shape the run are
+`LANGSMITH_TEST_SUITE` (the dataset name for the whole run), `LANGSMITH_EXPERIMENT` (the experiment name),
+`LANGSMITH_EXPERIMENT_METADATA` (a JSON string of metadata, which needs a recent `langsmith`) and `LANGSMITH_TEST_CACHE`
+(a directory in which HTTP requests are cached, so a CI run does not pay for the same LLM calls twice). The
+`--langsmith-output` flag prints a live results table. Those recording features were not run here; the plugin's
+`LANGSMITH_TEST_TRACKING=false` mode was. Plain unit tests of an agent's logic, without any LangSmith concept, are the
+subject of xref:ai/langchain/testing.adoc[Testing]. See
+https://docs.langchain.com/langsmith/pytest[LangSmith -- Run evaluations with pytest].
+
+== Online evaluators
+
+Offline datasets only contain the questions you thought of. *Online evaluators* run automatically on traces from a
+tracing project, so they see the questions users actually ask. They are configured in the LangSmith UI (Tracing
+project, Evaluators tab, add an evaluator), not in your application code, and they have no reference outputs to compare
+with, so they check properties of the output itself. The configuration has four parts:
+
+* *The evaluator.* An LLM-as-judge evaluator with a prompt over the run's input and output, or a code evaluator
+  written inline in Python or JavaScript. Code evaluators may import the standard library and a short list of packages
+  (numpy, pandas, jsonschema, scipy and scikit-learn) and cannot reach the network.
+* *A filter.* Which runs trigger it: runs where a user left negative feedback, runs that called a particular tool,
+  runs whose metadata matches (for example a plan type).
+* *A sampling rate.* The fraction of matching runs to score (for example 0.1), to control cost.
+* *A backfill.* An option, available only when the rule is created, to apply the rule to past runs from a chosen date.
+
+Scores appear as feedback on the traces, so you can filter to the failures and add them to the dataset, closing the
+loop in the diagram. *Multi-turn* online evaluators score a whole conversation thread rather than one run, and the weekly LLM
+spend of evaluators can be capped. Be aware that a trace that an online
+evaluator runs on is upgraded to extended data retention, which changes its pricing; the pricing itself is documented
+by LangSmith and not repeated here.
+
+A code evaluator is a plain function of the sampled run, so it can be written and tested locally before it is pasted
+into the UI. A traced DocsAssistant entry point that returns an `answer` and its `sources` is assumed; this evaluator checks that a
+non-empty answer cites a documentation page or is the standard refusal:
+
+.`online_eval.py` -- a reference-free code evaluator
+[source,python]
+----
+def cites_a_docs_page(run: dict) -> dict:
+    """Online code evaluator: a LangSmith code evaluator receives the sampled run; there is no reference answer here."""
+    outputs = run.get("outputs") or {}
+    answer = outputs.get("answer", "")
+    if not answer.strip():
+        return {"answered": 0, "cites_a_page": 0}
+    cited = any(".adoc" in source for source in outputs.get("sources", []))
+    return {"answered": 1, "cites_a_page": int(cited or answer.startswith("I can only"))}
+----
+
+.Checking it locally against three runs
+[source,python]
+----
+from online_eval import cites_a_docs_page
+
+runs = [
+    {"outputs": {"answer": "HNSW and IVFFlat.",
+                 "sources": ["modules/ROOT/pages/database/vector-rag/postgresql-pgvector.adoc"]}},
+    {"outputs": {"answer": "HNSW.", "sources": []}},
+    {"outputs": {"answer": ""}},
+]
+for run in runs:
+    print(cites_a_docs_page(run))
+----
+
+.Output
+[source,text]
+----
+{'answered': 1, 'cites_a_page': 1}
+{'answered': 1, 'cites_a_page': 0}
+{'answered': 0, 'cites_a_page': 0}
+----
+
+The evaluator was run as a plain function; attaching it to a project was not (that needs an account). The keys of the
+returned dictionary become feedback names, so `cites_a_page` can be charted and alerted on in the tracing project.
+Reference-free LLM-as-judge prompts work the same way: the `RAG_GROUNDEDNESS_PROMPT` and `HALLUCINATION_PROMPT`
+texts above are good starting points, entered in the UI with template variables for the run's input and output. See
+https://docs.langchain.com/langsmith/online-evaluations-llm-as-judge[LangSmith -- LLM-as-a-judge online evaluators],
+https://docs.langchain.com/langsmith/online-evaluations-code[LangSmith -- Online code evaluators] and
+https://docs.langchain.com/langsmith/online-evaluations-multi-turn[LangSmith -- Multi-turn online evaluators].
+Dashboards and alerting over these scores are covered in
+xref:ai/llmops/metrics-dashboards-and-alerting.adoc[LLMOps: Metrics, Dashboards & Alerting], scoring live traffic in
+xref:ai/llmops/online-evaluation-and-feedback.adoc[LLMOps: Online Evaluation & Feedback] and drift detection in
+xref:ai/llmops/drift-and-regression-monitoring.adoc[LLMOps: Drift & Regression Monitoring].
+
+[#what-ran-where]
+== What ran where
+
+[cols="2,1,3"]
+|===
+| Feature | Run for this page? | How
+
+| `evaluate` with code evaluators
+| Yes
+| Local, `upload_results=False`, scripted agent
+
+| openevals `exact_match` and `create_llm_as_judge`
+| Yes
+| Scripted judge model; prompts and the evaluator plumbing are the real ones
+
+| agentevals match modes and trajectory judge
+| Yes
+| Real evaluators; judge model scripted
+
+| Regression gate, repetitions
+| Yes
+| Local, exit status 1 on regression
+
+| pytest plugin
+| Yes
+| `LANGSMITH_TEST_TRACKING=false`
+
+| Online code evaluator function
+| Yes (as a function)
+| Called on dictionaries shaped like runs
+
+| Dataset creation, uploaded experiments, comparison view, dataset-bound evaluators
+| No
+| Need a LangSmith account and API key
+
+| pytest recording, `--langsmith-output`, `LANGSMITH_TEST_CACHE`
+| No
+| Need a LangSmith account and API key
+
+| Attaching online evaluators to a tracing project
+| No
+| UI feature of an account
+
+| Real Ollama agent and judge
+| No
+| Ollama was not available; scripted models were used
+|===
+
+== References
+
+* https://docs.langchain.com/langsmith/evaluation[LangSmith -- Evaluation]
+* https://docs.langchain.com/langsmith/evaluation-concepts[LangSmith -- Evaluation concepts]
+* https://docs.langchain.com/langsmith/evaluation-types[LangSmith -- Evaluation types]
+* https://docs.langchain.com/langsmith/manage-datasets[LangSmith -- Manage datasets]
+* https://docs.langchain.com/langsmith/manage-datasets-programmatically[LangSmith -- Manage datasets programmatically]
+* https://docs.langchain.com/langsmith/define-target-function[LangSmith -- Define a target function]
+* https://docs.langchain.com/langsmith/evaluate-llm-application[LangSmith -- How to evaluate agents]
+* https://docs.langchain.com/langsmith/evaluate-graph[LangSmith -- How to evaluate a graph]
+* https://docs.langchain.com/langsmith/local[LangSmith -- Run an evaluation locally]
+* https://docs.langchain.com/langsmith/read-local-experiment-results[LangSmith -- Read experiment results locally]
+* https://docs.langchain.com/langsmith/repetition[LangSmith -- Evaluate with repetitions]
+* https://docs.langchain.com/langsmith/summary[LangSmith -- Summary evaluators]
+* https://docs.langchain.com/langsmith/compare-experiment-results[LangSmith -- Compare experiment results]
+* https://docs.langchain.com/langsmith/bind-evaluator-to-dataset[LangSmith -- Automatically run evaluators on experiments]
+* https://docs.langchain.com/langsmith/openevals[LangSmith -- Run evals with the openevals package]
+* https://docs.langchain.com/langsmith/improve-judge-evaluator-feedback[LangSmith -- Improve LLM-as-judge evaluators using human feedback]
+* https://docs.langchain.com/langsmith/trajectory-evals[LangSmith -- Trajectory evaluations]
+* https://docs.langchain.com/langsmith/pytest[LangSmith -- Run evaluations with pytest]
+* https://docs.langchain.com/langsmith/online-evaluations-llm-as-judge[LangSmith -- LLM-as-a-judge online evaluators]
+* https://docs.langchain.com/langsmith/online-evaluations-code[LangSmith -- Online code evaluators]
+* https://docs.langchain.com/langsmith/online-evaluations-multi-turn[LangSmith -- Multi-turn online evaluators]
+* https://github.com/langchain-ai/openevals[openevals]
+* https://github.com/langchain-ai/agentevals[agentevals]

@@ -1,0 +1,397 @@
+= Context Engineering
+:description: How to deliberately curate what goes into an LLM's context window -- context budgets, just-in-time retrieval, compaction, structured notes, sub-agent isolation, and progressive disclosure -- as distinct from prompt engineering.
+:keywords: context engineering, prompt engineering, context budget, just-in-time retrieval, compaction, summarization, structured note-taking, sub-agent isolation, progressive disclosure, skills, lost in the middle, primacy, recency
+
+include::partial$ai-llm-foundations-disclaimer.adoc[]
+
+Examples on this page target Python 3.12 with the current `anthropic` SDK, checked against Anthropic's own
+engineering guidance as of 2026-09-28. This page treats context engineering as a discipline that sits above any
+single prompt: xref:ai/llm-foundations/context-windows-and-memory.adoc[Context Windows & Memory] covers the
+*mechanics* of the window itself -- how big it is, how the KV-cache makes attention over it tractable, what
+prompt caching reuses across turns -- while this page is about the *choices* an application makes about what
+actually occupies that window at each step, for our running example, an assistant called *DocsAssistant* that
+answers questions over a documentation set by combining retrieval with a running conversation.
+
+== Context engineering vs. prompt engineering
+
+*Prompt engineering* is the craft of writing a single, effective instruction: choosing wording, providing
+examples, specifying an output format, for one call whose input is essentially fixed. It optimizes a static
+piece of text.
+
+*Context engineering* is broader and dynamic. It treats the entire contents of the context window at inference
+time -- system instructions, tool definitions, retrieved documents, prior conversation turns, and the current
+user turn -- as a limited, curated resource that must be assembled fresh, or incrementally revised, for every
+single call an agent makes over a long-running task. A prompt-engineered instruction can still fail if the
+*context* around it is wrong: stale retrieved documents, an overflowing conversation history that pushes the
+actual question out of the model's effective attention, or tool definitions that eat the budget a retrieved
+answer needed. Prompt engineering asks "what should I ask the model to do?"; context engineering asks "what
+does the model need to see, right now, to do it well, and what do I leave out?" The distinction matters
+operationally: a single well-crafted prompt is written once and reused, while a context-engineering
+strategy runs on every turn of an agent's loop, deciding anew what to include, what to compact, and what to
+discard as the interaction grows. The rest of this page covers the concrete techniques that make up that
+strategy.
+
+== The context budget
+
+Every request has a hard ceiling (the model's context window,
+xref:ai/llm-foundations/context-windows-and-memory.adoc[covered in detail here]) and a much lower *practical*
+ceiling: past a certain point, filling the window with more tokens degrades response quality and latency even
+though the request would still technically fit. Context engineering starts by treating the window as a budget
+to be allocated across competing slots, not a bucket to be filled. A concrete allocation for DocsAssistant,
+against an assumed 128K-token window and an 8K generation reserve, might look like:
+
+[cols="2,1,3", options="header"]
+|===
+| Slot | Example budget | Notes
+
+| System prompt
+| 1,000 tokens
+| Fixed instructions, persona, and output-format rules; should be the most stable, least-often-changed slot.
+
+| Tool / function definitions
+| 1,500 tokens
+| Grows with the number of tools registered; prune unused tools per request rather than registering everything
+  globally (xref:ai/llm-foundations/managing-prompts.adoc[Managing Prompts] covers versioning these definitions
+  alongside prompt templates).
+
+| Retrieved documents
+| 20,000 tokens
+| The just-in-time retrieval budget below; typically the largest single slot, but capped so a large retrieval
+  hit cannot silently starve the rest of the budget.
+
+| Conversation history
+| 15,000 tokens
+| Prior turns, subject to the compaction strategy below once exceeded.
+
+| Structured notes / scratchpad
+| 2,000 tokens
+| Durable state written by the agent itself (see structured note-taking below), distinct from raw history.
+
+| Current user turn
+| 500 tokens
+| Usually small, but never truncated -- it is the one slot that must always survive intact.
+
+| Output budget (reserved, not input)
+| 8,000 tokens
+| Reserved `max_tokens` headroom for the model's response; input slots above must leave this untouched.
+|===
+
+These numbers are illustrative starting points for one application, not fixed rules -- the right split depends
+on the task (an agent that mostly reasons over a long document needs a larger retrieval slot; one that mostly
+holds a long back-and-forth needs a larger history slot), and should be tuned against real traffic rather than
+assumed.
+
+The following function allocates a total input budget across slots and truncates each candidate's content to
+fit, using a simple word-count stand-in for token counting (`len(text.split())`); a real deployment should use
+a proper tokenizer instead, as covered in
+xref:ai/llm-foundations/tokens-and-tokenization.adoc[Tokens & Tokenization]:
+
+[source,python]
+----
+from dataclasses import dataclass
+
+
+def count_tokens(text: str) -> int:
+    # Stand-in for a real tokenizer (see Tokens & Tokenization for e.g. tiktoken-based counting).
+    return len(text.split())
+
+
+@dataclass
+class Slot:
+    name: str
+    content: str
+    budget: int  # max tokens this slot may contribute
+
+
+def truncate_to_budget(text: str, budget: int) -> str:
+    words = text.split()
+    if len(words) <= budget:
+        return text
+    return " ".join(words[:budget]) + " …[truncated]"
+
+
+def assemble_context(slots: list[Slot], total_budget: int) -> dict[str, str]:
+    """Allocate `total_budget` across slots in priority order (list order),
+    never exceeding each slot's own per-slot budget, and stop once the
+    running total is spent."""
+    assembled: dict[str, str] = {}
+    remaining = total_budget
+    for slot in slots:
+        slot_budget = min(slot.budget, remaining)
+        if slot_budget <= 0:
+            assembled[slot.name] = ""
+            continue
+        fitted = truncate_to_budget(slot.content, slot_budget)
+        assembled[slot.name] = fitted
+        remaining -= count_tokens(fitted)
+    return assembled
+
+
+slots = [
+    Slot("system", system_prompt_text, budget=1000),
+    Slot("tools", tool_definitions_text, budget=1500),
+    Slot("docs", retrieved_docs_text, budget=20000),
+    Slot("history", conversation_history_text, budget=15000),
+]
+context = assemble_context(slots, total_budget=37500)
+----
+
+See link:https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents[Anthropic --
+Effective context engineering for AI agents].
+
+== Just-in-time retrieval
+
+Rather than pre-loading everything an agent might conceivably need, *just-in-time retrieval* fetches content
+only when a step of the task actually calls for it, keeping the retrieved-documents slot small until it is
+needed and populated with what is relevant *right now* rather than a broad, stale snapshot taken at the start
+of a session. For DocsAssistant this means the retrieval call happens per user question, not once at
+conversation start: each turn's retrieval query is built from the current question (plus, when useful, a short
+summary of the recent conversation), so the documents slot always reflects the immediate need instead of
+accumulating every page ever touched in the session. This is the same underlying pattern that
+xref:database/vector-rag/prompt-augmentation-and-generation.adoc[] describes for retrieval-augmented
+generation -- embedding a query, retrieving the top-matching chunks, and inserting them into the prompt -- seen
+here as one specific instance of the general context-engineering problem of deciding, per turn, what belongs in
+the window. Just-in-time retrieval also composes with agentic tool use: instead of a single retrieval call, the
+agent can be given a `search_docs` tool it invokes explicitly whenever a step needs more information, so the
+retrieval decision (and its resulting token cost) is made by the model in context rather than paid on every
+turn regardless of need.
+
+== Compaction and summarization
+
+Even with just-in-time retrieval keeping the documents slot lean, the conversation-history slot grows
+monotonically as a session continues, and eventually exceeds its budget. *Compaction* addresses this by
+replacing older turns with a shorter summary once a threshold is crossed, rather than either dropping them
+outright (losing information the agent may still need) or letting the slot overflow (starving other slots or
+exceeding the window). A simple compaction step for DocsAssistant: once the history slot's token count crosses
+its budget, call the model itself to summarize everything except the most recent few turns, then replace that
+older span with the summary in place:
+
+[source,python]
+----
+import anthropic
+
+client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+HISTORY_BUDGET = 15000
+KEEP_RECENT_TURNS = 4
+
+
+def compact_history_if_needed(turns: list[dict]) -> list[dict]:
+    """turns: [{"role": "user"|"assistant", "content": str}, ...] oldest first."""
+    total = sum(count_tokens(t["content"]) for t in turns)
+    if total <= HISTORY_BUDGET or len(turns) <= KEEP_RECENT_TURNS:
+        return turns
+
+    older, recent = turns[:-KEEP_RECENT_TURNS], turns[-KEEP_RECENT_TURNS:]
+    transcript = "\n".join(f"{t['role']}: {t['content']}" for t in older)
+
+    summary_response = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=400,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Summarize the key facts, decisions and open questions from this "
+                "DocsAssistant conversation so far, in under 200 words, preserving "
+                "anything a later turn would need to stay consistent:\n\n" + transcript
+            ),
+        }],
+    )
+    summary_text = summary_response.content[0].text
+
+    return [{"role": "user", "content": f"[Earlier conversation summary]\n{summary_text}"}] + recent
+----
+
+See link:https://platform.claude.com/docs/en/api/messages[Anthropic Messages API reference].
+
+== Structured note-taking
+
+Compaction discards detail by design; some information should instead be preserved *verbatim* across an
+arbitrarily long session, independent of what gets summarized away. *Structured note-taking* addresses this by
+giving the agent a small, durable scratchpad -- a distinct slot from the conversation history -- that it writes
+to explicitly (a running list of open questions, decisions already made, document sections already checked)
+rather than relying on the raw transcript to still contain that information after several rounds of compaction.
+For DocsAssistant, this might be a short running list such as "user is on version 3.x", "already checked the
+authentication page, no answer found", or "user prefers curl examples over SDK code" -- facts that a plain
+chat-history summary might compress away but that materially change how later turns should behave. Because the
+notes slot is deliberately small and explicitly written (not accumulated automatically), it stays cheap and
+reliable even across a session long enough that the conversation history has been compacted several times over.
+
+A minimal version keeps the notes as a small JSON object in application state, lets the model add to it through
+a `save_note` tool, and injects the current notes into the system prompt on every call:
+
+[source,python]
+----
+import json
+
+import anthropic
+
+client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+notes: dict[str, list[str]] = {"facts": [], "checked_pages": []}
+
+save_note_tool = {
+    "name": "save_note",
+    "description": "Record a durable fact or a page already checked, so it survives history compaction.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {"type": "string", "enum": ["facts", "checked_pages"]},
+            "text": {"type": "string"},
+        },
+        "required": ["kind", "text"],
+    },
+}
+
+
+def call_with_notes(messages: list[dict]):
+    system = (
+        "You are DocsAssistant. Use save_note to record facts that later turns must respect.\n"
+        f"<notes>\n{json.dumps(notes, indent=2)}\n</notes>"
+    )
+    response = client.messages.create(
+        model="claude-sonnet-5", max_tokens=800, system=system, tools=[save_note_tool], messages=messages,
+    )
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "save_note":
+            notes[block.input["kind"]].append(block.input["text"])
+    return response
+----
+
+See the "Structured note-taking" section of
+link:https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents[Anthropic -- Effective
+context engineering for AI agents] for the pattern.
+
+== Sub-agent isolation
+
+A single agent's context window is a shared resource across every sub-task it performs, which means a long or
+noisy sub-task (searching many documents, running many tool calls to narrow down an answer) can consume most of
+the budget before the main task is even addressed. *Sub-agent isolation* solves this by delegating a bounded
+sub-task to a separate agent invocation with its own, fresh context window, and returning only that sub-agent's
+*result* -- not its full working transcript -- to the parent's context. For DocsAssistant, a question that
+requires searching across many unrelated sections of the documentation could be delegated to a sub-agent whose
+own context fills up with search queries and candidate passages, while the parent agent's context only ever
+receives that sub-agent's final synthesized answer, keeping the parent's own budget stable regardless of how
+much exploration the sub-task needed. This trades an extra model call (latency and cost) for keeping the
+parent's context clean, which is worthwhile specifically when a sub-task's *process* is large but its *result*
+is small.
+
+In its simplest form the sub-agent is a separate call with its own fresh `messages` list, and only its final
+summary text is returned into the parent's history (a real sub-agent would also run its own tool loop inside
+`run_subagent`, and all of that transcript stays local to the function):
+
+[source,python]
+----
+import anthropic
+
+client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+
+def run_subagent(task: str, material: str) -> str:
+    sub_messages = [{  # fresh context: nothing from the parent's history
+        "role": "user",
+        "content": f"<material>\n{material}\n</material>\n\n{task}\n"
+                   "Reply with a summary of at most 150 words that cites the sections you used.",
+    }]
+    response = client.messages.create(model="claude-sonnet-5", max_tokens=400, messages=sub_messages)
+    return response.content[0].text  # only the result leaves the sub-agent
+
+
+parent_history = [{"role": "user", "content": "Which pages explain how retrieval results are ranked?"}]
+summary = run_subagent("Find every passage about ranking retrieval results.", all_candidate_passages_text)
+parent_history.append({"role": "user", "content": f"<subagent_summary>\n{summary}\n</subagent_summary>"})
+----
+
+See the "Sub-agent architectures" section of
+link:https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents[Anthropic -- Effective
+context engineering for AI agents] for when this trade-off pays off.
+
+== Progressive disclosure (skills)
+
+*Progressive disclosure* is the principle that an agent's available capabilities should occupy context in
+proportion to how relevant they are right now, not how many exist in total: a short, always-loaded description
+of each capability, with its full instructions loaded into context only once that capability is actually
+triggered. Anthropic's Agent Skills follow exactly this pattern: a skill's `name` and `description` (roughly
+100 tokens) stay resident so the model can decide whether it applies, while the skill's full body -- its actual
+step-by-step instructions, reference files, and scripts -- is read into context only once the skill is
+triggered, and any bundled scripts run without their code ever entering context at all. This is what lets an
+agent have access to dozens of skills without a proportional context cost: unused skills cost only their
+metadata line, not their full content. The planned *Customizing AI Workflows* sub-section covers writing these
+skill definitions in more depth; for now, the relevant point is that progressive disclosure is context
+engineering applied to an agent's own capability set, the same budgeting discipline as the rest of this page
+applied to "what instructions does the model see" rather than "what documents does it see." The same discipline
+applies to writing the instruction files themselves -- keeping a `CLAUDE.md` or `SKILL.md` direct, structured,
+and scoped to what a given task actually needs rather than exhaustive -- which the ai-catalog project's
+guidance on authoring effective instructions covers in more detail
+(xref:ai-catalog::guides/authoring-effective-instructions.adoc[]).
+
+The skill format makes the split concrete: only the YAML frontmatter of a `SKILL.md` file is loaded up front,
+and the Markdown body below it is read only once the description matches the task:
+
+[source,markdown]
+----
+---
+name: docs-citation-check
+description: Check that a DocsAssistant answer cites real headings from the retrieved pages. Use when reviewing or finalizing an answer.
+---
+
+# Docs citation check
+
+- List every heading the answer cites.
+- Confirm each heading appears verbatim in the retrieved page text.
+- Report any citation that does not match, and suggest the closest real heading.
+----
+
+See the link:https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview[Anthropic Agent Skills
+documentation] for the `SKILL.md` format and its levels of progressive loading.
+
+== Ordering and primacy / recency effects
+
+Where content sits within the assembled context, not just whether it fits the budget, measurably affects how
+well a model uses it. Liu et al. found that model performance on long-context tasks is markedly better when the
+relevant information sits at the very start or the very end of the context than when it is buried in the
+middle -- a *primacy* effect (content early in context) and a *recency* effect (content near the end, closest
+to the actual question) both outperform the middle, with accuracy degrading the deeper into the middle of a
+long context the needed information sits, a pattern commonly called "lost in the middle" (see References). For
+DocsAssistant this has direct, practical consequences for how the assembled context above should be ordered,
+not just sized: retrieved documents should be ranked so the most relevant passages sit closest to the actual
+user question rather than first-retrieved-first-placed; a compacted summary of older conversation should sit
+before, not interleaved with, the most recent (and most relevant) turns; and system instructions that must be
+followed reliably benefit from reinforcement near the end of the context, close to where generation begins,
+rather than relying solely on their position at the very start. Ordering is a free lever in the sense that it
+costs no extra tokens -- it is worth tuning independently of, and in addition to, the budget allocation covered
+earlier on this page.
+
+A small assembly function applies these rules: summary first, retrieved chunks sorted so the highest-scoring
+chunk sits last, then the recent turns, a short reminder of the key instruction, and the question at the very
+end:
+
+[source,python]
+----
+def order_context(summary: str, chunks: list[tuple[float, str]], recent_turns: list[str], question: str) -> str:
+    ranked = sorted(chunks, key=lambda c: c[0])  # ascending: best-scoring chunk ends up closest to the question
+    documents = "\n".join(f"<document score=\"{score:.2f}\">\n{text}\n</document>" for score, text in ranked)
+    return "\n\n".join([
+        f"<conversation_summary>\n{summary}\n</conversation_summary>",
+        f"<documents>\n{documents}\n</documents>",
+        "\n".join(recent_turns),
+        "Answer using only the documents above, and cite the heading you used.",
+        f"Question: {question}",
+    ])
+----
+
+See the link:https://arxiv.org/abs/2307.03172[lost-in-the-middle paper] (References) for the position effects
+this ordering works around.
+
+== Related pages
+
+* xref:ai/llm-foundations/context-windows-and-memory.adoc[]
+* xref:ai/llm-foundations/tokens-and-tokenization.adoc[]
+* xref:ai/llm-foundations/managing-prompts.adoc[]
+* xref:database/vector-rag/prompt-augmentation-and-generation.adoc[]
+
+== References
+
+* link:https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents[Anthropic -- Effective context engineering for AI agents]
+* link:https://arxiv.org/abs/2307.03172[Liu et al., Lost in the Middle: How Language Models Use Long Contexts]
+* link:https://platform.claude.com/docs/en/agents-and-tools/agent-skills/overview[Anthropic -- Agent Skills documentation] (checked 2026-09-28)
