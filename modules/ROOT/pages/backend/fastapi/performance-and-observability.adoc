@@ -1,0 +1,1775 @@
+= Performance & Observability
+:description: Making a FastAPI service fast and visible in production: async correctness, Pydantic serialization, caching with functools.cache and Redis, database indexes and N+1 queries, streaming large responses, profiling, PyPy, Cython and Rust, structured logging with request IDs, Prometheus metrics with Grafana, and OpenTelemetry (native since 0.142.0).
+:keywords: FastAPI, performance, observability, async, event loop, blocking, Pydantic serialization, TypeAdapter, model_validate_json, functools.cache, lru_cache, Redis, cache-aside, Cache-Control, N+1, selectinload, index, EXPLAIN, StreamingResponse, cProfile, pyinstrument, PyPy, Cython, Rust, PyO3, maturin, logging, Uvicorn, uvicorn.access, --log-config, request ID, ContextVar, JSON logs, Prometheus, prometheus-fastapi-instrumentator, PROMETHEUS_MULTIPROC_DIR, Grafana, OpenTelemetry, OTLP, FastAPIInstrumentor, telemetry, tracing
+
+include::partial$fastapi-disclaimer.adoc[]
+
+This page is written against FastAPI 0.142.2 (released 2026-09-30), Pydantic 2.13, Starlette 1.7 and Uvicorn 0.54,
+checked on 2026-10-02. Every Python example on the page was executed on Python 3.13 (with `TestClient`, `httpx`'s ASGI
+transport, or a real Uvicorn process where stated); the Prometheus, Grafana and Docker configuration files and the
+exports to an OpenTelemetry collector are shown but were not run, because they need services that are not part of the
+examples. Timings are from one laptop run and only their relative size matters. The page has two halves for the
+_Bookshelf API_: first how to make it fast (and how to find out what is slow), then how to see what it is doing in
+production with logs, metrics and traces. FastAPI 0.142.0 (2026-09-29) added native OpenTelemetry support, which
+changes the third part of the second half; see <<opentelemetry>>.
+
+[#order]
+== Measure First, Then Fix the Biggest Thing
+
+Most slow services are slow for one reason: a blocked event loop, an N+1 query, a missing index, or a payload that
+is simply too large. Guessing is expensive, so the order of work on this page is the order of work in a real
+project:
+
+[cols="1,2,2",options="header"]
+.Where time usually goes, and where to look
+|===
+| Symptom | Usual cause | Section
+
+| Every request gets slower when one endpoint is busy
+| A blocking call inside `async def` stalls the event loop
+| <<async>>
+
+| High CPU in the process, large JSON responses
+| Serialization or validation done in Python rather than in Pydantic's Rust core
+| <<serialization>>
+
+| The same expensive result is computed again and again
+| No caching, or caching in the wrong layer
+| <<caching>>
+
+| The database is the slowest part of the trace
+| Missing index, N+1 queries, no pagination
+| <<database>>
+
+| Memory grows with response size
+| A big file or export is built in memory
+| <<streaming>>
+
+| You do not know which of the above applies
+| Nothing measures it yet
+| <<profiling>> and, in production, <<observability>>
+|===
+
+Scaling out (several worker processes, several containers) multiplies capacity but does not fix any of those causes;
+the worker options (`fastapi run --workers`, `uvicorn --workers`, one process per container on Kubernetes) are
+covered by the deployment pages of this section and, for the concurrency model underneath, by
+xref:backend/fastapi/async-and-concurrency.adoc[Async & Concurrency].
+
+[#async]
+== Async Correctness
+
+The first rule is in xref:backend/fastapi/async-and-concurrency.adoc[Async & Concurrency]: an `async def` path
+operation runs on the event loop, and anything that blocks it blocks _every_ request in the process. A path operation
+declared with plain `def` is run in a threadpool instead, so a blocking call there only occupies a thread. The example
+below sends ten concurrent requests to four versions of the same 100 ms operation through `httpx`'s ASGI transport:
+
+[source,python]
+----
+import asyncio
+import time
+
+import httpx
+from fastapi import FastAPI
+
+app = FastAPI(title="Bookshelf API")
+
+
+@app.get("/slow-blocking")
+async def slow_blocking() -> dict[str, str]:
+    time.sleep(0.1)  # blocks the event loop: nothing else runs
+    return {"how": "time.sleep inside async def"}
+
+
+@app.get("/slow-await")
+async def slow_await() -> dict[str, str]:
+    await asyncio.sleep(0.1)  # yields to the loop
+    return {"how": "await asyncio.sleep"}
+
+
+@app.get("/slow-offloaded")
+async def slow_offloaded() -> dict[str, str]:
+    await asyncio.to_thread(time.sleep, 0.1)  # blocking call moved to a thread
+    return {"how": "asyncio.to_thread"}
+
+
+@app.get("/slow-def")
+def slow_def() -> dict[str, str]:
+    time.sleep(0.1)  # plain def: FastAPI runs it in the threadpool
+    return {"how": "def runs in the threadpool"}
+
+
+async def burst(path: str, n: int = 10) -> float:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        start = time.perf_counter()
+        responses = await asyncio.gather(*(c.get(path) for _ in range(n)))
+        assert all(r.status_code == 200 for r in responses)
+        return time.perf_counter() - start
+
+
+async def main() -> None:
+    for path in ("/slow-blocking", "/slow-await", "/slow-offloaded", "/slow-def"):
+        print(f"{path:16} 10 concurrent requests: {await burst(path):.2f}s")
+
+
+asyncio.run(main())
+----
+Source: https://fastapi.tiangolo.com/async/[FastAPI: Concurrency and async / await]
+
+[source,text]
+----
+/slow-blocking   10 concurrent requests: 1.08s
+/slow-await      10 concurrent requests: 0.10s
+/slow-offloaded  10 concurrent requests: 0.11s
+/slow-def        10 concurrent requests: 0.13s
+----
+
+The blocking `async def` took ten times as long, because the ten requests ran one after the other; the other three
+overlapped. The checklist that follows from this:
+
+* Inside `async def`, use an async library (`httpx.AsyncClient`, an async database driver, `redis.asyncio`) and
+  `await` it. This is the fastest option.
+* If a library only has a blocking API, either declare the path operation with `def` or move the single call into a
+  thread with `asyncio.to_thread()` (as `/slow-offloaded` does).
+* CPU-bound work (image processing, large data transformations, password hashing) is not helped by threads under the
+  global interpreter lock; move it to a process pool or a job queue, as the async page explains.
+* Do not put `time.sleep()`, a synchronous HTTP client, or a synchronous database session in an `async def` path
+  operation or in an `async def` dependency. A synchronous call in a dependency declared with `def` is fine.
+* A forgotten `await` does not block, it silently skips the work and returns a coroutine object; the async page shows
+  the symptom.
+* The threadpool is finite (40 threads by default), so a `def` endpoint that is slow because of a slow remote service
+  can still exhaust it under load; that page shows how to tune the limit.
+
+[#serialization]
+== Pydantic Serialization
+
+FastAPI validates what you return and turns it into JSON using the return type annotation or `response_model`, and
+since 0.130.0 (2026-02-22) that JSON is produced directly by Pydantic's Rust core, without going through Python
+objects first. The FastAPI documentation says so itself: Pydantic is written in Rust, "so it will be much faster".
+The example serves 5000 books three ways and measures each:
+
+[source,python]
+----
+import timeit
+from typing import Annotated
+
+from fastapi import FastAPI, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, TypeAdapter
+
+app = FastAPI(title="Bookshelf API")
+
+
+class BookPublic(BaseModel):
+    id: int
+    title: str
+    isbn: str
+    pages: Annotated[int, Field(ge=1)]
+    authors: list[str]
+
+
+ROWS = [
+    {"id": i, "title": f"Book {i}", "isbn": f"978-{i:010d}", "pages": 300, "authors": ["A. Writer", "B. Author"]}
+    for i in range(5000)
+]
+BOOKS = [BookPublic(**row) for row in ROWS]
+books_adapter = TypeAdapter(list[BookPublic])  # built once, reused for every request
+
+
+@app.get("/typed")
+async def typed() -> list[BookPublic]:
+    # Return annotation: validated, filtered and serialized to JSON bytes by Pydantic's Rust core.
+    return BOOKS
+
+
+@app.get("/legacy")
+async def legacy() -> JSONResponse:
+    # The older pattern: convert to Python primitives first, then json.dumps in Python.
+    return JSONResponse(content=jsonable_encoder(BOOKS))
+
+
+@app.get("/prebuilt")
+async def prebuilt() -> Response:
+    # Bypasses FastAPI's response validation: you promise the data is already correct.
+    return Response(content=books_adapter.dump_json(BOOKS), media_type="application/json")
+
+
+client = TestClient(app)
+sizes = set()
+for path in ("/typed", "/legacy", "/prebuilt"):
+    r = client.get(path)
+    assert r.status_code == 200 and len(r.json()) == 5000
+    sizes.add(len(r.content))
+    t = timeit.timeit(lambda: client.get(path), number=20) / 20
+    print(f"{path:10} {t * 1000:7.1f} ms per request (5000 books)")
+print("same body size on all three:", len(sizes) == 1)
+----
+Source: https://fastapi.tiangolo.com/tutorial/response-model/[FastAPI: Response Model - Return Type]
+
+[source,text]
+----
+/typed         2.0 ms per request (5000 books)
+/legacy       28.4 ms per request (5000 books)
+/prebuilt      1.8 ms per request (5000 books)
+same body size on all three: True
+----
+
+The older pattern, converting with `jsonable_encoder` and returning a `JSONResponse`, produced the same bytes about
+fourteen times slower, because every field was converted to Python primitives and then serialized by Python's `json`
+module. The return annotation is both the fast path and the safe one: it also filters out any field that is not in
+`BookPublic`, which is why the `/prebuilt` shortcut (serializing yourself and returning a `Response`) is only worth it
+when you have measured a need and can guarantee the data is already right. The details of return types and
+`response_model` are on xref:backend/fastapi/response-models-and-return-types.adoc[Response Models & Return Types], and
+the deprecation of `ORJSONResponse` and `UJSONResponse` (0.131.0) on
+xref:backend/fastapi/custom-responses.adoc[Custom Responses]: there is no longer a reason to install a faster JSON
+library for FastAPI responses.
+
+The Pydantic documentation has a list of performance tips for your own models. Four of them matter most in an API,
+and the example below measures each one:
+
+[source,python]
+----
+import json
+import timeit
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, Field, TypeAdapter
+from typing_extensions import TypedDict
+
+
+class Review(BaseModel):
+    book_id: int
+    rating: Annotated[int, Field(ge=1, le=5)]
+    text: str
+
+
+PAYLOAD = json.dumps({"book_id": 1, "rating": 5, "text": "Great"})
+N = 50_000
+
+# 1. Parse JSON inside Pydantic instead of json.loads + validate.
+two_step = timeit.timeit(lambda: Review.model_validate(json.loads(PAYLOAD)), number=N)
+one_step = timeit.timeit(lambda: Review.model_validate_json(PAYLOAD), number=N)
+print(f"model_validate_json is {two_step / one_step:.1f}x the speed of json.loads + model_validate")
+
+
+# 2. Build a TypeAdapter once, not inside the function that uses it.
+def bad(raw: list[int]) -> list[int]:
+    return TypeAdapter(list[int]).validate_python(raw)  # builds a validator on every call
+
+
+ADAPTER = TypeAdapter(list[int])
+
+
+def good(raw: list[int]) -> list[int]:
+    return ADAPTER.validate_python(raw)
+
+
+rebuilt = timeit.timeit(lambda: bad([1, 2, 3]), number=2000)
+reused = timeit.timeit(lambda: good([1, 2, 3]), number=2000)
+print(f"reusing the TypeAdapter is {rebuilt / reused:.0f}x faster")
+
+
+# 3. Nested TypedDict instead of nested models, for data you only read and forward.
+class AuthorDict(TypedDict):
+    name: str
+    born: int
+
+
+class BookDict(TypedDict):
+    title: str
+    author: AuthorDict
+
+
+class Author(BaseModel):
+    name: str
+    born: int
+
+
+class Book(BaseModel):
+    title: str
+    author: Author
+
+
+raw = {"title": "Dune", "author": {"name": "Frank Herbert", "born": 1920}}
+book_adapter = TypeAdapter(BookDict)
+t_dict = timeit.timeit(lambda: book_adapter.validate_python(raw), number=N)
+t_model = timeit.timeit(lambda: Book.model_validate(raw), number=N)
+print(f"nested models take {t_model / t_dict:.1f}x as long as TypedDict")
+
+
+# 4. A tagged (discriminated) union checks one field instead of trying every member.
+class Paperback(BaseModel):
+    kind: Literal["paperback"] = "paperback"
+    pages: int
+
+
+class Ebook(BaseModel):
+    kind: Literal["ebook"] = "ebook"
+    size_mb: float
+
+
+class Audiobook(BaseModel):
+    kind: Literal["audiobook"] = "audiobook"
+    minutes: int
+
+
+Plain = TypeAdapter(Paperback | Ebook | Audiobook)
+Tagged = TypeAdapter(Annotated[Paperback | Ebook | Audiobook, Field(discriminator="kind")])
+item = {"kind": "audiobook", "minutes": 600}
+t_plain = timeit.timeit(lambda: Plain.validate_python(item), number=N)
+t_tagged = timeit.timeit(lambda: Tagged.validate_python(item), number=N)
+print(f"plain union takes {t_plain / t_tagged:.1f}x as long as the tagged union")
+----
+Source: https://pydantic.dev/docs/validation/latest/concepts/performance/[Pydantic: Performance tips]
+
+[source,text]
+----
+model_validate_json is 1.7x the speed of json.loads + model_validate
+reusing the TypeAdapter is 64x faster
+nested models take 2.3x as long as TypedDict
+plain union takes 2.0x as long as the tagged union
+----
+
+[cols="2,3",options="header"]
+.Pydantic performance tips for API code
+|===
+| Tip | Why
+
+| `model_validate_json()` for raw JSON
+| The JSON is parsed and validated in one pass inside Pydantic. The documentation notes a few cases (models with
+`before` or `wrap` validators) where the two-step form can be faster, so measure if you use those.
+
+| Create a `TypeAdapter` once
+| Each instantiation builds a new validator and serializer. Put it at module level, never inside a function or a path
+operation.
+
+| `TypedDict` instead of nested models
+| For structures you only read and forward, a `TypedDict` avoids creating model instances. The documentation's own
+benchmark gives about 2.5x. Use `typing_extensions.TypedDict` on Python older than 3.12.
+
+| Tagged (discriminated) unions
+| `Field(discriminator="kind")` makes Pydantic read one field instead of trying every member in turn.
+
+| `list` and `dict` instead of `Sequence` and `Mapping`
+| The abstract types force extra `isinstance` checks and attempts at several concrete types.
+
+| Avoid wrap validators
+| They need the data materialized in Python during validation.
+
+| `Annotated[list[T], FailFast()]`
+| Stops at the first invalid item; you trade the full list of errors for speed.
+|===
+
+Other serialization habits that keep responses cheap: return only the fields clients use (a separate public model),
+paginate lists instead of returning everything (see <<database>>), and do not call `.model_dump()` and then return the
+dict, which throws the fast path away. The Pydantic details are on
+xref:backend/fastapi/pydantic-v2-essentials.adoc[Pydantic v2 Essentials].
+
+[#caching]
+== Caching
+
+The fastest request is the one that does not repeat work. There are three places to cache, with different rules about
+who may see the result and how it is invalidated.
+
+[cols="1,2,2",options="header"]
+.Where to cache
+|===
+| Layer | Good for | Watch out for
+
+| In process (`functools.cache`, `lru_cache`)
+| Pure computations, parsed configuration, small reference data
+| Every worker process has its own copy; no expiry; never cache anything user-specific without the user in the key
+
+| Shared (Redis)
+| Results that are expensive to compute and the same for many users: rankings, aggregations, external API replies
+| Invalidation on write; a miss storm when a hot key expires
+
+| HTTP (`Cache-Control`, `ETag`)
+| Responses that browsers, proxies and CDNs may reuse
+| Anything personalised must not be marked `public`
+|===
+
+[#cache-functools]
+=== `functools.cache` and `lru_cache`
+
+`functools.cache` memoizes a synchronous function; `lru_cache(maxsize=...)` does the same with a bound on the number
+of entries (and plain `@lru_cache` as used in the FastAPI settings recipe). The Bookshelf API below caches the genre
+list per language, injects a cached settings object, and sets a `Cache-Control` header for client-side caching. The
+last block shows the one mistake that cannot be made with `async def`:
+
+[source,python]
+----
+import asyncio
+import time
+from functools import cache, lru_cache
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, Response
+from fastapi.testclient import TestClient
+from pydantic_settings import BaseSettings
+
+app = FastAPI(title="Bookshelf API")
+calls = {"genres": 0, "settings": 0}
+
+
+class Settings(BaseSettings):
+    page_size: int = 20
+
+
+@lru_cache  # one Settings object per process (see the settings page)
+def get_settings() -> Settings:
+    calls["settings"] += 1
+    return Settings()
+
+
+@cache  # unbounded: only for functions with a small, fixed set of inputs
+def genre_slugs(language: str) -> tuple[str, ...]:
+    calls["genres"] += 1
+    time.sleep(0.05)  # stands in for an expensive computation
+    return ("fiction", "poetry") if language == "en" else ("ficcion", "poesia")
+
+
+@app.get("/genres")
+async def genres(
+    settings: Annotated[Settings, Depends(get_settings)], language: str = "en"
+) -> dict[str, object]:
+    return {"genres": genre_slugs(language)[: settings.page_size]}
+
+
+@app.get("/catalog-version")
+async def catalog_version(response: Response) -> dict[str, int]:
+    # Client-side caching: browsers and proxies may reuse this for 60 seconds.
+    response.headers["Cache-Control"] = "public, max-age=60"
+    return {"version": 7}
+
+
+client = TestClient(app)
+for _ in range(3):
+    client.get("/genres?language=en")
+client.get("/genres?language=es")
+print("expensive calls:", calls)
+print(genre_slugs.cache_info())
+genre_slugs.cache_clear()  # invalidate, for example after the data changed
+print(client.get("/catalog-version").headers["cache-control"])
+
+
+# The pitfall: caching a coroutine function stores the coroutine OBJECT, not its result.
+@cache
+async def load_title(isbn: str) -> str:
+    return f"title of {isbn}"
+
+
+async def main() -> None:
+    print(await load_title("978-0"))
+    try:
+        print(await load_title("978-0"))
+    except RuntimeError as exc:
+        print("second call:", exc)
+
+
+asyncio.run(main())
+----
+Source: https://docs.python.org/3/library/functools.html#functools.cache[Python: functools.cache]
+
+[source,text]
+----
+expensive calls: {'genres': 2, 'settings': 1}
+CacheInfo(hits=2, misses=2, maxsize=None, currsize=2)
+public, max-age=60
+title of 978-0
+second call: cannot reuse already awaited coroutine
+----
+
+Four requests produced only two expensive calls (one per language), and `cache_info()` shows the hits; `cache_clear()`
+is the invalidation switch. Applied to a coroutine function, `@cache` stores the coroutine object instead of its
+result, so the second `await` fails: use a small async cache (a dictionary guarded by a lock, or Redis) for async
+loaders. The cache also holds its arguments alive and, with `cache`, never evicts, so use `lru_cache(maxsize=...)`
+whenever the key space is open-ended. The settings pattern with `@lru_cache` is explained on
+xref:backend/fastapi/settings-lifespan-and-background-tasks.adoc[Settings, Lifespan & Background Tasks].
+
+[#cache-redis]
+=== Redis
+
+When several processes or machines must share a cache, or entries must expire, use Redis. The full cache-aside
+walk-through, with a lifespan-managed client, hit and miss headers and invalidation on write, is on
+xref:backend/fastapi/nosql-and-other-data-stores.adoc[NoSQL & Other Data Stores]; the data-structure side is on this
+site under xref:database/redis/use-cases-and-patterns.adoc[Redis Use Cases and Patterns] and
+xref:database/redis/architecture-keyspace-and-eviction.adoc[Architecture, Keyspace and Eviction] (what happens when
+the memory limit is reached). The example below adds the one piece that page leaves out, protection against a burst of
+identical misses: a per-key lock inside the process makes eight simultaneous requests run the expensive loader once
+(it was executed with `fakeredis`, which implements the same async client API):
+
+[source,python]
+----
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Annotated, TypedDict
+
+from fakeredis import FakeAsyncRedis  # stands in for redis.asyncio.Redis in this run
+from fastapi import Depends, FastAPI, Request
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+from redis import asyncio as redis
+
+
+class State(TypedDict):
+    redis: redis.Redis
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[State]:
+    # Real deployment: redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    client = FakeAsyncRedis(decode_responses=True)
+    yield {"redis": client}
+    await client.aclose()
+
+
+app = FastAPI(title="Bookshelf API", lifespan=lifespan)
+
+
+def get_redis(request: Request) -> redis.Redis:
+    return request.state.redis
+
+
+Redis = Annotated[redis.Redis, Depends(get_redis)]
+_locks: dict[str, asyncio.Lock] = {}
+loads = 0
+
+
+class TopBooks(BaseModel):
+    titles: list[str]
+
+
+async def get_or_load(
+    r: redis.Redis, key: str, ttl: int, loader: Callable[[], Awaitable[TopBooks]]
+) -> TopBooks:
+    cached = await r.get(key)
+    if cached is not None:
+        return TopBooks.model_validate_json(cached)
+    # One in-process lock per key: a burst of identical misses runs the loader once.
+    async with _locks.setdefault(key, asyncio.Lock()):
+        cached = await r.get(key)  # somebody may have filled it while we waited
+        if cached is not None:
+            return TopBooks.model_validate_json(cached)
+        value = await loader()
+        await r.set(key, value.model_dump_json(), ex=ttl)
+        return value
+
+
+async def expensive_ranking() -> TopBooks:
+    global loads
+    loads += 1
+    await asyncio.sleep(0.05)  # a slow aggregation query
+    return TopBooks(titles=["Dune", "Emma"])
+
+
+@app.get("/books/top")
+async def top_books(r: Redis) -> TopBooks:
+    return await get_or_load(r, "top-books:v1", 60, expensive_ranking)
+
+
+with TestClient(app) as client:
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        bodies = list(pool.map(lambda _: client.get("/books/top").json(), range(8)))
+    print(bodies[0], all(b == bodies[0] for b in bodies), "loader calls:", loads)
+----
+Source: https://redis.io/docs/latest/develop/clients/redis-py/[Redis: Python client (redis-py)]
+
+[source,text]
+----
+{'titles': ['Dune', 'Emma']} True loader calls: 1
+----
+
+The lock only coordinates requests inside one process; with several workers each may load once, which is usually
+acceptable. The `ex=ttl` argument gives every entry an expiry so stale data cannot live forever, and the key carries a
+version (`:v1`) so a change of the cached shape can be deployed by bumping it. Cache only data that is the same for
+every caller.
+
+[#database]
+== Database: Indexes and N+1
+
+In most APIs the database is the slowest span of a trace. Two mistakes cause most of that.
+
+[#n-plus-one]
+=== N+1 Queries
+
+Reading a list of books and then touching a relationship for each one runs one query for the list plus one query per
+book. The code looks innocent, because the extra queries hide behind attribute access. The example counts the SQL
+statements for the same endpoint written both ways, using a SQLAlchemy event, and finishes with the query plan SQLite
+chooses for a lookup of reviews by book:
+
+[source,python]
+----
+from typing import Annotated
+
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+from sqlalchemy import event, text
+from sqlalchemy.orm import selectinload
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Field, Relationship, Session, SQLModel, create_engine, select
+
+
+class Book(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    title: str
+    reviews: list["Review"] = Relationship(back_populates="book")
+
+
+class Review(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    # index=True creates an index on the foreign key; join and filter columns need one.
+    book_id: int = Field(foreign_key="book.id", index=True)
+    rating: int
+    book: Book | None = Relationship(back_populates="reviews")
+
+
+engine = create_engine(
+    "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+)
+statements: list[str] = []
+
+
+@event.listens_for(engine, "before_cursor_execute")
+def count_statement(conn, cursor, statement, parameters, context, executemany):
+    statements.append(statement)
+
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+
+SessionDep = Annotated[Session, Depends(get_session)]
+app = FastAPI(title="Bookshelf API")
+
+
+class BookSummary(BaseModel):
+    title: str
+    review_count: int
+
+
+@app.get("/books/n-plus-one")
+def n_plus_one(session: SessionDep) -> list[BookSummary]:
+    books = session.exec(select(Book)).all()  # 1 query ...
+    return [BookSummary(title=b.title, review_count=len(b.reviews)) for b in books]  # ... + 1 per book
+
+
+@app.get("/books/eager")
+def eager(session: SessionDep) -> list[BookSummary]:
+    books = session.exec(select(Book).options(selectinload(Book.reviews))).all()  # 2 queries in total
+    return [BookSummary(title=b.title, review_count=len(b.reviews)) for b in books]
+
+
+SQLModel.metadata.create_all(engine)
+with Session(engine) as s:
+    for i in range(1, 51):
+        s.add(Book(title=f"Book {i}"))
+    s.flush()
+    for i in range(1, 51):
+        s.add(Review(book_id=i, rating=5))
+    s.commit()
+
+client = TestClient(app)
+for path in ("/books/n-plus-one", "/books/eager"):
+    statements.clear()
+    r = client.get(path)
+    selects = [q for q in statements if q.lstrip().startswith("SELECT")]
+    print(f"{path:18} {r.status_code} {len(r.json())} books -> {len(selects)} SELECT statements")
+
+QUERY = "EXPLAIN QUERY PLAN SELECT * FROM review WHERE book_id = 7"
+with engine.connect() as conn:
+    conn.exec_driver_sql("CREATE TABLE review_noindex AS SELECT * FROM review")
+    scan = conn.exec_driver_sql(QUERY.replace("review", "review_noindex")).all()
+    print("without index:", scan[0][-1])
+    print("with index:   ", conn.exec_driver_sql(QUERY).all()[0][-1])
+----
+Source: https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html[SQLAlchemy: Relationship Loading Techniques]
+
+[source,text]
+----
+/books/n-plus-one  200 50 books -> 51 SELECT statements
+/books/eager       200 50 books -> 2 SELECT statements
+without index: SCAN review_noindex
+with index:    SEARCH review USING INDEX ix_review_book_id (book_id=?)
+----
+
+`selectinload(Book.reviews)` loads all reviews of all returned books with one extra query, which is why fifty books cost
+two statements instead of fifty-one. Other strategies (`joinedload`, `subqueryload`) trade the number of queries for
+the size of each; the SQLAlchemy page explains when each fits. With an async session lazy loading is not allowed at
+all (it raises an error), which turns the N+1 into a visible failure; the async variant and the pagination used with
+it are on xref:backend/fastapi/sql-databases-with-sqlmodel.adoc[SQL Databases with SQLModel]. The same problem on the
+JVM is described on xref:backend/hibernate/fetching-and-n-plus-1.adoc[Fetching and the N+1 Problem]. A cheap safeguard
+is to assert the number of statements in a test, as the `before_cursor_execute` listener above does.
+
+[#indexes]
+=== Indexes
+
+An index lets the database find rows without reading the whole table. Index the columns you filter, join and sort by:
+foreign keys (`Field(foreign_key=..., index=True)` above), lookup fields such as an ISBN (`unique=True` creates a
+unique index), and the columns of a frequent `WHERE ... ORDER BY`. `EXPLAIN` (spelled `EXPLAIN QUERY PLAN` in SQLite)
+shows the difference: `SCAN` reads the whole table, `SEARCH ... USING INDEX` does not. Indexes are not free: every
+write updates them and they take space, so add them for measured queries, not for every column. Two further habits
+belong to the same family: never return an unbounded list (use `limit` and `offset` or keyset pagination, see the
+SQLModel page) and select only the columns the endpoint returns. For the database side, see
+xref:database/sql/ddl.adoc[SQL DDL] for creating indexes.
+
+[#streaming]
+== Streaming Large Responses
+
+Building a large export in memory costs memory proportional to the response and delays the first byte until the last
+row is ready. A `StreamingResponse` over a generator sends it piece by piece. The example below exports 100000 rows as
+CSV both ways and measures the peak memory of the server side by calling the ASGI app directly and discarding each
+message as it is sent (the test client would otherwise collect the body itself and hide the difference):
+
+[source,python]
+----
+import asyncio
+import csv
+import io
+import tracemalloc
+from collections.abc import Iterator
+
+from fastapi import FastAPI, Response
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+
+app = FastAPI(title="Bookshelf API")
+ROWS = 100_000
+
+
+def book_rows() -> Iterator[tuple[int, str, int]]:
+    # Stands in for a database cursor that yields rows in batches.
+    for i in range(ROWS):
+        yield i, f"Book {i}", 300
+
+
+@app.get("/export/buffered")
+def export_buffered() -> Response:
+    buffer = io.StringIO()
+    csv.writer(buffer).writerows(book_rows())  # the whole file exists in memory
+    return Response(buffer.getvalue(), media_type="text/csv")
+
+
+@app.get("/export/streamed")
+def export_streamed() -> StreamingResponse:
+    def generate() -> Iterator[str]:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        for number, row in enumerate(book_rows(), start=1):
+            writer.writerow(row)
+            if number % 1000 == 0:  # one chunk per 1000 rows, not one per row
+                yield buffer.getvalue()
+                buffer.seek(0)
+                buffer.truncate(0)
+        yield buffer.getvalue()  # the remainder
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="books.csv"'},
+    )
+
+
+async def drive(path: str) -> tuple[int, int]:
+    """Call the ASGI app directly and discard each chunk as it is sent."""
+    scope = {
+        "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+        "path": path, "raw_path": path.encode(), "query_string": b"", "headers": [],
+        "scheme": "http", "server": ("test", 80), "client": ("test", 1), "root_path": "",
+    }
+    sent = chunks = 0
+
+    first = True
+
+    async def receive():
+        nonlocal first
+        if first:
+            first = False
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await asyncio.Event().wait()  # no disconnect ever arrives
+
+    async def send(message):
+        nonlocal sent, chunks
+        if message["type"] == "http.response.body":
+            sent += len(message.get("body", b""))
+            chunks += 1
+
+    await app(scope, receive, send)
+    return sent, chunks
+
+
+async def main() -> None:
+    for path in ("/export/buffered", "/export/streamed"):
+        tracemalloc.start()
+        sent, chunks = await drive(path)
+        peak = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        print(f"{path:18} {sent / 1e6:.1f} MB in {chunks:6} body messages, peak memory {peak / 1e6:.2f} MB")
+
+
+asyncio.run(main())
+
+with TestClient(app) as client:  # and the download still works end to end
+    r = client.get("/export/streamed")
+    print(r.status_code, r.headers["content-disposition"], r.text.splitlines()[:2])
+----
+Source: https://fastapi.tiangolo.com/advanced/custom-response/#streamingresponse[FastAPI: Custom Response - StreamingResponse]
+
+[source,text]
+----
+/export/buffered   2.2 MB in      1 body messages, peak memory 7.96 MB
+/export/streamed   2.2 MB in    102 body messages, peak memory 0.30 MB
+200 attachment; filename="books.csv" ['0,Book 0,300', '1,Book 1,300']
+----
+
+The streamed version used a twentieth of the memory, independent of the number of rows. Three details matter: the
+generator is a plain function, so FastAPI iterates it in the threadpool and a blocking database cursor does not block the
+loop; the chunks are batches of 1000 rows rather than one row each (a message per row wastes time on overhead); and
+there is no `Content-Length`, so progress bars cannot show a percentage. For a file that already exists on disk,
+`FileResponse` is simpler, and for JSON Lines and Server-Sent Events FastAPI can stream directly from a path operation
+with `yield`; all of that, and the proxy buffering that defeats streaming, is on
+xref:backend/fastapi/streaming-json-lines-and-sse.adoc[Streaming, JSON Lines & SSE].
+
+[#profiling]
+== Profiling
+
+Profiling answers "where does the time go in this code". Use the standard library's `cProfile` for a deterministic
+count of calls and a sampling profiler such as `pyinstrument` for a readable call tree. The example below profiles an
+endpoint that builds a lookup table, with `cProfile` around an in-process call and with `pyinstrument` as a
+middleware that is switched on by a `?profile` query parameter:
+
+[source,python]
+----
+import asyncio
+import cProfile
+import io
+import pstats
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+from pyinstrument import Profiler
+
+app = FastAPI(title="Bookshelf API")
+PROFILING = True  # in a real app: a setting that is off in production
+
+
+def slugify(title: str) -> str:
+    return "-".join(part.lower() for part in title.split())
+
+
+def build_index(n: int) -> dict[str, int]:
+    return {slugify(f"Book number {i}"): i for i in range(n)}
+
+
+@app.get("/books/index")
+async def books_index() -> dict[str, int]:
+    return {"entries": len(build_index(50_000))}
+
+
+if PROFILING:
+
+    @app.middleware("http")
+    async def profile_request(request: Request, call_next):
+        if "profile" not in request.query_params:
+            return await call_next(request)
+        profiler = Profiler(async_mode="enabled")
+        profiler.start()
+        await call_next(request)
+        profiler.stop()
+        return PlainTextResponse(profiler.output_text(unicode=False, color=False))
+
+
+async def main() -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. cProfile: deterministic, standard library, profiles the current thread.
+        pr = cProfile.Profile()
+        pr.enable()
+        await client.get("/books/index")
+        pr.disable()
+        out = io.StringIO()
+        pstats.Stats(pr, stream=out).strip_dirs().sort_stats("tottime").print_stats("slugify|build_index")
+        print("\n".join(out.getvalue().splitlines()[:12]))
+
+        # 2. pyinstrument: sampling, as a switchable middleware (async path operations only).
+        report = (await client.get("/books/index?profile=1")).text
+        print("\n".join(line for line in report.splitlines() if "build_index" in line or "slugify" in line or "Duration" in line))
+
+
+asyncio.run(main())
+----
+Source: https://docs.python.org/3/library/profile.html[Python: The Python Profilers]
+
+[source,text]
+----
+         513041 function calls (512694 primitive calls) in 0.076 seconds
+
+   Ordered by: internal time
+   List reduced from 843 to 2 due to restriction <'slugify|build_index'>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+    50000    0.010    0.000    0.049    0.000 e7_profile.py:15(slugify)
+        1    0.007    0.007    0.056    0.056 e7_profile.py:19(build_index)
+
+
+ /_//_/// /_\ / //_// / //_'/ //     Duration: 0.054     CPU time: 0.054
+|           `- 0.053 build_index  e7_profile.py:19
+|              |- 0.048 slugify  e7_profile.py:15
+----
+Source: https://pyinstrument.readthedocs.io/en/latest/guide.html[pyinstrument: User guide]
+
+Both profilers point at `slugify`, called 50000 times. Things to know:
+
+* `cProfile` profiles the thread it runs in. `TestClient` runs the application in a separate thread, which is why the
+  example calls the app in-process with the ASGI transport instead.
+* The `pyinstrument` guide states that this middleware approach profiles only `async def` path operations, because a
+  `def` operation runs in another thread. For those, profile the function directly.
+* A profiling endpoint is a denial-of-service lever and leaks code structure; enable it only through a setting that
+  is off in production, as the `PROFILING` constant stands for above.
+* `tracemalloc` from the standard library (used in <<streaming>>) answers the memory version of the same question.
+* Profile with realistic data volumes: a profile of three rows says little about three million.
+
+For a distributed picture across services, traces (see <<opentelemetry>>) show the same hot spots in production.
+
+[#native-code]
+== PyPy, Cython and Rust Extensions
+
+When a profile shows one pure-Python function dominating a CPU-bound endpoint and no algorithmic improvement is
+left, there are three ways to run Python code faster, in increasing order of effort. This is a brief orientation, not a
+guide:
+
+* *PyPy* is an alternative interpreter with a just-in-time compiler that speeds up long-running pure-Python code
+  without code changes. It cannot load every compiled extension, so check that each of your dependencies (Pydantic's
+  Rust core, the database driver, the JSON and cryptography libraries) supports it before choosing it; it was not run
+  for this page.
+* *Cython* compiles Python-like code, with optional C type declarations, to a C extension module you import as usual.
+* *Rust* extensions are written with PyO3 (Rust bindings for Python) and built and published with maturin; the result
+  is imported like any other module. Pydantic's validation and serialization core is itself written in Rust, as the
+  FastAPI documentation notes, which is why the earlier sections can stay in Python.
+
+The Cython example below compiles an ISBN-13 check-digit function and calls it from an endpoint. The build command is
+`python setup.py build_ext --inplace`:
+
+[source,python]
+.isbn_fast.pyx
+----
+# cython: language_level=3
+def isbn13_valid(str digits):
+    cdef int total = 0
+    cdef int i
+    cdef int d
+    if len(digits) != 13 or not digits.isdigit():
+        return False
+    for i in range(13):
+        d = ord(digits[i]) - 48
+        total += d * (1 if i % 2 == 0 else 3)
+    return total % 10 == 0
+----
+Source: https://cython.readthedocs.io/en/stable/src/quickstart/build.html[Cython: Building Cython code]
+
+[source,python]
+.setup.py
+----
+from Cython.Build import cythonize
+from setuptools import setup
+
+setup(ext_modules=cythonize("isbn_fast.pyx"))
+----
+Source: https://cython.readthedocs.io/en/stable/src/quickstart/build.html[Cython: Building Cython code]
+
+[source,python]
+.main.py
+----
+import timeit
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+import isbn_fast  # compiled with: python setup.py build_ext --inplace
+
+app = FastAPI(title="Bookshelf API")
+
+
+def isbn13_valid_py(digits: str) -> bool:
+    if len(digits) != 13 or not digits.isdigit():
+        return False
+    total = sum(int(d) * (1 if i % 2 == 0 else 3) for i, d in enumerate(digits))
+    return total % 10 == 0
+
+
+@app.get("/isbn/{digits}/valid")
+async def isbn_valid(digits: str) -> dict[str, bool]:
+    return {"valid": isbn_fast.isbn13_valid(digits)}
+
+
+client = TestClient(app)
+print(client.get("/isbn/9780306406157/valid").json(), client.get("/isbn/9780306406158/valid").json())
+py = timeit.timeit(lambda: isbn13_valid_py("9780306406157"), number=200_000)
+cy = timeit.timeit(lambda: isbn_fast.isbn13_valid("9780306406157"), number=200_000)
+print(f"pure Python {py:.3f}s, Cython {cy:.3f}s for 200000 calls ({py / cy:.1f}x)")
+----
+Source: https://cython.readthedocs.io/en/stable/src/quickstart/build.html[Cython: Building Cython code]
+
+[source,text]
+----
+{'valid': True} {'valid': False}
+pure Python 0.188s, Cython 0.008s for 200000 calls (24.2x)
+----
+
+The compiled function was 24 times faster on this micro-benchmark. Two caveats keep this in perspective. First, it
+changes the build: you now ship wheels per platform. Second, the whole win disappeared if the function were not the
+bottleneck, which is why <<profiling>> comes first. Reach for these tools last, after the fixes in the earlier sections
+and after considering scaling out with more processes.
+
+[#observability]
+== Observability: Logs, Metrics and Traces
+
+Observability is being able to ask a running service what it is doing without redeploying it. It rests on three
+kinds of signal: logs (what happened, as events), metrics (how much and how fast, as numbers aggregated over time)
+and traces (the path of one request through the code and across services). The following sections add each one to
+the _Bookshelf API_.
+
+[mermaid]
+....
+flowchart LR
+  app["Bookshelf API (FastAPI)"]
+  stdout["stdout: JSON log lines"]
+  metrics["GET /metrics"]
+  otlp["OTLP over HTTP"]
+  logs["Log collector or platform"]
+  prom["Prometheus"]
+  graf["Grafana"]
+  coll["OpenTelemetry Collector or monitoring service"]
+  app --> stdout --> logs
+  app --> metrics
+  prom -->|"scrapes every 15 s"| metrics
+  prom --> graf
+  app --> otlp --> coll
+  coll --> graf
+....
+
+Logs leave through standard output, metrics are _pulled_ by Prometheus from an HTTP endpoint, and traces are _pushed_ by
+the application over OTLP, the OpenTelemetry protocol. A request ID ties the three together.
+
+[#logging]
+== Structured Logging
+
+Uvicorn configures three loggers: `uvicorn` (the parent), `uvicorn.error` (server lifecycle messages such as startup
+and shutdown, despite the name) and `uvicorn.access` (one line per request). The server options that affect them are
+documented on the Uvicorn settings page:
+
+[cols="1,2",options="header"]
+.Uvicorn logging options
+|===
+| Option | Effect
+
+| `--log-level`
+| Log level, one of `critical`, `error`, `warning`, `info` (default), `debug`, `trace`.
+
+| `--no-access-log`
+| Disables only the access log, leaving the level alone.
+
+| `--log-config`
+| Path to a logging configuration, either a `dictConfig()` file in `.json` or `.yaml` format or any other format
+read by `fileConfig()`. YAML needs PyYAML.
+
+| `--use-colors` / `--no-use-colors`
+| Colored output; ignored when `--log-config` is used.
+|===
+
+The `fastapi run` command (fastapi-cli 0.0.32) lists `--host`, `--port`, `--workers`, `--proxy-headers` and a few more,
+but none of the logging options above, so for a custom logging configuration run Uvicorn directly or configure
+`logging` in your application's start-up code.
+
+A plain-text log line cannot be filtered or aggregated reliably, so production services log one JSON object per line
+and attach a request ID to every line. The Uvicorn access line has no place for that ID, so the application writes its own
+access line from a middleware and the Uvicorn access logger is quietened. The request ID middleware must be pure ASGI
+and use a `ContextVar`, for the reasons explained on
+xref:backend/fastapi/middleware-cors-and-proxies.adoc#asgi-middleware[Middleware, CORS & Proxies]. The first file holds
+the pieces:
+
+[source,python]
+.observability.py
+----
+import json
+import logging
+import time
+import uuid
+from contextvars import ContextVar
+from datetime import datetime, timezone
+
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+request_id_var: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class RequestIdFilter(logging.Filter):
+    """Copies the current request ID onto every record, whichever logger emitted it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get()
+        return True
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "time": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": getattr(record, "request_id", "-"),
+        }
+        for key in ("method", "path", "status", "duration_ms"):
+            if hasattr(record, key):
+                payload[key] = getattr(record, key)
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload)
+
+
+access_logger = logging.getLogger("bookshelf.access")
+
+
+class RequestLogMiddleware:
+    """Pure ASGI: assigns the request ID and writes one structured access line per request."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_id = Headers(scope=scope).get("x-request-id") or uuid.uuid4().hex
+        token = request_id_var.set(request_id)
+        status = 500
+        start = time.perf_counter()
+
+        async def send_wrapper(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                MutableHeaders(scope=message)["X-Request-ID"] = request_id
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            access_logger.info(
+                "request finished",
+                extra={
+                    "method": scope["method"],
+                    "path": scope["path"],  # the path, not the query string: it may hold secrets
+                    "status": status,
+                    "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+                },
+            )
+            request_id_var.reset(token)
+----
+Source: https://docs.python.org/3/library/logging.html[Python: logging]
+
+The configuration file wires them to the Uvicorn loggers; the formatter and the filter are referenced by import path
+with the `()` key of `dictConfig()`:
+
+[source,json]
+.log_config.json
+----
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "filters": {"request_id": {"()": "observability.RequestIdFilter"}},
+  "formatters": {"json": {"()": "observability.JsonFormatter"}},
+  "handlers": {
+    "stdout": {
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stdout",
+      "formatter": "json",
+      "filters": ["request_id"]
+    }
+  },
+  "loggers": {
+    "uvicorn": {"handlers": ["stdout"], "level": "INFO", "propagate": false},
+    "uvicorn.error": {"level": "INFO"},
+    "uvicorn.access": {"handlers": ["stdout"], "level": "WARNING", "propagate": false},
+    "bookshelf": {"handlers": ["stdout"], "level": "INFO", "propagate": false}
+  }
+}
+----
+Source: https://docs.python.org/3/library/logging.config.html#logging-config-dictschema[Python: logging.config - Configuration dictionary schema]
+
+[source,python]
+.main.py
+----
+import logging
+
+from fastapi import FastAPI, HTTPException
+
+from observability import RequestLogMiddleware
+
+logger = logging.getLogger("bookshelf.books")
+app = FastAPI(title="Bookshelf API")
+app.add_middleware(RequestLogMiddleware)
+
+BOOKS = {1: "Dune"}
+
+
+@app.get("/books/{book_id}")
+async def read_book(book_id: int) -> dict[str, str]:
+    logger.info("loading book", extra={"path": f"/books/{book_id}"})
+    if book_id not in BOOKS:
+        logger.warning("book not found")
+        raise HTTPException(status_code=404, detail="Book not found")
+    return {"title": BOOKS[book_id]}
+----
+Source: https://fastapi.tiangolo.com/tutorial/middleware/[FastAPI: Middleware]
+
+Running a real Uvicorn process with the configuration and sending two requests, one with a client-supplied
+`X-Request-ID`, gives this output (the first four lines are Uvicorn's own start-up messages, also in JSON now):
+
+[source,bash]
+----
+uvicorn main:app --port 8000 --log-config log_config.json
+curl -H 'X-Request-ID: demo-1' -i http://127.0.0.1:8000/books/1
+curl http://127.0.0.1:8000/books/9
+----
+Source: https://uvicorn.dev/settings/[Uvicorn: Settings]
+
+[source,json]
+----
+{"time": "2026-10-02T10:00:38.890+00:00", "level": "INFO", "logger": "uvicorn.error", "message": "Started server process [24993]", "request_id": "-"}
+{"time": "2026-10-02T10:00:41.399+00:00", "level": "INFO", "logger": "bookshelf.books", "message": "loading book", "request_id": "demo-1", "path": "/books/1"}
+{"time": "2026-10-02T10:00:41.399+00:00", "level": "INFO", "logger": "bookshelf.access", "message": "request finished", "request_id": "demo-1", "method": "GET", "path": "/books/1", "status": 200, "duration_ms": 1.28}
+{"time": "2026-10-02T10:00:41.415+00:00", "level": "INFO", "logger": "bookshelf.books", "message": "loading book", "request_id": "27776829d29f45ffb2eee7c444896046", "path": "/books/9"}
+{"time": "2026-10-02T10:00:41.415+00:00", "level": "WARNING", "logger": "bookshelf.books", "message": "book not found", "request_id": "27776829d29f45ffb2eee7c444896046"}
+{"time": "2026-10-02T10:00:41.416+00:00", "level": "INFO", "logger": "bookshelf.access", "message": "request finished", "request_id": "27776829d29f45ffb2eee7c444896046", "method": "GET", "path": "/books/9", "status": 404, "duration_ms": 0.49}
+----
+Source: https://uvicorn.dev/settings/[Uvicorn: Settings]
+
+Every line produced while handling a request carries its ID, so one `request_id` search in a log platform returns the
+whole story, and the same ID is returned to the client in `X-Request-ID` for support tickets. Logging rules worth
+keeping:
+
+* Log the path, not the query string, and never log request bodies, tokens or passwords; a log is read by many more
+  people than the database.
+* Log in the application's own logger hierarchy (`bookshelf.*`) so levels can be set per area.
+* Log exceptions with `logger.exception()` or `exc_info=True`; the formatter above turns the traceback into one JSON
+  field.
+* A logging call that formats a large object costs time even when the level is off; pass arguments instead of
+  f-strings for expensive values.
+* Trust a client-supplied request ID only for correlation; a proxy that generates the ID itself is a better source.
+
+[#prometheus]
+== Prometheus Metrics
+
+Prometheus scrapes numbers from an HTTP endpoint on a schedule. For FastAPI, `prometheus-fastapi-instrumentator` adds
+the standard HTTP metrics (request counts, durations, sizes) with one call and exposes them at `/metrics`; it uses
+the official `prometheus_client` library, which you also use for your own business metrics. This section is the
+application side. The server, the query language and dashboards are covered on this site by
+xref:database/prometheus/index.adoc[Prometheus], in particular
+xref:database/prometheus/instrumenting-applications.adoc[Instrumenting Applications] (client libraries, the exposition
+format, metric and label naming),
+xref:database/prometheus/data-model-and-metric-types.adoc[Data Model and Metric Types],
+xref:database/prometheus/promql-basics-and-selectors.adoc[PromQL Basics and Selectors] and
+xref:database/prometheus/grafana-dashboards-and-visualization.adoc[Grafana Dashboards and Visualization]. Install with
+`pip install prometheus-fastapi-instrumentator` (8.1.0 on 2026-10-02):
+
+[source,python]
+----
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from prometheus_client import Counter
+from prometheus_fastapi_instrumentator import Instrumentator
+
+REVIEWS_CREATED = Counter("bookshelf_reviews_created_total", "Reviews created", ["rating"])
+
+instrumentator = Instrumentator(
+    should_group_status_codes=True,
+    should_ignore_untemplated=True,
+    excluded_handlers=["/metrics", "/health"],
+)
+
+
+app = FastAPI(title="Bookshelf API")
+instrumentator.instrument(app).expose(app, include_in_schema=False)  # middleware + GET /metrics
+
+
+@app.get("/books/{book_id}")
+async def read_book(book_id: int) -> dict[str, int]:
+    return {"book_id": book_id}
+
+
+@app.post("/books/{book_id}/reviews", status_code=201)
+async def add_review(book_id: int, rating: int) -> dict[str, int]:
+    REVIEWS_CREATED.labels(rating=str(rating)).inc()
+    return {"book_id": book_id, "rating": rating}
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+with TestClient(app) as client:
+    for book_id in (1, 2, 3):
+        client.get(f"/books/{book_id}")
+    client.get("/health")
+    client.post("/books/1/reviews?rating=5")
+    client.get("/missing")
+    text = client.get("/metrics").text
+
+for line in text.splitlines():
+    if line.startswith(("http_requests_total", "bookshelf_reviews_created_total", "http_request_duration_seconds_count")):
+        print(line)
+print("health exported:", "/health" in text, "| untemplated /missing exported:", "/missing" in text)
+----
+Source: https://github.com/trallnag/prometheus-fastapi-instrumentator[prometheus-fastapi-instrumentator]
+
+[source,text]
+----
+bookshelf_reviews_created_total{rating="5"} 1.0
+http_requests_total{handler="/books/{book_id}",method="GET",status="2xx"} 3.0
+http_requests_total{handler="/books/{book_id}/reviews",method="POST",status="2xx"} 1.0
+http_request_duration_seconds_count{handler="/books/{book_id}",method="GET"} 3.0
+http_request_duration_seconds_count{handler="/books/{book_id}/reviews",method="POST"} 1.0
+health exported: False | untemplated /missing exported: False
+----
+
+The default metrics (checked against a real `/metrics` response) are the counter `http_requests_total`, the summaries
+`http_request_size_bytes` and `http_response_size_bytes`, and the histograms `http_request_duration_seconds` (few
+buckets) and `http_request_duration_highr_seconds` (many buckets, no labels). Notice what the example configured:
+
+* `handler` is the route template (`/books/\{book_id}`), not the concrete URL. Labels with unbounded values (user IDs,
+  concrete paths, ISBNs) create one time series each and exhaust Prometheus' memory; this is called a cardinality
+  explosion. `should_ignore_untemplated=True` drops requests that match no route, so a scanner probing random URLs
+  adds no series. The default groups them under the handler `none`.
+* `should_group_status_codes=True` (the default) records `2xx` instead of every code.
+* `excluded_handlers` takes regular expressions for paths to skip, such as `/metrics` and health checks.
+* Other options of the constructor include `should_instrument_requests_inprogress`, `should_respect_env_var` (only
+  instrument when an environment variable, `ENABLE_METRICS` by default, is `true`), `should_exclude_streaming_duration`,
+  `round_latency_decimals` and a custom `registry`.
+* The custom metric `bookshelf_reviews_created_total` comes straight from `prometheus_client`. Name counters with a
+  `_total` suffix and keep labels to a handful of known values (the rating, not the review text).
+
+The README's fast track is `Instrumentator().instrument(app).expose(app)`. `expose()` also takes `should_gzip`, an
+`endpoint` path and `include_in_schema`, which hides `/metrics` from the OpenAPI document as above. The `/metrics`
+endpoint should not be reachable from the internet: put it behind the proxy's allow-list or on an internal port (see
+xref:backend/fastapi/middleware-cors-and-proxies.adoc[Middleware, CORS & Proxies] for proxy setups).
+
+[#prometheus-workers]
+=== Several Worker Processes
+
+Each Uvicorn worker is a separate process with its own counters, so a scrape would see whichever worker answered.
+The `prometheus_client` library has a multiprocess mode that writes each process's metrics to files in a directory
+and merges them when scraped; the Prometheus client documentation requires the `PROMETHEUS_MULTIPROC_DIR` environment
+variable to be set to a directory that is wiped between runs and set by the start-up script, not from Python. The
+instrumentator honours the same variable. Running two workers and sending eight requests returned the merged total:
+
+[source,bash]
+----
+rm -rf /tmp/prom && mkdir /tmp/prom
+PROMETHEUS_MULTIPROC_DIR=/tmp/prom uvicorn prom_app:app --workers 2 --port 8000
+for i in 1 2 3 4 5 6 7 8; do curl -s http://127.0.0.1:8000/books/$i > /dev/null; done
+curl -s http://127.0.0.1:8000/metrics | grep '^http_requests_total'
+----
+Source: https://prometheus.github.io/client_python/multiprocess/[Prometheus client_python: Multiprocess Mode]
+
+[source,text]
+----
+http_requests_total{handler="/books/{book_id}",method="GET",status="2xx"} 8.0
+----
+
+The directory then held one file per process and metric type (such as `counter_25214.db` and `counter_25215.db`). The
+client documentation lists the limitations of this mode (custom collectors, `Info` and `Enum` metrics and exemplars do
+not work, and gauges need a `multiprocess_mode`), and for Gunicorn it adds a `child_exit` hook that calls
+`multiprocess.mark_process_dead(worker.pid)`. One process per container, scraped per container, avoids the whole topic.
+
+[#prometheus-scrape]
+=== Scraping and Graphing
+
+Prometheus is configured with a scrape job per service. The file below, and the Docker Compose file that runs
+Prometheus and Grafana next to the API, are shown but were not run for this page:
+
+[source,yaml]
+.prometheus.yml
+----
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: bookshelf-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+----
+Source: https://prometheus.io/docs/prometheus/latest/configuration/configuration/[Prometheus: Configuration]
+
+[source,yaml]
+.compose.yaml
+----
+services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana
+    ports: ["3000:3000"]
+----
+Source: https://grafana.com/docs/grafana/latest/datasources/prometheus/[Grafana: Prometheus data source]
+
+In Grafana, add Prometheus (`http://prometheus:9090` inside this Compose network) as a data source, then build panels
+with PromQL. Three queries cover most dashboards of an API, following the request-rate, error-rate and duration
+(RED) method:
+
+[source,text]
+----
+sum by (handler) (rate(http_requests_total[5m]))
+
+sum(rate(http_requests_total{status="5xx"}[5m])) / sum(rate(http_requests_total[5m]))
+
+histogram_quantile(0.95, sum by (le, handler) (rate(http_request_duration_seconds_bucket[5m])))
+----
+Source: https://prometheus.io/docs/practices/histograms/[Prometheus: Histograms and summaries]
+
+The first query is requests per second by route, the second the fraction of failing requests (it relies on
+`should_group_status_codes`), and the third the 95th percentile latency per route estimated from the histogram
+buckets. The default `http_request_duration_seconds` histogram has only a few buckets, so its percentiles are coarse;
+the `highr` histogram has many buckets but no labels, which gives an accurate overall latency. Write the queries with
+the help of xref:database/prometheus/promql-functions.adoc[PromQL Functions], and alert on them with
+xref:database/prometheus/recording-and-alerting-rules.adoc[Recording and Alerting Rules] or
+xref:database/prometheus/grafana-alerting.adoc[Grafana Alerting]. Metric names in Grafana's data source come from the
+real `/metrics` output, so run the instrumented app once and copy them.
+
+[#opentelemetry]
+== OpenTelemetry
+
+OpenTelemetry is a vendor-neutral set of standards and libraries for emitting traces, metrics and logs and sending
+them over OTLP to a collector or a monitoring service. Traces answer the question metrics cannot: which step of this
+one slow request was slow. A trace is a tree of timed operations called spans, and the root span is the HTTP request.
+
+[#otel-native]
+=== Native Support (FastAPI 0.142.0)
+
+Release 0.142.0 (2026-09-29) added native OpenTelemetry support, and the FastAPI documentation now has an
+OpenTelemetry page. Per that page, FastAPI emits traces, metrics and logs for HTTP requests by default, and traces and
+logs for WebSocket connections; no custom code is needed, you only configure where the data goes. The
+`fastapi[standard]` extra contains the packages for sending telemetry (the `opentelemetry` extra is the smaller
+alternative), and FastAPI Cloud shows the metrics automatically. For any other monitoring service you set environment
+variables to an OTLP endpoint:
+
+[source,bash]
+----
+export OTEL_SERVICE_NAME=bookshelf-api
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://collector.example.com
+fastapi run
+----
+Source: https://fastapi.tiangolo.com/advanced/opentelemetry/[FastAPI: OpenTelemetry]
+
+`OTEL_SERVICE_NAME` is the name that identifies the app in the monitoring service. The endpoint is the HTTP/protobuf base
+URL; traces go to `/v1/traces`, metrics to `/v1/metrics` and logs to `/v1/logs` under it. If the service needs
+authentication, `OTEL_EXPORTER_OTLP_HEADERS` carries the headers; keep their values in your secret store, not in the
+repository. This sending path was not run for this page, because it needs a collector.
+
+Customization is a `telemetry` dictionary passed to `FastAPI(...)`. The following example supplies its own providers
+(the way you would plug in a library or, as here, an in-memory exporter) and uses `exclude` to skip health checks. It
+runs a request that also schedules a background task:
+
+[source,python]
+----
+from fastapi import BackgroundTasks, FastAPI
+from fastapi.testclient import TestClient
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+exporter = InMemorySpanExporter()
+tracer_provider = TracerProvider()
+tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+reader = InMemoryMetricReader()
+meter_provider = MeterProvider(metric_readers=[reader])
+
+app = FastAPI(
+    title="Bookshelf API",
+    telemetry={
+        "tracer_provider": tracer_provider,
+        "meter_provider": meter_provider,
+        "exclude": lambda scope: scope["path"] == "/health",
+    },
+)
+
+
+def audit(book_id: int) -> None:
+    pass
+
+
+@app.get("/books/{book_id}")
+async def read_book(book_id: int, tasks: BackgroundTasks) -> dict[str, int]:
+    tasks.add_task(audit, book_id)
+    return {"book_id": book_id}
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+client = TestClient(app)
+client.get("/books/1")
+client.get("/health")
+for span in exporter.get_finished_spans():
+    print(f"{span.name:45} parent={'yes' if span.parent else 'no '} kind={span.kind.name}")
+data = reader.get_metrics_data()
+names = sorted(m.name for rm in data.resource_metrics for sm in rm.scope_metrics for m in sm.metrics)
+print(names)
+----
+Source: https://fastapi.tiangolo.com/advanced/opentelemetry/[FastAPI: OpenTelemetry]
+
+[source,text]
+----
+fastapi.dependencies                          parent=yes kind=INTERNAL
+fastapi.endpoint                              parent=yes kind=INTERNAL
+fastapi.serialization                         parent=yes kind=INTERNAL
+GET /books/{book_id}                          parent=no  kind=SERVER
+fastapi.background_task                       parent=yes kind=INTERNAL
+['http.server.active_requests', 'http.server.request.duration']
+----
+
+One request produced a root `SERVER` span named after the route template, with child spans for resolving dependencies,
+running the endpoint function, serializing the response and, after the response span ended, each background task. The
+span names in the output were observed in this run; the documentation describes the operations without naming the
+spans. The excluded `/health` request produced nothing, and the metrics reader holds request duration and active
+requests. The settings of the dictionary, from the documentation:
+
+[cols="1,3,1",options="header"]
+.The `telemetry` settings
+|===
+| Setting | Purpose | Default
+
+| `tracing`
+| Record HTTP request and WebSocket connection spans
+| `True`
+
+| `metrics`
+| Record HTTP request metrics
+| `True`
+
+| `logs`
+| Record validation failures (as warnings, without the invalid input) and unhandled exceptions (type, message and stack
+trace)
+| `True`
+
+| `operation_spans`
+| Add spans for dependencies, the endpoint, serialization and background tasks
+| `True`
+
+| `exclude`
+| Skip requests when a function receiving the ASGI scope returns `True`
+| `None`
+
+| `auto_configure`
+| Add exporters for endpoints set in environment variables
+| `True`
+|===
+
+`tracer_provider`, `meter_provider` and `logger_provider` may be passed in the same dictionary. Four rules from the page
+deserve repeating. Telemetry libraries can configure OpenTelemetry's global providers, and FastAPI uses them when they
+are configured before the app starts. Each destination should be configured once: if another library already exports
+to the environment's endpoint, turn off that export or set `auto_configure` to `False`, as in
+`FastAPI(telemetry=\{"auto_configure": False})`. Exception logs can contain sensitive data, so filter them with your
+provider's log processors or set `logs` to `False`. And because OpenTelemetry uses global providers, independent
+configuration for mounted sub-applications is not guaranteed (see
+xref:backend/fastapi/sub-applications-wsgi-and-graphql.adoc[Sub-Applications, WSGI & GraphQL]).
+
+0.142.2 (2026-09-30) additionally stopped start-up from failing when the automatic OpenTelemetry configuration fails, so
+a misconfigured endpoint no longer prevents the service from starting; check the logs for the configuration error
+instead of assuming that telemetry works because the service is up.
+
+[#otel-contrib]
+=== `opentelemetry-instrumentation-fastapi`
+
+Before 0.142.0 the way to get traces from FastAPI was the contrib package `opentelemetry-instrumentation-fastapi`
+(0.66b0 and its OpenTelemetry SDK 1.45.0 were current on 2026-10-02; the "b" marks a beta release). It is still
+available, and it is the choice if you instrument several frameworks the same way or run an older FastAPI:
+
+[source,python]
+----
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+exporter = InMemorySpanExporter()
+tracer_provider = TracerProvider()
+tracer_provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+app = FastAPI(title="Bookshelf API")
+# Wraps the app in OpenTelemetry's ASGI middleware. Call it once, at start-up of the process.
+FastAPIInstrumentor.instrument_app(
+    app,
+    tracer_provider=tracer_provider,
+    excluded_urls="health",  # comma-separated regular expressions matched against the URL
+)
+
+
+@app.get("/books/{book_id}")
+async def read_book(book_id: int) -> dict[str, int]:
+    return {"book_id": book_id}
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+client = TestClient(app)
+client.get("/books/1")
+client.get("/health")
+for span in exporter.get_finished_spans():
+    print(f"{span.name:28} kind={span.kind.name}")
+----
+Source: https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/fastapi/fastapi.html[OpenTelemetry Python Contrib: FastAPI Instrumentation]
+
+[source,text]
+----
+GET /books/{book_id} http send kind=INTERNAL
+GET /books/{book_id} http send kind=INTERNAL
+GET /books/{book_id}         kind=SERVER
+----
+
+`excluded_urls` matched `/health`, so it produced no spans, and the three spans of the request are the server span
+and two spans for sending the response start and body. Compared with the native support, the contrib package has no
+spans for dependencies, the endpoint or serialization. If both are active, the two do not duplicate each other: in a run
+with a native `tracer_provider` configured and the contrib instrumentation applied, only the contrib spans appeared,
+and 0.142.2's source checks for that middleware and then disables its own tracing, metrics and logs. This is an
+implementation detail that the documentation does not state, so do not rely on it; choose one.
+
+[cols="1,2",options="header"]
+.Which OpenTelemetry route to use
+|===
+| Situation | Use
+
+| New project on FastAPI 0.142 or later
+| Native support: set the `OTEL_*` variables and, when needed, the `telemetry` dictionary
+
+| FastAPI older than 0.142.0 (not supported by this page's baseline)
+| `opentelemetry-instrumentation-fastapi`
+
+| Same instrumentation for FastAPI, database drivers and HTTP clients in one setup
+| The contrib package, or the OpenTelemetry Python instrumentation guide's auto-instrumentation
+
+| Spans for each dependency and endpoint call
+| Native support with `operation_spans` left on
+|===
+
+Whichever route you choose, correlate the signals: the OpenTelemetry trace ID can be added to the JSON log line next
+to the `request_id` of <<logging>>, which lets you jump from a slow trace to its logs.
+
+[#changes]
+== Where Older Guides Are Outdated, and What Changed Recently
+
+* *JSON serialization in Rust (0.130.0, 2026-02-22).* Guides that recommend `ORJSONResponse`, `UJSONResponse` or
+  a hand-written `jsonable_encoder` step for speed are out of date. Return annotations are serialized by Pydantic's core,
+  and `ORJSONResponse` and `UJSONResponse` were deprecated in 0.131.0 (2026-02-22).
+* *`@app.on_event("startup")` for metrics and clients.* The instrumentator's README still shows `on_event` as an
+  alternative; lifespan handlers superseded startup and shutdown events in 0.93.0 (2023-03-07), and the module-level
+  `instrument(app).expose(app)` call used above needs neither.
+* *Pydantic v1 performance advice.* v1-era tips (`orjson` config on models, `parse_raw`) do not apply; use
+  `model_validate_json()` and a shared `TypeAdapter`. Pydantic v1 support ended in FastAPI 0.126.0 (2025-12-20).
+* *Native OpenTelemetry (0.142.0, 2026-09-29).* Tutorials that hand-wire `FastAPIInstrumentor` and a tracer provider
+  predate it; for a new service FastAPI emits traces, metrics and logs by itself, and 0.142.2 (2026-09-30) made
+  start-up tolerant of a failing automatic configuration. Check the
+  xref:backend/fastapi/whats-changed-and-migration.adoc[What's Changed & Migration] page for the full list.
+* *Dependency exit code runs after the response (0.118.0).* Spans and timing measured around a dependency with
+  `yield` now include its exit code only after the response has been sent; see
+  xref:backend/fastapi/dependencies-with-yield.adoc[Dependencies with `yield`].
+* *Free-threaded Python (0.136.0).* FastAPI supports Python 3.14t, which changes the advice on CPU-bound threads; the
+  async page covers it and this page's examples were not run on it.
+* *Process managers.* Older deployment advice used Gunicorn with Uvicorn workers by default; the FastAPI documentation
+  now shows `--workers` on `fastapi run` and `uvicorn`, and says that on Kubernetes you will probably want one
+  process per container instead. Prometheus multiprocess mode only matters when several workers share one container.
+* *Python 3.10 or later.* Python 3.8 and 3.9 were dropped (0.125.0 and 0.129.0), so the examples use current syntax
+  (`list[str]`, `X | None`).
+
+[#pitfalls]
+== Pitfalls
+
+* *Benchmarking the test client.* `TestClient` runs the app in another thread and measures client overhead too; use
+  it for correctness and use a load tool against a real server (Locust is covered in the testing material of this
+  section) for throughput. Timings here show relative effects only.
+* *Optimizing the wrong thing.* Rewriting JSON handling while an N+1 dominates is wasted effort; profile or read the
+  trace first.
+* *Blocking calls hidden in `async def`.* A synchronous database session, `requests`, `time.sleep` or a heavy loop
+  looks fine in development and collapses under concurrent load.
+* *Caching coroutines and per-user data.* `@cache` on `async def` fails on the second call; a cache key that omits the user
+  turns a performance feature into a data leak.
+* *Unbounded caches.* `functools.cache` never evicts; a Redis key without `ex=` never expires.
+* *Indexes added blindly.* Each index slows writes; confirm with `EXPLAIN` that the planner uses it.
+* *High-cardinality labels.* A Prometheus label from a URL, ID or exception message multiplies the series count; use
+  route templates and bounded values.
+* *Exposing `/metrics` and profiling endpoints publicly.* Both reveal internals; restrict them at the proxy.
+* *Logging secrets and personal data.* Logs outlive requests and are shared widely; log identifiers, not bodies.
+* *Per-process metrics with several workers.* Without multiprocess mode, each scrape sees one worker; the numbers
+  jump around.
+* *Instrumenting twice.* Configuring the same OTLP destination in two libraries sends every span twice; configure
+  each destination once.
+* *Assuming telemetry works because the service starts.* Since 0.142.2 a failing automatic OpenTelemetry setup does
+  not stop start-up; verify that data arrives.
+* *Trusting a client-supplied `X-Request-ID` as an identity.* It is user input; use it for correlation only and keep
+  it to a sane length if you echo it into logs.
+
+== References
+
+* https://fastapi.tiangolo.com/async/[FastAPI: Concurrency and async / await]
+* https://fastapi.tiangolo.com/tutorial/response-model/[FastAPI: Response Model - Return Type]
+* https://fastapi.tiangolo.com/advanced/custom-response/[FastAPI: Custom Response]
+* https://fastapi.tiangolo.com/tutorial/middleware/[FastAPI: Middleware]
+* https://fastapi.tiangolo.com/advanced/opentelemetry/[FastAPI: OpenTelemetry]
+* https://fastapi.tiangolo.com/deployment/server-workers/[FastAPI: Server Workers - Uvicorn with Workers]
+* https://fastapi.tiangolo.com/release-notes/[FastAPI: Release Notes]
+* https://pydantic.dev/docs/validation/latest/concepts/performance/[Pydantic: Performance tips]
+* https://pydantic.dev/docs/validation/latest/concepts/serialization/[Pydantic: Serialization]
+* https://docs.python.org/3/library/functools.html#functools.cache[Python: functools.cache]
+* https://docs.python.org/3/library/profile.html[Python: The Python Profilers]
+* https://docs.python.org/3/library/tracemalloc.html[Python: tracemalloc]
+* https://docs.python.org/3/library/logging.html[Python: logging]
+* https://docs.python.org/3/library/logging.config.html[Python: logging.config]
+* https://docs.python.org/3/library/contextvars.html[Python: contextvars]
+* https://docs.sqlalchemy.org/en/20/orm/queryguide/relationships.html[SQLAlchemy: Relationship Loading Techniques]
+* https://docs.sqlalchemy.org/en/20/core/events.html[SQLAlchemy: Events]
+* https://sqlite.org/eqp.html[SQLite: EXPLAIN QUERY PLAN]
+* https://redis.io/docs/latest/develop/clients/redis-py/[Redis: Python client (redis-py)]
+* https://uvicorn.dev/settings/[Uvicorn: Settings]
+* https://pyinstrument.readthedocs.io/en/latest/guide.html[pyinstrument: User guide]
+* https://pypy.org/[PyPy]
+* https://cython.readthedocs.io/en/stable/[Cython documentation]
+* https://pyo3.rs/[PyO3 user guide]
+* https://www.maturin.rs/[maturin user guide]
+* https://github.com/trallnag/prometheus-fastapi-instrumentator[prometheus-fastapi-instrumentator]
+* https://prometheus.github.io/client_python/[Prometheus client_python]
+* https://prometheus.github.io/client_python/multiprocess/[Prometheus client_python: Multiprocess Mode]
+* https://prometheus.io/docs/prometheus/latest/configuration/configuration/[Prometheus: Configuration]
+* https://prometheus.io/docs/practices/histograms/[Prometheus: Histograms and summaries]
+* https://prometheus.io/docs/practices/naming/[Prometheus: Metric and label naming]
+* https://grafana.com/docs/grafana/latest/datasources/prometheus/[Grafana: Prometheus data source]
+* https://grafana.com/docs/grafana/latest/visualizations/dashboards/[Grafana: Dashboards]
+* https://opentelemetry.io/docs/languages/python/[OpenTelemetry: Python]
+* https://opentelemetry.io/docs/languages/python/instrumentation/[OpenTelemetry: Python instrumentation]
+* https://opentelemetry-python-contrib.readthedocs.io/en/latest/instrumentation/fastapi/fastapi.html[OpenTelemetry Python Contrib: FastAPI Instrumentation]
+* https://opentelemetry.io/docs/specs/otlp/[OpenTelemetry: OTLP Specification]
