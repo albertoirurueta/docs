@@ -1,0 +1,1260 @@
+= Docker & Kubernetes
+:description: Packaging and running FastAPI in containers: the official Dockerfile line by line, layer caching, exec-form CMD and graceful shutdown, --proxy-headers, a uv-based image, one Uvicorn process per container versus --workers and Gunicorn, Docker Compose with PostgreSQL, Alembic migrations as a pre-start step, Kubernetes Deployments with probes, resources, graceful shutdown, autoscaling and disruption budgets, and the deprecated tiangolo/uvicorn-gunicorn-fastapi image.
+:keywords: FastAPI, Docker, Dockerfile, container, fastapi run, exec form, CMD, ENTRYPOINT, SIGTERM, graceful shutdown, lifespan, --proxy-headers, --forwarded-allow-ips, --workers, Uvicorn, Gunicorn, uvicorn-worker, uv, uv sync, uv.lock, .dockerignore, Docker Compose, PostgreSQL, healthcheck, depends_on, service_completed_successfully, secrets, POSTGRES_PASSWORD_FILE, Alembic, migrations, Kubernetes, Deployment, Job, init container, liveness probe, readiness probe, startup probe, preStop, terminationGracePeriodSeconds, HorizontalPodAutoscaler, PodDisruptionBudget, Azure Container Apps, AKS, tiangolo/uvicorn-gunicorn-fastapi
+
+include::partial$fastapi-disclaimer.adoc[]
+
+This page is written against FastAPI 0.142.2 (released 2026-09-30), Pydantic 2.13, Starlette 1.7 and Uvicorn 0.54,
+checked on 2026-10-02. FastAPI supports Python 3.10 through 3.14. The application code and the `entrypoint.sh`,
+`alembic` and `fastapi run` steps below were executed on Python 3.13 (real Uvicorn processes, `curl`, `SIGTERM`), and the
+outputs shown come from those runs. The Dockerfiles were not built and the Kubernetes manifests were not applied here,
+because no Docker daemon or cluster was available: the Compose file was checked with `docker compose config` and the
+manifests were parsed as YAML, so treat the container steps as reviewed templates and run them in your own environment.
+The page covers the FastAPI-specific parts of containerization: what to put in the image, how to start the process,
+how many processes to run, and what a platform expects from the application (health endpoints, signals, configuration).
+Generic Docker knowledge lives on the Docker pages of this site, linked where each topic comes up. The running scenario is
+the _Bookshelf API_.
+
+[#in-a-hurry]
+== In a Hurry: The Short Version
+
+.The container recipe in seven rules
+[cols="2,4",options="header"]
+|===
+| Decision | Recommendation
+| Base image | The official `python` image, ideally a `-slim` variant, pinned to a minor version (`python:3.13-slim`); the official FastAPI guide itself uses `python:3.14`
+| Installing dependencies | Copy only the dependency file first and install, then copy the code, so the install layer is cached
+| Start command | Exec form: `CMD ["fastapi", "run", "app/main.py", "--port", "8000"]`, never the shell form
+| Behind a load balancer or ingress | Add `--proxy-headers` (and restrict who is trusted with `--forwarded-allow-ips`)
+| Processes per container | One Uvicorn process per container when an orchestrator (Kubernetes, Container Apps, ECS) provides the replicas; `--workers` for a single host without one
+| Configuration and secrets | Environment variables and secret files read by pydantic-settings, never baked into the image
+| Schema migrations | A separate one-shot step (Compose service, Kubernetes Job) that runs `alembic upgrade head` before the new version starts serving
+|===
+
+[#project]
+== The Example Project
+
+Every example in this page builds on one small Bookshelf service. It is deliberately minimal so that the container
+mechanics stay visible: settings that read the database location from the environment (the password from a *file*, see
+xref:backend/fastapi/settings-lifespan-and-background-tasks.adoc#settings-secrets[Settings: secrets directories and files]),
+a lifespan that creates and disposes the database engine (xref:backend/fastapi/settings-lifespan-and-background-tasks.adoc#lifespan[Lifespan]),
+a session dependency, and two health endpoints used later by Docker and Kubernetes.
+
+.Project layout
+[source,text]
+----
+.
+├── Dockerfile
+├── .dockerignore
+├── alembic.ini
+├── compose.yaml
+├── entrypoint.sh
+├── requirements.txt
+├── app
+│   ├── __init__.py
+│   ├── main.py
+│   └── settings.py
+├── migrations
+│   ├── env.py
+│   ├── script.py.mako
+│   └── versions
+└── k8s
+    ├── configmap.yaml
+    ├── deployment.yaml
+    ├── hpa-pdb.yaml
+    └── migrate-job.yaml
+----
+
+.app/settings.py: configuration from the environment
+[source,python]
+----
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="BOOKSHELF_")
+
+    db_drivername: str = "sqlite"
+    db_host: str | None = None
+    db_port: int | None = None
+    db_name: str = "bookshelf.db"
+    db_user: str | None = None
+    db_password_file: Path | None = None  # path of a secret file, never the password itself
+
+    def database_url(self) -> URL:
+        password = None
+        if self.db_password_file is not None:
+            password = self.db_password_file.read_text().strip()
+        return URL.create(
+            self.db_drivername,
+            username=self.db_user,
+            password=password,
+            host=self.db_host,
+            port=self.db_port,
+            database=self.db_name,
+        )
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+----
+
+Source: https://fastapi.tiangolo.com/advanced/settings/[FastAPI: Settings and Environment Variables]
+
+With no variables set the service uses a local SQLite file, which keeps `fastapi dev` and the tests simple. In a
+container the same code is pointed at PostgreSQL purely through `BOOKSHELF_DB_*` variables, and the password never
+appears in an environment variable, a layer or a manifest: only the *path* of the secret file does.
+
+.app/main.py: lifespan, session dependency and health endpoints
+[source,python]
+----
+import logging
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException
+from sqlalchemy import text
+from sqlmodel import Field, Session, SQLModel, create_engine, select
+
+from .settings import get_settings
+
+logger = logging.getLogger("uvicorn.error")
+
+
+class Book(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    title: str = Field(index=True)
+    author: str
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.engine = create_engine(get_settings().database_url(), pool_pre_ping=True)
+    logger.info("startup: engine created")
+    yield
+    app.state.engine.dispose()
+    logger.info("shutdown: engine disposed")
+
+
+app = FastAPI(title="Bookshelf API", lifespan=lifespan)
+
+
+def get_session() -> Iterator[Session]:
+    with Session(app.state.engine) as session:
+        yield session
+
+
+SessionDep = Annotated[Session, Depends(get_session)]
+
+
+@app.get("/healthz")
+def liveness() -> dict[str, str]:
+    """Liveness: the process is up. No dependency is checked on purpose."""
+    return {"status": "alive"}
+
+
+@app.get("/readyz")
+def readiness(session: SessionDep) -> dict[str, str]:
+    """Readiness: the database answers."""
+    try:
+        session.exec(text("SELECT 1"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="database unavailable")
+    return {"status": "ready"}
+
+
+@app.post("/books", status_code=201)
+def create_book(book: Book, session: SessionDep) -> Book:
+    session.add(book)
+    session.commit()
+    session.refresh(book)
+    return book
+
+
+@app.get("/books")
+def list_books(session: SessionDep) -> list[Book]:
+    return list(session.exec(select(Book)))
+----
+
+Source: https://fastapi.tiangolo.com/advanced/events/[FastAPI: Lifespan Events]
+
+`requirements.txt` pins the packages, as the FastAPI documentation advises for a 0.x framework
+(https://fastapi.tiangolo.com/deployment/versions/[Deployment: About FastAPI versions]). `fastapi[standard]` brings the `fastapi`
+command (`fastapi-cli`), Uvicorn and pydantic-settings; an application image does not need the extras for templates or
+uploads unless it uses them, so slimming the extras is possible (see <<slim-extras>>).
+
+.requirements.txt
+[source,text]
+----
+fastapi[standard]==0.142.2
+sqlmodel==0.0.47
+alembic==1.20.0
+psycopg[binary]==3.3.6
+----
+
+Source: https://fastapi.tiangolo.com/deployment/versions/[FastAPI: About FastAPI versions]
+
+Before any container exists, the application runs and shuts down cleanly with the same command the image will use.
+This is the baseline that later steps are compared with:
+
+[source,bash]
+----
+PYTHONPATH=. fastapi run app/main.py --port 8123 --proxy-headers
+curl http://127.0.0.1:8123/healthz
+curl http://127.0.0.1:8123/readyz
+curl -X POST http://127.0.0.1:8123/books -H 'content-type: application/json' \
+     -d '{"title":"Dune","author":"Frank Herbert"}'
+----
+
+[source,json]
+----
+{"status":"alive"}
+{"status":"ready"}
+{"title":"Dune","id":1,"author":"Frank Herbert"}
+----
+
+Source: https://fastapi.tiangolo.com/fastapi-cli/[FastAPI: FastAPI CLI]
+
+[#official-dockerfile]
+== The Official Dockerfile
+
+The FastAPI documentation's recommended image is built from scratch on the official Python image, with no special FastAPI
+base image. This is its Dockerfile as published (the page shows it with Python 3.14), with the proxy variant as the final comment:
+
+.The Dockerfile from the FastAPI documentation
+[source,dockerfile]
+----
+FROM python:3.14
+
+WORKDIR /code
+
+COPY ./requirements.txt /code/requirements.txt
+
+RUN pip install --no-cache-dir --upgrade -r /code/requirements.txt
+
+COPY ./app /code/app
+
+CMD ["fastapi", "run", "app/main.py", "--port", "80"]
+
+# If running behind a proxy like Nginx or Traefik add --proxy-headers
+# CMD ["fastapi", "run", "app/main.py", "--port", "80", "--proxy-headers"]
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+Build and run it (not executed here, no Docker daemon was available; these are the commands of the official page):
+
+[source,bash]
+----
+docker build -t myimage .
+docker run -d --name mycontainer -p 80:80 myimage
+curl http://127.0.0.1/items/5?q=somequery
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+What each instruction contributes:
+
+.Dockerfile instructions explained
+[cols="2,4",options="header"]
+|===
+| Instruction | Purpose
+| `FROM python:3.14` | The official Python image. It already contains Python and `pip`, so the Dockerfile only adds the application. Pin at least the minor version so that a rebuild next month does not silently move to a new Python.
+| `WORKDIR /code` | Current directory for all later instructions and for the running process. `fastapi run app/main.py` is resolved relative to it.
+| `COPY ./requirements.txt /code/requirements.txt` | Copies *only* the dependency list, so the next step can be cached (see <<layer-cache>>).
+| `RUN pip install --no-cache-dir --upgrade -r ...` | Installs the packages. `--no-cache-dir` stops pip from keeping downloaded wheels inside the layer; it concerns pip only, not the Docker build cache.
+| `COPY ./app /code/app` | The code, last, because it changes most often.
+| `CMD [...]` | The default command of the container, in exec form (see <<exec-form>>). The container runs as long as this process runs.
+|===
+
+`fastapi run` is the production mode of the FastAPI CLI: the same as `fastapi dev` with reload disabled, listening on
+`0.0.0.0` (so it is reachable from outside the container) and using Uvicorn underneath. It looks for the application
+by itself: it tries `main.py`, `app.py`, `api.py`, `app/main.py`, `app/app.py` and `app/api.py` when no path is given,
+detects the package root from `__init__.py` files, and looks for an object named `app` or `api` (otherwise it takes the first
+`FastAPI` instance it finds in the module). A single-file project works the same way: copy `main.py` to `/code/` and use
+`CMD ["fastapi", "run", "main.py", "--port", "80"]`. Options that matter in a container:
+
+.fastapi run options relevant to containers
+[cols="2,4",options="header"]
+|===
+| Option | Meaning
+| `--host` | Defaults to `0.0.0.0` in `run` (in `dev` it is `127.0.0.1`). Leave it: a container bound to `127.0.0.1` cannot be reached through a published port.
+| `--port` | Defaults to `8000`, and can also come from the `PORT` environment variable. Ports below 1024 need root unless the platform allows it, which is why the hardened image below uses `8000`.
+| `--workers` | Number of worker processes (see <<workers>>). Mutually exclusive with `--reload`.
+| `--proxy-headers` / `--no-proxy-headers` | Trust `X-Forwarded-Proto`, `X-Forwarded-For` and `X-Forwarded-Port` from the proxy. The default is enabled; the documentation spells it out in the Dockerfile for clarity.
+| `--forwarded-allow-ips` | Comma-separated list of proxy IPs to trust; the literal `*` trusts everything.
+| `--root-path` | Tell the app it is served under a path prefix by the proxy (see xref:backend/fastapi/middleware-cors-and-proxies.adoc#root-path[Path prefixes and `root_path`]).
+| `--app`, `--entrypoint` / `-e` | Name of the app object, or an explicit `module:attribute`, when auto-detection is not what you want.
+| `--verbose` | Show how the app was found, imported and configured; useful when a container "starts" but serves the wrong object.
+|===
+
+`fastapi run` has no `--reload-dir` and no `--timeout-graceful-shutdown`; for that Uvicorn option call `uvicorn` directly
+(see <<graceful-shutdown>>).
+
+[#exec-form]
+=== Exec Form `CMD` and Graceful Shutdown
+
+`CMD` can be written as a JSON array (exec form) or as plain text (shell form). The official guide is explicit: always use the exec form so
+that FastAPI can shut down gracefully and its lifespan shutdown code runs.
+
+.Exec form versus shell form
+[source,dockerfile]
+----
+# Do this: the container's main process (PID 1) is fastapi itself
+CMD ["fastapi", "run", "app/main.py", "--port", "80"]
+
+# Don't do this: Docker wraps the text in /bin/sh -c, so the shell is PID 1
+CMD fastapi run app/main.py --port 80
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+The reason is signals. `docker stop`, Docker Compose and Kubernetes all stop a container by sending `SIGTERM` to the main process and, after a
+grace period, `SIGKILL`. With the exec form the main process is the server, which handles `SIGTERM` by finishing
+the requests in flight and running the lifespan shutdown code (here: disposing the engine). With the shell form the main
+process is a shell, which in many setups does not forward the signal, so the server never learns that it should stop, the
+grace period runs out, and the container is killed without cleanup. That is also the cause of the "services take 10
+seconds to stop or recreate" symptom with Docker Compose that the official page points to (the default stop timeout in
+Docker is 10 seconds). The same applies to a wrapper script: end it with `exec` so the server replaces the shell (see
+<<prestart>>).
+
+This is what a correct shutdown looks like. The server was started as in the Dockerfile and sent `SIGTERM` (the lifespan messages are the
+`logger.info` calls in `main.py`; timestamps and ports vary):
+
+[source,text]
+----
+INFO:     Started server process [22860]
+INFO:     Waiting for application startup.
+INFO:     startup: engine created
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8123 (Press CTRL+C to quit)
+...
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     shutdown: engine disposed
+INFO:     Application shutdown complete.
+INFO:     Finished server process [22860]
+----
+
+Source: https://fastapi.tiangolo.com/advanced/events/[FastAPI: Lifespan Events]
+
+[#layer-cache]
+=== Layer Caching: Dependencies Before Code
+
+An image is a stack of layers, one per instruction. When Docker rebuilds, it reuses every layer from the top until the first one whose inputs
+changed, and rebuilds everything after it. The Dockerfile therefore orders instructions from least to most
+frequently changing: base image, then the dependency file and its install, then the code. A code edit invalidates only the last
+`COPY`; installing the dependencies, which can take minutes, is served from the cache. If you wrote `COPY . /code` before
+`pip install`, every code change would reinstall every package. The generic mechanics, BuildKit cache mounts and multi-stage
+builds are covered in xref:backend/docker/build-cache-and-multi-stage-builds.adoc[Build Cache and Multi-Stage Builds] and
+xref:backend/docker/buildkit-and-buildx.adoc[BuildKit and Buildx]; the basics of each instruction are in
+xref:backend/docker/dockerfile-fundamentals.adoc[Dockerfile Fundamentals].
+
+A `.dockerignore` file keeps local junk out of the build context (and out of cache invalidation): a changing `.git`
+directory or a developer's `__pycache__` would otherwise invalidate the `COPY` layers or end up in the image.
+
+.`.dockerignore`
+[source,text]
+----
+.git
+.venv
+__pycache__/
+*.pyc
+*.db
+.env
+secrets/
+k8s/
+compose.yaml
+----
+
+Source: https://docs.docker.com/build/building/best-practices/[Docker: Building best practices]
+
+[#slim-dockerfile]
+=== A Hardened Variant: Slim Base, Non-Root User
+
+The official Dockerfile is deliberately minimal. For anything that leaves a laptop, three small changes are worth making: a
+`-slim` base image (Debian-based, without compilers and most tools), a non-root user, and a port above 1023 so no
+privilege is needed. This is the image the Compose file and the Kubernetes manifests below use:
+
+.Dockerfile: slim base, layer cache, non-root, exec-form CMD
+[source,dockerfile]
+----
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /code
+
+# 1. Dependencies first: this layer is rebuilt only when requirements.txt changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 2. Code last: it changes most often.
+COPY app ./app
+COPY alembic.ini entrypoint.sh ./
+COPY migrations ./migrations
+
+# 3. Do not run as root. A numeric UID also works with runAsNonRoot in Kubernetes.
+RUN useradd --system --uid 10001 --no-create-home bookshelf
+USER 10001
+
+EXPOSE 8000
+
+# Exec form: fastapi is PID 1 and receives SIGTERM, so lifespan shutdown runs.
+CMD ["fastapi", "run", "app/main.py", "--port", "8000", "--proxy-headers"]
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+* `PYTHONUNBUFFERED=1` makes log lines appear immediately in `docker logs` instead of being held in a buffer, and
+  `PYTHONDONTWRITEBYTECODE=1` avoids writing `.pyc` files into the layer.
+* `slim` images lack build tools. A dependency without a prebuilt wheel for your platform may need a compiler, which is why the
+  requirements use `psycopg[binary]` (prebuilt wheels) instead of compiling the driver. If you need to compile something,
+  use a multi-stage build and copy only the result into the slim stage.
+* `EXPOSE` documents the port; it does not publish it. Publishing happens with `-p`/`ports:` in Compose or a Service in Kubernetes.
+* Logs go to standard output and error, which is where Docker and Kubernetes collect them: do not configure a log file inside the
+  container. Structured logging and metrics belong to the observability setup of the application.
+* More on image hardening (pinning digests, scanning, read-only filesystems) is in
+  xref:backend/docker/image-best-practices-and-security.adoc[Image Best Practices and Supply-Chain Security] and
+  xref:backend/docker/security.adoc[Docker Security].
+
+[#slim-extras]
+==== Choosing the extras
+
+The `standard` extra includes the FastAPI Cloud CLI (`fastapi-cloud-cli`, the `fastapi deploy` command) next to Uvicorn, Jinja2, `httpx`,
+`python-multipart` and others. An image that only serves the API does not need to ship a deployment client. FastAPI 0.142.2 also publishes
+`standard-no-fastapi-cloud-cli`, which keeps the `fastapi` command and Uvicorn but leaves that client out, and you can go further by naming
+only the packages you use (`fastapi`, `uvicorn`, `fastapi-cli`, `pydantic-settings`). Whichever you pick, `fastapi run` needs the
+`fastapi-cli` package: plain `pip install fastapi` has not installed the CLI or Uvicorn since 0.112.0, so a Dockerfile that installs only
+`fastapi` and then runs `fastapi run` fails at start with a "command not found".
+
+.requirements.txt without the Cloud CLI
+[source,text]
+----
+fastapi[standard-no-fastapi-cloud-cli]==0.142.2
+----
+
+Source: https://fastapi.tiangolo.com/release-notes/[FastAPI: Release Notes]
+
+[#behind-proxy]
+=== Behind a Load Balancer: `--proxy-headers`
+
+In production the container almost never faces clients directly: an ingress controller, cloud load balancer or Traefik
+terminates TLS and forwards plain HTTP. Without help the application then sees `http` and the proxy's IP, so generated
+redirects point to `http://`, `request.url` is wrong and rate limits see one client. `--proxy-headers` makes Uvicorn
+(through the FastAPI CLI) honour the `X-Forwarded-*` headers, but only from trusted peers. Uvicorn's default trusted list is the loopback
+address (`127.0.0.1` and `::1`) only, so in a cluster, where the proxy has a pod or node IP, add `--forwarded-allow-ips` with the
+proxy's address or range. Trusting everything with `*` is acceptable only when the container is reachable exclusively through
+the proxy, because otherwise any client can forge its own address or scheme. The full explanation, with a run showing the
+spoofing difference, is in xref:backend/fastapi/middleware-cors-and-proxies.adoc#forwarded-headers[Forwarded headers and `--forwarded-allow-ips`]
+and the TLS side in xref:backend/fastapi/middleware-cors-and-proxies.adoc#https-termination[HTTPS and TLS Termination].
+
+.Trusting a known proxy range
+[source,dockerfile]
+----
+CMD ["fastapi", "run", "app/main.py", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "10.0.0.0/8"]
+----
+
+Source: https://fastapi.tiangolo.com/advanced/behind-a-proxy/[FastAPI: Behind a Proxy]
+
+[#uv-image]
+== A uv-Based Image
+
+The FastAPI documentation now manages its own projects with `uv` (`uv add "fastapi[standard]"`, with the exact versions in `uv.lock`). Its container
+page shows how to export the lock file to a `requirements.txt` for the pip-based Dockerfile above:
+
+[source,bash]
+----
+uv export --format requirements-txt --no-dev --no-emit-project --output-file requirements.txt
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+That keeps the Dockerfile simple but installs with pip, so uv's speed and the lock file's hashes are used only on the export. For a
+uv project the FastAPI page defers to uv's own Docker guide: install uv into the image, then run `uv sync --locked` so that the build fails when
+`uv.lock` is out of date. The variant below splits the work into two layers (dependencies, then project) using the pattern from that guide,
+`--locked` to assert the lock file, `UV_NO_DEV=1` to skip development dependencies, and bytecode compilation for faster startup:
+
+.Dockerfile.uv: uv with a locked, layered install
+[source,dockerfile]
+----
+FROM python:3.13-slim
+
+# Pin the uv version (and, for reproducible builds, optionally its sha256 digest).
+COPY --from=ghcr.io/astral-sh/uv:0.12.22 /uv /uvx /bin/
+
+ENV UV_NO_DEV=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    PATH="/app/.venv/bin:$PATH"
+
+WORKDIR /app
+
+# Layer 1: dependencies only, from the lock file. Rebuilt when uv.lock or pyproject.toml change.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --locked --no-install-project
+
+# Layer 2: the project itself.
+COPY . /app
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked
+
+RUN useradd --system --uid 10001 --no-create-home bookshelf
+USER 10001
+
+EXPOSE 8000
+CMD ["fastapi", "run", "app/main.py", "--port", "8000", "--proxy-headers"]
+----
+
+Source: https://docs.astral.sh/uv/guides/integration/docker/[uv: Using uv in Docker]
+
+How it works and why:
+
+* *Where uv comes from.* Copying the binaries out of the official uv image (`COPY --from=ghcr.io/astral-sh/uv:<version> /uv /uvx /bin/`) is the
+  approach the uv guide describes, together with pinning the version; the guide also publishes derived images with uv and Python together
+  (for example Debian slim or Alpine based). The version shown (`0.12.22`) is the guide's own example: replace it with the uv release you
+  have tested.
+* *`uv sync --locked`* installs exactly what `uv.lock` records and errors if the lock does not match `pyproject.toml`, which is what a CI image build wants.
+  `--no-install-project` in the first layer installs only the dependencies, so the layer is reused while only your code changes.
+* *`PATH="/app/.venv/bin:$PATH"`* puts the project's virtual environment first, so `fastapi` is found directly and `CMD` can stay in exec form.
+  The alternative the guide shows is `uv run`; as a `CMD` it adds a wrapper process, so prefer the environment on the `PATH` for
+  signal handling.
+* *`.venv` in `.dockerignore`.* The guide recommends it: the virtual environment of your machine must not be copied into the image,
+  because it is platform specific. The `.dockerignore` above already lists it.
+* *Cache mounts* (`--mount=type=cache`) require BuildKit, the default builder in current Docker.
+* The uv guide also documents development setups for Compose (`docker compose watch` syncing the project but ignoring `.venv`).
+
+[#workers]
+== One Process per Container, or `--workers`
+
+A single Uvicorn process runs one event loop on one CPU core. To use several cores you need several processes, and the question is *where*
+they are managed. The FastAPI documentation gives a clear default by environment:
+
+.Where to put the replicas
+[cols="2,3,3",options="header"]
+|===
+| Situation | Recommendation | Why
+| Kubernetes, Azure Container Apps, ECS, Nomad, Swarm: an orchestrator that runs many containers | One Uvicorn process per container; scale with replicas | The cluster already provides replication, load balancing, restarts and per-container memory limits; a process manager inside the container duplicates this
+| A single server with Docker Compose, no orchestrator | One container with `--workers N` is a legitimate choice | Compose cannot easily replicate containers behind a shared port and load balancer
+| A simple application on one machine | `--workers N` in the container | A process manager inside is enough
+| Local development | One process, `fastapi dev` with reload | `--reload` and `--workers` are mutually exclusive
+|===
+
+The mechanics are one flag. Here a real run of `fastapi run --workers 2`, showing the parent process that supervises and the two server processes that each
+run the lifespan (so each worker has its *own* engine and pool, which is why the number of workers multiplies your database connections), and the shutdown after `SIGTERM`:
+
+[source,bash]
+----
+fastapi run app/main.py --port 8125 --workers 2
+----
+
+[source,text]
+----
+INFO:     Started parent process [23037]
+INFO:     Started server process [23041]
+INFO:     Started server process [23040]
+INFO:     Application startup complete.
+INFO:     Application startup complete.
+...
+INFO:     Shutting down
+INFO:     Shutting down
+INFO:     Finished server process [23041]
+INFO:     Finished server process [23040]
+INFO:     Stopping parent process [23037]
+----
+
+Source: https://fastapi.tiangolo.com/deployment/server-workers/[FastAPI: Server Workers - Uvicorn with Workers]
+
+In a Dockerfile this is `CMD ["fastapi", "run", "app/main.py", "--port", "8000", "--workers", "4"]`, as in the official page. Things to weigh when you choose workers:
+
+* *Memory multiplies.* Each worker imports the application and holds its own copies of models, caches and pools. One process per container gives a stable,
+  per-container memory figure that you can express as a Kubernetes or Compose limit; with `--workers` the limit must cover all of them.
+* *Connection pools multiply.* Four workers with a pool of ten connections each is forty connections to PostgreSQL, per container, per replica.
+* *Do not hard-code a core count.* Inside a container the machine's core count may not match the CPU limit that the container actually gets
+  (a Kubernetes CPU limit throttles rather than hides cores), so size `--workers` from a measurement or a platform setting, not from detection.
+  Uvicorn itself defaults `--workers` to the `WEB_CONCURRENCY` environment variable when set, and to 1 otherwise.
+* *CPU-bound code is a separate problem.* Workers help throughput when requests are independent; they do not turn a CPU-heavy
+  endpoint into a fast one, and blocking calls in `async def` handlers still stall their own worker's loop (see
+  xref:backend/fastapi/async-and-concurrency.adoc[Async & Concurrency]).
+* *The orchestrator still sees one thing.* A container with four workers looks like one unit to Kubernetes. If one worker is stuck, the liveness
+  probe may hit a healthy sibling and the container is not restarted.
+
+[#gunicorn]
+=== Gunicorn with Uvicorn Workers
+
+Before Uvicorn could supervise its own workers, the standard answer was Gunicorn managing Uvicorn worker processes, and it remains valid when you need
+Gunicorn's process-management features (for example a worker recycled after N requests or a Gunicorn configuration file). Uvicorn's
+documentation warns that `uvicorn.workers` is deprecated and points to the separate `uvicorn-worker` package:
+
+.Gunicorn with the uvicorn-worker class
+[source,bash]
+----
+pip install gunicorn uvicorn-worker
+gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 2 -b 0.0.0.0:8000
+----
+
+Source: https://uvicorn.dev/deployment/[Uvicorn: Deployment]
+
+This was run with Gunicorn 26.2 and uvicorn-worker 0.4: both workers ran the lifespan, and on `SIGTERM` the master forwarded the signal and both
+workers ran their shutdown before the master exited. For an ordinary container the extra layer buys little over `fastapi run --workers`, and it is one more
+dependency to keep current. The `Dockerfile` form is the exec-form `CMD ["gunicorn", "app.main:app", "-k", "uvicorn_worker.UvicornWorker", "-w", "2", "-b", "0.0.0.0:8000"]`;
+Gunicorn's own documentation is at https://gunicorn.org/.
+
+[#compose]
+== Docker Compose with PostgreSQL
+
+Compose runs the API, the database and the migration step as one unit on a single host. It is the usual way to run the whole stack for local
+development, integration tests and small single-server deployments. The generic Compose material is in
+xref:backend/docker/compose-fundamentals.adoc[Compose Fundamentals],
+xref:backend/docker/compose-in-practice.adoc[Compose in Practice] and
+xref:backend/docker/compose-for-local-development.adoc[Compose for Local Development]; this section shows the FastAPI-specific wiring.
+The PostgreSQL-only variant used from the data layer is in
+xref:backend/fastapi/sql-databases-with-sqlmodel.adoc#postgresql-compose[PostgreSQL in Docker Compose].
+
+Create the secret file first, with a generated value and kept out of version control (`secrets/` is in `.gitignore` and `.dockerignore`):
+
+[source,bash]
+----
+mkdir -p secrets
+openssl rand -hex 24 > secrets/db_password.txt
+docker compose up --build
+----
+
+Source: https://docs.docker.com/compose/how-tos/use-secrets/[Docker: Secrets in Compose]
+
+.compose.yaml: PostgreSQL, a one-shot migration, and the API
+[source,yaml]
+----
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: bookshelf
+      POSTGRES_DB: bookshelf
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - pgdata:/var/lib/postgresql   # PostgreSQL 18 and later: the volume is the parent directory
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &db_env
+      BOOKSHELF_DB_DRIVERNAME: postgresql+psycopg
+      BOOKSHELF_DB_HOST: db
+      BOOKSHELF_DB_PORT: "5432"
+      BOOKSHELF_DB_NAME: bookshelf
+      BOOKSHELF_DB_USER: bookshelf
+      BOOKSHELF_DB_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment: *db_env
+    secrets:
+      - db_password
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt   # create it first: openssl rand -hex 24 > secrets/db_password.txt
+
+volumes:
+  pgdata:
+----
+
+Source: https://docs.docker.com/compose/how-tos/startup-order/[Docker: Control startup and shutdown order in Compose]
+
+`docker compose config` (run here, no daemon needed) validated and normalized the file. Points about it:
+
+* *Startup order is a chain of conditions.* `depends_on` with `condition: service_healthy` waits for the database healthcheck, and
+  `service_completed_successfully` waits for the migration container to exit with status 0. Plain `depends_on` only waits for the container to *start*, which for PostgreSQL is
+  long before it accepts connections; this is the classic "connection refused on first boot".
+* *The healthcheck uses `pg_isready`*, which ships in the PostgreSQL image. The `$$` stops Compose from interpolating the variable on the host, so the shell inside the container expands it.
+* *Secrets as files.* The PostgreSQL image supports the `_FILE` form of `POSTGRES_PASSWORD`, `POSTGRES_USER` and `POSTGRES_DB`
+  (`POSTGRES_PASSWORD_FILE`), and the API reads the same file through `BOOKSHELF_DB_PASSWORD_FILE`. Compose mounts a file secret under `/run/secrets/<name>`.
+  The process in the API image runs as UID 10001, so the file on the host must be readable by other users (the default mode of the file created above is); on a
+  production host prefer an orchestrator's real secret store. The mechanism is described in
+  https://docs.docker.com/compose/how-tos/use-secrets/[Docker: Secrets in Compose].
+* *The data volume.* From PostgreSQL 18 the image's declared volume is `/var/lib/postgresql` (the data lives in a version-specific subdirectory), so mount the named volume
+  there; mounting `/var/lib/postgresql/data`, as in older examples, no longer matches.
+* *`stop_grace_period`.* Compose waits this long after `SIGTERM` before `SIGKILL`; it must exceed the time your slowest in-flight request needs.
+* *Only one place for the settings.* The YAML anchor `&db_env` / `*db_env` shares the same environment between the migration and the API.
+* *Dev mode.* For a development stack replace `command` with `fastapi dev --host 0.0.0.0` and bind-mount `./app`, as described on
+  xref:backend/docker/compose-for-local-development.adoc[Compose for Local Development].
+  `fastapi dev` listens on `127.0.0.1` unless told otherwise, which makes it unreachable from the host.
+
+[mermaid]
+....
+flowchart LR
+  db["db (postgres:18)<br/>healthcheck: pg_isready"]
+  migrate["migrate<br/>alembic upgrade head"]
+  api["api<br/>fastapi run :8000"]
+  db -- "service_healthy" --> migrate
+  migrate -- "service_completed_successfully" --> api
+  client(["curl / browser"]) -- "localhost:8000" --> api
+  api -- "BOOKSHELF_DB_* + password file" --> db
+....
+
+[#prestart]
+== Running Alembic as a Pre-Start Step
+
+Schema changes must be applied before the new code serves traffic, and the application must not apply them itself on every worker start:
+with two replicas or four workers, several processes would race to alter the same tables. The FastAPI
+deployment concepts call this "previous steps before starting", and the container page describes two options: a *separate container* that runs the step once before the replicas
+(an init container or Job in Kubernetes), or the step in the same container right before the main process when running it several times is harmless.
+Alembic itself, the `env.py` that reads the URL from the same settings as the application, and the `import sqlmodel` line that
+`script.py.mako` needs for SQLModel's string type are covered in xref:backend/fastapi/sql-databases-with-sqlmodel.adoc#alembic[Alembic Migrations].
+
+[#prestart-script]
+=== A Wrapper Script (single container)
+
+For a single container (a small VM, Compose without a separate migration service, or a Container Apps revision with one replica), a tiny entrypoint
+script runs the migration and then *replaces itself* with the server. `exec` is what keeps `fastapi` as PID 1, so the signal handling of
+<<exec-form>> still works:
+
+.entrypoint.sh
+[source,bash]
+----
+#!/bin/sh
+set -eu
+
+# Optional pre-start step: apply migrations, then replace the shell with the server.
+if [ "${RUN_MIGRATIONS:-0}" = "1" ]; then
+    alembic upgrade head
+fi
+
+exec "$@"
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+In the Dockerfile add `ENTRYPOINT ["./entrypoint.sh"]` before the unchanged exec-form `CMD`; the `CMD` is passed to the script as `"$@"`. This was run
+against SQLite: the first line of the log is Alembic, then the normal server start, and after `SIGTERM` the lifespan shutdown ran and no process was left:
+
+[source,text]
+----
+INFO  [alembic.runtime.migration] Will assume non-transactional DDL.
+INFO  [alembic.runtime.migration] Running upgrade  -> d55bac28c9c9, create books
+ ⚡️ Starting FastAPI in production mode
+...
+INFO:     Application startup complete.
+...
+INFO:     Waiting for application shutdown.
+INFO:     shutdown: engine disposed
+INFO:     Application shutdown complete.
+----
+
+Source: https://alembic.sqlalchemy.org/en/latest/tutorial.html[Alembic: Tutorial]
+
+The script is only safe with one instance. If it ran in every replica at once, two `alembic upgrade head` commands could try to create the same table; do not rely on Alembic to coordinate concurrent runs: a failed concurrent
+run would crash a starting pod. The script is also a bad place to *wait* for the database: use the healthcheck chain or the readiness probe for that.
+
+[#prestart-k8s]
+=== A Kubernetes Job
+
+On Kubernetes the one-shot step is a `Job` that uses the same image and runs to completion once per release (a Helm hook, an Argo CD sync wave or a pipeline step
+decides when). Because the Job is separate from the Deployment, it runs exactly once however many replicas follow:
+
+.k8s/migrate-job.yaml
+[source,yaml]
+----
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bookshelf-migrate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: registry.example.com/bookshelf-api:1.0.0
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: bookshelf-config
+          volumeMounts:
+            - name: db-secret
+              mountPath: /run/secrets/db
+              readOnly: true
+      volumes:
+        - name: db-secret
+          secret:
+            secretName: bookshelf-db   # kubectl create secret generic bookshelf-db --from-file=password=./secrets/db_password.txt
+----
+
+Source: https://kubernetes.io/docs/concepts/workloads/controllers/job/[Kubernetes: Jobs]
+
+An init container (https://kubernetes.io/docs/concepts/workloads/pods/init-containers/[Kubernetes: Init Containers]) is the other native option, and the
+FastAPI documentation names it, but it runs in every pod, so with several replicas the migration runs several times, at the same time on a first rollout.
+Use it only for steps that are safe to repeat in parallel, such as "wait until the database accepts connections", and put real migrations in a Job.
+
+Rolling out a schema change safely is mostly about compatibility: during a rolling update old and new pods run side by side against the new schema, so
+the migration must keep working for the old code (add the nullable column in one release, start using it in the next, drop the old one later).
+The pattern (expand and contract) is described in the schema evolution material on this site, starting from
+xref:database/schema-evolution/index.adoc[Schema Evolution].
+
+[#kubernetes]
+== Kubernetes
+
+Kubernetes (the cluster itself is covered by the xref:backend/kubernetes/index.adoc[Kubernetes Reference] and, on Azure, by
+xref:cloud/azure/aks-clusters.adoc[AKS Clusters]) provides everything that the process-manager-in-the-container approach tried to imitate: replicas,
+rolling restarts, load balancing, resource limits and health-based replacement. What the FastAPI application must supply is
+*one process per container*, honest health endpoints, correct signal handling and configuration from the environment. For the Docker
+side of orchestrators see xref:backend/docker/orchestration-swarm-and-kubernetes.adoc[Orchestration: Swarm Mode and Kubernetes].
+
+.k8s/configmap.yaml: non-secret configuration
+[source,yaml]
+----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bookshelf-config
+data:
+  BOOKSHELF_DB_DRIVERNAME: postgresql+psycopg
+  BOOKSHELF_DB_HOST: bookshelf-db.example.internal   # your PostgreSQL service or managed database
+  BOOKSHELF_DB_PORT: "5432"
+  BOOKSHELF_DB_NAME: bookshelf
+  BOOKSHELF_DB_USER: bookshelf
+  BOOKSHELF_DB_PASSWORD_FILE: /run/secrets/db/password
+----
+
+Source: https://kubernetes.io/docs/concepts/configuration/configmap/[Kubernetes: ConfigMaps]
+
+The password is a Kubernetes Secret created from a file (never written into a manifest in version control), mounted as a file, and read by `db_password_file`:
+
+[source,bash]
+----
+openssl rand -hex 24 > secrets/db_password.txt
+kubectl create secret generic bookshelf-db --from-file=password=./secrets/db_password.txt
+----
+
+Source: https://kubernetes.io/docs/concepts/configuration/secret/[Kubernetes: Secrets]
+
+On a real cluster the Secret normally comes from an external secret store instead (on Azure see
+xref:cloud/azure/key-vault-and-secrets.adoc[Key Vault and Secrets]); the application does not change, because it only reads a file.
+
+[#k8s-deployment]
+=== The Deployment, Service and Rolling Update
+
+.k8s/deployment.yaml
+[source,yaml]
+----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bookshelf-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bookshelf-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: bookshelf-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: api
+          image: registry.example.com/bookshelf-api:1.0.0
+          # One Uvicorn process per container: the Deployment provides the replicas.
+          command: ["fastapi", "run", "app/main.py", "--port", "8000", "--proxy-headers"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: bookshelf-config
+          volumeMounts:
+            - name: db-secret
+              mountPath: /run/secrets/db
+              readOnly: true
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+      volumes:
+        - name: db-secret
+          secret:
+            secretName: bookshelf-db
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bookshelf-api
+spec:
+  selector:
+    app: bookshelf-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+----
+
+Source: https://kubernetes.io/docs/concepts/workloads/controllers/deployment/[Kubernetes: Deployments]
+
+* *Replication.* `replicas: 3` gives three single-process containers. Each is a full copy with its own memory; the Service load-balances over the pods that are
+  ready. This is the "one load balancer, multiple worker containers" picture of the FastAPI container documentation.
+* *Rolling update.* `maxUnavailable: 0` and `maxSurge: 1` start one new pod, wait for it to become ready, then remove an old one, so capacity never drops below three during a
+  release. Without a readiness probe Kubernetes would consider the pod ready as soon as the container started, and traffic could reach an application that is still importing models.
+* *The command.* The `command` replaces the image's `CMD`; it is repeated here only to make the one-process choice visible. Leaving it out and relying on the
+  image's `CMD` is equivalent, and usually better, because the command then exists in exactly one place.
+* *Resources.* The memory request is what the scheduler reserves, and the memory limit is where the container is killed (OOM) when exceeded. A CPU *limit* throttles the
+  container and can add latency spikes to an async server, which is why the example sets a CPU request and no CPU limit; set one if your platform's policy requires it. Details in
+  https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/[Kubernetes: Resource Management for Pods and Containers].
+* *Security context.* `runAsNonRoot` makes the kubelet refuse an image whose user is root; the numeric UID from the Dockerfile satisfies it (a user *name* cannot be verified), see
+  https://kubernetes.io/docs/tasks/configure-pod-container/security-context/[Kubernetes: Configure a Security Context].
+* *Ingress and TLS.* The Service is cluster-internal. An Ingress (or Gateway) in front of it terminates TLS and adds the forwarded headers, which is where `--proxy-headers`
+  and `--forwarded-allow-ips` come in (see <<behind-proxy>>). The API gateway question is the subject of issue #184.
+
+[#k8s-probes]
+=== Health Endpoints and Probes
+
+Kubernetes asks three different questions of a container, and each needs a different answer from the application:
+
+.The three probes
+[cols="2,3,4",options="header"]
+|===
+| Probe | Question | What happens on failure
+| `startupProbe` | Has the application finished starting? | Other probes are held back until it succeeds; if it never does within `failureThreshold` x `periodSeconds`, the container is restarted. It lets slow starts (loading a model) be tolerated without a long liveness delay.
+| `livenessProbe` | Is the process alive, or stuck beyond recovery? | The container is restarted.
+| `readinessProbe` | Can this pod serve traffic right now? | The pod is removed from the Service's endpoints (no restart) and added back when it passes again.
+|===
+
+The crucial design rule is in the example endpoints above: *liveness must not depend on external systems*. If `/healthz` checked the database and
+the database had an outage, every pod would fail liveness, Kubernetes would restart all of them, and the restarts would add load to a database that is already
+struggling. Liveness answers only "is this process responsive?", which is why `/healthz` does nothing. Readiness may check dependencies that this pod needs to serve requests, so a pod
+that cannot reach the database is taken out of rotation instead of returning errors; `/readyz` runs a `SELECT 1` through the same session dependency as the real
+endpoints. Keep the check cheap, with a short timeout, because it runs every few seconds on every pod.
+
+This is the observed behaviour of the two endpoints with the database unreachable (the SQLite path pointed at a missing directory):
+
+[source,text]
+----
+GET /healthz  -> HTTP/1.1 200 OK
+GET /readyz   -> HTTP/1.1 503 Service Unavailable
+{"detail":"database unavailable"}
+----
+
+Source: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/[Kubernetes: Configure Liveness, Readiness and Startup Probes]
+
+Any status from 200 to 399 passes an HTTP probe, so the `503` fails readiness. The probe endpoints appear in the OpenAPI schema and in the access log like any other; hide them from
+the schema with `include_in_schema=False` on the decorator if you do not want them in the API documentation (see
+xref:backend/fastapi/openapi-and-interactive-docs.adoc[OpenAPI & Interactive Docs]) and filter them from access logs in the observability setup. Other probe types (TCP, gRPC, exec)
+exist, but HTTP is the natural fit and works through the same server as the real traffic. The same two endpoints serve the Docker healthcheck, with
+`CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]`, because the slim image has no `curl`.
+
+An application test of the two endpoints needs the lifespan (so that `app.state.engine` exists), which `TestClient` runs only inside a `with` block:
+
+.test_health.py
+[source,python]
+----
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+def test_liveness_and_readiness() -> None:
+    with TestClient(app) as client:  # the with-block runs lifespan
+        assert client.get("/healthz").json() == {"status": "alive"}
+        assert client.get("/readyz").status_code == 200
+----
+
+Source: https://fastapi.tiangolo.com/advanced/testing-events/[FastAPI: Testing Events: lifespan and startup - shutdown]
+
+Outcome: `1 passed`.
+
+[#graceful-shutdown]
+=== Graceful Shutdown
+
+When a pod is deleted (a rollout, a scale-down, a node drain), two things happen at the same time and Kubernetes does not order them: the pod is removed from
+Service endpoints, and the kubelet starts shutting the containers down. Proxies learn about the removal with a small delay, so for a moment a pod that has begun
+stopping can still receive new requests. The sequence is:
+
+[mermaid]
+....
+sequenceDiagram
+  autonumber
+  participant K as Kubernetes
+  participant E as Service endpoints / proxies
+  participant C as Container (fastapi run)
+  K->>E: pod marked terminating, remove from endpoints
+  K->>C: preStop hook (sleep 5)
+  Note over E,C: proxies stop sending new requests during the sleep
+  K->>C: SIGTERM
+  C->>C: Uvicorn stops accepting, finishes in-flight requests
+  C->>C: lifespan shutdown runs (dispose engine, close clients)
+  C-->>K: process exits 0
+  Note over K,C: if still running when terminationGracePeriodSeconds ends: SIGKILL
+....
+
+The pieces the application and the manifest must get right:
+
+* *`SIGTERM` reaches the server.* That requires the exec-form `CMD` (or `exec` in a wrapper): see <<exec-form>>. The log shown earlier
+  (`Shutting down`, `Waiting for application shutdown`, the lifespan message) is the proof you want to see in your own pods.
+* *`terminationGracePeriodSeconds`* (default 30 seconds) is the total budget; after it the container receives `SIGKILL`. Its countdown starts *before* the
+  `preStop` hook, and the hook must finish before `SIGTERM` is sent (see the Kubernetes container lifecycle documentation), so budget `preStop` plus the slowest
+  request plus the lifespan shutdown.
+* *The `preStop` sleep.* A short sleep (five seconds in the manifest) delays `SIGTERM` until the endpoint removal has propagated, so the load balancer stops sending new requests
+  before the server stops accepting them. The sleep action is built into the lifecycle hooks, so the slim image needs no `sleep` binary.
+* *In-flight requests.* On `SIGTERM` Uvicorn stops accepting new connections and waits for requests in progress to complete; requests that
+  can take a long time (large uploads, slow reports) must fit inside the grace period, or be moved to a background worker.
+* *Long-lived connections.* WebSockets, Server-Sent Events and streaming responses keep a connection open indefinitely, and Uvicorn's graceful shutdown waits for them. Without a
+  limit the pod waits until `SIGKILL`. Uvicorn has `--timeout-graceful-shutdown <seconds>`: the maximum wait for a graceful shutdown, after which the server starts
+  terminating the remaining requests. It is an option of the `uvicorn` command (it is not in the `fastapi run` options), so use
+  `CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--timeout-graceful-shutdown", "20"]` when you need it, and pick a value below the grace period. Clients of those
+  endpoints should reconnect (see xref:backend/fastapi/websockets.adoc[WebSockets] and
+  xref:backend/fastapi/streaming-json-lines-and-sse.adoc[Streaming, JSON Lines & SSE]).
+* *Lifespan work stays short.* Cleanup in the lifespan (closing pools and clients, flushing metrics) runs after the requests have ended; a hung `await` there would consume the rest of the grace period.
+  Background tasks started with `BackgroundTasks` run after the response in the same process and can be cut off by `SIGKILL`; work that must not be lost belongs in a queue (see
+  xref:backend/fastapi/settings-lifespan-and-background-tasks.adoc#bg-shutdown[BackgroundTasks and shutdown]).
+
+Source: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/[Kubernetes: Pod Lifecycle: termination of Pods]
+
+[#k8s-scaling]
+=== Autoscaling and Disruption Budgets
+
+.k8s/hpa-pdb.yaml
+[source,yaml]
+----
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: bookshelf-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bookshelf-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: bookshelf-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: bookshelf-api
+----
+
+Source: https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/[Kubernetes: Horizontal Pod Autoscaling]
+
+* The HorizontalPodAutoscaler adds or removes pods based on CPU utilization *relative to the request*, so a CPU request is required for it (the Deployment sets one). An async API is I/O bound,
+  and CPU can stay low while requests queue behind a slow database; scale on request rate or latency with a metrics adapter when CPU is a poor signal.
+* Scaling out multiplies database connections: `maxReplicas` times the pool size must stay below the database's connection limit
+  (see xref:backend/fastapi/sql-databases-with-sqlmodel.adoc#pooling[Connection pooling]).
+* The PodDisruptionBudget keeps at least two pods up during voluntary disruptions such as node drains
+  (https://kubernetes.io/docs/tasks/run-application/configure-pdb/[Kubernetes: Specifying a Disruption Budget]).
+* Cluster-wide topics are covered by the Kubernetes Reference: xref:backend/kubernetes/ingress.adoc[Ingress],
+  xref:backend/kubernetes/helm.adoc[Helm], xref:backend/kubernetes/gitops-and-ci-cd.adoc[GitOps and CI/CD] and
+  xref:backend/kubernetes/network-policies.adoc[Network Policies]. The managed cloud options are in the next section.
+
+[#cloud]
+== Managed Container Platforms
+
+The same image runs on any platform that can start a container, with these FastAPI-specific points staying constant: one process per container, `0.0.0.0` and a known port, configuration from environment
+variables and secret files, probes pointing at `/healthz` and `/readyz`, and exec-form `CMD`.
+
+* *Azure Container Apps* runs the image without managing a cluster and scales replicas on HTTP concurrency or events, including to zero:
+  xref:cloud/azure/container-apps.adoc[Container Apps] and xref:cloud/azure/container-apps-scaling-jobs-and-dapr.adoc[Container Apps: Scaling, Jobs and Dapr]. Its Jobs are the equivalent of the
+  migration Job above. Scale-to-zero means a cold start includes your imports and lifespan, so keep startup light.
+* *Azure Kubernetes Service* is the managed cluster for the manifests of this page: xref:cloud/azure/aks-clusters.adoc[AKS Clusters] and
+  xref:cloud/azure/aks-microservices.adoc[Deploying Microservices on AKS].
+* *Azure Container Registry* stores the image that these platforms pull: xref:cloud/azure/container-registry.adoc[Azure Container Registry]; the generic registry material is
+  xref:backend/docker/registries-and-docker-hub.adoc[Registries and Docker Hub].
+* *Database and secrets.* xref:cloud/azure/postgresql-and-mysql.adoc[PostgreSQL and MySQL on Azure] replaces the Compose `db` service, and
+  xref:cloud/azure/key-vault-and-secrets.adoc[Key Vault and Secrets] replaces the secret file.
+* *CI/CD.* Building, scanning and pushing the image from a pipeline is shown in xref:backend/docker/ci-cd-with-github-actions.adoc[Docker CI/CD with GitHub Actions].
+* *AWS and Google Cloud* equivalents: xref:cloud/aws/ecs-and-fargate.adoc[ECS and Fargate] and
+  xref:cloud/aws/eks-clusters.adoc[EKS clusters] (see xref:cloud/aws/index.adoc[AWS]), and
+  xref:cloud/google-cloud/cloud-run.adoc[Cloud Run] and xref:cloud/google-cloud/gke-clusters.adoc[GKE clusters] (see
+  xref:cloud/google-cloud/index.adoc[Google Cloud]).
+* *FastAPI Cloud*, the hosting service from the FastAPI team, deploys without a Dockerfile (`fastapi deploy`) and is covered with the other
+  deployment options in xref:backend/fastapi/deployment.adoc[Deployment].
+
+[#base-image]
+== The Deprecated `tiangolo/uvicorn-gunicorn-fastapi` Image
+
+Many tutorials still start with `FROM tiangolo/uvicorn-gunicorn-fastapi`, a ready-made image that ran Gunicorn managing Uvicorn workers and chose the number of workers by itself. The FastAPI documentation, re-checked on
+2026-10-02, now states that this image is deprecated and that you should probably not use it or any similar base image. Its history explains why: the image was created when
+Uvicorn could not manage and restart dead workers itself, so Gunicorn was needed for that. Today Uvicorn and the `fastapi` command support `--workers`, so there is no reason to prefer a special base image over
+your own image from the official Python image, which is "pretty much the same amount of code". Kubernetes and similar platforms handle replication at the cluster level, so a one-process image is the better fit anyway.
+
+.Migrating from the old base image
+[source,dockerfile]
+----
+# Old: FROM tiangolo/uvicorn-gunicorn-fastapi:python3.9 (workers chosen by the image, app in /app)
+FROM python:3.13-slim
+WORKDIR /code
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY ./app /code/app
+CMD ["fastapi", "run", "app/main.py", "--port", "8000", "--proxy-headers"]
+# Several workers on one machine: add "--workers", "4" to the CMD list.
+----
+
+Source: https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+
+The migration list: replace the image's worker-count environment variables with an explicit `--workers`; replace its configuration files with
+settings read from the environment; move its `/app/app/main.py` convention to your own layout; and add the health endpoints, signals and non-root user from this page, which the old image did not give you.
+
+[#changes]
+== Where Older Guides Are Outdated, and What Changed Recently
+
+* *The base image.* `tiangolo/uvicorn-gunicorn-fastapi` is deprecated in the official documentation; older guides still recommend it. See <<base-image>>.
+* *Gunicorn as the process manager.* Guides that put Gunicorn in front of every container predate Uvicorn's own worker supervision. `--workers` on `fastapi run` or `uvicorn` now covers it;
+  if you still want Gunicorn, Uvicorn's documentation deprecates its bundled `uvicorn.workers` module in favour of the `uvicorn-worker` package.
+* *`CMD` and the CLI.* Before the `fastapi` command (0.111.0, 2024-05-03) containers ran `uvicorn main:app --host 0.0.0.0 --port 80`. The current
+  documentation uses `fastapi run`, which listens on `0.0.0.0` by default and detects the app. Plain `uvicorn` remains valid and is needed for options such as
+  `--timeout-graceful-shutdown`.
+* *`pip install fastapi` is not enough.* Since 0.112.0 (2024-08-02) the CLI, Uvicorn and the other defaults come with `fastapi[standard]`; the older `fastapi-slim` package was
+  deprecated and then dropped (0.129.2, 0.128.8, February 2026), so use `fastapi` or one of the extras (`standard`, `standard-no-fastapi-cloud-cli`, `opentelemetry`, `all`).
+* *Python versions in Dockerfiles.* The documentation's Dockerfile now uses Python 3.14, while many guides still show 3.8 or 3.9. FastAPI dropped 3.8 (0.125.0) and 3.9 (0.129.0), so a base image older than 3.10 can no longer install current FastAPI.
+  Python 3.14 is supported since 0.118.3, and free-threaded 3.14t since 0.136.0.
+* *Pydantic v1 images.* An image pinned to Pydantic v1 cannot run current FastAPI: Pydantic v1 support was dropped in 0.126.0 (2025-12-20) and `pydantic.v1` in 0.128.0 (2025-12-27).
+* *Dependency management in the docs.* The documentation now uses `uv` projects by default (0.140.0, 2026-07-24) and shows `uv export` for the pip-based Dockerfile; guides that only show `pip install -r requirements.txt` are not wrong, but miss the locked workflow.
+* *PostgreSQL 18 volume path.* Compose examples that mount `/var/lib/postgresql/data` predate PostgreSQL 18, whose image declares `/var/lib/postgresql` as the volume.
+* *`on_event` and shutdown.* Guides that rely on `@app.on_event("shutdown")` for cleanup should use the lifespan, which is what the log in this page shows running (see
+  xref:backend/fastapi/settings-lifespan-and-background-tasks.adoc#on-event[Deprecated on_event]).
+* *Healthchecks in images.* Old guides used the Docker `HEALTHCHECK` instruction as the only health signal; Kubernetes ignores it and uses its own probes, so the application endpoints, not the Dockerfile, are the portable part.
+* *Native OpenTelemetry (0.142.0, 2026-09-29).* FastAPI can emit traces itself, and its `opentelemetry` extra is part of `standard`; tracing configuration is passed to containers through
+  environment variables (see xref:backend/fastapi/whats-changed-and-migration.adoc[What's Changed & Migration]).
+
+[#pitfalls]
+== Pitfalls
+
+* *Shell-form `CMD`.* The container takes ten seconds to stop (Docker's default timeout) and the lifespan shutdown never runs. Use the exec form; end wrapper scripts with `exec`.
+* *`localhost` inside a container.* A server bound to `127.0.0.1` is unreachable from outside; `fastapi run` binds `0.0.0.0` already, `fastapi dev` does not. Likewise
+  `localhost` in a database URL means the API's own container, not the `db` service: use the service name.
+* *Copying code before installing dependencies.* Every edit reinstalls every package. Copy `requirements.txt` (or `pyproject.toml` and `uv.lock`) first.
+* *No `.dockerignore`.* The build context contains `.git`, a local `.venv` (platform specific, and it breaks the image) and `.env` files with secrets.
+* *Secrets in the image or in Compose YAML.* Anything in a layer or a manifest in version control is a leak. Use secret files or the platform's secret store, and read them through pydantic-settings.
+* *`depends_on` without a condition.* It waits for the container to start, not for PostgreSQL to accept connections.
+* *Migrations in every replica.* Several pods or workers running `alembic upgrade head` at once can collide. Run a Job or a one-shot Compose service.
+* *A database check in the liveness probe.* A database outage then restarts every pod. Put dependency checks in readiness only.
+* *Probe timing.* A readiness `timeoutSeconds` shorter than a slow endpoint's response while the loop is busy makes a healthy pod flap in and out of the Service; use a startup probe for slow starts instead of a long liveness delay.
+* *`--workers` plus replicas.* Four workers in each of five pods is twenty processes, twenty pools of connections, and memory limits that must cover four copies of the app.
+* *A CPU limit that throttles.* A hard CPU limit can add latency to an async server; start with requests and measure before adding limits.
+* *Trusting every proxy.* `--forwarded-allow-ips "*"` on a container that is also reachable without the proxy lets clients forge their address and scheme.
+* *`latest` tags.* `image: ...:latest` makes a rollout irreproducible and a rollback impossible; tag by version or digest, and pin FastAPI itself (`fastapi==0.142.2`) because it is still 0.x.
+* *Running as root.* The official example does; production images should not. A non-root user needs a port above 1023 and readable secret files.
+* *Slim images without a compiler.* A dependency that needs building fails on `python:*-slim`; use a binary wheel, or build in a multi-stage build.
+* *No `curl` in the image for the Docker healthcheck.* Slim images do not include it; use Python's standard library, as shown, or rely on the orchestrator's probes.
+* *Docker build verification.* The Dockerfiles and manifests of this page were not built or applied in this environment; build the image and run `docker compose up` once, and `kubectl apply --dry-run=server` against your cluster, before relying on them.
+
+== References
+
+* https://fastapi.tiangolo.com/deployment/docker/[FastAPI: FastAPI in Containers - Docker]
+* https://fastapi.tiangolo.com/deployment/server-workers/[FastAPI: Server Workers - Uvicorn with Workers]
+* https://fastapi.tiangolo.com/deployment/concepts/[FastAPI: Deployments Concepts]
+* https://fastapi.tiangolo.com/deployment/versions/[FastAPI: About FastAPI versions]
+* https://fastapi.tiangolo.com/deployment/[FastAPI: Deployment]
+* https://fastapi.tiangolo.com/fastapi-cli/[FastAPI: FastAPI CLI]
+* https://fastapi.tiangolo.com/advanced/settings/[FastAPI: Settings and Environment Variables]
+* https://fastapi.tiangolo.com/advanced/events/[FastAPI: Lifespan Events]
+* https://fastapi.tiangolo.com/advanced/behind-a-proxy/[FastAPI: Behind a Proxy]
+* https://fastapi.tiangolo.com/advanced/testing-events/[FastAPI: Testing Events: lifespan and startup - shutdown]
+* https://fastapi.tiangolo.com/release-notes/[FastAPI: Release Notes]
+* https://uvicorn.dev/deployment/[Uvicorn: Deployment]
+* https://uvicorn.dev/settings/[Uvicorn: Settings]
+* https://docs.astral.sh/uv/guides/integration/docker/[uv: Using uv in Docker]
+* https://github.com/astral-sh/uv-docker-example[uv: uv-docker-example project]
+* https://docs.docker.com/reference/dockerfile/[Docker: Dockerfile reference]
+* https://docs.docker.com/build/cache/[Docker: Build cache]
+* https://docs.docker.com/build/building/best-practices/[Docker: Building best practices]
+* https://docs.docker.com/compose/support-and-feedback/faq/[Docker: Compose FAQ]
+* https://docs.docker.com/compose/how-tos/startup-order/[Docker: Control startup and shutdown order in Compose]
+* https://docs.docker.com/compose/how-tos/use-secrets/[Docker: Secrets in Compose]
+* https://docs.docker.com/reference/compose-file/services/[Docker: Compose file reference, services]
+* https://hub.docker.com/_/postgres[Docker Hub: Official PostgreSQL image]
+* https://alembic.sqlalchemy.org/en/latest/tutorial.html[Alembic: Tutorial]
+* https://kubernetes.io/docs/concepts/workloads/controllers/deployment/[Kubernetes: Deployments]
+* https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/[Kubernetes: Configure Liveness, Readiness and Startup Probes]
+* https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/[Kubernetes: Pod Lifecycle]
+* https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/[Kubernetes: Container Lifecycle Hooks]
+* https://kubernetes.io/docs/concepts/workloads/pods/init-containers/[Kubernetes: Init Containers]
+* https://kubernetes.io/docs/concepts/workloads/controllers/job/[Kubernetes: Jobs]
+* https://kubernetes.io/docs/concepts/configuration/configmap/[Kubernetes: ConfigMaps]
+* https://kubernetes.io/docs/concepts/configuration/secret/[Kubernetes: Secrets]
+* https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/[Kubernetes: Resource Management for Pods and Containers]
+* https://kubernetes.io/docs/tasks/configure-pod-container/security-context/[Kubernetes: Configure a Security Context]
+* https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/[Kubernetes: Horizontal Pod Autoscaling]
+* https://kubernetes.io/docs/tasks/run-application/configure-pdb/[Kubernetes: Specifying a Disruption Budget for your Application]
+* https://kubernetes.io/docs/concepts/services-networking/service/[Kubernetes: Service]
+* https://kubernetes.io/docs/concepts/services-networking/ingress/[Kubernetes: Ingress]
+* https://gunicorn.org/[Gunicorn]
