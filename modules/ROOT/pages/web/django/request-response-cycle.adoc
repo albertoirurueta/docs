@@ -1,0 +1,2350 @@
+= Request/Response Cycle
+:description: What happens between a browser sending a request and Django returning a response -- WSGI and ASGI handlers, the middleware chain and its hooks, URL resolution, the view, deferred template rendering, exception handling and error views, and the HttpRequest, QueryDict and HttpResponse APIs, in sync and async mode.
+:keywords: Django, request response cycle, WSGIHandler, ASGIHandler, middleware, process_view, process_exception, process_template_response, URL resolution, ResolverMatch, HttpRequest, HttpResponse, QueryDict, JsonResponse, TemplateResponse, Http404, handler404, handler500, content negotiation, request.accepts, get_preferred_type, ASGI, async views, Bookshelf
+
+include::partial$django-disclaimer.adoc[]
+
+This page is written against Django 6.1 (6.1.1 on PyPI; 6.1.2 is scheduled for 2026-10-06), Python 3.12-3.14 and PostgreSQL 15+,
+checked on 2026-10-03; where Django 5.2 LTS behaves differently the text says so. The listings were run in a scratch project on
+Python 3.13.16 and Django 6.1.1 with SQLite: `manage.py check`, 32 tests (`manage.py test`), `curl` sessions against `runserver`,
+Uvicorn and Gunicorn, and the stand-alone scripts below all passed, and the output shown is the real output. Nothing on this page
+needs PostgreSQL or Redis.
+
+Every Django site, however large, is a function from an HTTP request to an HTTP response. Understanding the path a request takes
+through the framework explains most of the questions people ask in practice: why a middleware sees a response it did not
+create, why `request.user` is missing in one place, why a `404` page looks different with `DEBUG = True`, why a view that
+forgets `return` fails with a `ValueError`, or why an async view is slower under one server than another. This page follows one
+request from the socket to the view and back, in order, and describes every object it meets on the way: the handler, the
+middleware chain, the URL resolver, the view, the deferred template renderer, the error views, and the `HttpRequest`,
+`QueryDict` and `HttpResponse` classes. The Bookshelf scenario (the `catalog` app) supplies the examples.
+
+Each layer has a page of its own for the details this page only summarises: xref:web/django/middleware.adoc[Middleware] for
+writing and ordering middleware, xref:web/django/function-based-views-and-shortcuts.adoc[Function-Based Views & Shortcuts] for
+the views themselves, and xref:web/django/introduction-and-architecture.adoc[Introduction & Architecture] for the MTV
+architecture this cycle implements. URL patterns (`path()`, converters, namespaces, `reverse()`), class-based and generic
+views, file uploads, and streaming, CSV and PDF responses each have their own pages in this section; here they appear only
+at the point where the cycle reaches them. Readers coming from FastAPI will find the same ideas under different names on
+xref:backend/fastapi/request-object-and-content-type.adoc[FastAPI: Request Object & Content Type] and
+xref:backend/fastapi/status-codes-and-error-handling.adoc[FastAPI: Status Codes & Error Handling].
+
+== The cycle at a glance
+
+image::django-request-response-cycle.svg["A diagram titled The Django request/response cycle. A client sends a request down a column of boxes: a WSGI or ASGI server, then WSGIHandler or ASGIHandler, then the middleware chain that contains URL resolution, process_view hooks, the view and deferred template rendering, and finally the handler sends the response. Dashed arrows return the HttpResponse up the left side to the client. A side panel lists how exceptions become responses: Resolver404 and Http404 go to handler404, PermissionDenied to handler403, BadRequest and SuspiciousOperation to handler400, and anything else through process_exception hooks to handler500",width=720,role=text-center]
+
+In words, for one ordinary `GET` under WSGI:
+
+. The *server* (Gunicorn, `runserver`, uWSGI, mod_wsgi; or Uvicorn, Daphne, Granian, Hypercorn under ASGI) accepts the connection, parses the HTTP request and calls the application object that `config/wsgi.py` or `config/asgi.py` exposes.
+. The *handler* (`WSGIHandler` or `ASGIHandler`) sends the `request_started` signal, builds an `HttpRequest` from the server's `environ` (WSGI) or `scope` and body (ASGI), and passes it to `get_response()`.
+. `get_response()` calls the outermost *middleware*. Each middleware's `+__call__()+` runs its "before" code, then calls `get_response` to hand the request to the next layer.
+. The innermost layer (Django's own, not yours) *resolves the URL*: it matches `request.path_info` against the `urlpatterns` of `ROOT_URLCONF` (or of `request.urlconf` if a middleware set one) and stores the result in `request.resolver_match`.
+. Every middleware's `process_view()` hook runs, top-down. Any of them may answer on its own.
+. The *view* runs with the request plus the URL's captured arguments, and returns a response object.
+. If the response has a `render()` method (a `TemplateResponse`), every `process_template_response()` hook runs, bottom-up, and then the template is rendered.
+. The response travels back out through each middleware's "after" code, bottom-up.
+. The handler turns the response into a status line, headers (including `Set-Cookie`) and a body for the server, which sends them and calls `response.close()`; closing sends `request_finished`.
+
+Whenever something raises along the way, Django turns the exception into a response and the cycle continues from step 8, as the red panel in the figure shows. The sections below take the steps in order.
+
+[mermaid]
+....
+sequenceDiagram
+  participant S as Server
+  participant H as Handler
+  participant A as Outer middleware
+  participant B as Inner middleware
+  participant R as URL resolver
+  participant V as View
+  S->>H: environ (WSGI) or scope and body (ASGI)
+  H->>A: request
+  A->>B: get_response(request)
+  B->>R: resolve path_info
+  R-->>B: view, args, kwargs (ResolverMatch)
+  B->>V: process_view hooks, then view(request, args, kwargs)
+  V-->>B: response
+  Note over B,V: process_template_response hooks, then render()
+  B-->>A: response
+  A-->>H: response
+  H-->>S: status, headers, body
+....
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/urls/#how-django-processes-a-request[Django: How Django processes a request],
+https://docs.djangoproject.com/en/6.1/topics/http/middleware/[Django: Middleware] and
+https://docs.djangoproject.com/en/6.1/ref/request-response/[Django: Request and response objects]
+
+== The Bookshelf project used on this page
+
+The examples need only a project (`config`) with one app (`catalog`) containing two models, a few views and a test module.
+The settings are the `startproject` defaults plus `catalog` in `INSTALLED_APPS`, with `SECRET_KEY` and `DEBUG` read from the
+environment so that the same file serves both the development session and the `DEBUG = False` checks below:
+
+.config/settings.py (changed lines only)
+[source,python]
+----
+import os
+
+from django.core.management.utils import get_random_secret_key
+
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY") or get_random_secret_key()
+DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
+ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+
+INSTALLED_APPS = [
+    # ... the default django.contrib apps ...
+    "catalog",
+]
+----
+
+.catalog/models.py
+[source,python]
+----
+from django.db import models
+
+
+class Author(models.Model):
+    name = models.CharField(max_length=200)
+
+    def __str__(self):
+        return self.name
+
+
+class Book(models.Model):
+    title = models.CharField(max_length=200)
+    author = models.ForeignKey(Author, on_delete=models.PROTECT, related_name="books")
+    price = models.DecimalField(max_digits=6, decimal_places=2)
+
+    class Meta:
+        ordering = ["title"]
+
+    def __str__(self):
+        return self.title
+----
+
+The root URLconf below wires every view used in this page. Each `path()` line is explained where its view appears;
+the two `handler` variables at the bottom are covered under <<error-views,error views>>:
+
+.config/urls.py
+[source,python]
+----
+from django.contrib import admin
+from django.urls import path
+
+from catalog import views
+
+urlpatterns = [
+    path("admin/", admin.site.urls),
+    path("hello/", views.hello, name="hello"),
+    path("books/", views.book_list, name="book-list"),
+    path("books/<int:pk>/inspect/", views.inspect_request, name="inspect"),
+    path("negotiate/", views.negotiate, name="negotiate"),
+    path("attributes/", views.attributes, name="attributes"),
+    path("csrf/", views.csrf_cookie, name="csrf"),
+    path("cookies/", views.cookies, name="cookies"),
+    path("moved/", views.moved, name="moved"),
+    path("empty/", views.gone_forever, name="empty"),
+    path("errors/missing/", views.missing),
+    path("errors/forbidden/", views.forbidden),
+    path("errors/bad-request/", views.bad_request),
+    path("errors/suspicious/", views.suspicious),
+    path("errors/boom/", views.boom),
+    path("errors/lookup/", views.lookup_failure),
+    path("mistakes/none/", views.returns_none),
+    path("mistakes/await/", views.forgot_await),
+    path("async/", views.async_hello, name="async"),
+]
+
+handler404 = "catalog.views.not_found"
+handler500 = "catalog.views.server_error"
+----
+
+The first view is as small as a view can be, and it is the one used to exercise the handlers directly in the next section:
+
+.catalog/views.py (first view)
+[source,python]
+----
+from django.http import HttpResponse
+
+
+def hello(request):
+    return HttpResponse("Hello from Bookshelf", content_type="text/plain")
+----
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/views/[Django: Writing views] and
+https://docs.djangoproject.com/en/6.1/topics/http/urls/[Django: URL dispatcher]
+
+== The server and the handler
+
+Django does not listen on a socket. A *server* does, and it speaks to Django through one of two Python standards:
+https://peps.python.org/pep-3333/[WSGI] (a synchronous callable `application(environ, start_response)`) or
+https://asgi.readthedocs.io/en/latest/[ASGI] (an asynchronous callable `application(scope, receive, send)`).
+`startproject` generates `config/wsgi.py` and `config/asgi.py`, each of which exposes a module-level `application`;
+xref:web/django/introduction-and-architecture.adoc[Introduction & Architecture] compares the two interfaces and lists
+the servers. What matters here is what the *callable behind `application`* does, because it is the first piece of
+Django code that touches the request. `get_wsgi_application()` and `get_asgi_application()` call `django.setup()` and
+return an instance of `django.core.handlers.wsgi.WSGIHandler` or `django.core.handlers.asgi.ASGIHandler`. Django documents the
+two functions, not the classes, as the public interface, so build on them in production code. The classes are used
+directly below only to make the cycle visible.
+
+=== WSGIHandler
+
+`+WSGIHandler.__call__(environ, start_response)+` does five things, in this order (read in Django 6.1.1's
+`django/core/handlers/wsgi.py`):
+
+. It records the script prefix (`SCRIPT_NAME`, or `FORCE_SCRIPT_NAME`) so that `reverse()` and `{% url %}` produce paths that work when Django is mounted below `/`.
+. It sends the `request_started` signal with the handler class as `sender` and the `environ` dictionary.
+. It builds a `WSGIRequest` (an `HttpRequest` subclass) from the `environ`.
+. It calls `get_response(request)`, which runs the middleware chain, the view and everything in between, and always returns a response object.
+. It calls `start_response()` with the status line and the headers (the response's headers plus one `Set-Cookie` per cookie) and returns the response, which is an iterable of byte strings. When the server provides `wsgi.file_wrapper`, a `FileResponse` is handed to it so the server can use `sendfile`-style transfers.
+
+The handler can be called without a server, which is the clearest way to see that a WSGI application is "just a function":
+
+.catalog/tests.py (HandlerTests, WSGI half)
+[source,python]
+----
+from wsgiref.util import setup_testing_defaults
+
+from django.core.handlers.wsgi import WSGIHandler
+from django.test import SimpleTestCase
+
+
+class HandlerTests(SimpleTestCase):
+    def test_wsgi_handler_speaks_wsgi(self):
+        environ = {}
+        setup_testing_defaults(environ)
+        environ.update(PATH_INFO="/hello/", REQUEST_METHOD="GET", HTTP_HOST="localhost")
+        seen = {}
+
+        def start_response(status, headers):
+            seen["status"], seen["headers"] = status, dict(headers)
+
+        body = b"".join(WSGIHandler()(environ, start_response))
+        self.assertEqual(seen["status"], "200 OK")
+        self.assertEqual(seen["headers"]["Content-Type"], "text/plain")
+        self.assertEqual(body, b"Hello from Bookshelf")
+----
+
+`setup_testing_defaults()` from the standard library's `wsgiref` fills in the `environ` keys a real server would provide.
+`WSGIHandler()` loads the middleware chain once, in its constructor; a production server creates it once per worker process
+(the module-level `application`), never per request.
+
+Source: https://docs.djangoproject.com/en/6.1/howto/deployment/wsgi/[Django: How to deploy with WSGI]
+
+=== ASGIHandler
+
+`+ASGIHandler.__call__(scope, receive, send)+` has the same job with different mechanics:
+
+* It serves only `http` scopes. A `websocket` scope raises `ValueError`; WebSockets belong to Channels, which routes the
+`websocket` scope to consumers and hands `http` to Django (see the Channels page of this section).
+* It *reads the whole request body before the view runs*: `read_body()` collects `http.request` messages into a
+`SpooledTemporaryFile` (in memory up to `FILE_UPLOAD_MAX_MEMORY_SIZE`, which is 2.5 MiB by default, then on disk) and wraps
+it as the request's body stream. A slow upload therefore never occupies the view, but it also means the view cannot start
+processing a body while it is still arriving.
+* It sends `request_started` with `await signals.request_started.asend(...)` (asynchronous signal dispatch exists since
+Django 5.0) and builds an `ASGIRequest`.
+* `ASGIRequest` fills `META` from the scope: header names containing an underscore are dropped (the same anti-spoofing rule
+as `runserver`), repeated headers are joined with commas and repeated `Cookie` headers with `"; "`. If the request cannot even
+be built (an undecodable query string gives a plain `400`, an oversized body a plain-text `413`), the handler answers
+directly and no middleware runs.
+* While the view runs it listens for the `http.disconnect` message. If the client goes away first, the view's task is
+cancelled and an `asyncio.CancelledError` is raised inside it, so an `async` view can clean up (supported since Django 5.0).
+* It sends the response in chunks of up to 64 KiB (`ASGIHandler.chunk_size`) as `http.response.start` and
+`http.response.body` messages; for a `StreamingHttpResponse` it sends each chunk of the iterator as it is produced.
+
+A hand-written ASGI "server" shows the message flow. The `receive` callable must behave like a real server's: deliver the body,
+and then block until the client disconnects (a version that returns a second `http.request` message makes Django raise an
+`AssertionError`, because the protocol forbids it):
+
+.catalog/tests.py (HandlerTests, ASGI half)
+[source,python]
+----
+import asyncio
+
+from django.core.handlers.asgi import ASGIHandler
+
+
+class HandlerTests(SimpleTestCase):  # the same class as above
+    async def test_asgi_handler_speaks_asgi(self):
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/hello/",
+            "raw_path": b"/hello/",
+            "query_string": b"",
+            "headers": [(b"host", b"localhost")],
+            "server": ("localhost", 8000),
+            "client": ("127.0.0.1", 50000),
+            "scheme": "http",
+        }
+        sent = []
+        messages = [{"type": "http.request", "body": b"", "more_body": False}]
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await asyncio.Event().wait()  # like a real server: block until disconnect
+
+        async def send(message):
+            sent.append(message)
+
+        await ASGIHandler()(scope, receive, send)
+        self.assertEqual(sent[0]["type"], "http.response.start")
+        self.assertEqual(sent[0]["status"], 200)
+        self.assertEqual(sent[1]["body"], b"Hello from Bookshelf")
+----
+
+Source: https://docs.djangoproject.com/en/6.1/howto/deployment/asgi/[Django: How to deploy with ASGI] and
+https://docs.djangoproject.com/en/6.1/topics/async/[Django: Asynchronous support]
+
+=== What differs inside the cycle
+
+Everything after the handler is shared code in `django.core.handlers.base.BaseHandler`, but the handler's mode decides
+whether each step runs natively or through an adapter (see <<sync-async,Sync and async through the cycle>>):
+
+[cols="1,2,2",options="header"]
+|===
+| | WSGI | ASGI
+
+| Request class
+| `WSGIRequest`, reading `environ`.
+| `ASGIRequest`, reading `scope` and a spooled body file.
+
+| Body handling
+| The server streams the body; Django reads it lazily when `request.body`, `request.POST` or `request.read()` is used.
+| Django buffers the body before calling the middleware (a 2.5 MiB threshold decides memory versus disk).
+
+| Client disconnects
+| Not visible to the view; the server simply fails to write.
+| Cancels the view's task with `asyncio.CancelledError` (5.0+).
+
+| `request_started` / `request_finished`
+| Sent with `send()`, before the request object is built.
+| Sent with `asend()` (5.0+) after the body has been read; receivers may be sync or async.
+
+| `StreamingHttpResponse` content
+| Must be a synchronous iterator.
+| Should be an asynchronous iterator (4.2+); a sync iterator is consumed fully, with a warning.
+
+| Multiple `Cookie` headers (HTTP/2)
+| Handled by the server.
+| Supported since 6.0.
+
+| Middleware chain
+| Built with `is_async=False`.
+| Built with `is_async=True`; sync-only middleware is wrapped.
+|===
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#streaminghttpresponse-objects[Django: StreamingHttpResponse objects] and
+https://docs.djangoproject.com/en/6.1/releases/5.0/[Django 5.0 release notes]
+
+=== Signals around a request
+
+Three signals in `django.core.signals` frame the cycle:
+
+[cols="1,3",options="header"]
+|===
+| Signal | When it is sent
+
+| `request_started`
+| By the handler, before the `HttpRequest` is built. Arguments: `sender` (the handler class) and `environ` (WSGI) or `scope` (ASGI).
+
+| `request_finished`
+| When the response has been delivered and `response.close()` runs. Arguments: `sender` (the handler class).
+
+| `got_request_exception`
+| Whenever an exception reaches Django's exception-to-response conversion and will become a `500` (and when an error view itself fails). Arguments: `sender` (always `None`) and `request`.
+|===
+
+Django itself listens: the database layer connects `reset_queries` and `close_old_connections` to `request_started` and
+`close_old_connections` to `request_finished`, which is how `CONN_MAX_AGE` is enforced, and the URL machinery resets the
+thread's URLconf (`set_urlconf(None)`) on `request_finished`. The test below connects two receivers and records the order
+around a hand-driven WSGI call:
+
+.catalog/tests.py (HandlerTests, signals)
+[source,python]
+----
+from django.core import signals
+
+
+class HandlerTests(SimpleTestCase):  # the same class again
+    def test_signals_around_one_request(self):
+        events = []
+
+        def started(sender, **kwargs):
+            events.append(("request_started", sender.__name__))
+
+        def finished(sender, **kwargs):
+            events.append(("request_finished", sender.__name__))
+
+        environ = {}
+        setup_testing_defaults(environ)
+        environ.update(PATH_INFO="/hello/", HTTP_HOST="localhost")
+        signals.request_started.connect(started)
+        signals.request_finished.connect(finished)
+        try:
+            result = WSGIHandler()(environ, lambda status, headers: None)
+            events.append(("response returned to the server", ""))
+            result.close()  # the WSGI server calls close() when it has sent the body
+        finally:
+            signals.request_started.disconnect(started)
+            signals.request_finished.disconnect(finished)
+        self.assertEqual(
+            events,
+            [
+                ("request_started", "WSGIHandler"),
+                ("response returned to the server", ""),
+                ("request_finished", "WSGIHandler"),
+            ],
+        )
+----
+
+Two practical consequences follow. First, `request_finished` fires when the *server* closes the response, which for a
+streaming response is after the last chunk, not when the view returns. Second, the official signals reference names the
+sender class `WsgiHandler`; the real class is `WSGIHandler`, which is what the receiver above printed.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/signals/#request-started[Django: request_started],
+https://docs.djangoproject.com/en/6.1/ref/signals/#request-finished[request_finished] and
+https://docs.djangoproject.com/en/6.1/ref/signals/#got-request-exception[got_request_exception]
+
+== The middleware chain
+
+Middleware is the first and the last code your project runs for a request. Django builds the chain once, when the handler is
+created: `BaseHandler.load_middleware()` walks `settings.MIDDLEWARE` *in reverse*, calls each *middleware factory* with a
+`get_response` callable (the layer that was just built, starting from the handler's own `_get_response`), and wraps every
+layer in an exception-to-response converter. The outermost layer ends up in the handler's `_middleware_chain`, and
+`get_response(request)` simply calls it. A factory is any callable that takes `get_response` and returns a callable that takes a
+request and returns a response, either a function or a class with `+__init__(get_response)+` and `+__call__(request)+`. Because the
+chain is built once, `+__init__()+` (or the body of a function factory) runs once per process, not per request.
+
+[cols="1,3",options="header"]
+|===
+| Phase | Order and rule
+
+| Request ("before" code)
+| `MIDDLEWARE` order, top-down: each `+__call__()+` runs its code, then calls `get_response`.
+
+| `process_view(request, view_func, view_args, view_kwargs)`
+| `MIDDLEWARE` order, top-down, after URL resolution, just before the view. Return `None` to continue or a response to skip the view.
+
+| View
+| Called with the request and the URL's arguments.
+
+| `process_template_response(request, response)`
+| Reverse order (innermost first), only if the response has a `render()` method. Must return a response with `render()`.
+
+| `process_exception(request, exception)`
+| Reverse order (innermost first), only for exceptions raised by the view or by `render()`. Return `None` to pass the exception on or a response to stop.
+
+| Response ("after" code)
+| Reverse order, bottom-up: the same layers that saw the request see the response.
+|===
+
+The three `process_*` hooks are optional extras on a class-based middleware; they are what the figure at the top of this page draws
+inside the chain. Writing each kind of middleware, the full list of built-in classes and their ordering rules are on the
+xref:web/django/middleware.adoc[Middleware] page; this page uses just enough middleware to show the cycle.
+
+=== The default stack
+
+`startproject` generates this `MIDDLEWARE`; each entry has a role in the cycle:
+
+[cols="2,3",options="header"]
+|===
+| Middleware | What it does in the cycle
+
+| `SecurityMiddleware`
+| Optional HTTPS redirect (before the view), security headers such as HSTS and `X-Content-Type-Options` (on the way out).
+
+| `SessionMiddleware`
+| Attaches `request.session` lazily on the way in; saves it and sets the session cookie on the way out.
+
+| `CommonMiddleware`
+| Rejects `DISALLOWED_USER_AGENTS`, optional `PREPEND_WWW`; on the way out turns a `404` into a redirect when `APPEND_SLASH` is true and the same path with a trailing slash resolves, and sets `Content-Length` on non-streaming responses.
+
+| `CsrfViewMiddleware`
+| In `process_view()`: rejects unsafe-method requests without a valid CSRF token with a `403` before the view runs; sets the CSRF cookie on the way out.
+
+| `AuthenticationMiddleware`
+| Attaches `request.user` (a lazy object) and `request.auser()`. Needs the session, so it comes after `SessionMiddleware`.
+
+| `MessageMiddleware`
+| Attaches `+request._messages+`; stores pending messages in the session or a cookie on the way out.
+
+| `XFrameOptionsMiddleware`
+| Adds `X-Frame-Options` on the way out.
+|===
+
+The order is not decoration: `AuthenticationMiddleware` reads the session, so moving it above `SessionMiddleware` breaks it, and
+a middleware that wants to wrap everything (timing, request IDs, logging) goes first, while one that needs `request.user` goes
+after `AuthenticationMiddleware`.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/middleware/[Django: Middleware reference] and
+https://docs.djangoproject.com/en/6.1/topics/http/middleware/#activating-middleware[Django: Activating middleware]
+
+=== Watching the chain work
+
+A middleware that records every hook it receives makes the order visible. Because two instances of one class cannot be given
+different arguments (Django instantiates with only `get_response`), the example uses two subclasses that differ in their `name`:
+
+.catalog/middleware.py (tracing middleware)
+[source,python]
+----
+from django.http import HttpResponse
+
+TRACE: list[str] = []
+
+
+class TraceMiddleware:
+    """Records every hook Django calls, in order."""
+
+    name = "trace"
+
+    def __init__(self, get_response):
+        self.get_response = get_response  # called once, at server start-up
+
+    def __call__(self, request):
+        TRACE.append(f"{self.name}: before get_response")
+        response = self.get_response(request)
+        TRACE.append(f"{self.name}: after get_response -> {response.status_code}")
+        return response
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        TRACE.append(f"{self.name}: process_view({view_func.__name__})")
+        return None  # None means "carry on"
+
+    def process_template_response(self, request, response):
+        TRACE.append(f"{self.name}: process_template_response")
+        return response
+
+    def process_exception(self, request, exception):
+        TRACE.append(f"{self.name}: process_exception({type(exception).__name__})")
+        return None
+
+
+class OuterTrace(TraceMiddleware):
+    name = "outer"
+
+
+class InnerTrace(TraceMiddleware):
+    name = "inner"
+----
+
+`TRACE` is a module-level list only because the example is a demonstration; real middleware must not keep per-request state
+in module or instance attributes, because one instance serves every request of the process, concurrently. A small script drives the
+test client through a chain of just those two classes and prints the trace (the test client builds the same handler chain, with
+`DEBUG = False` so the error views are the production ones):
+
+.demo_trace.py
+[source,python]
+----
+import os
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+django.setup()
+
+from django.test import Client
+from django.test.utils import setup_test_environment, override_settings
+
+from catalog.middleware import TRACE
+
+setup_test_environment()  # lets the test Client work outside the test runner
+
+CHAIN = ["catalog.middleware.OuterTrace", "catalog.middleware.InnerTrace"]
+
+
+def show(title, path, **extra):
+    TRACE.clear()
+    client = Client(raise_request_exception=False)
+    response = client.get(path, **extra)
+    print(f"--- {title}: GET {path} -> {response.status_code}")
+    for line in TRACE:
+        print("   ", line)
+
+
+with override_settings(MIDDLEWARE=CHAIN, ALLOWED_HOSTS=["testserver"], DEBUG=False):
+    show("plain view", "/hello/")
+    show("exception", "/errors/boom/")
+    show("404 raised by URL resolution", "/nowhere/")
+----
+
+[source,text]
+----
+--- plain view: GET /hello/ -> 200
+    outer: before get_response
+    inner: before get_response
+    outer: process_view(hello)
+    inner: process_view(hello)
+    inner: after get_response -> 200
+    outer: after get_response -> 200
+--- exception: GET /errors/boom/ -> 500
+    outer: before get_response
+    inner: before get_response
+    outer: process_view(boom)
+    inner: process_view(boom)
+    inner: process_exception(RuntimeError)
+    outer: process_exception(RuntimeError)
+    inner: after get_response -> 500
+    outer: after get_response -> 500
+--- 404 raised by URL resolution: GET /nowhere/ -> 404
+    outer: before get_response
+    inner: before get_response
+    inner: after get_response -> 404
+    outer: after get_response -> 404
+----
+
+Four facts the trace proves, each of which surprises someone:
+
+* Both layers' "before" code runs before *any* `process_view()`: the view hooks belong to the innermost step, after URL resolution, not to each layer's own turn.
+* `process_view()` runs top-down, but `process_exception()` (and `process_template_response()`) run bottom-up.
+* The response of a failing view, a `500` here, is an ordinary response when it passes the "after" code of each layer. Neither layer needed a `try`/`except`.
+* A URL that matches no pattern never reaches `process_view()` or `process_exception()`: resolution raises `Resolver404` before either step, and the converter turns it into a `404` response (see <<url-resolution,URL resolution>>). A `Http404` raised *inside* a view is different: it passes through `process_exception()` like any other exception, as the next test shows.
+
+The tests that assert these traces (and the next two behaviours) use `override_settings(MIDDLEWARE=...)`, which replaces the chain for
+one test:
+
+.catalog/tests.py (TraceTests, abridged)
+[source,python]
+----
+TRACED = [
+    "catalog.middleware.OuterTrace",
+    "catalog.middleware.InnerTrace",
+]
+
+
+class TraceTests(TestCase):
+    def setUp(self):
+        TRACE.clear()
+
+    @override_settings(MIDDLEWARE=TRACED)
+    def test_template_response(self):
+        response = self.client.get("/books/")
+        self.assertContains(response, "Dune by Frank Herbert")
+        self.assertEqual(
+            [line for line in TRACE if "template" in line],
+            ["inner: process_template_response", "outer: process_template_response"],
+        )
+
+    @override_settings(MIDDLEWARE=TRACED)
+    def test_exception_hooks(self):
+        self.client.raise_request_exception = False
+        response = self.client.get("/errors/boom/")
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            [line for line in TRACE if "exception" in line],
+            [
+                "inner: process_exception(RuntimeError)",
+                "outer: process_exception(RuntimeError)",
+            ],
+        )
+        # the 500 is an ordinary response by the time it leaves the inner layer
+        self.assertIn("inner: after get_response -> 500", TRACE)
+----
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/middleware/#middleware-order-and-layering[Django: Middleware order and layering],
+https://docs.djangoproject.com/en/6.1/topics/http/middleware/#other-middleware-hooks[Other middleware hooks] and
+https://docs.djangoproject.com/en/6.1/topics/testing/tools/#django.test.override_settings[Django: override_settings]
+
+=== Short-circuiting and rescuing
+
+A layer may answer without calling `get_response`. Nothing inside it, the view included, ever sees the request, but the response
+still travels back out through the layers *above* it. The next middleware returns `503` for requests carrying a maintenance
+header, and the `RescueMiddleware` shows a `process_exception()` that returns a response for one exception type; both live in
+`catalog/middleware.py` beside the tracing classes:
+
+.catalog/middleware.py (short-circuit and rescue)
+[source,python]
+----
+class MaintenanceGate:
+    """Short-circuits: answers 503 without ever calling get_response."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.headers.get("X-Maintenance") == "on":
+            TRACE.append("gate: short-circuit 503")
+            return HttpResponse("Back soon", status=503, headers={"Retry-After": "120"})
+        return self.get_response(request)
+
+
+class RescueMiddleware(TraceMiddleware):
+    """process_exception that turns one exception type into a response."""
+
+    name = "rescue"
+
+    def process_exception(self, request, exception):
+        super().process_exception(request, exception)
+        if isinstance(exception, LookupError):
+            return HttpResponse("rescued: " + str(exception), status=422)
+        return None
+----
+
+.catalog/tests.py (short-circuit and rescue)
+[source,python]
+----
+    @override_settings(
+        MIDDLEWARE=TRACED[:1] + ["catalog.middleware.MaintenanceGate"] + TRACED[1:]
+    )
+    def test_short_circuit(self):
+        response = self.client.get("/hello/", headers={"X-Maintenance": "on"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response["Retry-After"], "120")
+        self.assertEqual(
+            TRACE,
+            [
+                "outer: before get_response",
+                "gate: short-circuit 503",
+                "outer: after get_response -> 503",
+            ],
+        )
+
+    @override_settings(
+        MIDDLEWARE=TRACED[:1] + ["catalog.middleware.RescueMiddleware"] + TRACED[1:]
+    )
+    def test_exception_middleware_can_rescue(self):
+        response = self.client.get("/errors/lookup/")
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.content, b"rescued: no such shelf")
+        # outer sits above rescue, so its process_exception is never called
+        self.assertNotIn("outer: process_exception(LookupError)", TRACE)
+        # but the response still travels back out through every layer
+        self.assertIn("outer: after get_response -> 422", TRACE)
+----
+
+The built-in middleware short-circuits constantly, and it is the usual source of "my view is never called" reports.
+`CsrfViewMiddleware.process_view()` rejects an unsafe-method request without a valid token with a `403` *before* the view
+runs. Against `runserver` with `DEBUG = False`, a bare `POST` to the `attributes` view of the next section fails, and a `POST`
+that first fetches the CSRF cookie and echoes it in the `X-CSRFToken` header succeeds (the `csrf` view is
+`@ensure_csrf_cookie` and returns plain text):
+
+[source,bash]
+----
+$ curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8764/attributes/ \
+    -H "Content-Type: application/json" -d '{"title":"Dune"}'
+403
+$ curl -s -c jar.txt http://localhost:8764/csrf/
+csrftoken cookie set
+$ TOKEN=$(awk '$6=="csrftoken"{print $7}' jar.txt)
+$ curl -s -b jar.txt -X POST http://localhost:8764/attributes/ \
+    -H "X-CSRFToken: $TOKEN" -H "Content-Type: application/json" -d '{"title":"Dune"}'
+{"received": {"title": "Dune"}}
+----
+
+The Django test client skips CSRF checks by default (`Client(enforce_csrf_checks=True)` turns them on), which is why such
+failures only appear in a browser or with `curl`:
+
+.catalog/tests.py (RequestResponseApiTests, CSRF)
+[source,python]
+----
+    def test_csrf_middleware_answers_before_the_view_runs(self):
+        strict = Client(enforce_csrf_checks=True)
+        response = strict.post("/attributes/", {"a": "1"})
+        self.assertEqual(response.status_code, 403)  # the view never ran
+        strict.get("/csrf/")  # sets the csrftoken cookie
+        token = strict.cookies["csrftoken"].value
+        ok = strict.post("/attributes/", {"a": "1"}, headers={"X-CSRFToken": token})
+        self.assertEqual(ok.status_code, 200)
+----
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/middleware/[Django: Middleware],
+https://docs.djangoproject.com/en/6.1/ref/csrf/[Django: Cross Site Request Forgery protection] and
+https://docs.djangoproject.com/en/6.1/topics/testing/tools/#django.test.Client[Django: The test client]
+
+=== Exceptions are converted between layers
+
+Each layer is wrapped by `convert_exception_to_response()`. When a view or a middleware raises, the wrapper turns the
+exception into a response *before the next layer up sees anything*. Every middleware therefore always gets a response back from
+`get_response`, and never needs its own `try`/`except` around it. The official documentation puts it this way: even if the very
+next middleware raises `Http404`, your middleware will receive a response with `status_code` `404`. Two corollaries:
+
+* `process_exception()` is *not* a general error hook. It sees only exceptions raised by the view or by a `TemplateResponse`'s `render()`; an exception raised by another middleware is converted straight to a response.
+* Setting `DEBUG_PROPAGATE_EXCEPTIONS` to `True` stops the conversion of exceptions that would become a `500`: they propagate out of the handler to the server (the test `test_debug_propagate_exceptions_skips_the_500_page` below shows it). It is a debugging aid for servers that have their own error pages, not a production switch. The official text says it skips "this conversion", but in Django 6.1.1 the `4xx` conversions (`Http404`, `PermissionDenied`, `BadRequest`, `SuspiciousOperation`) still happen.
+
+The full set of conversions is the subject of <<exceptions,Exceptions and error views>>.
+
+=== Middleware in sync and async mode
+
+A middleware declares which modes it supports with the class or function attributes `sync_capable` (default `True`) and
+`async_capable` (default `False`). When the handler builds the chain it compares each layer's mode with the mode of the layer
+below it and, if they differ, wraps the callable with `asgiref`'s `sync_to_async()` or `async_to_sync()`. The adaptation costs a
+thread hop, which is why a single synchronous third-party middleware makes an ASGI deployment slower than it should be.
+A function middleware that supports both modes uses the `sync_and_async_middleware` decorator and checks the mode of
+`get_response` once, at start-up:
+
+.catalog/middleware.py (a middleware for both modes)
+[source,python]
+----
+from inspect import iscoroutinefunction
+
+from django.utils.decorators import sync_and_async_middleware
+
+
+@sync_and_async_middleware
+def timing_middleware(get_response):
+    """Function middleware that adapts to whichever mode it is given."""
+    import time
+
+    if iscoroutinefunction(get_response):
+
+        async def middleware(request):
+            start = time.perf_counter()
+            response = await get_response(request)
+            response.headers["X-Elapsed-ms"] = f"{(time.perf_counter() - start) * 1000:.1f}"
+            return response
+
+    else:
+
+        def middleware(request):
+            start = time.perf_counter()
+            response = get_response(request)
+            response.headers["X-Elapsed-ms"] = f"{(time.perf_counter() - start) * 1000:.1f}"
+            return response
+
+    return middleware
+----
+
+.catalog/tests.py (HybridMiddlewareTests)
+[source,python]
+----
+class HybridMiddlewareTests(SimpleTestCase):
+    @override_settings(MIDDLEWARE=["catalog.middleware.timing_middleware"])
+    def test_timing_middleware_under_wsgi(self):
+        self.assertIn("X-Elapsed-ms", self.client.get("/hello/"))
+
+    @override_settings(MIDDLEWARE=["catalog.middleware.timing_middleware"])
+    async def test_timing_middleware_under_asgi(self):
+        response = await AsyncClient().get("/hello/")
+        self.assertIn("X-Elapsed-ms", response)
+----
+
+Django logs every adaptation at `DEBUG` level on the `django.request` logger when `DEBUG = True`, which is the quickest audit of
+a middleware stack. The script builds both handlers with `timing_middleware` first and the sync-only `OuterTrace` last:
+
+.demo_adapt.py
+[source,python]
+----
+import logging, os, sys
+
+import django
+
+os.environ["DJANGO_SETTINGS_MODULE"] = "config.settings"
+logging.basicConfig(level=logging.DEBUG, format="%(name)s %(levelname)s %(message)s", stream=sys.stdout)
+django.setup()
+
+from django.conf import settings
+from django.core.handlers.asgi import ASGIHandler
+from django.core.handlers.wsgi import WSGIHandler
+
+logging.getLogger("django.request").setLevel(logging.DEBUG)
+settings.DEBUG = True
+settings.MIDDLEWARE = ["catalog.middleware.timing_middleware", "catalog.middleware.OuterTrace"]
+print("== building ASGIHandler (OuterTrace is sync-only, timing_middleware is both)")
+ASGIHandler()
+print("== building WSGIHandler")
+WSGIHandler()
+----
+
+[source,text]
+----
+== building ASGIHandler (OuterTrace is sync-only, timing_middleware is both)
+django.request DEBUG Asynchronous handler adapted for middleware catalog.middleware.OuterTrace.
+== building WSGIHandler
+----
+
+Under ASGI the chain is built asynchronous, so the sync-only `OuterTrace` is the one adaptation (the message, worded from the
+adapter's side, says the asynchronous handler below it is adapted for a synchronous middleware); the hybrid function adds
+none. Under WSGI nothing is adapted. The `process_view`, `process_template_response` and `process_exception` hooks are adapted
+individually: `process_exception` hooks are always run synchronously, even under ASGI.
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/middleware/#asynchronous-support[Django: Middleware, asynchronous support] and
+https://docs.djangoproject.com/en/6.1/topics/async/#async-views[Django: Asynchronous support]
+
+[#url-resolution]
+== URL resolution
+
+At the centre of the chain, `BaseHandler.resolve_request()` decides which view will run:
+
+. If the request has a `urlconf` attribute (set by a middleware), that module is the root URLconf; otherwise `ROOT_URLCONF` is used. `set_urlconf()` records the choice for the current thread (so `reverse()` and `{% url %}` agree with it), and `request_finished` resets it.
+. The resolver matches `request.path_info` (the path *without* the script prefix, and without the query string) against each entry of `urlpatterns`, in order, and stops at the first match. `include()` hands the rest of the path to a nested list.
+. The result is a `ResolverMatch`, stored in `request.resolver_match` and unpacked into the view, its positional arguments and its keyword arguments.
+. If nothing matches, `Resolver404` (a subclass of `Http404`) is raised.
+
+The `ResolverMatch` object is what a view or a template gets when it asks "which route am I?":
+
+[cols="1,3",options="header"]
+|===
+| Attribute | Meaning
+
+| `func`
+| The view callable; for a class-based view, the function returned by `as_view()` (which has a `view_class` attribute).
+
+| `args`, `kwargs`
+| The arguments that will be passed to the view: positional groups, or named parts. `kwargs` also contains any extra dictionary given to `path()`.
+
+| `captured_kwargs`, `extra_kwargs`
+| The two halves of `kwargs`: values captured from the URL, and the extra dictionary from `path(..., kwargs={...})`.
+
+| `url_name`, `route`
+| The pattern's `name=` and its route string, for example `books/<int:pk>/inspect/`.
+
+| `app_name`, `app_names`, `namespace`, `namespaces`
+| The application and instance namespaces, joined with `:` or as lists.
+
+| `view_name`
+| The namespaced name used with `reverse()`, such as `catalog:book-detail`, or the dotted path of the view when there is no `name=`.
+
+| `tried`
+| The patterns tried before a match was found or the list was exhausted (useful in debugging).
+|===
+
+`resolve("/path/")` returns the same object without a request, and `reverse()` goes the other way. The test below resolves a
+path, checks every attribute that matters, and goes through the whole stack with the test client:
+
+.catalog/tests.py (ResolutionTests)
+[source,python]
+----
+class ResolutionTests(SimpleTestCase):
+    def test_resolve_returns_resolver_match(self):
+        match = resolve("/books/7/inspect/")
+        self.assertIs(match.func, views.inspect_request)
+        self.assertEqual(match.args, ())
+        self.assertEqual(match.kwargs, {"pk": 7})
+        self.assertEqual(match.url_name, "inspect")
+        self.assertEqual(match.route, "books/<int:pk>/inspect/")
+        self.assertEqual(reverse("inspect", kwargs={"pk": 7}), "/books/7/inspect/")
+
+    def test_request_factory_skips_middleware_and_urls(self):
+        request = RequestFactory().get("/anything/")
+        # URL resolution never happened, so there is no resolver_match
+        self.assertIsNone(request.resolver_match)
+        self.assertEqual(views.hello(request).status_code, 200)
+----
+
+The second test marks a boundary that matters for testing: `RequestFactory` builds a request and calls a view directly, so
+neither middleware nor URL resolution runs; `request.resolver_match` is `None` and `request.user` does not exist unless the
+test sets it. The test client, by contrast, goes through every layer on this page.
+
+Two details come from the official reference: `request.resolver_match` exists in views and in `process_view()`, but not in
+middleware code that runs *before* URL resolution (the "before" half of `+__call__()+`); and `reverse()` accepts `query=` and
+`fragment=` since Django 5.2, a feature that belongs to the URLs & Routing page of this section.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/urlresolvers/[Django: django.urls utility functions] and
+https://docs.djangoproject.com/en/6.1/topics/http/urls/#how-django-processes-a-request[Django: How Django processes a request]
+
+=== Switching the URLconf per request
+
+Because the handler looks for `request.urlconf` before resolving, a middleware can route different hosts to different URL
+trees; setting it to `None` returns to `ROOT_URLCONF`. This is how multi-tenant or `api.` subdomain setups are built without
+a second project:
+
+.catalog/middleware.py (HostUrlconfMiddleware)
+[source,python]
+----
+class HostUrlconfMiddleware:
+    """Serve a different URLconf for api.* hosts (sets request.urlconf)."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        if request.get_host().split(":")[0].startswith("api."):
+            request.urlconf = "catalog.api_urls"
+        return self.get_response(request)
+----
+
+.catalog/api_urls.py
+[source,python]
+----
+from django.http import JsonResponse
+from django.urls import path
+
+
+def index(request):
+    return JsonResponse({"urlconf": request.urlconf, "host": request.get_host()})
+
+
+urlpatterns = [path("", index)]
+----
+
+.catalog/tests.py (urlconf switch)
+[source,python]
+----
+    @override_settings(
+        ALLOWED_HOSTS=[".testserver"],
+        MIDDLEWARE=["catalog.middleware.HostUrlconfMiddleware"],
+    )
+    def test_request_urlconf_replaces_root_urlconf(self):
+        api = self.client.get("/", headers={"Host": "api.testserver"})
+        self.assertEqual(api.json(), {"urlconf": "catalog.api_urls", "host": "api.testserver"})
+        # the same path under the normal host is not routed at all
+        self.assertEqual(self.client.get("/").status_code, 404)
+----
+
+The middleware must come before anything that resolves URLs, and `reverse()` inside the request then uses the replaced
+URLconf as well.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#django.http.HttpRequest.urlconf[Django: HttpRequest.urlconf]
+
+=== Trailing slashes and APPEND_SLASH
+
+A request for `/hello` (no slash) matches no pattern, so resolution raises `Resolver404`. `CommonMiddleware` sees the `404`
+on the way out and, because `APPEND_SLASH` is `True` by default and `/hello/` *would* resolve, replaces the response with a
+permanent redirect. It is a good illustration of the middleware doing work *after* the cycle's middle:
+
+.catalog/tests.py (HybridMiddlewareTests, APPEND_SLASH)
+[source,python]
+----
+    @override_settings(MIDDLEWARE=["django.middleware.common.CommonMiddleware"])
+    def test_append_slash_redirects_a_404(self):
+        response = self.client.get("/hello")
+        self.assertEqual((response.status_code, response["Location"]), (301, "/hello/"))
+        self.assertEqual(self.client.get("/hello/")["Content-Length"], "20")
+----
+
+[source,bash]
+----
+$ curl -si http://localhost:28773/hello | grep -i "^HTTP\|^location"
+HTTP/1.1 301 Moved Permanently
+Location: /hello/
+$ curl -si http://localhost:28773/hello/ | grep -i "^HTTP\|^content-length"
+HTTP/1.1 200 OK
+Content-Length: 20
+----
+
+The same middleware set `Content-Length: 20` on the `200` response. Two pitfalls: a `POST` to a URL without the slash cannot be
+redirected without losing its body, so with `DEBUG = True` Django raises a `RuntimeError` telling you to fix the form's `action`;
+and a view can opt out with `should_append_slash = False` (the `no_append_slash` decorator).
+
+Source: https://docs.djangoproject.com/en/6.1/ref/settings/#append-slash[Django: APPEND_SLASH]
+
+== Calling the view
+
+With a `ResolverMatch` in hand, `_get_response()` runs the `process_view()` hooks and then calls the view:
+
+[source,python]
+----
+response = view(request, *args, **kwargs)
+----
+
+`args` are the unnamed groups of a `re_path()` pattern (used only when the pattern has no named groups); `kwargs` are the named
+parts, such as `pk`, overridden by the optional `kwargs` dictionary given to `path()`. A view may be a function, the callable
+returned by `View.as_view()`, or any callable that takes a request; the sections of this page after this one use plain
+functions, and xref:web/django/function-based-views-and-shortcuts.adoc[Function-Based Views & Shortcuts] covers the
+conveniences around them. Before the call the handler does two more things.
+
+*Transactions.* If `ATOMIC_REQUESTS` is `True` for a database alias in `DATABASES`, the view is wrapped in
+`transaction.atomic(using=alias)`, unless the view is decorated with `@transaction.non_atomic_requests`. That wrapping is
+only possible for synchronous views: with an `async def` view the handler raises `RuntimeError: You cannot use ATOMIC_REQUESTS
+with async views.` The wrapping covers the view only, not the middleware around it and not template rendering (the transaction commits when
+the view returns, before a `TemplateResponse` renders).
+
+*Async views.* A view that is a coroutine function is run through `async_to_sync()` in WSGI mode and awaited natively in ASGI mode;
+a synchronous view in ASGI mode runs in a thread (`sync_to_async(thread_sensitive=True)`). Both are described in
+<<sync-async,Sync and async through the cycle>>.
+
+*The contract.* A view must return an `HttpResponse` (or a subclass, or an object with the same interface such as
+`StreamingHttpResponse` or `TemplateResponse`). Two mistakes are caught by the handler with a clear message:
+
+.catalog/views.py (two view mistakes)
+[source,python]
+----
+def returns_none(request):
+    pass  # forgot the return statement
+
+
+def forgot_await(request):
+    return async_hello(request)  # a coroutine object, never awaited
+----
+
+.catalog/tests.py (ViewContractTests)
+[source,python]
+----
+class ViewContractTests(TestCase):
+    def test_view_must_return_a_response(self):
+        with self.assertRaisesMessage(
+            ValueError, "didn't return an HttpResponse object. It returned None"
+        ):
+            self.client.get("/mistakes/none/")
+        with self.assertRaisesMessage(ValueError, "It returned an unawaited coroutine"):
+            self.client.get("/mistakes/await/")
+
+    def test_atomic_requests_rejects_async_views(self):
+        # ATOMIC_REQUESTS is a per-database setting; turn it on for this test only
+        with mock.patch.dict(connection.settings_dict, {"ATOMIC_REQUESTS": True}):
+            with self.assertRaisesMessage(
+                RuntimeError, "You cannot use ATOMIC_REQUESTS with async views."
+            ):
+                self.client.get("/async/")
+            # the same setting is harmless for a sync view
+            self.assertEqual(self.client.get("/hello/").status_code, 200)
+----
+
+The `ValueError` for `returns_none` reads "The view catalog.views.returns_none didn't return an HttpResponse object. It returned
+None instead." In production this becomes a `500`. The `forgot_await` case (a synchronous view that returns the result
+of calling an `async def` function without `await`) gives the same check a different message; Python also prints a "coroutine was
+never awaited" `RuntimeWarning`.
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/views/[Django: Writing views],
+https://docs.djangoproject.com/en/6.1/topics/db/transactions/#tying-transactions-to-http-requests[Django: Tying transactions to HTTP requests] and
+https://docs.djangoproject.com/en/6.1/topics/async/#async-views[Django: Async views]
+
+== Deferred rendering with TemplateResponse
+
+A plain `HttpResponse` holds finished bytes. A `TemplateResponse` holds the *template name and the context* instead, so that
+decorators and middleware can still change them after the view has returned; Django renders it only when the response
+leaves the chain's inner step. The shortcut `render()` is the opposite: it renders immediately and returns an ordinary
+`HttpResponse` (the usual choice, and slightly cheaper). The `book_list` view uses `TemplateResponse`:
+
+.catalog/views.py (book_list)
+[source,python]
+----
+from django.template.response import TemplateResponse
+
+from .models import Book
+
+
+def book_list(request):
+    books = Book.objects.select_related("author")
+    return TemplateResponse(
+        request, "catalog/book_list.html", {"heading": "Books", "books": books}
+    )
+----
+
+.catalog/templates/catalog/book_list.html
+[source,html+django]
+----
+<!doctype html>
+<html lang="en">
+<body>
+  <h1>{{ heading }}</h1>
+  <ul>
+  {% for book in books %}
+    <li>{{ book.title }} by {{ book.author.name }} ({{ book.price }})</li>
+  {% endfor %}
+  </ul>
+</body>
+</html>
+----
+
+The constructor is `TemplateResponse(request, template, context=None, content_type=None, status=None, charset=None, using=None,
+headers=None)`; its base class `SimpleTemplateResponse` has the same signature without `request`. Rendering follows rules
+the test below demonstrates, all taken from the reference:
+
+* After the view returns, the handler runs the `process_template_response()` hooks (bottom-up) and then calls `render()`; the response middleware then sees the rendered response.
+* `render()` takes effect once; later calls return the first result. Assigning `response.content` renders immediately.
+* Reading `content` before rendering raises `ContentNotRenderedError`. `is_rendered` tells you which state you are in.
+* `add_post_render_callback()` registers a function that runs right after rendering (useful for caching the output).
+* An exception during `render()` is passed to `process_exception()` like a view exception, and an error view that returns a `TemplateResponse` is rendered by the handler automatically.
+
+.catalog/tests.py (ViewContractTests, deferred rendering)
+[source,python]
+----
+    def test_template_response_is_lazy_until_rendered(self):
+        request = RequestFactory().get("/books/")
+        response = views.book_list(request)
+        self.assertFalse(response.is_rendered)
+        with self.assertRaises(ContentNotRenderedError):
+            response.content
+        response.context_data["heading"] = "Changed after the view returned"
+        response.render()
+        self.assertTrue(response.is_rendered)
+        self.assertIn(b"Changed after the view returned", response.content)
+----
+
+With the seeded book (`Dune` by `Frank Herbert`), `curl` shows the rendered page; the queryset is evaluated *during* rendering,
+after the view has returned, which is a subtle reason to keep `select_related()` or `prefetch_related()` in the view, and
+a reason a `process_template_response()` hook can still add context:
+
+[source,bash]
+----
+$ curl -s http://localhost:8764/books/
+<!doctype html>
+<html lang="en">
+<body>
+  <h1>Books</h1>
+  <ul>
+
+    <li>Dune by Frank Herbert (9.99)</li>
+
+  </ul>
+</body>
+</html>
+----
+
+The template language and the rest of the template engine have their own pages in this section.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/template-response/[Django: TemplateResponse and SimpleTemplateResponse]
+
+== The HttpRequest object
+
+The handler builds one `HttpRequest` per request (a `WSGIRequest` or an `ASGIRequest`) and every layer after it receives the same object.
+Treat its attributes as read-only unless the reference says otherwise; middleware may *add* attributes. The attributes fall in three groups.
+
+=== Attributes Django sets
+
+[cols="1,3",options="header"]
+|===
+| Attribute | Meaning
+
+| `method`
+| The HTTP method, always uppercase. Test it with `request.method == "POST"`, never with `if request.POST:` (a `POST` can have an empty body).
+
+| `scheme`
+| `http` or `https`. Under a TLS-terminating proxy it is correct only if `SECURE_PROXY_SSL_HEADER` is configured.
+
+| `path`, `path_info`
+| The path including or excluding the script prefix (`SCRIPT_NAME`). URL resolution and most code should use `path_info`; use `path` when building links.
+
+| `GET`, `POST`
+| `QueryDict` objects (immutable). `POST` holds form-encoded data only; a JSON body leaves it empty (see below). `POST` does not include uploaded files.
+
+| `FILES`
+| Uploaded files, only for a `POST` whose form uses `enctype="multipart/form-data"`.
+
+| `COOKIES`
+| A dictionary of cookie names to string values.
+
+| `META`
+| A dictionary of server and header values: `REQUEST_METHOD`, `QUERY_STRING`, `REMOTE_ADDR`, `CONTENT_TYPE`, `CONTENT_LENGTH`, `SERVER_NAME`, and headers as `HTTP_<NAME>` (uppercased, hyphens replaced by underscores). `runserver` and the ASGI handler drop headers that contain an underscore, to prevent spoofing.
+
+| `headers`
+| A case-insensitive, dict-like view of the request headers (`request.headers["User-Agent"]`, `request.headers.get("x-bender")`); in templates `{{ request.headers.user_agent }}` works too. Added in 2.2; prefer it to `META`.
+
+| `body`
+| The raw body as bytes. Reading it also consumes the stream; after `read()`, `readline()` or iteration, reading `body` raises `RawPostDataException`.
+
+| `content_type`, `content_params`, `encoding`
+| The parsed `Content-Type` and its parameters; `encoding` is the charset used to decode form data (`None` means `DEFAULT_CHARSET`, and assigning to it changes how `GET` and `POST` are decoded from then on).
+
+| `resolver_match`
+| The `ResolverMatch` of <<url-resolution,URL resolution>>; set only after resolution, so available in views and `process_view()`, not in the "before" half of a middleware.
+
+| `multipart_parser_class`
+| New in 6.1: the class used to parse `multipart/form-data`, `django.http.multipartparser.MultiPartParser` by default. Assign a subclass in a middleware or a view to customise parsing.
+|===
+
+When no `Content-Type` header is sent, `request.content_type` is `"text/plain"`, as the `curl` output below shows.
+
+=== Attributes your code or middleware sets
+
+Django does not set these but honours them if present: `request.urlconf` (root URLconf for this request, covered above),
+`request.current_app` (a hint for `{% url %}` and `reverse()` namespace resolution), and `request.exception_reporter_filter` and
+`request.exception_reporter_class` (replace `DEFAULT_EXCEPTION_REPORTER_FILTER` and `DEFAULT_EXCEPTION_REPORTER` for this request).
+The bundled middleware adds `request.session` (`SessionMiddleware`), `request.user` and `request.auser()`
+(`AuthenticationMiddleware`; `auser()` is the coroutine for async code and has existed since 5.0), and `request.site`
+(`CurrentSiteMiddleware`). If an attribute you expect is missing, the middleware that sets it is not in `MIDDLEWARE` or comes too late.
+
+=== Methods
+
+[cols="1,3",options="header"]
+|===
+| Method | What it returns
+
+| `get_host()`, `get_port()`
+| The originating host and port, from `X-Forwarded-Host` and `X-Forwarded-Port` only if `USE_X_FORWARDED_HOST` and `USE_X_FORWARDED_PORT` are true, then from the `Host` header or `SERVER_NAME`. `get_host()` raises `DisallowedHost` (a `SuspiciousOperation`, hence a `400`) unless the host is in `ALLOWED_HOSTS`.
+
+| `get_full_path()`, `get_full_path_info()`
+| The path plus the query string (the second one from `path_info`).
+
+| `build_absolute_uri(location=None)`
+| An absolute URL with the *request's own scheme*; Django will not turn `http` into `https` for you.
+
+| `is_secure()`
+| `True` for HTTPS (or when `SECURE_PROXY_SSL_HEADER` says so).
+
+| `get_signed_cookie(key, default=RAISE_ERROR, salt="", max_age=None)`
+| A cookie set with `set_signed_cookie()`, or `BadSignature` / `SignatureExpired`; pass `default` to suppress the error.
+
+| `accepts(mime_type)`, `get_preferred_type(media_types)`
+| Content negotiation from the `Accept` header; see below.
+
+| `read()`, `readline()`, `readlines()`, iteration
+| A file-like interface for streaming a big body, for example straight into `ElementTree.iterparse(request)`.
+
+| `auser()`
+| The authenticated user in async code.
+|===
+
+One reference-page sentence is out of date in Django 6.1: the `get_signed_cookie()` entry says cookies signed by older Django
+versions are accepted by default. The 6.1 release notes deprecate the transitional setting `SIGNED_COOKIE_LEGACY_SALT_FALLBACK`, and its
+default is `False` in 6.1 (read in `global_settings.py` of Django 6.1.1): signed cookies that carry the legacy salt derivation (produced by older releases) are rejected
+unless the setting is set to `True` during a migration.
+
+A view that reports what Django knows about the request makes all of this concrete:
+
+.catalog/views.py (inspect_request)
+[source,python]
+----
+from django.http import JsonResponse
+
+
+def inspect_request(request, pk):
+    match = request.resolver_match
+    data = {
+        "method": request.method,
+        "scheme": request.scheme,
+        "is_secure": request.is_secure(),
+        "host": request.get_host(),
+        "path": request.path,
+        "path_info": request.path_info,
+        "full_path": request.get_full_path(),
+        "absolute_uri": request.build_absolute_uri(),
+        "query": request.GET.dict(),
+        "tags": request.GET.getlist("tag"),
+        "content_type": request.content_type,
+        "user_agent": request.headers.get("user-agent"),
+        "meta_has_http_accept": "HTTP_ACCEPT" in request.META,
+        "cookies": request.COOKIES,
+        "view_name": match.view_name,
+        "url_name": match.url_name,
+        "route": match.route,
+        "kwargs": match.kwargs,
+        "pk": pk,
+    }
+    return JsonResponse(data)
+----
+
+Requested against `runserver` (with `DJANGO_DEBUG=0` and the repeated parameter `tag`), the answer is:
+
+[source,bash]
+----
+$ curl -s "http://localhost:28774/books/7/inspect/?tag=a&tag=b&page=2" \
+    -H "Accept: application/json" -b "theme=dark" | python -m json.tool
+----
+
+[source,json]
+----
+{
+    "method": "GET",
+    "scheme": "http",
+    "is_secure": false,
+    "host": "localhost:28774",
+    "path": "/books/7/inspect/",
+    "path_info": "/books/7/inspect/",
+    "full_path": "/books/7/inspect/?tag=a&tag=b&page=2",
+    "absolute_uri": "http://localhost:28774/books/7/inspect/?tag=a&tag=b&page=2",
+    "query": {
+        "tag": "b",
+        "page": "2"
+    },
+    "tags": [
+        "a",
+        "b"
+    ],
+    "content_type": "text/plain",
+    "user_agent": "curl/8.7.1",
+    "meta_has_http_accept": true,
+    "cookies": {
+        "theme": "dark"
+    },
+    "view_name": "inspect",
+    "url_name": "inspect",
+    "route": "books/<int:pk>/inspect/",
+    "kwargs": {
+        "pk": 7
+    },
+    "pk": 7
+}
+----
+
+Note `"query": {"tag": "b"}` against `"tags": ["a", "b"]`: `QueryDict.get()` and `dict()` return the *last* value for a repeated key, and
+`getlist()` returns all of them.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#httprequest-objects[Django: HttpRequest objects]
+
+=== Reading the body
+
+`request.POST` is filled only for `application/x-www-form-urlencoded` and `multipart/form-data` bodies. JSON, XML and any other format
+arrive in `request.body` and must be parsed by the view. The `attributes` view handles both and turns a malformed JSON body into
+`BadRequest`, a `400` (see <<exceptions,Exceptions and error views>>):
+
+.catalog/views.py (attributes)
+[source,python]
+----
+import json
+
+from django.core.exceptions import BadRequest
+from django.http import HttpResponseNotAllowed, JsonResponse
+
+
+def attributes(request):
+    """Show request.body, request.POST and the file-like interface."""
+    if request.method != "POST":
+        return HttpResponseNotAllowed(["POST"])
+    if request.content_type == "application/json":
+        try:
+            payload = json.loads(request.body)
+        except json.JSONDecodeError:
+            raise BadRequest("Malformed JSON")
+        return JsonResponse({"received": payload})
+    return JsonResponse({"form": request.POST.dict()})
+----
+
+.catalog/tests.py (RequestResponseApiTests, bodies)
+[source,python]
+----
+    def test_body_post_and_json(self):
+        form = self.client.post("/attributes/", {"a": "1", "b": ["x", "y"]})
+        self.assertEqual(form.json(), {"form": {"a": "1", "b": "y"}})
+        js = self.client.post("/attributes/", {"x": 1}, content_type="application/json")
+        self.assertEqual(js.json(), {"received": {"x": 1}})
+        refused = self.client.get("/attributes/")
+        self.assertEqual(refused.status_code, 405)
+        self.assertEqual(refused["Allow"], "POST")
+----
+
+The file-like interface, the header mapping and the immutability rules are easiest to see on a `RequestFactory` request, whose output
+is shown after the script (run in `manage.py shell`):
+
+.demo_request.py
+[source,python]
+----
+import json
+
+from django.http import RawPostDataException
+from django.test import RequestFactory
+
+rf = RequestFactory()
+
+# a JSON POST: request.POST stays empty, request.body holds the bytes
+request = rf.post("/api/books/", data=json.dumps({"title": "Dune"}), content_type="application/json")
+print(request.method, request.content_type, dict(request.POST), request.body)
+
+# the file-like interface consumes the stream; body can no longer be read afterwards
+request = rf.post("/api/books/", data='{"title": "Dune"}', content_type="application/json")
+print(request.read(8))
+try:
+    request.body
+except RawPostDataException as exc:
+    print("RawPostDataException:", exc)
+
+# header handling: META keys versus request.headers
+request = rf.get(
+    "/books/?page=2",
+    headers={"X-Bender": "bite my shiny metal", "Accept": "text/html,application/json;q=0.8"},
+)
+print(request.META["HTTP_X_BENDER"], "|", request.headers["x-bender"], "|", request.headers["X-BENDER"])
+print(request.accepts("text/html"), request.accepts("image/png"))
+print(request.get_preferred_type(["application/json", "text/html"]))
+print(request.get_preferred_type(["image/png"]))
+
+# immutability of GET/POST
+try:
+    request.GET["page"] = "3"
+except AttributeError as exc:
+    print("AttributeError:", exc)
+
+print(type(request).__name__, request.path, request.path_info, request.get_full_path())
+----
+
+[source,text]
+----
+POST application/json {} b'{"title": "Dune"}'
+b'{"title"'
+RawPostDataException: You cannot access body after reading from request's data stream
+bite my shiny metal | bite my shiny metal | bite my shiny metal
+True False
+text/html
+None
+AttributeError: This QueryDict instance is immutable
+WSGIRequest /books/ /books/ /books/?page=2
+----
+
+Request size is bounded by settings: `DATA_UPLOAD_MAX_MEMORY_SIZE` (2.5 MiB by default; counts everything except file uploads),
+`DATA_UPLOAD_MAX_NUMBER_FIELDS` (1000) and `DATA_UPLOAD_MAX_NUMBER_FILES` (100). Exceeding them raises `RequestDataTooBig`,
+`TooManyFieldsSent` or `TooManyFilesSent`, all `SuspiciousOperation` subclasses, *when the body or `POST` is first read*, which is why
+the error appears inside the view (or in a middleware that touches `request.POST` early), not at connection time:
+
+.catalog/tests.py (ErrorTests, body limit)
+[source,python]
+----
+    @override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=10)
+    def test_oversized_body_is_a_400_raised_lazily(self):
+        # RequestDataTooBig (a SuspiciousOperation) fires when the body is read
+        with self.assertLogs("django.security.RequestDataTooBig", level="ERROR"):
+            response = self.client.post("/attributes/", {"title": "x" * 100})
+        self.assertEqual(response.status_code, 400)
+----
+
+A related rule from the middleware reference: do not read `request.POST` in middleware before the view runs, because that
+freezes the upload handlers a view might still want to change; `CsrfViewMiddleware` is the one exception (it offers
+`csrf_exempt` and `csrf_protect` so a view can decide when validation happens).
+
+Source: https://docs.djangoproject.com/en/6.1/ref/settings/#data-upload-max-memory-size[Django: DATA_UPLOAD_MAX_MEMORY_SIZE] and
+https://docs.djangoproject.com/en/6.1/ref/request-response/#django.http.HttpRequest.body[Django: HttpRequest.body]
+
+=== QueryDict
+
+`request.GET` and `request.POST` are `django.http.QueryDict` instances: dictionaries that keep a *list* of values per key, because HTML
+forms (`<select multiple>`, repeated checkboxes) and URLs (`?tag=a&tag=b`) allow repeated keys. They are immutable inside a request; call `.copy()` for a
+mutable deep copy, for example to rebuild a query string with one parameter changed.
+
+[cols="1,3",options="header"]
+|===
+| Call | Behaviour
+
+| `q["tag"]`, `q.get("tag")`
+| The *last* value; `q["missing"]` raises `MultiValueDictKeyError` (a `KeyError`), `get()` returns the default.
+
+| `q.getlist("tag")`
+| All values as a list (`[]` for a missing key unless a default list is given).
+
+| `q.dict()`
+| A plain `dict` with the last value of each key.
+
+| `q.lists()`, `q.items()`, `q.values()`
+| `lists()` gives every `(key, [values])` pair; `items()` and `values()` use last-value semantics and return iterators.
+
+| `q.setlist()`, `q.appendlist()`, `q.update()`
+| Mutators (on a mutable copy only); `update()` appends instead of replacing.
+
+| `q.urlencode(safe=None)`
+| The query-string form; `safe` lists characters not to encode.
+
+| `QueryDict("a=1&a=2", mutable=True)`
+| A standalone instance; `QueryDict.fromkeys()` builds one from an iterable.
+|===
+
+.demo_response.py (QueryDict part)
+[source,python]
+----
+from django.http import QueryDict
+
+q = QueryDict("tag=a&tag=b&page=2")
+print(q["tag"], q.getlist("tag"), q.dict(), q.urlencode())
+print(q.copy().__class__.__name__, q._mutable, q.copy()._mutable)
+----
+
+[source,text]
+----
+b ['a', 'b'] {'tag': 'b', 'page': '2'} tag=a&tag=b&page=2
+QueryDict False True
+----
+
+.catalog/tests.py (RequestResponseApiTests, QueryDict)
+[source,python]
+----
+    def test_querydict(self):
+        q = QueryDict("a=1&a=2&c=3")
+        self.assertEqual(q["a"], "2")
+        self.assertEqual(q.getlist("a"), ["1", "2"])
+        with self.assertRaises(AttributeError):
+            q["z"] = "boom"
+        m = q.copy()
+        m["z"] = "ok"
+        self.assertEqual(m.urlencode(), "a=1&a=2&c=3&z=ok")
+----
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#querydict-objects[Django: QueryDict objects]
+
+=== Content negotiation: accepts() and get_preferred_type()
+
+Browsers, `curl` and API clients tell the server which representations they can handle in the `Accept` header. Two request methods read it:
+
+* `request.accepts("application/json")` returns `True` if the header matches that type (since 3.1). Most browsers send `Accept: */*` by default, in which case `accepts()` is `True` for every type, so it answers "may I send this?", not "which is best?".
+* `request.get_preferred_type(["text/html", "application/json"])` returns the *best* of the candidates according to the header's `q` weights and parameters, or `None` if none is acceptable (since 5.2). With `*/*` it returns the first candidate, so list your default first.
+
+The `negotiate` view answers HTML, JSON or `406 Not Acceptable`. Because the response now depends on a request header, it declares that
+with `Vary: Accept` (the `vary_on_headers` decorator adds it) so that caches keep one entry per representation:
+
+.catalog/views.py (negotiate)
+[source,python]
+----
+from http import HTTPStatus
+
+from django.http import HttpResponse, JsonResponse
+from django.views.decorators.vary import vary_on_headers
+
+
+@vary_on_headers("Accept")
+def negotiate(request):
+    best = request.get_preferred_type(["text/html", "application/json"])
+    if best is None:
+        return HttpResponse(status=HTTPStatus.NOT_ACCEPTABLE)
+    if best == "application/json":
+        return JsonResponse({"books": ["Dune", "Emma"]})
+    return HttpResponse("<ul><li>Dune</li><li>Emma</li></ul>")
+----
+
+.catalog/tests.py (RequestResponseApiTests, negotiation)
+[source,python]
+----
+    def test_content_negotiation(self):
+        html = self.client.get("/negotiate/", headers={"Accept": "text/html"})
+        self.assertEqual(html["Content-Type"], "text/html; charset=utf-8")
+        data = self.client.get(
+            "/negotiate/", headers={"Accept": "application/json;q=1, text/html;q=0.5"}
+        )
+        self.assertEqual(data.json(), {"books": ["Dune", "Emma"]})
+        self.assertEqual(data["Vary"], "Accept")
+        nope = self.client.get("/negotiate/", headers={"Accept": "image/png"})
+        self.assertEqual(nope.status_code, 406)
+----
+
+[source,bash]
+----
+$ for h in "text/html" "application/json" "application/json;q=1, text/html;q=0.5" "image/png" "*/*"; do
+>   echo "## Accept: $h"; curl -si localhost:8764/negotiate/ -H "Accept: $h" | grep -i "^HTTP\|^content-type\|^vary\|^{\|^<"; done
+## Accept: text/html
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Vary: Accept
+<ul><li>Dune</li><li>Emma</li></ul>
+## Accept: application/json
+HTTP/1.1 200 OK
+Content-Type: application/json
+Vary: Accept
+{"books": ["Dune", "Emma"]}
+## Accept: application/json;q=1, text/html;q=0.5
+HTTP/1.1 200 OK
+Content-Type: application/json
+Vary: Accept
+{"books": ["Dune", "Emma"]}
+## Accept: image/png
+HTTP/1.1 406 Not Acceptable
+Content-Type: text/html; charset=utf-8
+Vary: Accept
+## Accept: */*
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Vary: Accept
+<ul><li>Dune</li><li>Emma</li></ul>
+----
+
+`request.accepts()` and `get_preferred_type()` replace the old habit of deciding "is this an AJAX call?" with
+`request.is_ajax()`, which looked at the non-standard `X-Requested-With` header: it was deprecated in 3.1 and removed in 4.0.
+Negotiate on what the client *accepts* (or on the URL, for example a `.json` suffix) instead of how the request was made.
+If you must still detect the header, read `request.headers.get("x-requested-with") == "XMLHttpRequest"` yourself.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#django.http.HttpRequest.get_preferred_type[Django: HttpRequest.get_preferred_type()] and
+https://docs.djangoproject.com/en/6.1/ref/request-response/#django.http.HttpRequest.accepts[HttpRequest.accepts()]
+
+== The HttpResponse object
+
+Unlike the request, the response is your responsibility: a view builds it and returns it. `django.http.HttpResponse` is the
+workhorse; it holds the body and the headers in memory, which also lets middleware read and change them.
+
+[source,python]
+----
+HttpResponse(content=b"", content_type=None, status=200, reason=None, charset=None, headers=None)
+----
+
+`content` may be a `str`, `bytes`, `memoryview` or an iterator of strings or bytes (consumed *immediately*, which is not
+streaming); `content_type` defaults to `text/html; charset=utf-8` (from `DEFAULT_CHARSET`); `status` accepts an integer or an
+`http.HTTPStatus` member; `headers` is a dictionary of headers. The most useful attributes and methods:
+
+[cols="1,3",options="header"]
+|===
+| Member | Meaning
+
+| `content`, `text`
+| The body as bytes, and as a decoded string (`text` was added in 5.2).
+
+| `status_code`, `reason_phrase`
+| The status; the reason phrase follows `status_code` unless set explicitly.
+
+| `headers`
+| A case-insensitive, dict-like object (added in 3.2; the older `response["Name"] = value` interface still works and proxies to it). `del` does not raise if the header is absent. A header value containing a newline raises `BadHeaderError`.
+
+| `cookies`
+| A `http.cookies.SimpleCookie`; `Set-Cookie` is *not* in `headers`.
+
+| `charset`, `streaming`, `closed`
+| The encoding, whether the response streams (always `False` here), and whether `close()` has run.
+
+| `write()`, `flush()`, `tell()`, `getvalue()`
+| A file-like interface for building the body incrementally; `readable()` and `seekable()` are `False`.
+
+| `set_cookie()`, `set_signed_cookie()`, `delete_cookie()`
+| Cookie helpers, described below.
+
+| `close()`
+| Called by the server at the end of the request; closes files and sends `request_finished`.
+|===
+
+A stand-alone script exercises the constructor, `reason_phrase`, `write()`, `BadHeaderError`, the redirect classes, `JsonResponse` and
+the streaming flag; every line of the output below was produced by it:
+
+.demo_response.py (response part)
+[source,python]
+----
+from http import HTTPStatus
+
+from django.http import (
+    BadHeaderError,
+    HttpResponse,
+    HttpResponsePermanentRedirect,
+    HttpResponseRedirect,
+    JsonResponse,
+    StreamingHttpResponse,
+)
+
+r = HttpResponse("Hello", status=HTTPStatus.CREATED, headers={"X-Shelf": "A1"})
+print(r.status_code, r.reason_phrase, r.charset, r["content-type"])
+r.write(", world")
+print(r.content, r.text, r.streaming, r.closed)
+r.status_code = 202
+print(r.reason_phrase)                      # follows status_code until set explicitly
+r.headers["Cache-Control"] = "no-store"
+print(sorted(k for k, _ in r.items()))
+try:
+    r["X-Bad"] = "a\nb"
+except BadHeaderError as exc:
+    print("BadHeaderError:", exc)
+
+print(HttpResponseRedirect("/a/").status_code,
+      HttpResponseRedirect("/a/", preserve_request=True).status_code,
+      HttpResponsePermanentRedirect("/a/").status_code,
+      HttpResponsePermanentRedirect("/a/", preserve_request=True).status_code)
+
+j = JsonResponse([1, 2, 3], safe=False)
+print(j["Content-Type"], j.content)
+try:
+    JsonResponse([1, 2, 3])
+except TypeError as exc:
+    print("TypeError:", exc)
+
+s = StreamingHttpResponse(iter([b"a", b"b"]))
+print(s.streaming, s.is_async, hasattr(s, "content"), list(s.streaming_content))
+----
+
+[source,text]
+----
+201 Created utf-8 text/html; charset=utf-8
+b'Hello, world' Hello, world False False
+Accepted
+['Cache-Control', 'Content-Type', 'X-Shelf']
+BadHeaderError: Header values can't contain newlines (got 'a\nb')
+302 307 301 308
+application/json b'[1, 2, 3]'
+TypeError: In order to allow non-dict objects to be serialized set the safe parameter to False.
+True False False [b'a', b'b']
+----
+
+For `Cache-Control` and `Vary`, which can hold several comma-separated values that other layers also set, use
+`django.utils.cache.patch_cache_control()` and `patch_vary_headers()` rather than assigning, so values added by middleware
+are not lost.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#httpresponse-objects[Django: HttpResponse objects]
+
+=== Subclasses and status codes
+
+Django ships a subclass for each common status. They differ from `HttpResponse` only in `status_code` (and in the constructor
+arguments noted):
+
+[cols="2,1,3",options="header"]
+|===
+| Class | Status | Notes
+
+| `HttpResponseRedirect`
+| 302
+| Required first argument: the target; `preserve_request=True` gives `307` (5.2+); `max_length` overrides the URL length limit (6.1+); read-only attribute `url`.
+
+| `HttpResponsePermanentRedirect`
+| 301
+| `preserve_request=True` gives `308` (5.2+).
+
+| `HttpResponseNotModified`
+| 304
+| No arguments and no content; used for conditional requests.
+
+| `HttpResponseBadRequest`
+| 400
+|
+
+| `HttpResponseForbidden`
+| 403
+|
+
+| `HttpResponseNotFound`
+| 404
+|
+
+| `HttpResponseNotAllowed`
+| 405
+| Required argument: the list of permitted methods, which the class puts in the `Allow` header (shown below).
+
+| `HttpResponseGone`
+| 410
+|
+
+| `HttpResponseServerError`
+| 500
+|
+
+| `JsonResponse`
+| 200
+| `HttpResponse` subclass for JSON; first argument must be a `dict` unless `safe=False`; `encoder` defaults to `DjangoJSONEncoder`; `json_dumps_params` passes arguments to `json.dumps()`.
+
+| `StreamingHttpResponse`
+| 200
+| *Not* an `HttpResponse` subclass; takes an iterator and has `streaming_content` instead of `content`.
+
+| `FileResponse`
+| 200
+| A `StreamingHttpResponse` for binary files; `as_attachment=True` and `filename=` control `Content-Disposition`.
+|===
+
+Any other status uses `HttpResponse(status=...)`, or a one-line subclass:
+
+.catalog/views.py (custom response class and redirect)
+[source,python]
+----
+from http import HTTPStatus
+
+from django.http import HttpResponse, HttpResponseRedirect
+
+
+class HttpResponseNoContent(HttpResponse):
+    status_code = HTTPStatus.NO_CONTENT
+
+
+def moved(request):
+    return HttpResponseRedirect("/hello/", preserve_request=True)
+
+
+def gone_forever(request):
+    return HttpResponseNoContent()
+----
+
+.catalog/tests.py (RequestResponseApiTests, redirect and custom class)
+[source,python]
+----
+    def test_redirect_and_custom_response(self):
+        moved = self.client.get("/moved/")
+        self.assertEqual((moved.status_code, moved["Location"]), (307, "/hello/"))
+        self.assertEqual(self.client.get("/empty/").status_code, 204)
+----
+
+[source,bash]
+----
+$ curl -si http://localhost:8764/moved/ | grep -i "^HTTP\|^location"
+HTTP/1.1 307 Temporary Redirect
+Location: /hello/
+$ curl -si http://localhost:8764/empty/ | head -1
+HTTP/1.1 204 No Content
+$ curl -si http://localhost:8764/attributes/ | grep -i "^HTTP\|^allow"
+HTTP/1.1 405 Method Not Allowed
+Allow: POST
+----
+
+A `302` lets the browser switch a `POST` to a `GET` when it follows the redirect, which is what the *post/redirect/get* pattern
+wants; `307` and `308` (`preserve_request=True`, Django 5.2+) ask the client to repeat the same method and body, which is what
+you want for an API that moved. The `redirect()` shortcut gained the same argument.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#httpresponse-subclasses[Django: HttpResponse subclasses] and
+https://docs.djangoproject.com/en/6.1/releases/5.2/[Django 5.2 release notes]
+
+=== Cookies
+
+Cookies are response state, not request state: the server sets them in `Set-Cookie` headers and the browser returns them in
+`Cookie`. `set_cookie(key, value="", max_age=None, expires=None, path="/", domain=None, secure=False, httponly=False, samesite=None)`
+takes `max_age` as seconds or a `timedelta` (a `timedelta` is accepted since 4.1) and computes `expires` for you.
+Use `secure=True` so the cookie is sent only over HTTPS, `httponly=True` so JavaScript cannot read it, and `samesite="Lax"` or
+`"Strict"` as defence in depth against cross-site requests (not a replacement for CSRF protection; `samesite="None"` is the explicit
+"send always" form). `delete_cookie(key, path="/", domain=None, samesite=None)` must repeat the `path` and `domain` used to set the
+cookie. Browsers guarantee about 4096 bytes per cookie; Django does not warn if you exceed it.
+`set_signed_cookie(key, value, salt="", ...)` adds a signature, and `request.get_signed_cookie(key, salt=...)` verifies it: the signature
+protects against tampering, but the value is still readable by the client, so never put secrets in it.
+
+.catalog/views.py (cookies)
+[source,python]
+----
+def cookies(request):
+    response = HttpResponse("cookies set")
+    response.set_cookie("theme", "dark", max_age=3600, httponly=True, samesite="Lax")
+    response.set_signed_cookie("cart", "42", salt="cart", httponly=True)
+    return response
+----
+
+.catalog/tests.py (RequestResponseApiTests, cookies)
+[source,python]
+----
+    def test_cookies_and_signed_cookie(self):
+        response = self.client.get("/cookies/")
+        self.assertEqual(response.cookies["theme"]["samesite"], "Lax")
+        self.assertTrue(response.cookies["theme"]["httponly"])
+        self.assertTrue(response.cookies["cart"].value.startswith("42:"))
+----
+
+[source,bash]
+----
+$ curl -si http://localhost:8764/cookies/ | grep -i "^HTTP\|set-cookie"
+HTTP/1.1 200 OK
+Set-Cookie: theme=dark; expires=Sat, 03 Oct 2026 00:38:57 GMT; HttpOnly; Max-Age=3600; Path=/; SameSite=Lax
+Set-Cookie: cart=42:1xCmq9:_JNWCn_MaziEVcOm2qbo8qm0s4kohvPvuXdqVC5KNUs; HttpOnly; Path=/
+----
+
+The signed value is `value:timestamp:signature`. Its signing key comes from `SECRET_KEY` (and `SECRET_KEY_FALLBACKS` for rotation),
+which is why `SECRET_KEY` must come from the environment. Sessions, the messages framework and the `signing` module have their own
+page in this section; here it is enough to know that signed cookies are an `HttpResponse` feature. Note that 6.1 changed the salt
+derivation of signed cookies; see <<recent,What changed recently>>.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#django.http.HttpResponse.set_cookie[Django: HttpResponse.set_cookie()] and
+https://docs.djangoproject.com/en/6.1/topics/signing/[Django: Cryptographic signing]
+
+=== Streaming and file responses in the cycle
+
+`StreamingHttpResponse` and its subclass `FileResponse` send their body in pieces instead of building it in memory. They change the cycle
+in four ways: they have no `content` (middleware must test `response.streaming` and wrap `streaming_content` instead of reading it; wrappers must match
+the iterator type, which `response.is_async` reveals); middleware that needs the whole body, such as `CommonMiddleware`'s
+`Content-Length` or `ConditionalGetMiddleware`'s `ETag`, skips them; `request_finished` fires only when the server has sent the last
+chunk; and under WSGI a streaming response ties up a worker for its whole duration. Under ASGI the iterator should be asynchronous
+(supported since 4.2); a synchronous one is consumed completely, with a warning, which defeats streaming. If a client disconnects
+mid-stream under ASGI, Django cancels the coroutine, and you may catch `asyncio.CancelledError` to release resources (re-raise it afterwards).
+Building such responses in practice (CSV exports, PDFs, server-sent events) belongs to the *Responses, Streaming, CSV & PDF* page
+of this section.
+
+Source: https://docs.djangoproject.com/en/6.1/ref/request-response/#streaminghttpresponse-objects[Django: StreamingHttpResponse objects] and
+https://docs.djangoproject.com/en/6.1/topics/http/middleware/#dealing-with-streaming-responses[Django: Dealing with streaming responses]
+
+[#exceptions]
+== Exceptions and error views
+
+Exceptions do not escape the cycle. The converter described in the middleware section catches every exception raised in a view or
+a middleware and turns it into a response, using `django.core.handlers.exception.response_for_exception()`. The mapping in Django 6.1.1:
+
+[cols="2,1,2,3",options="header"]
+|===
+| Raised | Status | Error view | Logging and notes
+
+| `Http404` (including `Resolver404` and `Model.DoesNotExist` turned into `Http404` by `get_object_or_404()`)
+| 404
+| `handler404`
+| Logged at `WARNING` on `django.request` ("Not Found: /path"). With `DEBUG = True` Django shows its technical 404 page *instead of* your handler.
+
+| `PermissionDenied`
+| 403
+| `handler403`
+| Logged at `WARNING` ("Forbidden (Permission denied)").
+
+| `BadRequest`
+| 400
+| `handler400`
+| Logged at `WARNING`. With `DEBUG = True` the technical page is shown with status 400. Used for malformed input, for example non-UTF-8 form data since 5.0.
+
+| `SuspiciousOperation` and subclasses (`DisallowedHost`, `RequestDataTooBig`, `TooManyFieldsSent`, `SuspiciousFileOperation`, `SuspiciousSession`, ...)
+| 400
+| `handler400`
+| Logged at `ERROR` on the logger `django.security.<ClassName>`, which is *not* a child of `django.request`; configure it separately.
+
+| `MultiPartParserError`
+| 400
+| `handler400`
+| Logged at `WARNING` ("Bad request (Unable to parse request body)").
+
+| Anything else
+| 500
+| `handler500`
+| The `got_request_exception` signal is sent, the error is logged at `ERROR` on `django.request` with the traceback, and (when `DEBUG = False` and `ADMINS` is set) the default logging configuration emails the admins. With `DEBUG = True` the technical 500 page is shown. With `DEBUG_PROPAGATE_EXCEPTIONS = True` the exception is re-raised to the server.
+|===
+
+Before any of this, `process_exception()` hooks see an exception raised by the view (and only that), and a hook that returns a
+response ends the conversion. If an *error view itself* fails, Django falls back: it sends `got_request_exception` and
+answers through the `500` handler. Under ASGI there is a last line of defence too: a plain-text `500` if even that
+fails, with the traceback only when `DEBUG` is on.
+
+[#error-views]
+=== Custom error views
+
+`handler400`, `handler403`, `handler404` and `handler500` are plain module-level variables in the *root* URLconf (setting them in an
+included URLconf has no effect). Each holds a callable or its dotted path. `handler404`, `handler403` and `handler400` receive
+`(request, exception)`, and `handler500` receives only `(request)`. The default `404.html`, `500.html`, `403.html` and
+`400.html` templates (top level of the template tree) are what the built-in views render; a custom view replaces them when you need
+to vary the output, here by the `Accept` header so API clients get JSON and browsers get HTML:
+
+.catalog/views.py (error views)
+[source,python]
+----
+from django.http import HttpResponse, JsonResponse
+
+
+def not_found(request, exception=None):
+    if request.accepts("application/json") and not request.accepts("text/html"):
+        return JsonResponse({"error": "not_found", "path": request.path}, status=404)
+    return HttpResponse("<h1>Sorry, nothing here</h1>", status=404)
+
+
+def server_error(request):
+    return HttpResponse("<h1>Something broke on our side</h1>", status=500)
+----
+
+The URLconf already ends with `handler404 = "catalog.views.not_found"` and `handler500 = "catalog.views.server_error"` (see the
+project listing above). Keep error views simple and independent of the database and of context processors: they run when something
+else is already wrong. Tests drive them by raising the exception from a view; the test client re-raises unhandled exceptions by
+default (`raise_request_exception`), so set it to `False` when you want to see the `500` page:
+
+.catalog/tests.py (ErrorTests)
+[source,python]
+----
+class ErrorTests(SimpleTestCase):
+    def test_exceptions_become_status_codes(self):
+        self.client.raise_request_exception = False
+        cases = {
+            "/errors/missing/": 404,
+            "/errors/forbidden/": 403,
+            "/errors/bad-request/": 400,
+            "/errors/suspicious/": 400,
+            "/errors/boom/": 500,
+            "/nowhere/": 404,
+        }
+        with self.assertLogs("django.request", level="WARNING"):
+            for path, status in cases.items():
+                with self.subTest(path=path):
+                    self.assertEqual(self.client.get(path).status_code, status)
+
+    def test_custom_handlers(self):
+        self.client.raise_request_exception = False
+        html = self.client.get("/nowhere/", headers={"Accept": "text/html"})
+        self.assertContains(html, "Sorry, nothing here", status_code=404)
+        api = self.client.get("/nowhere/", headers={"Accept": "application/json"})
+        self.assertEqual(api.json(), {"error": "not_found", "path": "/nowhere/"})
+        boom = self.client.get("/errors/boom/")
+        self.assertContains(boom, "Something broke", status_code=500)
+
+    def test_client_reraises_unhandled_exceptions_by_default(self):
+        with self.assertRaisesMessage(RuntimeError, "database exploded"):
+            self.client.get("/errors/boom/")
+
+    @override_settings(DEBUG_PROPAGATE_EXCEPTIONS=True)
+    def test_debug_propagate_exceptions_skips_the_500_page(self):
+        self.client.raise_request_exception = False
+        # a would-be 500 now escapes the handler and reaches the server...
+        with self.assertRaises(RuntimeError):
+            self.client.get("/errors/boom/")
+        # ...while 4xx conversions are unaffected
+        self.assertEqual(self.client.get("/errors/missing/").status_code, 404)
+
+    @override_settings(DEBUG=True)
+    def test_debug_true_shows_technical_pages_instead_of_handlers(self):
+        response = self.client.get("/nowhere/", headers={"Accept": "text/html"})
+        self.assertContains(response, "Page not found", status_code=404)
+        self.assertNotContains(response, "Sorry, nothing here", status_code=404)
+----
+
+The views these tests call are one-liners that raise (`missing` raises `Http404("No such book")`, `forbidden` raises
+`PermissionDenied("Staff only")`, `bad_request` raises `BadRequest("Malformed filter")`, `suspicious` raises
+`SuspiciousOperation("Tampered cookie")`, `boom` raises `RuntimeError("database exploded")`). Against `runserver` with `DJANGO_DEBUG=0`:
+
+[source,bash]
+----
+$ curl -si localhost:8764/nowhere/ -H "Accept: text/html" | grep -i "^HTTP\|^<"
+HTTP/1.1 404 Not Found
+<h1>Sorry, nothing here</h1>
+$ curl -si localhost:8764/nowhere/ -H "Accept: application/json" | grep -i "^HTTP\|^{"
+HTTP/1.1 404 Not Found
+{"error": "not_found", "path": "/nowhere/"}
+$ curl -si localhost:8764/errors/boom/ | grep -i "^HTTP\|^<"
+HTTP/1.1 500 Internal Server Error
+<h1>Something broke on our side</h1>
+----
+
+With the default `DEBUG = True`, the console shows the logging described in the table (tracebacks trimmed here), and the browser
+gets the technical pages (about 63 KB each for the `400` and `500` cases) instead of the handlers:
+
+[source,text]
+----
+Not Found: /nowhere/
+[02/Oct/2026 23:39:36] "GET /nowhere/ HTTP/1.1" 404 5055
+Forbidden (Permission denied): /errors/forbidden/
+django.core.exceptions.PermissionDenied: Staff only
+[02/Oct/2026 23:39:36] "GET /errors/forbidden/ HTTP/1.1" 403 135
+Tampered cookie
+django.core.exceptions.SuspiciousOperation: Tampered cookie
+[02/Oct/2026 23:39:36] "GET /errors/suspicious/ HTTP/1.1" 400 63800
+Malformed filter: /errors/bad-request/
+django.core.exceptions.BadRequest: Malformed filter
+[02/Oct/2026 23:39:36] "GET /errors/bad-request/ HTTP/1.1" 400 63744
+Internal Server Error: /errors/boom/
+RuntimeError: database exploded
+[02/Oct/2026 23:39:36] "GET /errors/boom/ HTTP/1.1" 500 63656
+----
+
+The CSRF failure view is separate: set `CSRF_FAILURE_VIEW` (default `django.views.csrf.csrf_failure`) to customise it. Error handling
+for URL patterns (`handler404` with a namespaced URLconf, `Resolver404`) and for forms and models has its own treatment on the URLs & Routing
+and Forms pages; for a comparison with FastAPI's exception handlers see
+xref:backend/fastapi/status-codes-and-error-handling.adoc[FastAPI: Status Codes & Error Handling].
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/views/#customizing-error-views[Django: Customizing error views],
+https://docs.djangoproject.com/en/6.1/ref/exceptions/[Django: Exceptions] and
+https://docs.djangoproject.com/en/6.1/topics/logging/[Django: Logging]
+
+[#sync-async]
+== Sync and async through the cycle
+
+One chain serves both modes, and Django adapts whatever does not match. Reading `django/core/handlers/base.py` (6.1.1) gives the
+rules:
+
+[cols="2,2,3",options="header"]
+|===
+| Piece | Under WSGI (sync chain) | Under ASGI (async chain)
+
+| Middleware
+| Sync middleware runs directly; async-only middleware is wrapped with `async_to_sync()`.
+| Async middleware runs directly; sync-only middleware is wrapped with `sync_to_async()` (a thread hop).
+
+| `process_view`, `process_template_response`
+| Adapted to the mode of the chain, individually.
+| Adapted to the mode of the chain, individually.
+
+| `process_exception`
+| Sync.
+| Always run in sync mode, in a thread.
+
+| Sync view
+| Called directly.
+| Run with `sync_to_async(thread_sensitive=True)`: one thread, shared with other sync code.
+
+| Async view
+| Run with `async_to_sync()` in an event loop created for the call; works, but without the benefits.
+| Awaited on the server's event loop.
+
+| `TemplateResponse.render()`
+| Called directly.
+| Run in a thread unless `render` is a coroutine function.
+
+| `ATOMIC_REQUESTS`
+| Supported for sync views.
+| Raises `RuntimeError` for async views.
+
+| Request body
+| Read lazily.
+| Buffered before the chain starts.
+|===
+
+Practical consequences:
+
+* A *single* synchronous middleware in the stack makes every request pay a thread hop under ASGI, hence the advice to check the `django.request` `DEBUG` log as shown earlier. The bundled middleware supports both modes.
+* Do not call blocking code in an `async def` view. The ORM's synchronous methods are *async-unsafe*: Django raises `SynchronousOnlyOperation` instead of risking corruption, so use the `a`-prefixed ORM methods or `sync_to_async()`.
+* `request.user` is a lazy object that touches the database; in an async view use `await request.auser()` (5.0+).
+* With a purely synchronous codebase there is no need to switch to ASGI; async pays off when requests spend their time waiting (external APIs, streaming, long polling, WebSockets) and many must be open at once.
+
+The `async_hello` view uses `await request.auser()` and runs on both server types:
+
+.catalog/views.py (async_hello)
+[source,python]
+----
+import asyncio
+
+from django.http import JsonResponse
+
+
+async def async_hello(request):
+    await asyncio.sleep(0.01)
+    user = await request.auser()
+    return JsonResponse({"async": True, "anonymous": not user.is_authenticated})
+----
+
+.catalog/tests.py (AsyncTests)
+[source,python]
+----
+class AsyncTests(SimpleTestCase):
+    async def test_async_view_and_auser(self):
+        response = await AsyncClient().get("/async/")
+        self.assertEqual(response.json(), {"async": True, "anonymous": True})
+
+    def test_async_view_under_the_sync_client(self):
+        self.assertTrue(self.client.get("/async/").json()["async"])
+----
+
+The same code was then served by Uvicorn (ASGI) and by Gunicorn (WSGI):
+
+[source,bash]
+----
+$ DJANGO_DEBUG=0 uvicorn config.asgi:application --port 28771 &
+$ DJANGO_DEBUG=0 gunicorn config.wsgi:application -b 127.0.0.1:28772 &
+$ for P in 28771 28772; do echo "## port $P"; curl -si localhost:$P/async/ | grep -i "^HTTP\|^server\|^{"; done
+## port 28771
+HTTP/1.1 200 OK
+server: uvicorn
+{"async": true, "anonymous": true}
+## port 28772
+HTTP/1.1 200 OK
+Server: gunicorn
+{"async": true, "anonymous": true}
+----
+
+The ASGI deployment needs `uvicorn` installed (`python -m pip install uvicorn`), and a production setup needs process management,
+covered on the Deployment page of this section. The introduction page of this section runs a longer experiment about when async
+helps; this page only needs to show that one codebase serves both.
+
+Source: https://docs.djangoproject.com/en/6.1/topics/async/[Django: Asynchronous support] and
+https://docs.djangoproject.com/en/6.1/ref/exceptions/#synchronousonlyoperation[Django: SynchronousOnlyOperation]
+
+== Putting it together
+
+Everything above runs in one project. The commands used for verification:
+
+[source,bash]
+----
+$ python manage.py check
+System check identified no issues (0 silenced).
+$ python manage.py test
+Found 32 test(s).
+System check identified no issues (0 silenced).
+Creating test database for alias 'default'...
+................................
+----------------------------------------------------------------------
+Ran 32 tests in 0.049s
+
+OK
+Destroying test database for alias 'default'...
+----
+
+A compact reference of who may do what, by position in the cycle:
+
+[cols="3,1,1,2,2",options="header"]
+|===
+| Hook or object | Before the view | After the view | Can short-circuit | Sees exceptions
+
+| `+__call__()+` "before" code of a middleware
+| yes
+| no
+| yes (return a response)
+| no
+
+| `process_view()`
+| yes
+| no
+| yes (return a response)
+| no
+
+| The view
+| runs
+| no
+| not applicable
+| raises them
+
+| `process_template_response()`
+| no
+| yes
+| no (must return a response with `render()`)
+| no
+
+| `process_exception()`
+| no
+| yes
+| yes (return a response)
+| yes (from the view and `render()` only)
+
+| `+__call__()+` "after" code of a middleware
+| no
+| yes
+| can replace the response
+| never (they are already responses)
+|===
+
+Common pitfalls, collected from the sections above:
+
+* Using `request.POST` to detect a form submission instead of `request.method == "POST"`.
+* Reading `request.body` after the form parser, or `request.POST` in a middleware, and then wondering why uploads or later reads fail.
+* Forgetting that `process_exception()` does not see `Http404` raised by URL resolution or errors raised by other middleware.
+* Keeping per-request state on `self` in a middleware; one instance serves all requests concurrently.
+* Expecting `RequestFactory` to run middleware or URL resolution (it runs neither), or the test client to enforce CSRF (it does not unless asked).
+* Testing error pages with `DEBUG = True`: the technical pages replace your handlers. The test runner sets `DEBUG = False` for you; `runserver` does not.
+* Trusting `X-Forwarded-*` headers without `USE_X_FORWARDED_HOST`, `SECURE_PROXY_SSL_HEADER` and a proxy that overwrites them, so `request.scheme`, `get_host()` and `build_absolute_uri()` are wrong behind TLS termination.
+* A view that returns nothing, or returns an un-awaited coroutine: both fail with a `ValueError` naming the view.
+* Using `ATOMIC_REQUESTS = True` together with async views.
+* Forgetting that a `POST` to a URL without the trailing slash cannot be redirected by `APPEND_SLASH` without losing the body.
+
+Source: https://docs.djangoproject.com/en/6.1/topics/http/middleware/[Django: Middleware] and
+https://docs.djangoproject.com/en/6.1/topics/testing/tools/[Django: Testing tools]
+
+== Where the books are outdated
+
+The books listed in the section bibliography were written for Django 1.11 to 3.x and describe the same *cycle*, but several APIs on the way have changed.
+When following a book, translate these:
+
+* *Old-style middleware.* `MIDDLEWARE_CLASSES` with `process_request()` and `process_response()` methods was replaced by `MIDDLEWARE` and `get_response` callables in Django 1.10; support for the old setting was removed in 2.0. Old middleware classes can be adapted with `django.utils.deprecation.MiddlewareMixin`, whose `+__init__()+` requires the `get_response` argument since 4.0, but new code should use the factory pattern shown above. The old semantics also differ: under `MIDDLEWARE` every layer that saw the request sees the response and a failing layer cannot skip the others.
+* *`request.is_ajax()`.* Deprecated in 3.1 and removed in 4.0, because it relied on a non-standard header. Use `request.headers`, `request.accepts()` (3.1) or `get_preferred_type()` (5.2).
+* *`request.REQUEST`.* Gone since 1.9; use `request.GET` or `request.POST` explicitly.
+* *`url()` and `django.core.urlresolvers`.* `django.conf.urls.url()` was removed in 4.0 (use `path()` or `re_path()`); `django.core.urlresolvers` was removed in 2.0 (use `django.urls`).
+* *`render_to_response()`.* Removed in 3.0; use `render()` or `TemplateResponse`.
+* *`HttpResponse(mimetype=...)`.* The `mimetype` argument is long gone (1.7); the argument is `content_type`.
+* *Headers.* Books set `response["Header"]` or read `request.META["HTTP_X"]`. Both still work, but `response.headers` (3.2) and `request.headers` (2.2) are the supported, case-insensitive interfaces.
+* *WSGI only.* Books describe a synchronous, WSGI-only framework. ASGI arrived in 3.0, async views and middleware in 3.1, the async ORM in 4.1, async streaming responses in 4.2, and client-disconnect handling in 5.0; the `Channels`-only advice for anything long-lived is dated, though Channels remains right for WebSockets.
+* *Error handlers.* The current signatures are `handler404(request, exception)`, `handler403(request, exception)`, `handler400(request, exception)` and `handler500(request)`; older code that defines `handler404(request)` must accept the extra `exception` argument.
+* *Signed cookies.* Examples that use the `signing` module or `set_signed_cookie()` are correct in outline, but the salt derivation changed in 6.1 and the compatibility switch is deprecated.
+
+[#recent]
+== What changed recently
+
+[cols="1,3",options="header"]
+|===
+| Version | Change relevant to this page
+
+| 3.0
+| ASGI support; `render_to_response()` removed.
+
+| 3.1
+| Async views and async middleware (`sync_capable`, `async_capable`, `sync_and_async_middleware`); `request.accepts()`; `request.is_ajax()` deprecated.
+
+| 3.2
+| `HttpResponse.headers` and the `headers` constructor argument.
+
+| 4.0
+| `request.is_ajax()`, `url()` removed; `+MiddlewareMixin.__init__()+` requires `get_response`.
+
+| 4.2
+| `StreamingHttpResponse` accepts async iterators under ASGI.
+
+| 5.0
+| `await request.auser()`; asynchronous signal dispatch (`asend()`), used by `request_started` under ASGI; client disconnects reach the view as `asyncio.CancelledError` under ASGI; `BadRequest` for non-UTF-8 form data.
+
+| 5.2 LTS
+| `request.get_preferred_type()`; `HttpResponse.text`; `preserve_request` on `HttpResponseRedirect`, `HttpResponsePermanentRedirect` and `redirect()`; `reverse()` accepts `query=` and `fragment=`.
+
+| 6.0
+| Several `Cookie` headers supported for HTTP/2 under ASGI.
+
+| 6.1
+| `HttpRequest.multipart_parser_class`; `max_length` on `HttpResponseRedirect` and `redirect()`; `RedirectView.preserve_request`; signed cookies use an unambiguous salt derivation by default and the transitional `SIGNED_COOKIE_LEGACY_SALT_FALLBACK` is deprecated (and `False` by default); `assertContains()` can be called repeatedly on a streaming response in tests.
+|===
+
+On 5.2 LTS the 6.1 items (`multipart_parser_class`, `max_length` on redirects, `RedirectView.preserve_request`, the new signed-cookie salt) are absent, and everything older than 6.1 in the table is available. Between 5.2 LTS and 6.1 the cycle itself (handler, middleware chain, resolution, error conversion) did not change shape. The visible differences are the
+additions above.
+
+Source: https://docs.djangoproject.com/en/6.1/releases/6.1/[Django 6.1 release notes], https://docs.djangoproject.com/en/6.1/releases/6.0/[6.0], https://docs.djangoproject.com/en/6.1/releases/5.2/[5.2], https://docs.djangoproject.com/en/6.1/releases/5.0/[5.0], https://docs.djangoproject.com/en/6.1/releases/4.2/[4.2], https://docs.djangoproject.com/en/6.1/releases/4.0/[4.0], https://docs.djangoproject.com/en/6.1/releases/3.2/[3.2], https://docs.djangoproject.com/en/6.1/releases/3.1/[3.1] and https://docs.djangoproject.com/en/6.1/internals/deprecation/[Django Deprecation Timeline]
+
+== Where to go next
+
+* xref:web/django/middleware.adoc[Middleware]: writing, ordering and configuring middleware, with a reference of every built-in class.
+* xref:web/django/function-based-views-and-shortcuts.adoc[Function-Based Views & Shortcuts]: `render()`, `redirect()`, `get_object_or_404()`, decorators and conditional processing.
+* xref:web/django/introduction-and-architecture.adoc[Introduction & Architecture]: the MTV component map that this cycle fits into.
+* xref:web/django/settings-and-configuration.adoc[Settings & Configuration]: `MIDDLEWARE`, `ROOT_URLCONF`, `ALLOWED_HOSTS` and the other settings named above.
+* The URLs & Routing, Class-Based Views, Generic Views, Sessions/Cookies/Messages/Signing, File Uploads & Storage and Responses/Streaming/CSV/PDF pages of this section continue each thread this page started.
+
+[#references]
+== References
+
+* https://docs.djangoproject.com/en/6.1/ref/request-response/[Request and response objects]
+* https://docs.djangoproject.com/en/6.1/topics/http/middleware/[Middleware]
+* https://docs.djangoproject.com/en/6.1/ref/middleware/[Middleware reference]
+* https://docs.djangoproject.com/en/6.1/topics/http/urls/[URL dispatcher]
+* https://docs.djangoproject.com/en/6.1/ref/urlresolvers/[django.urls utility functions]
+* https://docs.djangoproject.com/en/6.1/topics/http/views/[Writing views]
+* https://docs.djangoproject.com/en/6.1/ref/template-response/[TemplateResponse and SimpleTemplateResponse]
+* https://docs.djangoproject.com/en/6.1/ref/exceptions/[Django exceptions]
+* https://docs.djangoproject.com/en/6.1/ref/signals/#request-response-signals[Signals: request/response signals]
+* https://docs.djangoproject.com/en/6.1/topics/logging/[Logging]
+* https://docs.djangoproject.com/en/6.1/howto/error-reporting/[Error reporting]
+* https://docs.djangoproject.com/en/6.1/topics/async/[Asynchronous support]
+* https://docs.djangoproject.com/en/6.1/howto/deployment/wsgi/[How to deploy with WSGI]
+* https://docs.djangoproject.com/en/6.1/howto/deployment/asgi/[How to deploy with ASGI]
+* https://docs.djangoproject.com/en/6.1/topics/signing/[Cryptographic signing]
+* https://docs.djangoproject.com/en/6.1/ref/csrf/[Cross Site Request Forgery protection]
+* https://docs.djangoproject.com/en/6.1/topics/testing/tools/[Testing tools]
+* https://docs.djangoproject.com/en/6.1/ref/settings/[Settings reference]
+* https://docs.djangoproject.com/en/6.1/internals/deprecation/[Django Deprecation Timeline]
+* https://docs.djangoproject.com/en/6.1/releases/6.1/[Django 6.1 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/6.0/[Django 6.0 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/5.2/[Django 5.2 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/5.0/[Django 5.0 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/4.2/[Django 4.2 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/4.0/[Django 4.0 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/3.2/[Django 3.2 release notes]
+* https://docs.djangoproject.com/en/6.1/releases/3.1/[Django 3.1 release notes]
+* https://peps.python.org/pep-3333/[PEP 3333: Python Web Server Gateway Interface v1.0.1]
+* https://asgi.readthedocs.io/en/latest/[ASGI specification]
+* https://uvicorn.dev/[Uvicorn]
