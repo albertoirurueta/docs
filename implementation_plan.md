@@ -130,15 +130,15 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task, no shared files**
 
-- [ ] Task 4. `programming-languages/php/getting-started.adoc` ★ (install, CLI, `php -S`, history/RFC process; 📊 SVG `php-script-execution.svg`: source → lexer/parser → AST → opcodes → Zend VM, OPcache, JIT).
-- [ ] Task 5. `configuration-and-extensions.adoc` (php.ini cascade, `INI_*`, extensions, PECL vs PIE, SAPIs).
-- [ ] Task 6. `basic-syntax-and-style.adoc` (tags, comments, reserved words, PSR-1, PER Coding Style 3, PHPDoc).
-- [ ] Task 7. `types-and-the-type-system.adoc` ★ (scalar/compound/union/intersection/DNF, nullable, `never`, `strict_types`, `mixed`, `void`, `static`).
-- [ ] Task 8. `type-juggling-and-comparisons.adoc` ★ (PHP 8 comparison rules, `==` vs `===`, `<=>`, juggling tables).
-- [ ] Task 9. `variables-scope-and-constants.adoc`.
-- [ ] Task 10. `operators-and-expressions.adoc` ★ (every `language.operators.*` page incl. `??`, `??=`, `?->`, `|>`, spread).
-- [ ] Task 11. `control-structures.adoc` ★ (`match`, loops, `goto`, alternative syntax, `declare`).
-- [ ] Task 12. Group validation: delegate `npm run validate:mermaid` and a scoped Antora build to `iru-gate-runner`; fix findings.
+- [x] Task 4. `programming-languages/php/getting-started.adoc` ★ (install, CLI, `php -S`, history/RFC process; 📊 SVG `php-script-execution.svg`: source → lexer/parser → AST → opcodes → Zend VM, OPcache, JIT). — done: 591 lines, php-script-execution.svg, 6 examples run on PHP 8.5.11 + php -S/curl check
+- [x] Task 5. `configuration-and-extensions.adoc` (php.ini cascade, `INI_*`, extensions, PECL vs PIE, SAPIs). — done: 373 lines, ini/extension examples run on 8.5; PIE verified against php/pie docs
+- [x] Task 6. `basic-syntax-and-style.adoc` (tags, comments, reserved words, PSR-1, PER Coding Style 3, PHPDoc). — done: 417 lines, 9 examples run
+- [x] Task 7. `types-and-the-type-system.adoc` ★ (scalar/compound/union/intersection/DNF, nullable, `never`, `strict_types`, `mixed`, `void`, `static`). — done: 826 lines, php-type-lattice.svg, 23 examples run
+- [x] Task 8. `type-juggling-and-comparisons.adoc` ★ (PHP 8 comparison rules, `==` vs `===`, `<=>`, juggling tables). — done: 378 lines, comparison tables generated from PHP 8.5.11 and PHP 7.4 runs
+- [x] Task 9. `variables-scope-and-constants.adoc`. — done: 446 lines, 11 examples run
+- [x] Task 10. `operators-and-expressions.adoc` ★ (every `language.operators.*` page incl. `??`, `??=`, `?->`, `|>`, spread). — done: 584 lines, 17 examples run (pipe operator on 8.5)
+- [x] Task 11. `control-structures.adoc` ★ (`match`, loops, `goto`, alternative syntax, `declare`). — done: 474 lines, 12 examples run
+- [x] Task 12. Group validation: delegate `npm run validate:mermaid` and a scoped Antora build to `iru-gate-runner`; fix findings. — done: Antora build: 0 unexpected errors/warnings (only xrefs to not-yet-written section pages); no Mermaid blocks in group
 
 ### Group 3 — PHP Reference: strings, arrays, functions and OOP core
 
