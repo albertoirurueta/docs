@@ -1,0 +1,786 @@
+= Bucket4j: Production Checklist
+:description: A production checklist for Bucket4j 8.21.0 -- the official generic checklist (long periods, short bursts) and distributed checklist (exceptions, backups, retention, high availability) applied to a Spring Boot 4.1 service, eight anti-patterns with a wrong and a right example each (blocking servlet threads, proxies rebuilt per request, unbounded keys, spoofable headers, limiting after authentication, unsynchronized clocks, per-instance limits sold as global, no outage strategy), capacity planning for Redis and JDBC with measured round trips and memory, cleanup of expired JDBC rows with a scheduled job, and security (brute-force login limits, API keys).
+:keywords: Bucket4j, production checklist, anti-patterns, distributed checklist, asBlocking, Optimizations, ExpirationAfterWriteStrategy, basedOnTimeForRefillingBucketUpToMax, X-Forwarded-For, brute force, credential stuffing, login rate limit, API key, clientClock, clock skew, per-instance limit, fail-open, fail-closed, requestTimeout, capacity planning, Redis, JDBC, ExpiredEntriesCleaner, removeExpired, Scheduled, Spring Security, Spring Boot 4
+:stem: latexmath
+
+include::partial$resilience-disclaimer.adoc[]
+
+A rate limiter that passes its tests can still fail in production in ways no test of the happy path shows: an attacker who
+chooses the bucket key, a store that stops answering, a table that grows until the disk is full, a limit that was meant to be
+global and is not. Bucket4j's reference carries two short checklists for this, a generic one for any token-bucket limiter and
+a distributed one; this page restates both for a Spring Boot service, then adds the anti-patterns that appear most often when
+Bucket4j is wired in by hand, capacity numbers for the two shared stores most services use, the cleanup job that JDBC needs,
+and the security decisions around login limits and API keys.
+
+It was written against Bucket4j 8.21.x, Spring Boot 4.1.x, Spring Framework 7.0.x and Java 21 and verified on 5 October 2026.
+Every example on the page was compiled and run on Boot 4.1.1 in a scratch project: Redis 7 and PostgreSQL 17 in
+Testcontainers for the distributed behaviour, MockMvc requests through a real Spring Security chain for the login limit, and a
+manual clock where time matters. The numbers quoted (round trips, bytes, tokens admitted) were observed in those runs; the
+timings are from a laptop and are given as orders of magnitude, not as benchmarks. The *Bookshelf* scenario of the other
+Bucket4j pages is used throughout. The concepts are on xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc[the
+distributed page], the wiring on xref:backend/resilience/bucket4j-spring-boot-manual-integration.adoc[the manual Spring Boot
+integration], and the Resilience4j side of production tuning on
+xref:backend/resilience/production-tuning-and-anti-patterns.adoc[Production tuning and anti-patterns].
+
+== Where the limits sit
+
+Most of the checklist is about *where* a check runs and *what it can see*. The Bookshelf has three kinds of limit and each one
+belongs at a different place on the request path.
+
+.Where each limit sits on the Bookshelf request path
+[mermaid]
+....
+flowchart LR
+    C[Client] --> E[Edge or gateway<br/>coarse per-address limit]
+    E --> L[Login limiter<br/>before authentication<br/>keyed by user and address]
+    L --> S[Spring Security<br/>authentication]
+    S --> Q[Quota filter<br/>after authentication<br/>keyed by user or API key]
+    Q --> K[Controller]
+    L -.->|store error| D1{Fail closed}
+    Q -.->|store error| D2{Fail open or closed}
+    L --> P[(Shared store<br/>Redis or JDBC)]
+    Q --> P
+....
+
+The login limiter has to run before the credentials are checked, otherwise a wrong password never reaches it; the quota filter
+runs after authentication because it needs the principal. Both talk to the same shared store, which is a dependency of the
+request path and so needs the failure policy of the last anti-pattern.
+
+== The official generic checklist
+
+The generic checklist applies to every token-bucket or leaky-bucket limiter, not only to Bucket4j. It has two items, both about
+how the algorithm behaves over time. The wider background is on
+xref:backend/resilience/bucket4j-token-bucket-and-bandwidths.adoc[the token bucket page].
+
+=== Be wary of long periods
+
+A limit of 10,000 requests per hour per user sounds strict, but a bucket does not know about the hour: a client that sends
+9,999 requests in the first seconds has used no more than it was given, and has caused a burst of about a thousand requests per
+second. A patient attacker can repeat that every hour and never reach the limit, so no alert fires. The remedy is a second,
+short bandwidth in the same bucket; the number of bandwidths has no effect on performance.
+
+.A long limit and a short limit in one bucket
+[source,java]
+----
+Bucket bucket = Bucket.builder()
+        .addLimit(limit -> limit.capacity(10_000).refillGreedy(10_000, Duration.ofHours(1)))
+        .addLimit(limit -> limit.capacity(20).refillGreedy(20, Duration.ofSeconds(1)))   // caps the burst rate
+        .build();
+----
+
+With a manual clock, the hourly bucket alone admitted all 9,999 requests in the same instant; with the second bandwidth only
+20 were admitted, and 20 more after the clock moved one second. Source:
+https://bucket4j.com/8.21.0/toc.html#be-wary-of-long-periods[Bucket4j reference: Be wary of long periods].
+
+=== Be wary of short-timed bursts
+
+A token bucket guarantees its rate only over a long time. A bucket of 100 tokens per minute that is drained at the start of a
+minute is full again one minute later, so up to 200 tokens can be consumed in about a minute. That is inherent to the algorithm
+and the reference says so plainly: either accept bursts, or trade capacity for strictness by reducing capacity and refill
+together.
+
+.Halving capacity and refill to keep a strict limit
+[source,java]
+----
+Bucket strict = Bucket.builder()
+        .addLimit(limit -> limit.capacity(50).refillIntervally(50, Duration.ofMinutes(1)))
+        .build();
+// 100 requests are admitted across the boundary where 200 would have passed with capacity 100,
+// but one request can no longer cost more than 50 tokens
+----
+
+Both claims were run: the capacity-100 bucket admitted 200 tokens across a refill boundary, the capacity-50 bucket admitted 100
+and refused a single `tryConsume(51)`. The price is under-consumption over long periods, which is the trade the reference
+describes. Source: https://bucket4j.com/8.21.0/toc.html#short-timed-bursts[Bucket4j reference: Be wary of short-timed bursts].
+
+== The official distributed checklist
+
+The distributed checklist lists four responsibilities that Bucket4j leaves to the application, because they are properties of
+the store and not of the library. The table maps each one to what it means on this site.
+
+.The distributed checklist applied
+[cols="3,5,4",options="header"]
+|===
+|Official item |What to do |Covered by
+
+|Handle the exceptions
+|Every call to a remote bucket can throw an unchecked exception. Decide per limit whether the request fails or goes through,
+and bound the wait with `requestTimeout`.
+|Anti-pattern 8, and xref:backend/resilience/bucket4j-spring-boot-manual-integration.adoc#_when_the_store_is_down[when the store is down]
+
+|Configure backups
+|Whether bucket state survives a node failure is a setting of Redis, the grid or the database. Under `RECONSTRUCT` a lost
+bucket becomes a full bucket, which is acceptable for most limits and not for a login limit.
+|xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc#_recovery_strategies[Recovery strategies]
+
+|Tune retention
+|Per-client keys accumulate. Set a maximum size on the store and an expiration strategy, preferably
+`basedOnTimeForRefillingBucketUpToMax`. Ignite 2 and Ignite 3 are the exceptions without per-entry expiry; JDBC needs a cleanup job.
+|Anti-pattern 3, and the JDBC cleanup below
+
+|Tune and test high availability
+|Bucket4j only calls the store; redundancy is yours. Kill the store in a test and observe the behaviour.
+|xref:backend/resilience/bucket4j-testing.adoc[Testing Bucket4j]
+|===
+
+Source: https://bucket4j.com/8.21.0/toc.html#distributed-checklist[Bucket4j reference: Distributed checklist].
+
+The reference's checklist is a list of duties; it does not say how a mistake looks. The next section does.
+
+== Eight anti-patterns
+
+Each subsection states why the pattern is wrong, shows the wrong code next to the right code, and says what was observed when
+both were run. The numbers come from the scratch project; the page for each fix is linked.
+
+=== Blocking servlet threads with asBlocking()
+
+`bucket.asBlocking().tryConsume(1, maxWait)` parks the calling thread until a token is available. That is the right behaviour
+for a batch step or an outbound call that may wait, and the wrong one for the inbound limiter of an interactive API: a client
+would rather be told 429 with `Retry-After` than be kept waiting, and a waiting request holds a platform thread, a connection and
+anything it has already opened. Under load a limiter that blocks turns a rejection into a thread-pool exhaustion.
+
+.Wrong: the request thread waits for the refill
+[source,java]
+----
+Bucket bucket = Bucket.builder()
+        .addLimit(limit -> limit.capacity(1).refillIntervally(1, Duration.ofSeconds(1)))
+        .build();
+bucket.tryConsume(1);                                                      // the bucket is now empty
+boolean admitted = bucket.asBlocking().tryConsume(1, Duration.ofSeconds(5)); // parks this thread for about a second
+----
+
+.Right: answer at once and say when to come back
+[source,java]
+----
+ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+if (!probe.isConsumed()) {
+    long retryAfterSeconds = Math.max(1, (probe.getNanosToWaitForRefill() + 999_999_999L) / 1_000_000_000L);
+    // respond 429 with Retry-After: retryAfterSeconds
+}
+----
+
+The blocking call returned after more than 800 ms; the probe returned in under 100 ms with a one-second `Retry-After`. Blocking
+consumption stays appropriate for outbound work, and on virtual threads it is cheap while it waits; always give it a maximum wait.
+Source: https://bucket4j.com/8.21.0/toc.html#blocking-api-example[Bucket4j reference: Blocking API]. The fix in context is on
+xref:backend/resilience/bucket4j-spring-boot-manual-integration.adoc#_virtual_threads_and_blocking_consumption[the manual integration page]
+and xref:backend/resilience/bucket4j-bucket-api.adoc[the Bucket API page].
+
+=== New proxies per request when optimizations are on
+
+A `BucketProxy` without optimizations holds no state, so building one per request is fine. A proxy built with `withOptimization`
+is different: it keeps the batched requests or the locally consumed tokens that have not been synchronized yet. If it is rebuilt
+for every request that state is thrown away, nothing is ever amortized, and the delayed tokens are lost. The optimization then
+costs complexity and delivers nothing.
+
+.Wrong: a fresh proxy, and so a fresh optimization state, per request
+[source,java]
+----
+for (int i = 0; i < 50; i++) {
+    BucketProxy perRequest = proxyManager.builder()
+            .withOptimization(Optimizations.delaying(new DelayParameters(50, Duration.ofSeconds(10))))
+            .build("quota:isbn", () -> quota);
+    perRequest.tryConsume(1);
+}
+----
+
+.Right: build it once and share it
+[source,java]
+----
+public final class IsbnQuota {
+
+    private final BucketProxy proxy;
+
+    public IsbnQuota(ProxyManager<String> proxyManager) {
+        this.proxy = proxyManager.builder()
+                .withOptimization(Optimizations.delaying(new DelayParameters(50, Duration.ofSeconds(10))))
+                .build("quota:isbn", () -> DAILY);
+    }
+
+    public boolean tryAcquire() {
+        return proxy.tryConsume(1);
+    }
+}
+----
+
+Counting the commands the Lettuce client sent to Redis, 50 requests with a proxy per request made 101 round trips (50 `EVAL` and
+51 `GET`), and the same 50 requests through one shared proxy made 3. The shared proxy is a singleton bean; make it thread-safe
+by construction, which it is, because the proxy is. Remember that `delaying` can over-admit by up to its token budget across
+replicas, so it is for large quotas such as the daily ISBN limit and not for login attempts. Source: `Optimizations.java` and
+`DelayParameters.java` at tag 8.21.0; the reference does not describe optimizations. The fix in context is
+xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc#_optimizations[Optimizations on the distributed page].
+
+=== Unbounded keys with no expiration
+
+A bucket is created the first time a key is seen and, with the default `ExpirationAfterWriteStrategy.none()`, it stays in the
+store for ever. For a handful of well-known keys that is fine; for a key per client address or per user it is a memory leak that
+an attacker can drive: every new source address adds a row.
+
+.Wrong: per-address buckets that never go away
+[source,java]
+----
+ProxyManager<String> unbounded = Bucket4jLettuce.casBasedBuilder(redisClient)
+        .build()
+        .withMapper(key -> key.getBytes(StandardCharsets.UTF_8));
+----
+
+.Right: expire a bucket once it would be full anyway
+[source,java]
+----
+ProxyManager<String> bounded = Bucket4jLettuce.casBasedBuilder(redisClient)
+        .expirationAfterWrite(ExpirationAfterWriteStrategy
+                .basedOnTimeForRefillingBucketUpToMax(Duration.ofSeconds(30)))
+        .build()
+        .withMapper(key -> key.getBytes(StandardCharsets.UTF_8));
+----
+
+Against Redis, 1,000 per-address buckets created without expiration were all still there with a time to live of -1 (no expiry).
+With the strategy above, a bucket of the free plan (20 per minute) that had consumed one token had a time to live of 33,000 ms:
+the three seconds needed to refill that token plus the 30-second grace period. In a second run with a 500 ms grace period, 50
+buckets had disappeared on their own within five seconds. `basedOnTimeForRefillingBucketUpToMax` drops a bucket exactly when it
+would be full again, so forgetting it changes nothing; `fixedTimeToLive` does not have that property and can forget consumed
+tokens. In addition, bound the key space (see the next two anti-patterns) and set a memory limit and eviction policy on the
+store itself, as described in xref:database/redis/architecture-keyspace-and-eviction.adoc[Redis architecture, keyspace and eviction].
+Source: https://bucket4j.com/8.21.0/toc.html#expiration-policy[Bucket4j reference: Expiration policy]. The fix in context is
+xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc#_expiration[Expiration on the distributed page].
+
+=== Keying by spoofable headers
+
+The key decides who shares a bucket, so it must come from something the client cannot choose. `X-Forwarded-For` and similar
+headers are set by the client unless a trusted proxy overwrites them; a limiter that keys on them gives every request its own
+bucket as soon as the attacker varies the header.
+
+.Wrong: the bucket key comes from a header the client controls
+[source,java]
+----
+static String spoofableKey(HttpServletRequest request) {
+    String forwarded = request.getHeader("X-Forwarded-For");
+    return "ip:" + (forwarded != null ? forwarded : request.getRemoteAddr());
+}
+----
+
+.Right: the TCP peer, or a known API key that cannot be invented
+[source,java]
+----
+public Client identify(HttpServletRequest request) {
+    String apiKey = request.getHeader("X-API-Key");
+    Plan plan = apiKey == null ? null : apiKeys.get(apiKey);
+    if (plan != null) {
+        return new Client("key:" + Keys.fingerprint(apiKey), plan);
+    }
+    // an unknown key must not create a bucket of its own: random keys would give unlimited buckets
+    return new Client("ip:" + request.getRemoteAddr(), Plan.FREE);
+}
+----
+
+Sending 100 requests from one address with a different `X-Forwarded-For` each, the wrong key admitted all 100 of them (the 20
+per minute limit never applied); the right resolver, given the same requests with a random `X-API-Key` in addition, admitted 20.
+`request.getRemoteAddr()` is the real client only when Spring Boot is configured to replace it from the forwarded headers of a
+trusted proxy; that configuration, and the four combinations that were run, are in
+xref:backend/resilience/bucket4j-spring-boot-manual-integration.adoc#_the_client_address_behind_proxies[the client address behind proxies].
+Hash secrets used as keys (the fingerprint above is the first eight bytes of a SHA-256 digest) so that API keys do not appear in
+Redis, in `KEYS` output or in logs. Source: https://docs.spring.io/spring-boot/how-to/webserver.html#howto.webserver.use-behind-a-proxy-server[Spring Boot how-to: Use behind a proxy server].
+
+=== Limiting after authentication when you need to stop brute force
+
+A servlet filter registered after the Spring Security chain only sees requests that Security let through. A wrong password is
+rejected by Security with a 401 or a redirect and never reaches such a limiter, so a per-user quota placed there does nothing
+against credential guessing. The measured difference is on
+xref:backend/resilience/bucket4j-spring-boot-manual-integration.adoc#_order_relative_to_spring_security[the ordering section of the manual integration page]:
+25 wrong logins were 25 rejections by Security and none by the limiter placed after it.
+
+The login limiter has to run before the credentials are evaluated. Placing it inside the Security chain, ahead of
+`UsernamePasswordAuthenticationFilter`, keeps CSRF and the rest of the chain in front of it and is easy to test; the security
+section below has the complete code.
+
+The wrong version is a quota filter registered with `FilterRegistrationBean` at an order above Spring Security's default of -100:
+every wrong password stops in the Security chain before that filter runs.
+
+.Right: the login limiter inside the chain, before the authentication filter
+[source,java]
+----
+return http
+        .authorizeHttpRequests(requests -> requests
+                .requestMatchers("/login").permitAll()
+                .anyRequest().authenticated())
+        .formLogin(Customizer.withDefaults())
+        // not a @Bean: Boot would register a Filter bean a second time, outside the security chain
+        .addFilterBefore(new LoginRateLimitFilter(limiter), UsernamePasswordAuthenticationFilter.class)
+        .build();
+----
+
+Source: https://docs.spring.io/spring-security/reference/servlet/architecture.html[Spring Security reference: Servlet architecture].
+See also xref:backend/springboot/spring-security.adoc[Spring Security in the SpringBoot reference].
+
+=== Relying on a JVM clock without synchronization
+
+A refill is computed from elapsed time. For compare-and-swap, lock-based and JDBC select-for-update managers the default
+`clientClock` is `TimeMeter.SYSTEM_MILLISECONDS`, which is the wall clock of the *application* JVM, so every replica computes
+refills with its own clock. Entry-processor and server-side backends use the clock of the grid member unless a `clientClock` was
+set. If the machines disagree about the time, the replicas disagree about how many tokens a bucket holds.
+
+.Wrong: replicas whose clocks drift, nobody checks
+[source,java]
+----
+ProxyManager<String> ahead = Bucket4jLettuce.casBasedBuilder(redisClient)
+        .clientClock(clockThirtySecondsAhead)          // what an unsynchronized machine looks like
+        .build()
+        .withMapper(key -> key.getBytes(StandardCharsets.UTF_8));
+----
+
+.Right: keep every replica on synchronized time and, when exactness matters, set one trusted clock explicitly
+[source,java]
+----
+ProxyManager<String> onTime = Bucket4jLettuce.casBasedBuilder(redisClient)
+        .clientClock(TimeMeter.SYSTEM_MILLISECONDS)    // the default, made explicit; NTP or chrony keeps it right
+        .build()
+        .withMapper(key -> key.getBytes(StandardCharsets.UTF_8));
+----
+
+On one Redis bucket of 10 tokens refilled at 10 per minute, drained by the replica with the correct clock, the replica whose clock
+was 30 seconds ahead read 5 tokens available: it refills early by exactly its skew. For a per-minute login or API limit that
+is large; for a per-day quota it is negligible. The remedies are operational (NTP or chrony on every node, and an alert on
+clock offset), architectural (a server-side backend, or one `clientClock` that reads a single trusted time source) and
+organizational (a rolling deployment that mixes library versions should also use `backwardCompatibleWith`). In tests, a
+controllable `TimeMeter` makes the refill deterministic; it must implement both `currentTimeNanos()` and `isWallClockBased()`.
+Source: `AbstractProxyManager.getClientSideTime()` and `AbstractProxyManagerBuilder.clientClock` at tag 8.21.0, and
+https://bucket4j.com/8.21.0/toc.html#customizing-time-measurement-a-custom-time-measurement-strategy[Bucket4j reference: Customizing time measurement].
+The fix in context is xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc#_clock_skew[Clock skew on the distributed page].
+
+=== Per-instance limits presented as a global quota
+
+A local `Bucket` limits one JVM. With three replicas a "100 per day" bucket is three buckets of 100, and the ISBN provider that
+allows 100 calls per day for the whole account sees up to 300. The limit also changes silently whenever autoscaling changes the
+number of replicas, so the contract with the provider depends on the replica count.
+
+.Wrong: every replica has its own bucket
+[source,java]
+----
+int admitted = 0;
+for (int replica = 0; replica < 3; replica++) {
+    Bucket local = Bucket.builder()
+            .addLimit(limit -> limit.capacity(100).refillIntervally(100, Duration.ofDays(1)))
+            .build();
+    for (int i = 0; i < 150; i++) {
+        if (local.tryConsume(1)) admitted++;
+    }
+}
+// admitted == 300
+----
+
+.Right: one bucket in a shared store, one key
+[source,java]
+----
+int shared = 0;
+for (int replica = 0; replica < 3; replica++) {
+    ProxyManager<String> proxyManager = Stores.redis(redisClient);     // one manager per replica
+    BucketProxy bucket = proxyManager.getProxy("quota:isbn", () -> quota);
+    for (int i = 0; i < 150; i++) {
+        if (bucket.tryConsume(1)) shared++;
+    }
+}
+// shared == 100
+----
+
+Per-instance limits are legitimate when they are labelled as such: a per-replica protection against overload, or a quota split
+evenly with a fixed replica count. They are an anti-pattern when documented or contracted as service-wide. Source:
+https://bucket4j.com/8.21.0/toc.html#distributed-concepts[Bucket4j reference: Distributed concepts]. The fix in context is
+xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc[the distributed rate limiting page]; the Resilience4j
+xref:backend/resilience/rate-limiter.adoc[RateLimiter] is per-instance by design.
+
+=== No backend-outage strategy
+
+A shared limiter puts the store on the request path. When Redis stops answering, `tryConsume` throws an unchecked exception;
+uncaught, that is a 500 for every request, including the ones that never needed the limit. A hung store is worse than a
+refused connection, because nothing fails until the client's own timeout expires, and every request thread waits for it.
+
+.Wrong: no timeout, no decision
+[source,java]
+----
+ProxyManager<String> proxyManager = Bucket4jLettuce.casBasedBuilder(redisClient).build()
+        .withMapper(key -> key.getBytes(StandardCharsets.UTF_8));
+proxyManager.getProxy("api:alice", () -> config).tryConsume(1);      // throws, or waits, when Redis is down
+----
+
+.Right: bound the wait and decide in advance
+[source,java]
+----
+ProxyManager<String> proxyManager = Bucket4jLettuce.casBasedBuilder(redisClient)
+        .requestTimeout(Duration.ofMillis(250))
+        .build()
+        .withMapper(key -> key.getBytes(StandardCharsets.UTF_8));
+
+public Decision check(String key, BucketConfiguration configuration, long tokens) {
+    try {
+        ConsumptionProbe probe = proxyManager.getProxy(key, () -> configuration).tryConsumeAndReturnRemaining(tokens);
+        return probe.isConsumed() ? Decision.allowed(probe.getRemainingTokens())
+                : Decision.rejected(probe.getNanosToWaitForRefill());
+    } catch (RuntimeException storeFailure) {      // timeouts and connection errors are unchecked
+        return policy == FailurePolicy.OPEN
+                ? new Decision(Decision.Outcome.UNCHECKED_ALLOWED, -1, 0)
+                : new Decision(Decision.Outcome.UNAVAILABLE_DENIED, 0, 5);
+    }
+}
+----
+
+With the Redis container paused (a hung server), the bare call failed with an exception after about 260 ms, which is the
+`requestTimeout`, and the guarded call returned `UNAVAILABLE_DENIED` after the same time under fail-closed and
+`UNCHECKED_ALLOWED` under fail-open; after the container was resumed the next check succeeded. Choose the policy per limit:
+fail closed for security limits (login attempts, one-time codes) and for quotas whose breach costs money, fail open for limits
+that only protect capacity. A Resilience4j CircuitBreaker around the check turns "every request waits 250 ms" into "requests
+fail at once", as shown on xref:backend/resilience/bucket4j-spring-boot-manual-integration.adoc#_when_the_store_is_down[the manual integration page].
+Source: https://bucket4j.com/8.21.0/toc.html#request-timeout[Bucket4j reference: Request timeout] and
+https://bucket4j.com/8.21.0/toc.html#distributed-checklist[Bucket4j reference: Distributed checklist].
+
+== Capacity planning
+
+A shared limiter is a service in its own right and needs the same planning: how many operations per second it must serve, how
+many connections that needs, and how much memory or disk the keys occupy. The measurements below are from the scratch project
+(Redis 7 and PostgreSQL 17 containers) and are a starting point; repeat them against your own store, client and network.
+
+=== Round trips per request
+
+The unit of planning is the number of round trips one consumption costs, and it depends on the backend.
+
+.Observed cost of one consumption on an existing bucket
+[cols="3,3,5",options="header"]
+|===
+|Backend |Cost per request |What was observed
+
+|Redis, Lettuce, compare-and-swap
+|2 round trips when tokens are consumed, 1 when the request is rejected
+|200 allowed requests sent 200 `GET` and 200 `EVAL`; 200 rejected requests sent 200 `GET` and no `EVAL`. A conflicting
+concurrent update adds a retry, so a hot key costs more than two.
+
+|PostgreSQL, select-for-update
+|1 transaction of 2 statements
+|100 requests produced 100 commits and 200 statements, the `SELECT ... FOR UPDATE` and the `UPDATE`
+
+|Entry-processor and server-side backends (JCache, Hazelcast, Ignite, Coherence, Infinispan)
+|1 round trip
+|From the backend design: the whole operation runs on the member that owns the entry
+|===
+
+This differs from the one-round-trip figure that is sometimes quoted for Bucket4j, which holds for the entry-processor backends and
+not for compare-and-swap Redis. The rate at which the store must answer is therefore
+
+[stem]
+++++
+\lambda_{\text{store}} = R \cdot c
+++++
+
+where stem:[R] is the number of limit checks per second (the request rate times the number of limited buckets per request) and
+stem:[c] the round trips per check from the table. A service at 5,000 requests per second with one Redis check per request
+asks Redis for about 10,000 round trips per second. A request that touches two buckets, for instance a per-address and a per-user
+one as the login limiter does, doubles that. Rejected requests still pay their round trip, which is why hostile traffic should be
+rejected earlier, at the edge, when it is expected.
+
+=== Connections and hot keys
+
+The store must also be reachable with enough concurrent connections. By Little's law the number of operations in flight is
+
+[stem]
+++++
+N = \lambda \cdot W
+++++
+
+with stem:[\lambda] the checks per second and stem:[W] the time one check takes. Over loopback to a container the Redis check
+took between 0.3 and 1.2 ms in repeated runs and the PostgreSQL transaction about 5 to 7 ms (its commit waits for a disk flush);
+these are laptop figures, so measure your own. With stem:[W] at 5 ms and 500 checks per second a JDBC-backed limiter
+keeps about 2.5 connections busy, so a pool of 10 leaves headroom, and a pool shared with the business queries needs the
+limiter's share added to its size. For JDBC remember that the limiter's transaction holds a row lock: operations on the same key
+are serialized, so a single hot key such as the ISBN quota is limited to about stem:[1/W] checks per second regardless of pool size.
+The batching optimization, or a store with a one-round-trip operation, is the answer for hot keys; see
+xref:backend/resilience/bucket4j-distributed-rate-limiting.adoc#_latency_and_throughput[latency and throughput].
+
+=== Memory and disk
+
+The state of a bucket is small and fixed, whatever the request rate. Redis reported 168 bytes for the key and value of an API
+bucket and 200 bytes for a login bucket whose key holds a username digest and an address. A PostgreSQL row of the `bucket`
+table held 108 bytes of state in a 152-byte row, before index and page overhead. The number of keys alive at one moment is
+what matters, and with expiration it is the arrival rate of new keys times how long each one is kept:
+
+[stem]
+++++
+K \approx \lambda_{\text{new}} \cdot \left( T_{\text{refill}} + T_{\text{keep}} + T_{\text{cleanup}} \right)
+++++
+
+where stem:[\lambda_{\text{new}}] is the number of previously unseen keys per second, stem:[T_{\text{refill}}] the time the bucket needs
+to become full, stem:[T_{\text{keep}}] the grace period given to `basedOnTimeForRefillingBucketUpToMax`, and stem:[T_{\text{cleanup}}] the
+interval of the cleanup job, which is zero for Redis (expiry is automatic) and positive for JDBC. For the per-address login
+bucket, 50 new addresses per second, a 15-minute refill and a 30-second grace period keep about
+stem:[50 \times 930 = 46500] keys alive, or roughly 9 MB at 200 bytes each. Without expiration the same traffic adds 50 keys per
+second for ever: 4.3 million keys and 860 MB after a day.
+
+== Cleaning up expired JDBC rows
+
+A relational database has no per-row time to live. With an `expirationAfterWrite` strategy the manager fills the `expires_at`
+column but never deletes a row, so a scheduled job has to. The select-for-update managers implement `ExpiredEntriesCleaner`,
+whose single method `removeExpired(int batchSize)` deletes up to `batchSize` expired rows in one transaction and returns how
+many it removed. The manager must therefore be typed with its concrete class (or as `ExpiredEntriesCleaner`), because the
+`ProxyManager` interface does not have the method.
+
+.The table, with the expiry column
+[source,sql]
+----
+CREATE TABLE IF NOT EXISTS bucket (
+    id         BIGINT PRIMARY KEY,
+    state      BYTEA,
+    expires_at BIGINT
+);
+----
+
+.The manager, typed so that removeExpired stays reachable
+[source,java]
+----
+public static PostgreSQLSelectForUpdateBasedProxyManager<Long> postgres(DataSource dataSource, Duration keepAfterRefill) {
+    return Bucket4jPostgreSQL.selectForUpdateBasedBuilder(dataSource)
+            .expirationAfterWrite(ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(keepAfterRefill))
+            .build();
+}
+----
+
+.The cleanup job
+[source,java]
+----
+public class ExpiredBucketCleaner {
+
+    static final int MAX_TO_REMOVE_IN_ONE_TRANSACTION = 1_000;
+    static final int THRESHOLD_TO_CONTINUE_REMOVING = 50;
+
+    private final ExpiredEntriesCleaner cleaner;
+
+    public ExpiredBucketCleaner(ExpiredEntriesCleaner cleaner) {
+        this.cleaner = cleaner;
+    }
+
+    @Scheduled(cron = "${bookshelf.rate-limit.cleanup-cron:0 5 * * * *}")      // hourly; needs @EnableScheduling
+    public void removeExpiredBuckets() {
+        int removed;
+        do {
+            removed = cleaner.removeExpired(MAX_TO_REMOVE_IN_ONE_TRANSACTION);
+        } while (removed > THRESHOLD_TO_CONTINUE_REMOVING);
+    }
+}
+----
+
+Source: https://bucket4j.com/8.21.0/toc.html#jdbc-integrations[Bucket4j reference: JDBC integrations],
+`ExpiredEntriesCleaner.java` at tag 8.21.0 and
+https://docs.spring.io/spring-framework/reference/integration/scheduling.html[Spring Framework reference: Task execution and scheduling].
+
+The tests exercised four behaviours. With a 200 ms grace period and five buckets created, all five rows were still in the table
+after the buckets had expired, `removeExpired` removed them, and `lastRun` showed 5. Live buckets were not touched: with a ten-minute
+grace period `removeExpired(1000)` returned 0. With 300 expired rows `removeExpired(100)` removed exactly 100, which is why the job
+loops while a batch removes more than a threshold. And the annotation does run: with `@EnableScheduling` and the cron property
+set to every second, the job emptied the table by itself.
+
+Two operational choices remain. The first is the frequency: the memory formula above applies to the table too, so with 50 new
+keys per second a daily job leaves a day of expired rows (about 4.3 million rows, around 650 MB of row data before indexes),
+while an hourly job leaves about 180,000. The batch size bounds how long each transaction holds its locks. The second is who
+runs it: in a deployment with several replicas the job runs on each of them, and concurrent cleaners only contend on the deletes,
+which is harmless but wasteful; to run it on one replica at a time use a scheduler lock as described in
+xref:backend/springboot/scheduling-and-shedlock.adoc[Scheduling and ShedLock]. Redis needs none of this, because the expiration
+strategy sets a native key expiry.
+
+== Security: login limits and API keys
+
+Rate limiting is a security control only when its key, its position and its failure mode are chosen with an attacker in mind.
+
+=== Brute-force login limits
+
+The Bookshelf login limiter keeps two buckets per attempt. One is keyed by the username and the address and allows five
+attempts per 15 minutes; the other is keyed by the address alone and allows 30, which catches one source trying many usernames
+(password spraying). The username goes into the key as a digest, lower-cased and trimmed, so that `Alice` and `alice` with a trailing space share a
+bucket, the key length is bounded, and no user-controlled separator can forge another key.
+
+.LoginAttemptLimiter.java
+[source,java]
+----
+public final class LoginAttemptLimiter {
+
+    static final BucketConfiguration PER_USER_AND_ADDRESS = BucketConfiguration.builder()
+            .addLimit(limit -> limit.capacity(5).refillGreedy(5, Duration.ofMinutes(15)))
+            .build();
+
+    static final BucketConfiguration PER_ADDRESS = BucketConfiguration.builder()
+            .addLimit(limit -> limit.capacity(30).refillGreedy(30, Duration.ofMinutes(15)))
+            .build();
+
+    private final ProxyManager<String> proxyManager;
+
+    public LoginAttemptLimiter(ProxyManager<String> proxyManager) {
+        this.proxyManager = proxyManager;
+    }
+
+    public Decision check(String username, String remoteAddress) {
+        try {
+            ConsumptionProbe address = proxyManager
+                    .getProxy("login:ip:" + remoteAddress, () -> PER_ADDRESS)
+                    .tryConsumeAndReturnRemaining(1);
+            if (!address.isConsumed()) {
+                return Decision.rejected(address.getNanosToWaitForRefill());
+            }
+            ConsumptionProbe user = proxyManager
+                    .getProxy("login:user-ip:" + Keys.fingerprint(username) + ":" + remoteAddress, () -> PER_USER_AND_ADDRESS)
+                    .tryConsumeAndReturnRemaining(1);
+            return user.isConsumed()
+                    ? Decision.allowed(user.getRemainingTokens())
+                    : Decision.rejected(user.getNanosToWaitForRefill());
+        } catch (RuntimeException storeFailure) {
+            // a security limit fails closed: no answer from the store means no login attempt
+            return new Decision(Decision.Outcome.UNAVAILABLE_DENIED, 0, 5);
+        }
+    }
+}
+----
+
+.LoginRateLimitFilter.java: counting every POST /login before authentication
+[source,java]
+----
+public final class LoginRateLimitFilter extends OncePerRequestFilter {
+
+    private final LoginAttemptLimiter limiter;
+
+    public LoginRateLimitFilter(LoginAttemptLimiter limiter) {
+        this.limiter = limiter;
+    }
+
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        return !("POST".equals(request.getMethod()) && (request.getContextPath() + "/login").equals(request.getRequestURI()));
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        String username = request.getParameter("username");
+        Decision decision = limiter.check(username == null ? "" : username, request.getRemoteAddr());
+        if (decision.allowed()) {
+            chain.doFilter(request, response);
+            return;
+        }
+        response.setHeader("Retry-After", Long.toString(decision.retryAfterSeconds()));
+        response.sendError(decision.outcome() == Decision.Outcome.REJECTED
+                ? HttpStatus.TOO_MANY_REQUESTS.value()
+                : HttpStatus.SERVICE_UNAVAILABLE.value());
+    }
+}
+----
+
+The filter is registered inside the security chain, as in the right-hand example of the fifth anti-pattern, and is deliberately
+not a `@Bean`: Boot registers every `Filter` bean as a servlet filter as well, which would run it twice. Source:
+https://docs.spring.io/spring-security/reference/servlet/architecture.html[Spring Security reference: Servlet architecture] and
+https://bucket4j.com/8.21.0/toc.html#bucket-proxy[Bucket4j reference: BucketProxy].
+
+Through a real MockMvc request chain with form login, five wrong passwords for `alice` from one address each got the
+usual redirect to the error page, the sixth got 429 with a `Retry-After` header, and so did a seventh with the *correct*
+password: once the budget is spent, the credentials are not even examined. A different address had its own allowance. Forty
+attempts with forty different usernames from one address were refused 10 times, the 30-per-address limit. With two limiter
+instances on separate managers over one Redis, three attempts through the first and two through the second exhausted the
+five, and the sixth was refused by both, so the limit holds across replicas. The behaviour when the store is unavailable is
+the fail-closed branch above.
+
+Several design points follow from the code and are worth stating rather than discovering.
+
+* *Every attempt consumes a token*, successful or not. That is simple and slightly harsh on a user who logs in often; the
+  alternative is to check with `estimateAbilityToConsume(1)` before authentication and consume in an
+  `AuthenticationFailureHandler`, which only counts failures at the price of a second store call.
+* *Keying by username alone* lets an attacker lock a victim out from anywhere; adding the address limits that, at the price of
+  letting a distributed attack try five passwords per source address. Both buckets together are a compromise, and a botnet is
+  beyond what rate limiting can stop: add multi-factor authentication or a challenge for the account level.
+* *The address must be trustworthy*, as in the fourth anti-pattern. Behind a proxy it is only the real client address when Boot is
+  configured to trust that proxy.
+* *Use a short `Retry-After`* and a greedy refill rather than a long lockout, so a legitimate user recovers quickly while
+  an automated guess rate stays low: five attempts per 15 minutes is one guess per three minutes at steady state.
+
+=== API keys
+
+An API key identifies a client for quota purposes, and a limiter built on it has three rules.
+
+* *Only known keys select a plan.* The resolver in the third anti-pattern looks the key up in a map loaded from a secret store
+  and falls back to the address bucket for unknown values, so a client that invents a key per request still shares one bucket;
+  100 requests with 100 random keys were limited to 20, the free plan.
+* *Never use the secret as the key, and never log it.* The bucket key is `key:` plus a 16-hex-digit digest, which keeps API keys
+  out of Redis `KEYS` listings, slow-log entries and heap dumps of the store. Keep the keys themselves in a secret manager or
+  in an encrypted database, not in a committed YAML file, and rotate them on a schedule; a rotated key simply gets a fresh bucket.
+* *A plan is a property of the key, not of the request.* Do not read the plan or the cost from a header or a query parameter.
+  The Bookshelf resolves it from the key's record, which is how a free key cannot ask for the partner limit.
+
+The generic and distributed checklists above still apply to every key: expire the buckets, bound the key space, decide the
+outage policy.
+
+== Pre-flight checklist
+
+.Before going to production
+[cols="1,4,4",options="header"]
+|===
+|Area |Check |Where it is covered
+
+|Algorithm
+|Every long window has a short one beside it; bursts of twice the capacity are acceptable or the capacity is halved
+|The official generic checklist above
+
+|Threads
+|No `asBlocking()` on request threads of an interactive API; blocking waits have a maximum
+|Anti-pattern 1
+
+|State
+|Proxies with optimizations are singletons; keys are bounded; every per-client key expires
+|Anti-patterns 2 and 3; capacity planning
+
+|Identity
+|Keys come from the peer address, a known API key or the principal, never from a client-set header
+|Anti-pattern 4; API keys
+
+|Position
+|Login limits run before authentication; quotas after it; the order is set explicitly
+|Anti-pattern 5
+
+|Time
+|Clocks synchronized on every node; a `clientClock` only when a trusted source exists
+|Anti-pattern 6
+
+|Scope
+|The limit that is documented as global lives in a shared store; per-instance limits are named as such
+|Anti-pattern 7
+
+|Failure
+|`requestTimeout` set; fail-open or fail-closed decided per limit; the outage tested with the store paused
+|Anti-pattern 8; xref:backend/resilience/bucket4j-testing.adoc[testing]
+
+|Capacity
+|Round trips, connections and memory computed; the JDBC cleanup scheduled and run on one replica
+|Capacity planning; cleanup
+
+|Observability
+|Rejections and store errors are counted and alerted on
+|xref:backend/resilience/bucket4j-observability.adoc[Bucket4j observability]
+|===
+
+== What changed
+
+* *Bucket4j 8.21.0*: the JDK 17 artifacts (`bucket4j_jdk17-*`) and the new `bucket4j_jdk17-bom` are the ones used here. The
+  builder methods `expirationAfterWrite`, `requestTimeout` and `clientClock` replace the `withClientSideConfig(...)` that the
+  reference's own distributed examples still show, and which no longer exists on the 8.21.0 builders. The detail is on
+  xref:backend/resilience/bucket4j-migration-and-whats-changed.adoc[migration and what's changed].
+* *The official distributed checklist* names Ignite and Ignite 3 as backends without per-entry expiration; the distributed page
+  also lists JCache and Geode, which makes retention a store setting for those backends.
+* *Spring Boot 4*: the servlet and Security classes are the Jakarta ones; `spring-boot-starter-webmvc` is the web starter, and
+  the MockMvc support lives in `spring-boot-starter-webmvc-test`.
+
+== References
+
+* https://bucket4j.com/8.21.0/toc.html#generic-production-checklist[Bucket4j reference: Generic production checklist]
+* https://bucket4j.com/8.21.0/toc.html#be-wary-of-long-periods[Bucket4j reference: Be wary of long periods]
+* https://bucket4j.com/8.21.0/toc.html#short-timed-bursts[Bucket4j reference: Be wary of short-timed bursts]
+* https://bucket4j.com/8.21.0/toc.html#distributed-checklist[Bucket4j reference: Distributed checklist]
+* https://bucket4j.com/8.21.0/toc.html#distributed-concepts[Bucket4j reference: Distributed concepts]
+* https://bucket4j.com/8.21.0/toc.html#expiration-policy[Bucket4j reference: Expiration policy]
+* https://bucket4j.com/8.21.0/toc.html#request-timeout[Bucket4j reference: Request timeout]
+* https://bucket4j.com/8.21.0/toc.html#blocking-api-example[Bucket4j reference: Blocking API]
+* https://bucket4j.com/8.21.0/toc.html#bucket-proxy[Bucket4j reference: BucketProxy]
+* https://bucket4j.com/8.21.0/toc.html#jdbc-integrations[Bucket4j reference: JDBC integrations]
+* https://bucket4j.com/8.21.0/toc.html#customizing-time-measurement-a-custom-time-measurement-strategy[Bucket4j reference: Customizing time measurement]
+* https://bucket4j.com/8.21.0/release-notes.html[Bucket4j 8.21.0 release notes]
+* https://docs.spring.io/spring-boot/how-to/webserver.html#howto.webserver.use-behind-a-proxy-server[Spring Boot how-to: Use behind a proxy server]
+* https://docs.spring.io/spring-framework/reference/integration/scheduling.html[Spring Framework reference: Task execution and scheduling]
+* https://docs.spring.io/spring-security/reference/servlet/architecture.html[Spring Security reference: Servlet architecture]
