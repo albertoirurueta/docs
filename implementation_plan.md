@@ -275,7 +275,7 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 104. `queues-and-jobs.adoc` ★ (Horizon, batching, failed jobs; link `backend/messaging/*`).
+- [x] Task 104. `queues-and-jobs.adoc` ★ (Horizon, batching, failed jobs; link `backend/messaging/*`). — done: 446 lines, Mermaid job lifecycle; SyncBookWithCatalogue with #[Tries]/#[Backoff]/#[Timeout], payload inspected (attributes copied, ModelIdentifier), queue:work runs against the mock catalogue (backoff 1 s/5 s visible, failed_jobs, queue:retry); found: job tries x HTTP client retries = 9 requests per job, database driver hides the rolled-back-dispatch bug that Redis shows (ModelNotFoundException) unless afterCommit, fail() prints FAIL then DONE, batch finally fires while finished=false; unique job, batch with allowFailures, Horizon 5.50 run with status/supervisors/stats API; Pest QueueTest (3 passing)
 - [ ] Task 105. `events-and-listeners.adoc`.
 - [ ] Task 106. `broadcasting-and-reverb.adoc` ★ (Reverb, Echo, SSE variant).
 - [ ] Task 107. `task-scheduling.adoc` (`onOneServer()`/`withoutOverlapping()`; #157 prose only).
