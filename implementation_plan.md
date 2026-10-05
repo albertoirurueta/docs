@@ -103,26 +103,26 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes (independent tasks)**
 
-- [ ] Task 1. Create the two disclaimer partials.
-  - [ ] Task 1.1. `modules/ROOT/partials/php-disclaimer.adoc` — single `[IMPORTANT]` block copied in shape from
+- [x] Task 1. Create the two disclaimer partials.
+  - [x] Task 1.1. `modules/ROOT/partials/php-disclaimer.adoc` — single `[IMPORTANT]` block copied in shape from
     `django-disclaimer.adoc`, with the AI-assistance sentence and `xref:programming-languages/php/index.adoc#_bibliography[the section bibliography]`.
-  - [ ] Task 1.2. `modules/ROOT/partials/php-laravel-disclaimer.adoc` — same, pointing at `xref:web/php-laravel/index.adoc#_bibliography[…]`.
-- [ ] Task 2. Verify and record the version baseline and build the scratch environments (scratchpad, never committed).
-  - [ ] Task 2.1. Re-read PHP release state (https://www.php.net/supported-versions.php, https://www.php.net/releases/): confirm 8.5.x
+  - [x] Task 1.2. `modules/ROOT/partials/php-laravel-disclaimer.adoc` — same, pointing at `xref:web/php-laravel/index.adoc#_bibliography[…]`.
+- [x] Task 2. (done 2026-10-05: PHP 8.5.11 current, 8.6.0RC2 not GA; Laravel 13.34.0; php.net/laravel.com/publishers blocked by egress policy, so manual/docs verified from php/doc-en and laravel/docs 13.x sources; PHP 8.5 via docker php:8.5-cli, Laravel scratch app on host PHP 8.3) Verify and record the version baseline and build the scratch environments (scratchpad, never committed).
+  - [x] Task 2.1. Re-read PHP release state (https://www.php.net/supported-versions.php, https://www.php.net/releases/): confirm 8.5.x
     latest, support windows, whether 8.6 is GA; record dated baseline in scratchpad `194/versions-194.md`.
-  - [ ] Task 2.2. Re-read Laravel 13.x state (https://laravel.com/framework/docs/13.x/releases, `/upgrade`, support policy), Livewire 4,
+  - [x] Task 2.2. Re-read Laravel 13.x state (https://laravel.com/framework/docs/13.x/releases, `/upgrade`, support policy), Livewire 4,
     Inertia 3, Pest/PHPUnit, Composer/PIE, PHPStan/Psalm/Rector, FrankenPHP, Reverb, Octane, Sail/Herd versions on Packagist.
-  - [ ] Task 2.3. Re-verify the issue's "outdated in the books / new since the books" lists against the PHP migration guides
+  - [x] Task 2.3. Re-verify the issue's "outdated in the books / new since the books" lists against the PHP migration guides
     (`appendices`) and the Laravel upgrade guide; record deviations for `whats-new-and-migration.adoc` and `whats-changed-and-upgrading.adoc`.
-  - [ ] Task 2.4. Diff the PHP Manual and the Laravel 13.x sidebar (Prologue → Packages incl. AI) against the issue's inventories;
+  - [x] Task 2.4. Diff the PHP Manual and the Laravel 13.x sidebar (Prologue → Packages incl. AI) against the issue's inventories;
     add any new/renamed page to the matching page task and record changed URLs.
-  - [ ] Task 2.5. `curl -sIL -o /dev/null -w '%{http_code} %{url_effective}'` every URL in the issue's Bibliography and book table;
+  - [x] Task 2.5. `curl -sIL -o /dev/null -w '%{http_code} %{url_effective}'` every URL in the issue's Bibliography and book table;
     record canonical forms and dead links (publishers may 403 automated fetches; Springer redirects).
-  - [ ] Task 2.6. Create a scratch PHP 8.5 CLI project (Composer, PHPUnit/Pest, PHPStan) with the library-catalogue scenario, and a
+  - [x] Task 2.6. Create a scratch PHP 8.5 CLI project (Composer, PHPUnit/Pest, PHPStan) with the library-catalogue scenario, and a
     scratch Laravel 13 app (`laravel new`, SQLite, Pest) with *Bookshelf* plus a plain-PHP *Bookshelf Lite*, so every example is run
     before it is pasted.
-  - [ ] Task 2.7. Check `git status` never lists any book PDF; confirm `node_modules` is installed (`npm install`) for `validate:mermaid` and Antora.
-- [ ] Task 3. Create `modules/ROOT/partials/nav-php.adoc` (relative-depth `*`/`**` like `nav-c.adoc`) listing every PHP Reference page in
+  - [x] Task 2.7. Check `git status` never lists any book PDF; confirm `node_modules` is installed (`npm install`) for `validate:mermaid` and Antora.
+- [x] Task 3. Create `modules/ROOT/partials/nav-php.adoc` (relative-depth `*`/`**` like `nav-c.adoc`) listing every PHP Reference page in
   outline order, last child `** xref:programming-languages/php/cheat-sheet.adoc[Cheat Sheet (PDF)]`. (Written last in Group 6 if page
   titles change; create the skeleton now so the nav build works.)
 
