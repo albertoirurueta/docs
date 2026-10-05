@@ -308,7 +308,7 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: no — several tasks edit `nav.adoc` and the shared index pages**
 
-- [ ] Task 127. `modules/ROOT/nav.adoc`: add `*** xref:web/php-laravel/index.adoc[PHP and Laravel]` after the Django block's last `****` child (just before `** xref:backend/index.adoc[Backend Development]`) with `****` children in outline order (optional non-link `****` group headings with `*****` children) ending with the cheat sheet; verify nav renders.
+- [x] Task 127. `modules/ROOT/nav.adoc`: add `*** xref:web/php-laravel/index.adoc[PHP and Laravel]` after the Django block's last `****` child (just before `** xref:backend/index.adoc[Backend Development]`) with `****` children in outline order (optional non-link `****` group headings with `*****` children) ending with the cheat sheet; verify nav renders. — done: nav.adoc: *** PHP and Laravel after the Django block's last child, just before Backend Development, with 62 **** children in outline order (labels = page titles) ending with Cheat Sheet (PDF); rendering checked in the Group 13 build
 - [ ] Task 128. `web/index.adoc`: add a **PHP and Laravel** bullet after Django (also linking the PHP Reference); append to `:description:`; add the issue's `:keywords:`.
 - [ ] Task 129. `backend/index.adoc`: one line "the full-stack PHP framework, including REST/JSON:API backends with Sanctum and Passport"; add `Laravel, PHP` to `:keywords:`.
 - [ ] Task 130. `modules/ROOT/pages/index.adoc`: `(including Next.js, Django and Laravel)` in `:description:`; append `PHP, Laravel, Eloquent, Blade` to `:keywords:` (no new tile).
