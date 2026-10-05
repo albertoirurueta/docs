@@ -59,13 +59,26 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   hard-wrap alt text or attribute lists, even past the usual 120-column prose length. A wrapped macro silently
   renders as a plain paragraph showing the filename and alt text, and the Antora build reports no error. The same
   applies to inline `image:` macros.
+- **Wrap the alt text in double quotes whenever it contains a comma** (`image::foo.svg["A, B and C",width=720]`).
+  An unquoted comma ends the alt text (the first positional attribute) and the rest spills into the positional
+  `width`/`height` attributes, so the alt is silently truncated (e.g. `alt="A" height="B and C"`). Keep named
+  attributes such as `width=` outside the quotes.
 - Block macros start at column 0 (never indented), with a blank line before and after.
 - Every SVG added to `modules/ROOT/images/` must be referenced by at least one page. An orphaned image means the
   reference was forgotten.
-- Verification for doc changes, since a green build doesn't prove figures render. Both commands must print nothing:
+- Verification for doc changes, since a green build doesn't prove figures render. Quote every `--include` pattern
+  (an unquoted `*.adoc`/`*.html` makes zsh abort with "no matches found" and print nothing, which looks like a
+  pass). All of these must print nothing:
   ```bash
-  grep -rnE '^image::' modules | grep -vE '\]\s*$'      # block image macros not closed on the same line
-  grep -rn 'image::' build/site --include=*.html         # unrendered macro text leaked into the built HTML
+  grep -rnE '^image::' modules | grep -vE '\]\s*$'                          # block macros not closed on the same line
+  grep -rnE '(^|[^:+])image:[^:[ ]+\[[^]]*$' modules --include='*.adoc'     # inline macros not closed on the same line
+  grep -rn '<p>image::' build/site --include='*.html'                       # unrendered block macro leaked into a paragraph
+  ```
+  The last check matches only paragraph text, so `image::` shown inside a code listing (`<pre>`/`<code>`) in this or
+  any remote component is not reported. For the files you changed, also check for alt text with an unquoted comma
+  (pre-existing pages still have some, so run it on your own files rather than the whole tree):
+  ```bash
+  grep -nE '^image::[^[]+\[[^"][^]]*,[^]=,]*(,|\]$)' <changed .adoc files>   # alt text with an unquoted comma
   ```
   Optionally also check that every `image::` target exists in `modules/ROOT/images/`, and that every image is
   referenced.
