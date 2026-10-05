@@ -144,18 +144,18 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 13. `strings.adoc` ★.
-- [ ] Task 14. `unicode-mbstring-and-intl.adoc`.
-- [ ] Task 15. `regular-expressions.adoc` (PCRE).
-- [ ] Task 16. `arrays.adoc` ★ (incl. `array_find`/`array_first`/`array_last`, destructuring, spread).
-- [ ] Task 17. `functions.adoc` ★ (named args, variadics, by-ref, return types, first-class callables).
-- [ ] Task 18. `closures-and-callables.adoc` ★ (closures, arrow functions, `Closure::bind`, callables, pipe operator).
-- [ ] Task 19. `classes-and-objects.adoc` ★ (constructor promotion, `new` in initializers, constants, static).
-- [ ] Task 20. `visibility-readonly-and-asymmetric-visibility.adoc` ★ (8.1 readonly, 8.2 readonly classes, 8.4 asymmetric visibility).
-- [ ] Task 21. `property-hooks.adoc` ★ (8.4 `get`/`set` hooks, virtual properties, interfaces, `final`, inheritance).
-- [ ] Task 22. `inheritance-interfaces-and-abstract-classes.adoc` ★.
-- [ ] Task 23. `traits.adoc`.
-- [ ] Task 24. Group validation (Mermaid + scoped build via `iru-gate-runner`).
+- [x] Task 13. `strings.adoc` ★. — done: 490 lines, 14 examples run on 8.5
+- [x] Task 14. `unicode-mbstring-and-intl.adoc`. — done: 406 lines, 12 examples run on 8.5 with intl (ICU 74) incl. IntlListFormatter/grapheme_levenshtein
+- [x] Task 15. `regular-expressions.adoc` (PCRE). — done: 301 lines, 7 examples run (PCRE2 10.44)
+- [x] Task 16. `arrays.adoc` ★ (incl. `array_find`/`array_first`/`array_last`, destructuring, spread). — done: 610 lines, 16 examples run (array_find/array_first)
+- [x] Task 17. `functions.adoc` ★ (named args, variadics, by-ref, return types, first-class callables). — done: 424 lines, 12 examples run (#[\NoDiscard])
+- [x] Task 18. `closures-and-callables.adoc` ★ (closures, arrow functions, `Closure::bind`, callables, pipe operator). — done: 416 lines, 9 examples run; PFA example run on PHP 8.6.0RC2
+- [x] Task 19. `classes-and-objects.adoc` ★ (constructor promotion, `new` in initializers, constants, static). — done: 463 lines, Mermaid class diagram, 11 examples run
+- [x] Task 20. `visibility-readonly-and-asymmetric-visibility.adoc` ★ (8.1 readonly, 8.2 readonly classes, 8.4 asymmetric visibility). — done: 414 lines, 8 examples run; readonly defaults on 8.6 RC
+- [x] Task 21. `property-hooks.adoc` ★ (8.4 `get`/`set` hooks, virtual properties, interfaces, `final`, inheritance). — done: 368 lines, 7 examples run
+- [x] Task 22. `inheritance-interfaces-and-abstract-classes.adoc` ★. — done: 426 lines, 7 examples run
+- [x] Task 23. `traits.adoc`. — done: 290 lines, 6 examples run
+- [x] Task 24. Group validation (Mermaid + scoped build via `iru-gate-runner`). — done: validate:mermaid OK; Antora build: no unexpected errors/warnings after fixing brace/table issues
 
 ### Group 4 — PHP Reference: OOP advanced, errors, iteration and concurrency
 
