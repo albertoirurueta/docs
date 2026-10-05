@@ -223,9 +223,9 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 - [x] Task 64. `databases-with-pdo.adoc` ★ (prepared statements, transactions, fetch modes, `PDO` subclasses in 8.4). — done: 425 lines; PDO::connect on MySQL 8.4, PostgreSQL 17 (pdo_pgsql built) and SQLite, injection demo, LIMIT under emulation, fetch modes incl. FETCH_CLASS vs readonly, transaction rollback, keyset pagination, BookRepository, mysqli execute_query; links database/sql and pagination-strategies
 - [x] Task 65. `authentication-without-a-framework.adoc`. — done: 343 lines; Auth class run on SQLite (rehash 10->12, dummy-hash timing measured, throttling, selector/validator remember-me, single-use reset tokens), HTTP Basic under php -S and PHP-FPM; book errata corrected
 - [x] Task 66. `web-security-fundamentals.adoc` ★ (OWASP: XSS, CSRF, SQLi, session fixation, file inclusion, headers; link `backend/oauth/*`). — done: 392 lines; OWASP Top 10:2025 (from OWASP/Top10 repo) mapping, CSRF token demo (419/200), include traversal and null-byte behaviour on 8.5, SSRF naive vs guarded fetch, open_basedir, security headers, composer audit; links backend/oauth, web/cors, Django CSP
-- [ ] Task 67. `templating-routing-and-middleware-by-hand.adoc`.
-- [ ] Task 68. `http-clients-apis-and-email.adoc`.
-- [ ] Task 69. Group validation.
+- [x] Task 67. `templating-routing-and-middleware-by-hand.adoc`. — done: 428 lines; templates with layout, Router (404/405+Allow), PSR-11 container and PSR-15 pipeline with Nyholm PSR-7 run under php -S, same app in Slim 4.15; Mezzio in prose
+- [x] Task 68. `http-clients-apis-and-email.adoc`. — done: 297 lines; JSON API with RFC 9457 problems and HMAC webhook, cURL client (timeouts, errno 28/7), stream context with ignore_errors, Guzzle 7.15 PSR-18, Symfony HttpClient 8.1 concurrent, Symfony Mailer 8.1 to Mailpit all run
+- [x] Task 69. Group validation. — done: validate:mermaid OK (1208); Antora build exit 0, only pending xrefs to not-yet-written php-laravel pages (54 refs, 30 pages); CLAUDE.md image greps clean; detect-secrets on new pages: 0 findings after rewording 2 false positives (see report)
 
 ### Group 9 — PHP and Laravel: Laravel foundations, HTTP and views
 
