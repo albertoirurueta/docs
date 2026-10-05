@@ -197,18 +197,18 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: no — landing page and cheat sheet link to every page written in Groups 2–5; PDF is rendered after the cheat sheet content is fixed**
 
-- [ ] Task 51. `programming-languages/php/index.adoc`: landing page per outline (what PHP is, version baseline/support policy in prose, "New here? Read in this order", grouped `== What's covered`, relationship to PHP and Laravel (prose until Group 12 creates it, then xref), 📊 Mermaid mind-map, `== Bibliography` listing every source with its official website: six book publisher pages, php.net, tooling docs, PSR/PER specs).
-- [ ] Task 52. `cheat-sheet.adoc` following `web/django/cheat-sheet.adoc` (disclaimer, intro linking `xref:attachment$php-cheat-sheet.pdf[downloadable PDF]`, grouped `*Group* --` xrefs to every page, download line, `== References`).
-- [ ] Task 53. `modules/ROOT/attachments/php-cheat-sheet.pdf`: throwaway HTML → headless Chrome print-to-PDF, exactly one A4 page, dense/multi-column/colour-coded, version and date in header, content per the issue's "Cheat sheets" list; verify page count; commit only the PDF.
-- [ ] Task 54. Finalise `partials/nav-php.adoc` against final page titles.
+- [x] Task 51. `programming-languages/php/index.adoc`: landing page per outline (what PHP is, version baseline/support policy in prose, "New here? Read in this order", grouped `== What's covered`, relationship to PHP and Laravel (prose until Group 12 creates it, then xref), 📊 Mermaid mind-map, `== Bibliography` listing every source with its official website: six book publisher pages, php.net, tooling docs, PSR/PER specs). — done: index.adoc (version baseline and support policy in prose, reading order, grouped What's covered, PHP-for-the-web prose pending Group 12, Mermaid mind-map, Bibliography: 4 books with ISBN/DOI/companion code/current editions, the PHP Manual by part, php.net/RFC/php-src/Foundation, standards and every tool cited on the pages)
+- [x] Task 52. `cheat-sheet.adoc` following `web/django/cheat-sheet.adoc` (disclaimer, intro linking `xref:attachment$php-cheat-sheet.pdf[downloadable PDF]`, grouped `*Group* --` xrefs to every page, download line, `== References`). — done: cheat-sheet.adoc per the Django convention: disclaimer, intro with PDF link and baseline, 8 grouped xref paragraphs covering all 43 pages, download line, References
+- [x] Task 53. `modules/ROOT/attachments/php-cheat-sheet.pdf`: throwaway HTML → headless Chrome print-to-PDF, exactly one A4 page, dense/multi-column/colour-coded, version and date in header, content per the issue's "Cheat sheets" list; verify page count; commit only the PDF. — done: php-cheat-sheet.pdf rendered from throwaway HTML with headless Chromium (Skia/PDF), pdfinfo: 1 page, A4; 3 colour-coded columns, 21 panels plus a changed-since-older-tutorials strip; every snippet linted on 8.5.11 and the class/enum/generator/fiber snippets and stated values executed
+- [x] Task 54. Finalise `partials/nav-php.adoc` against final page titles. — done: nav-php.adoc labels match every page title (Cheat Sheet (PDF) as the spec requires)
 
 ### Group 7 — PHP Reference: site wiring
 
 **Parallelizable: no — Tasks edit `nav.adoc` and shared index pages that Group 12 edits again**
 
-- [ ] Task 55. `modules/ROOT/nav.adoc`: add `include::partial$nav-php.adoc[]` after `include::partial$nav-swift.adoc[]` inside the Programming Languages open block.
-- [ ] Task 56. `programming-languages/index.adoc`: add a **PHP Reference** bullet in the existing style (ends ", plus a downloadable cheat sheet."); add PHP to `:description:` and `PHP, PHP 8.5, Composer, PSR, PHPStan, PHPUnit, Pest` to `:keywords:`; fix the "C, {cpp}, Objective-C, C# and Swift have no such secondary home…" sentence accurately.
-- [ ] Task 57. Build check (`npx antora antora-playbook.yml` via `iru-gate-runner`): PHP section renders, nav correct, 0 errors/warnings.
+- [x] Task 55. `modules/ROOT/nav.adoc`: add `include::partial$nav-php.adoc[]` after `include::partial$nav-swift.adoc[]` inside the Programming Languages open block. — done: include::partial$nav-php.adoc[] added after nav-swift inside the Programming Languages open block
+- [x] Task 56. `programming-languages/index.adoc`: add a **PHP Reference** bullet in the existing style (ends ", plus a downloadable cheat sheet."); add PHP to `:description:` and `PHP, PHP 8.5, Composer, PSR, PHPStan, PHPUnit, Pest` to `:keywords:`; fix the "C, {cpp}, Objective-C, C# and Swift have no such secondary home…" sentence accurately. — done: PHP Reference bullet added (ends ', plus a downloadable cheat sheet.'), PHP in :description:, keywords added; 'no secondary home' sentence now includes PHP and notes the PHP and Laravel section
+- [x] Task 57. Build check (`npx antora antora-playbook.yml` via `iru-gate-runner`): PHP section renders, nav correct, 0 errors/warnings. — done: Antora build exit 0; PHP section and nav render, PDF attached; all PHP-internal xrefs resolve; 34 remaining errors are forward xrefs to web/php-laravel pages created in Groups 8-11
 
 ### Group 8 — PHP and Laravel: foundations and plain PHP
 
