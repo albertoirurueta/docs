@@ -177,21 +177,21 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 36. `spl-data-structures.adoc`.
-- [ ] Task 37. `date-and-time.adoc` ★ (`DateTimeImmutable`, time zones, `DatePeriod`, `strftime` removal, Clock).
-- [ ] Task 38. `math-numbers-and-randomness.adoc` (BCMath/GMP, `Random\Randomizer`).
-- [ ] Task 39. `files-streams-and-io.adoc` ★.
-- [ ] Task 40. `json-xml-and-serialization.adoc`.
-- [ ] Task 41. `cryptography-hashing-and-passwords.adoc` (`password_hash`, sodium, OpenSSL; no hardcoded keys).
-- [ ] Task 42. `command-line-php.adoc`.
-- [ ] Task 43. `composer-and-packages.adoc` ★ (`composer.json`, autoload, lock, scripts, audit, PIE).
-- [ ] Task 44. `psr-standards-and-coding-style.adoc`.
-- [ ] Task 45. `static-analysis-and-refactoring.adoc` (PHPStan, Psalm, Rector, PHP-CS-Fixer).
-- [ ] Task 46. `testing-with-phpunit-and-pest.adoc` ★.
-- [ ] Task 47. `debugging-and-profiling.adoc` (Xdebug, profilers).
-- [ ] Task 48. `opcache-jit-and-performance.adoc`.
-- [ ] Task 49. `whats-new-and-migration.adoc` ★ (7.0 → 8.5/8.6 migration guides, "changed since older tutorials" table incl. `each()`, `create_function`, mysql/mcrypt removal, `FILTER_SANITIZE_STRING`, `strftime`, dynamic properties, `__sleep`).
-- [ ] Task 50. Group validation.
+- [x] Task 36. `spl-data-structures.adoc`. — done: 271 lines, examples run on 8.5
+- [x] Task 37. `date-and-time.adoc` ★ (`DateTimeImmutable`, time zones, `DatePeriod`, `strftime` removal, Clock). — done: 386 lines, examples run on 8.5 (intl via php85x)
+- [x] Task 38. `math-numbers-and-randomness.adoc` (BCMath/GMP, `Random\Randomizer`). — done: 229 lines, BCMath/GMP/Randomizer examples run (php85x)
+- [x] Task 39. `files-streams-and-io.adoc` ★. — done: 352 lines, examples run (HTTP stream fetch not executable: egress blocked)
+- [x] Task 40. `json-xml-and-serialization.adoc`. — done: 329 lines, examples run (XSL on host PHP 8.3)
+- [x] Task 41. `cryptography-hashing-and-passwords.adoc` (`password_hash`, sodium, OpenSSL; no hardcoded keys). — done: 242 lines, examples run; keys from env/random only
+- [x] Task 42. `command-line-php.adoc`. — done: 292 lines, examples run (pcntl on host); Symfony Console 8.1.8 command run
+- [x] Task 43. `composer-and-packages.adoc` ★ (`composer.json`, autoload, lock, scripts, audit, PIE). — done: 291 lines, Mermaid flowchart; composer commands run in scratch project (PIE install not executed)
+- [x] Task 44. `psr-standards-and-coding-style.adoc`. — done: 499 lines, PSR examples run with nyholm/psr7; php-cs-fixer output captured
+- [x] Task 45. `static-analysis-and-refactoring.adoc` (PHPStan, Psalm, Rector, PHP-CS-Fixer). — done: 367 lines, PHPStan 2.2.17 and Rector 2.6.7 output captured (Psalm not run: install failed)
+- [x] Task 46. `testing-with-phpunit-and-pest.adoc` ★. — done: 424 lines, PHPUnit 13.3.6 (7 tests) and Pest 5.3.0 (16 tests) run on 8.5; coverage (Xdebug 3.5.3, 100 %) and mutation run (75 %) executed
+- [x] Task 47. `debugging-and-profiling.adoc` (Xdebug, profilers). — done: 339 lines, Xdebug 3.5.3 built and run (develop/debug DBGp handshake/profile/trace/coverage), phpdbg run; DTrace not executable (no dtrace build)
+- [x] Task 48. `opcache-jit-and-performance.adoc`. — done: 339 lines, JIT benchmark, preload, file cache, myths measured; FFI run with ext built from 8.5.11 source; reuses php-script-execution.svg
+- [x] Task 49. `whats-new-and-migration.adoc` ★ (7.0 → 8.5/8.6 migration guides, "changed since older tutorials" table incl. `each()`, `create_function`, mysql/mcrypt removal, `FILTER_SANITIZE_STRING`, `strftime`, dynamic properties, `__sleep`). — done: 308 lines, Mermaid gantt support timeline (dates computed from php/web-php branches.inc), deprecation demo run on 8.5 and 8.6RC2, Rector dry run captured, consolidated 35-row book table; corrected list() claim (not deprecated in 8.6RC2) here and in arrays.adoc
+- [x] Task 50. Group validation. — done: validate:mermaid OK (1207 diagrams repo-wide); Antora build exit 0, only pending xrefs (php index, php-laravel pages); CLAUDE.md image greps clean
 
 ### Group 6 — PHP Reference: landing page, bibliography, cheat sheet
 
