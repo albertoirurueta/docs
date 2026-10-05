@@ -231,9 +231,9 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 70. `laravel-getting-started.adoc` ★ (`laravel new`, Herd, Sail, starter kits, Boost).
-- [ ] Task 71. `directory-structure-and-configuration.adoc` ★ (`bootstrap/app.php`, `.env`, config caching, no `Kernel`).
-- [ ] Task 72. `request-lifecycle.adoc` ★ (📊 sequence diagram).
+- [x] Task 70. `laravel-getting-started.adoc` ★ (`laravel new`, Herd, Sail, starter kits, Boost). — done: 351 lines; laravel new (installer 5.32) run non-interactively, generated .env/composer.json inspected (Pest 4 on the 8.3-compatible skeleton), artisan dev processes read from DevCommands, first route/controller/model/view loop run with artisan serve; release table from the 13.x releases page
+- [x] Task 71. `directory-structure-and-configuration.adoc` ★ (`bootstrap/app.php`, `.env`, config caching, no `Kernel`). — done: 335 lines; Mermaid bootstrap sequence (bootstrappers read from Kernel 13.34); make:* creating directories, env() vs config() before/after config:cache, config:publish, down --secret/--refresh with bypass cookie all run
+- [x] Task 72. `request-lifecycle.adoc` ★ (📊 sequence diagram). — done: 251 lines; php-laravel-request-lifecycle.svg (signature figure); global/web/api middleware stacks read from the kernel; lifecycle order traced in a running app (register, boot, middleware before/after, action, terminate, terminating)
 - [ ] Task 73. `service-container-providers-and-facades.adoc` ★.
 - [ ] Task 74. `artisan-tinker-and-prompts.adoc`.
 - [ ] Task 75. `routing.adoc` ★ (verbs, params, binding, groups, resource map table, rate limiting, route caching).
