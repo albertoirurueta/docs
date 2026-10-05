@@ -254,7 +254,7 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 88. `database-and-query-builder.adoc` ★.
+- [x] Task 88. `database-and-query-builder.adoc` ★. — done: 421 lines; pg/my connections added to Bookshelf (PostgreSQL 17.11, MySQL 8.4.11 containers), db:table/db:monitor, orderByRaw injection measured (stacked statement refused by PG, boolean-blind ordering leak works), listen/toRawSql, joins/JSON/grouping/subquery/full-text/union on PG with MySQL JSON SQL and missing-FULLTEXT-index error, upsert/insertOrIgnore/increment, real PG deadlock retried by attempts:3, lockForUpdate SQL, chunk() skipping 4 of 10 rows vs chunkById, get() 21.2 MB vs lazyById 0.5 MB
 - [ ] Task 89. `migrations-seeders-and-factories.adoc` ★ (class factories, `database/schema-evolution` link).
 - [ ] Task 90. `eloquent-models.adoc` ★ (`app/Models`, `casts()`).
 - [ ] Task 91. `eloquent-relationships.adoc` ★ (📊 ER/relationship diagram).
