@@ -161,17 +161,17 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 25. `enumerations.adoc` ★ (pure/backed enums, methods, interfaces, constants, `tryFrom`).
-- [ ] Task 26. `magic-methods-and-overloading.adoc`.
-- [ ] Task 27. `cloning-late-static-binding-and-object-lifecycle.adoc`.
-- [ ] Task 28. `namespaces-and-autoloading.adoc` ★ (namespaces, `use`, PSR-4, `spl_autoload_register`).
-- [ ] Task 29. `attributes.adoc` ★ (syntax, built-in attributes such as `#[\Override]`, `#[\Deprecated]`, `#[\NoDiscard]`, reflection access).
-- [ ] Task 30. `reflection.adoc`.
-- [ ] Task 31. `errors-and-exceptions.adoc` ★ (Throwable hierarchy, `try`/`catch`/`finally`, error handlers, `error_reporting`).
-- [ ] Task 32. `iterators-and-generators.adoc` ★.
-- [ ] Task 33. `fibers-and-asynchronous-php.adoc`.
-- [ ] Task 34. `references-and-memory-management.adoc`.
-- [ ] Task 35. Group validation.
+- [x] Task 25. `enumerations.adoc` ★ (pure/backed enums, methods, interfaces, constants, `tryFrom`). — done: 353 lines, 9 examples run (SortDirection on 8.6 RC)
+- [x] Task 26. `magic-methods-and-overloading.adoc`. — done: 373 lines, 8 examples run
+- [x] Task 27. `cloning-late-static-binding-and-object-lifecycle.adoc`. — done: 330 lines, 7 examples run (clone with, lazy objects)
+- [x] Task 28. `namespaces-and-autoloading.adoc` ★ (namespaces, `use`, PSR-4, `spl_autoload_register`). — done: 297 lines, 5 examples run + PSR-4 Composer scratch project verified
+- [x] Task 29. `attributes.adoc` ★ (syntax, built-in attributes such as `#[\Override]`, `#[\Deprecated]`, `#[\NoDiscard]`, reflection access). — done: 328 lines, 6 examples run (Deprecated, NoDiscard, DelayedTargetValidation)
+- [x] Task 30. `reflection.adoc`. — done: 342 lines, 6 examples run (isReadable on 8.6 RC)
+- [x] Task 31. `errors-and-exceptions.adoc` ★ (Throwable hierarchy, `try`/`catch`/`finally`, error handlers, `error_reporting`). — done: 331 lines, Mermaid Throwable hierarchy, 4 examples run (fatal backtraces)
+- [x] Task 32. `iterators-and-generators.adoc` ★. — done: 376 lines, 7 examples run (CSV pipeline)
+- [x] Task 33. `fibers-and-asynchronous-php.adoc`. — done: 280 lines, Mermaid sequence, 3 examples run (pcntl on host PHP 8.3)
+- [x] Task 34. `references-and-memory-management.adoc`. — done: 301 lines, php-copy-on-write.svg, 7 examples run
+- [x] Task 35. Group validation. — done: validate:mermaid OK (3 diagrams); Antora build clean apart from pending section xrefs; monospace/brace escaping fixed section-wide
 
 ### Group 5 — PHP Reference: standard library and tooling
 
