@@ -214,15 +214,15 @@ relevant options, request-lifecycle position (web), pitfalls, version notes, com
 
 **Parallelizable: yes — one new file per task**
 
-- [ ] Task 58. `web/php-laravel/introduction-and-architecture.adoc` ★ (PHP web ecosystem, framework comparison table with Django/ASP.NET/Vaadin/NestJS/FastAPI/Spring Boot "same idea in other stacks", Laravel vs Symfony components in prose, #263 prose only).
-- [ ] Task 59. `php-request-model-and-servers.adoc` ★ (shared-nothing model, PHP-FPM, Nginx/Apache, FrankenPHP, built-in server; 📊 figure).
-- [ ] Task 60. `http-requests-and-responses.adoc` ★ (superglobals, headers, status codes, redirects, PSR-7 in prose).
-- [ ] Task 61. `forms-validation-and-output-escaping.adoc` ★ (*Bookshelf Lite*).
-- [ ] Task 62. `sessions-and-cookies.adoc` ★ (hardening, `session_*`, cookie flags).
-- [ ] Task 63. `file-uploads-and-images.adoc`.
-- [ ] Task 64. `databases-with-pdo.adoc` ★ (prepared statements, transactions, fetch modes, `PDO` subclasses in 8.4).
-- [ ] Task 65. `authentication-without-a-framework.adoc`.
-- [ ] Task 66. `web-security-fundamentals.adoc` ★ (OWASP: XSS, CSRF, SQLi, session fixation, file inclusion, headers; link `backend/oauth/*`).
+- [x] Task 58. `web/php-laravel/introduction-and-architecture.adoc` ★ (PHP web ecosystem, framework comparison table with Django/ASP.NET/Vaadin/NestJS/FastAPI/Spring Boot "same idea in other stacks", Laravel vs Symfony components in prose, #263 prose only). — done: 430 lines, php-laravel-component-map.svg; front controller run under php -S, Bookshelf route/controller/Blade run in the Laravel 13.34 scratch app, Doctrine ORM 3.7 Data Mapper example run on 8.5; framework table versions from release tags; concept mapping to Django/ASP.NET/NestJS/FastAPI/Spring Boot; #263 in prose
+- [x] Task 59. `php-request-model-and-servers.adoc` ★ (shared-nothing model, PHP-FPM, Nginx/Apache, FrankenPHP, built-in server; 📊 figure). — done: 390 lines, php-laravel-request-model.svg; Nginx 1.31 + php:8.5-fpm, Apache 2.4 mod_php, php -S and FrankenPHP 1.13 worker mode all run (state-leak demo, slowlog with SYS_PTRACE, status page, persistent PDO connections against MySQL 8.4, fastcgi_finish_request)
+- [x] Task 60. `http-requests-and-responses.adoc` ★ (superglobals, headers, status codes, redirects, PSR-7 in prose). — done: 385 lines; superglobals, request_order (empty vs GP), JSON/415/400, request_parse_body PUT, PRG 303, content negotiation, headers already sent, ob_*, http_get_last_response_headers and the URI extension all run on 8.5.11
+- [x] Task 61. `forms-validation-and-output-escaping.adoc` ★ (*Bookshelf Lite*). — done: 392 lines; Bookshelf Lite review form run under php -S (422 with whitelist errors, sticky values, 303 PRG), filter_var incl. FILTER_THROW_ON_FAILURE, escaping in HTML/attribute/URL/JS contexts, FILTER_SANITIZE_STRING deprecation and mail() header injection demonstrated
+- [x] Task 62. `sessions-and-cookies.adoc` ★ (hardening, `session_*`, cookie flags). — done: 363 lines; session lifecycle, regenerate_id, flash, strict-mode fixation test and locking timings under PHP-FPM, PDO SessionHandler with validateId run, 8.5 vs 8.6RC2 defaults read with ini_get, setcookie with Partitioned (8.5)
+- [x] Task 63. `file-uploads-and-images.adoc`. — done: 303 lines; CoverUpload run under php -S (finfo rejects PHP named .jpg, UPLOAD_ERR_INI_SIZE, post_max_size 413 and the display_errors pitfall), $_FILES dumps, GD built for 8.5 (PNG) thumbnail, X-Accel-Redirect download through Nginx
+- [x] Task 64. `databases-with-pdo.adoc` ★ (prepared statements, transactions, fetch modes, `PDO` subclasses in 8.4). — done: 425 lines; PDO::connect on MySQL 8.4, PostgreSQL 17 (pdo_pgsql built) and SQLite, injection demo, LIMIT under emulation, fetch modes incl. FETCH_CLASS vs readonly, transaction rollback, keyset pagination, BookRepository, mysqli execute_query; links database/sql and pagination-strategies
+- [x] Task 65. `authentication-without-a-framework.adoc`. — done: 343 lines; Auth class run on SQLite (rehash 10->12, dummy-hash timing measured, throttling, selector/validator remember-me, single-use reset tokens), HTTP Basic under php -S and PHP-FPM; book errata corrected
+- [x] Task 66. `web-security-fundamentals.adoc` ★ (OWASP: XSS, CSRF, SQLi, session fixation, file inclusion, headers; link `backend/oauth/*`). — done: 392 lines; OWASP Top 10:2025 (from OWASP/Top10 repo) mapping, CSRF token demo (419/200), include traversal and null-byte behaviour on 8.5, SSRF naive vs guarded fetch, open_basedir, security headers, composer audit; links backend/oauth, web/cors, Django CSP
 - [ ] Task 67. `templating-routing-and-middleware-by-hand.adoc`.
 - [ ] Task 68. `http-clients-apis-and-email.adoc`.
 - [ ] Task 69. Group validation.
