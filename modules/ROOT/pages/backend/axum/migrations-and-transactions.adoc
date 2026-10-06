@@ -1,0 +1,374 @@
+= Migrations & Transactions
+:description: Evolving the schema and keeping data consistent in an axum 0.8 service with sqlx 0.9 -- sqlx migrate add, run, revert and info, reversible migrations, sqlx::migrate!() at start-up, transactions with pool.begin(), &mut *tx, commit and rollback on drop, a per-request transaction extractor, isolation levels, SELECT ... FOR UPDATE, optimistic locking with a version column, and why transaction scope must stay short.
+:keywords: axum, sqlx, migrations, sqlx-cli, sqlx migrate add, sqlx migrate run, sqlx migrate revert, reversible migrations, migrate!, Migrator, transactions, begin, commit, rollback, Transaction, &mut *tx, rollback on drop, transaction extractor, isolation level, READ COMMITTED, REPEATABLE READ, SERIALIZABLE, SELECT FOR UPDATE, row locks, optimistic locking, version column, lost update, deadlock, serialization failure, retry
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against sqlx 0.9.0 and sqlx-cli 0.9.0 with axum 0.8.9 on Rust 1.99 (edition 2024) and PostgreSQL
+16, checked on 2026-10-06. It continues xref:backend/axum/databases-with-sqlx.adoc[Databases with sqlx]. The general
+theory -- expand/contract migrations, zero-downtime changes, isolation anomalies -- is covered in the
+xref:database/schema-evolution/index.adoc[Schema Evolution] pages and on
+xref:database/sql/transactions.adoc[SQL Transactions]; this page shows the sqlx tooling.
+
+== Migrations with sqlx-cli
+
+Migrations are plain SQL files in a `migrations/` directory, applied in order of their numeric prefix and recorded in
+a `+_sqlx_migrations+` table together with a checksum. `sqlx migrate add -r` creates a *reversible* pair (`.up.sql` and
+`.down.sql`):
+
+[source,bash]
+----
+$ cargo install sqlx-cli --no-default-features --features postgres,rustls
+$ export DATABASE_URL=postgres://bookshelf:<password>@localhost/bookshelf
+$ sqlx database create
+$ sqlx migrate add -r create_loans
+Creating migrations/20261006230007_create_loans.up.sql
+Creating migrations/20261006230007_create_loans.down.sql
+$ sqlx migrate run
+Applied 20261006230007/migrate create loans (36.900146ms)
+$ sqlx migrate info
+20261006225711/installed create catalogue
+20261006230007/installed create loans
+$ sqlx migrate revert          # runs the newest .down.sql
+Applied 20261006230007/revert create loans (5.952092ms)
+----
+
+[source,sql]
+----
+-- migrations/20261006230007_create_loans.up.sql
+CREATE TABLE loans (
+    id          BIGSERIAL PRIMARY KEY,
+    isbn        TEXT NOT NULL REFERENCES books (isbn),
+    member_id   BIGINT NOT NULL,
+    lent_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    returned_at TIMESTAMPTZ
+);
+
+CREATE INDEX loans_open_idx ON loans (member_id) WHERE returned_at IS NULL;
+
+-- migrations/20261006230007_create_loans.down.sql
+DROP TABLE loans;
+----
+
+Source: https://github.com/transact-rs/sqlx/blob/main/sqlx-cli/README.md[sqlx-cli README]
+
+* *Never edit an applied migration*: the checksum changes and `migrate run` refuses to continue. Add a new migration
+  instead.
+* Each migration runs in a transaction by default on Postgres. Statements that cannot run in a transaction
+  (`CREATE INDEX CONCURRENTLY`) need `-- no-transaction` as the first line of the file.
+* Down migrations are for development; in production, roll *forward* with a new migration. Destructive changes follow
+  the expand/contract pattern so old and new versions of the service can run side by side during a deployment.
+
+== Applying migrations at start-up
+
+`sqlx::migrate!()` embeds the `migrations/` directory into the binary at compile time, so the deployed service carries
+its own schema and needs no CLI:
+
+[source,rust]
+----
+use sqlx::PgPool;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    // Runs every pending migration inside its own transaction; takes an advisory lock so that
+    // several replicas starting at once do not race.
+    sqlx::migrate!("./migrations").run(&pool).await?;
+    println!("schema up to date");
+    Ok(())
+}
+----
+
+Source: https://docs.rs/sqlx/0.9.0/sqlx/macro.migrate.html[sqlx: migrate!]
+
+Running migrations from the service is convenient for small deployments. Larger teams run them as a separate step --
+a Kubernetes `Job` or an init container, see xref:backend/axum/deployment.adoc[Deployment] -- so that a failed
+migration does not crash-loop every replica, and so that the application's database user does not need DDL rights.
+Add `println!("cargo:rerun-if-changed=migrations");` to a `build.rs` (or run `sqlx migrate build-script`) so that
+adding a migration triggers a rebuild.
+
+== Transactions
+
+`pool.begin()` returns a `+Transaction<'static, Postgres>+` holding one connection. Queries run *inside* it by passing
+`+&mut *tx+` as the executor. `tx.commit()` makes the changes permanent; if the transaction is dropped without commit --
+an early `return`, a `?`, a panic, or the request future being cancelled by a timeout -- sqlx rolls it back
+automatically.
+
+Lending a book must decrement `copies` and insert a loan atomically, and two members must not borrow the last copy at
+the same time. The `+SELECT ... FOR UPDATE+` locks the book's row until the transaction ends, so concurrent lenders queue
+behind it:
+
+[mermaid]
+....
+sequenceDiagram
+    participant H as lend handler
+    participant DB as PostgreSQL
+    H->>DB: BEGIN
+    H->>DB: SELECT copies FROM books WHERE isbn = $1 FOR UPDATE
+    DB-->>H: copies = 1 (row locked)
+    H->>DB: SELECT count(*) FROM loans WHERE member_id = $2 AND returned_at IS NULL
+    DB-->>H: 5 open loans
+    Note over H: rule violated: return Err(...)
+    H-->>DB: transaction dropped: ROLLBACK (lock released)
+    Note over H,DB: happy path: UPDATE books, INSERT loans, COMMIT
+....
+
+[source,rust]
+----
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+};
+use serde::Deserialize;
+use sqlx::PgPool;
+
+const MAX_OPEN_LOANS: i64 = 5;
+
+#[derive(Debug)]
+enum LendError {
+    NoSuchBook,
+    NoCopiesLeft,
+    TooManyLoans,
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for LendError {
+    fn from(e: sqlx::Error) -> Self {
+        LendError::Db(e)
+    }
+}
+
+impl IntoResponse for LendError {
+    fn into_response(self) -> Response {
+        match self {
+            LendError::NoSuchBook => (StatusCode::NOT_FOUND, "no such book\n").into_response(),
+            LendError::NoCopiesLeft => (StatusCode::CONFLICT, "no copies left\n").into_response(),
+            LendError::TooManyLoans => (StatusCode::CONFLICT, "loan limit reached\n").into_response(),
+            LendError::Db(err) => {
+                tracing::error!(%err, "lend failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct LendRequest {
+    member_id: i64,
+}
+
+async fn lend(
+    State(pool): State<PgPool>,
+    Path(isbn): Path<String>,
+    Json(req): Json<LendRequest>,
+) -> Result<(StatusCode, String), LendError> {
+    let mut tx = pool.begin().await?;
+
+    let copies = sqlx::query_scalar!("SELECT copies FROM books WHERE isbn = $1 FOR UPDATE", isbn)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(LendError::NoSuchBook)?; // `?` drops tx: ROLLBACK
+    if copies == 0 {
+        return Err(LendError::NoCopiesLeft);
+    }
+
+    let open = sqlx::query_scalar!(
+        r#"SELECT count(*) AS "n!" FROM loans WHERE member_id = $1 AND returned_at IS NULL"#,
+        req.member_id
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if open >= MAX_OPEN_LOANS {
+        return Err(LendError::TooManyLoans);
+    }
+
+    sqlx::query!("UPDATE books SET copies = copies - 1 WHERE isbn = $1", isbn).execute(&mut *tx).await?;
+    let loan_id =
+        sqlx::query_scalar!("INSERT INTO loans (isbn, member_id) VALUES ($1, $2) RETURNING id", isbn, req.member_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, format!("loan {loan_id}\n")))
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let app = Router::new().route("/api/v1/books/{isbn}/loans", post(lend)).with_state(pool);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html[sqlx: Transaction]
+
+[source,bash]
+----
+$ curl -s -H 'content-type: application/json' -d '{"member_id":42}' localhost:3000/api/v1/books/9780593099322/loans
+loan 1
+$ curl -s -H 'content-type: application/json' -d '{"member_id":43}' localhost:3000/api/v1/books/9780593099322/loans
+no copies left
+----
+
+* `+&mut *tx+` reborrows the transaction's connection as an executor; passing `&mut tx` does not compile. Pass
+  `+&mut *tx+` (or `tx.as_mut()`) to helper functions that take `+impl PgExecutor<'_>+` so the same repository code works
+  inside and outside transactions.
+* `pool.begin()` and `tx.commit()` are themselves `.await` points; keep anything slow -- HTTP calls, password hashing,
+  sending mail -- *outside* the transaction.
+* Nested `begin()` on a transaction creates a `SAVEPOINT`.
+
+== A per-request transaction extractor
+
+When most handlers of a router write data, a `Tx` extractor removes the `begin()` boilerplate. The handler receives an
+open transaction and commits it explicitly; a handler that returns early without committing rolls back:
+
+[source,rust]
+----
+use axum::{
+    Router,
+    extract::{FromRef, FromRequestParts, Path},
+    http::{StatusCode, request::Parts},
+    routing::post,
+};
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// An open transaction for the duration of the handler.
+struct Tx(Transaction<'static, Postgres>);
+
+impl<S> FromRequestParts<S> for Tx
+where
+    S: Send + Sync,
+    PgPool: FromRef<S>,
+{
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(_parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let pool = PgPool::from_ref(state);
+        pool.begin().await.map(Tx).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+async fn return_book(Tx(mut tx): Tx, Path(loan_id): Path<i64>) -> Result<StatusCode, StatusCode> {
+    let isbn = sqlx::query_scalar!(
+        "UPDATE loans SET returned_at = now() WHERE id = $1 AND returned_at IS NULL RETURNING isbn",
+        loan_id
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    sqlx::query!("UPDATE books SET copies = copies + 1 WHERE isbn = $1", isbn)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let app = Router::new().route("/api/v1/loans/{id}/return", post(return_book)).with_state(pool);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/extract/index.html#implementing-fromrequestparts[axum: Implementing FromRequestParts]
+
+The trade-off: the transaction (and its pooled connection) is held from extraction until the handler finishes,
+including time spent in other extractors and in non-database work. Put `Tx` *last* among the parts extractors so cheap
+rejections happen first, and do not use it on endpoints that call external services. The `axum-sqlx-tx` crate
+implements a fuller version that commits automatically on a successful response.
+
+== Isolation levels and locking
+
+Postgres defaults to `READ COMMITTED`: each statement sees data committed before it started. That is enough for the
+examples above because `FOR UPDATE` serialises access to the contested row. Alternatives:
+
+[cols="1,3",options="header"]
+|===
+|Technique |Use when
+|`+SELECT ... FOR UPDATE+` |a few known rows must not change between read and write (pessimistic). Lock rows in a
+consistent order (e.g. by primary key) to avoid deadlocks.
+|`+SELECT ... FOR UPDATE SKIP LOCKED+` |workers taking jobs from a queue table (see
+xref:backend/axum/background-jobs-and-tasks.adoc[Background Jobs & Tasks])
+|optimistic locking (`version` column) |conflicts are rare and the read happens in a different request (an edit form)
+|`SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` |complex invariants across many rows; the database aborts conflicting
+transactions with SQLSTATE `40001`, which the application must *retry*
+|===
+
+Run `+sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").execute(&mut *tx)+` as the first statement of the
+transaction to change its level, and wrap the whole transaction in a retry loop that retries on `40001` (serialisation
+failure) and `40P01` (deadlock) a few times with jitter.
+
+=== Optimistic locking
+
+The edit form of *Bookshelf* reads a book in one request and saves it in another, minutes later; holding a lock in
+between is impossible. Instead, every update checks and bumps the `version` column, and "0 rows affected" means
+someone else saved first:
+
+[source,rust]
+----
+use sqlx::PgPool;
+
+/// Returns Ok(Some(new_version)) on success, Ok(None) if the version was stale.
+async fn rename_book(pool: &PgPool, isbn: &str, title: &str, expected_version: i64) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar!(
+        "UPDATE books SET title = $1, version = version + 1 WHERE isbn = $2 AND version = $3 RETURNING version",
+        title,
+        isbn,
+        expected_version
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let current: i64 = sqlx::query_scalar!("SELECT version FROM books WHERE isbn = '9780441478125'").fetch_one(&pool).await?;
+    println!("{:?}", rename_book(&pool, "9780441478125", "The Left Hand of Darkness", current).await?); // Some(v+1)
+    println!("{:?}", rename_book(&pool, "9780441478125", "The Left Hand of Darkness", current).await?); // None: stale
+    Ok(())
+}
+----
+
+Source: https://www.postgresql.org/docs/16/mvcc.html[PostgreSQL 16: Concurrency Control]
+
+The HTTP side -- `ETag` from the version, `If-Match` on `PUT`, `412 Precondition Failed` -- is on
+xref:backend/axum/json-rest-apis.adoc[JSON REST APIs].
+
+== Keep transactions short
+
+A transaction holds a pooled connection and, with `FOR UPDATE`, row locks for its whole duration. Gangappa & Rangaraj
+(*Mastering Distributed Observability in Rust*, chapter 11) trace pool exhaustion incidents back to transactions that
+span an external HTTP call: every slow call pins a connection, the pool empties, and unrelated requests start timing out
+in `acquire`. Rules that follow:
+
+* do all reads and validation that do not need locks *before* `begin()`;
+* never `.await` network calls, message publishing or `spawn_blocking` work inside a transaction -- publish events with
+  a transactional *outbox* table instead;
+* set `statement_timeout` and `idle_in_transaction_session_timeout` on the database role as a safety net;
+* trace `begin` and `commit` and watch transaction duration in your dashboards.
+
+== Where the books are outdated
+
+Gangappa & Rangaraj use sqlx 0.8, where `Transaction` already rolled back on drop; in 0.9 the API is the same, but
+runtime-built SQL passed to `sqlx::query` requires `AssertSqlSafe` and `Migrator::set_ignore_missing`/`set_locking`
+now return `&mut Self`. Yoon (*Beginning Axum*, chapter 3) manages the schema with SeaORM's migrator instead, see
+xref:backend/axum/seaorm-and-diesel.adoc[SeaORM & Diesel].
+
+== References
+
+* https://docs.rs/sqlx/0.9.0/sqlx/macro.migrate.html[sqlx: migrate!] and https://docs.rs/sqlx/0.9.0/sqlx/migrate/struct.Migrator.html[Migrator]
+* https://docs.rs/sqlx/0.9.0/sqlx/struct.Transaction.html[sqlx: Transaction] and https://docs.rs/sqlx/0.9.0/sqlx/trait.Acquire.html[Acquire]
+* https://github.com/transact-rs/sqlx/blob/main/sqlx-cli/README.md[sqlx-cli README]
+* https://www.postgresql.org/docs/16/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL 16: The Locking Clause] and https://www.postgresql.org/docs/16/transaction-iso.html[Transaction Isolation]
+* https://www.packtpub.com/product/mastering-distributed-observability-in-rust/9781806671793[Manjunath Gangappa and Rajkumar Rangaraj, Mastering Distributed Observability in Rust (Packt, 2026)]
