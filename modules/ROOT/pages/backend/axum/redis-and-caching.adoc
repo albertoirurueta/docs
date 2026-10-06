@@ -1,0 +1,332 @@
+= Redis & Caching
+:description: Caching in an axum 0.8 service -- redis-rs 1.x ConnectionManager versus deadpool-redis pools in state, the cache-aside pattern with TTLs and invalidation on writes, HTTP caching headers (Cache-Control, ETag), in-process caches with moka, and Redis pub/sub to fan events out across several instances for WebSockets and SSE.
+:keywords: axum, Redis, redis-rs, redis 1.x, ConnectionManager, deadpool-redis, connection pool, cache-aside, TTL, SET EX, invalidation, cache stampede, Cache-Control, ETag, HTTP caching, moka, in-process cache, pub/sub, PUBLISH, SUBSCRIBE, fan-out, broadcast, multiple instances, Valkey
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against redis 1.7.1 (redis-rs), deadpool-redis 0.23.1 and moka 0.12.16 with axum 0.8.9 on Rust
+1.99 (edition 2024), checked on 2026-10-06. Redis itself -- data types, persistence, eviction, clustering -- is covered
+in the xref:database/redis/index.adoc[Redis] section; this page shows how an axum service uses it. Everything here also
+works with Valkey, the open-source Redis fork.
+
+[source,toml]
+----
+[dependencies]
+redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager"] }
+deadpool-redis = "0.23.1" # alternative to ConnectionManager
+moka = { version = "0.12.16", features = ["future"] }
+----
+
+== Connections: `ConnectionManager` or a pool?
+
+* `redis::aio::ConnectionManager` wraps one *multiplexed* connection: many concurrent commands share a single TCP
+  connection (Redis pipelines them), and the manager reconnects automatically after failures. It is `Clone` and cheap,
+  so it goes straight into axum state. This is the right default for request/response commands.
+* `deadpool-redis` maintains a *pool* of connections. Use it for commands that block a connection (`BLPOP`, `WATCH`/
+  `MULTI` transactions, long Lua scripts) or when one connection's throughput is not enough.
+* Pub/sub subscribers need a dedicated connection (`client.get_async_pubsub()`), because a subscribed connection can do
+  nothing else.
+
+== Cache-aside with TTLs
+
+*Cache-aside* (lazy loading): read from the cache; on a miss, load from the database and store the result with a
+time-to-live; on writes, update the database and *delete* the cache entry. *Bookshelf* caches book details, which are
+read far more often than they change:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::{StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
+use redis::{AsyncCommands, aio::ConnectionManager};
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+
+const TTL: Duration = Duration::from_secs(300);
+
+#[derive(Clone)]
+struct AppState {
+    db: PgPool,
+    redis: ConnectionManager,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct BookDetails {
+    isbn: String,
+    title: String,
+    year: i16,
+}
+
+fn cache_key(isbn: &str) -> String {
+    format!("bookshelf:v1:book:{isbn}") // namespace + version: change "v1" when the cached shape changes
+}
+
+async fn show(State(state): State<AppState>, Path(isbn): Path<String>) -> Result<impl IntoResponse, StatusCode> {
+    let mut redis = state.redis.clone();
+    let key = cache_key(&isbn);
+
+    // 1. try the cache; a Redis failure must not break the endpoint
+    match redis.get::<_, Option<String>>(&key).await {
+        Ok(Some(json)) => {
+            if let Ok(book) = serde_json::from_str::<BookDetails>(&json) {
+                return Ok(([("x-cache", "hit")], Json(book)));
+            }
+        }
+        Ok(None) => {}
+        Err(err) => tracing::warn!(%err, "cache read failed"),
+    }
+
+    // 2. miss: load from Postgres
+    let book = sqlx::query_as!(BookDetails, "SELECT isbn, title, year FROM books WHERE isbn = $1", isbn)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // 3. populate with a TTL (SET key value EX 300)
+    if let Ok(json) = serde_json::to_string(&book) {
+        let stored: redis::RedisResult<()> = redis.set_ex(&key, json, TTL.as_secs()).await;
+        if let Err(err) = stored {
+            tracing::warn!(%err, "cache write failed");
+        }
+    }
+    Ok(([("x-cache", "miss")], Json(book)))
+}
+
+async fn rename(State(state): State<AppState>, Path(isbn): Path<String>, title: String) -> Result<StatusCode, StatusCode> {
+    let updated = sqlx::query!("UPDATE books SET title = $1, version = version + 1 WHERE isbn = $2", title, isbn)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if updated.rows_affected() == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // invalidate AFTER the database write succeeded
+    let mut redis = state.redis.clone();
+    let deleted: redis::RedisResult<()> = redis.del(cache_key(&isbn)).await;
+    if let Err(err) = deleted {
+        tracing::warn!(%err, "cache invalidation failed; entry expires with its TTL");
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    let client = redis::Client::open(std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()))?;
+    let redis = ConnectionManager::new(client).await?;
+
+    let app = Router::new()
+        .route("/api/v1/books/{isbn}", get(show))
+        .route("/api/v1/books/{isbn}/title", axum::routing::put(rename))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("private, max-age=0, must-revalidate"),
+        ))
+        .with_state(AppState { db, redis });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/redis/1.7.1/redis/aio/struct.ConnectionManager.html[redis: ConnectionManager] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/tokio-redis[axum example: tokio-redis]
+
+[source,bash]
+----
+$ curl -si localhost:3000/api/v1/books/9780441013593 | grep x-cache
+x-cache: miss
+$ curl -si localhost:3000/api/v1/books/9780441013593 | grep x-cache
+x-cache: hit
+$ redis-cli TTL bookshelf:v1:book:9780441013593
+(integer) 298
+----
+
+Design notes:
+
+* *Fail open.* The cache is an optimisation; every Redis error is logged and the request continues against the
+  database. Set short timeouts on the Redis client so a sick Redis cannot slow every request.
+* *Invalidate, don't update.* Deleting the key on writes (and letting the next read repopulate it) avoids racing
+  writers leaving stale data; the TTL bounds staleness if a delete is lost.
+* *Version your keys* (`v1`) so a deployment that changes the cached JSON shape does not read old entries.
+* *Stampedes*: when a hot key expires, many requests miss at once and all hit the database. Mitigations: add random
+  jitter to TTLs, refresh hot keys before expiry, or let one request recompute while others wait (moka's `get_with`
+  does this in process).
+
+The `deadpool-redis` equivalent of the connection setup is
+`+deadpool_redis::Config::from_url(url).create_pool(Some(deadpool_redis::Runtime::Tokio1))?+`, and each handler then
+calls `pool.get().await?` to borrow a connection.
+
+== HTTP caching: let clients and CDNs do the work
+
+The cheapest cache is the one in front of your service. Set `Cache-Control` deliberately on every response:
+
+[cols="2,3",options="header"]
+|===
+|Header |Meaning
+|`Cache-Control: public, max-age=86400, immutable` |fingerprinted static assets (`app.3f2a1c.js`), see
+xref:backend/axum/static-files-and-spas.adoc[Static Files & SPAs]
+|`Cache-Control: public, max-age=60, stale-while-revalidate=300` |public catalogue pages and API lists that may be a
+minute old
+|`Cache-Control: private, max-age=0, must-revalidate` + `ETag` |per-user data; clients revalidate with
+`If-None-Match` and get `304` when unchanged (see xref:backend/axum/responses.adoc[Responses])
+|`Cache-Control: no-store` |secrets, tokens, account pages
+|===
+
+`Vary` must list every request header that changes the response (`Accept-Encoding`, `Accept`, `Origin`), or shared
+caches will serve the wrong variant.
+
+== In-process caches with moka
+
+For small, hot data -- configuration from the database, the list of genres, rate-limit counters per instance -- a
+memory cache avoids even the Redis round trip. `moka` is a concurrent cache with size limits, TTL/TTI expiry and an
+async API; `get_with` makes concurrent callers for the same key wait for a single computation:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{Json, Router, extract::State, routing::get};
+use moka::future::Cache;
+
+#[derive(Clone)]
+struct AppState {
+    genres: Cache<&'static str, std::sync::Arc<Vec<String>>>,
+}
+
+async fn load_genres_from_db() -> Vec<String> {
+    tokio::time::sleep(Duration::from_millis(200)).await; // pretend this is slow
+    vec!["fantasy".into(), "science-fiction".into(), "classics".into()]
+}
+
+async fn genres(State(state): State<AppState>) -> Json<Vec<String>> {
+    // only one caller computes the value; concurrent callers await the same future
+    let value = state.genres.get_with("all", async { std::sync::Arc::new(load_genres_from_db().await) }).await;
+    Json(value.as_ref().clone())
+}
+
+#[tokio::main]
+async fn main() {
+    let state = AppState {
+        genres: Cache::builder().max_capacity(1_000).time_to_live(Duration::from_secs(60)).build(),
+    };
+    let app = Router::new().route("/api/v1/genres", get(genres)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/moka/0.12.16/moka/future/struct.Cache.html[moka: future::Cache]
+
+Each instance has its own memory cache, so invalidation does not reach the others; keep TTLs short or broadcast
+invalidations over pub/sub (below).
+
+== Pub/sub: fan-out across instances
+
+The live review feed (see xref:backend/axum/websockets.adoc[WebSockets]) uses a `tokio::sync::broadcast` channel to
+reach every client connected *to this process*. With several replicas, an event raised on one instance must reach
+clients on all of them. Redis pub/sub bridges them: every instance subscribes to a channel and re-broadcasts what it
+receives locally, and publishing goes through Redis:
+
+[source,rust]
+----
+use axum::{
+    Router,
+    extract::State,
+    routing::{get, post},
+};
+use futures::StreamExt;
+use redis::{AsyncCommands, aio::ConnectionManager};
+use tokio::sync::broadcast;
+
+const CHANNEL: &str = "bookshelf:reviews";
+
+#[derive(Clone)]
+struct AppState {
+    redis: ConnectionManager,
+    local: broadcast::Sender<String>,
+}
+
+/// One task per instance: Redis channel -> local broadcast.
+async fn relay(client: redis::Client, local: broadcast::Sender<String>) -> redis::RedisResult<()> {
+    let mut pubsub = client.get_async_pubsub().await?;
+    pubsub.subscribe(CHANNEL).await?;
+    let mut messages = pubsub.on_message();
+    while let Some(msg) = messages.next().await {
+        if let Ok(payload) = msg.get_payload::<String>() {
+            let _ = local.send(payload); // Err only means no local subscriber right now
+        }
+    }
+    Ok(())
+}
+
+async fn post_review(State(state): State<AppState>, body: String) -> &'static str {
+    let mut redis = state.redis.clone();
+    let published: redis::RedisResult<i64> = redis.publish(CHANNEL, body).await;
+    match published {
+        Ok(_) => "published\n",
+        Err(_) => "queued for retry\n",
+    }
+}
+
+async fn next_review(State(state): State<AppState>) -> String {
+    let mut rx = state.local.subscribe();
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
+        Ok(Ok(review)) => format!("{review}\n"),
+        _ => "no review yet\n".to_owned(),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = redis::Client::open(std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()))?;
+    let (local, _) = broadcast::channel(256);
+    tokio::spawn(relay(client.clone(), local.clone()));
+
+    let state = AppState { redis: ConnectionManager::new(client).await?, local };
+    let app = Router::new()
+        .route("/api/v1/reviews", post(post_review))
+        .route("/api/v1/reviews/next", get(next_review))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/redis/1.7.1/redis/aio/struct.PubSub.html[redis: aio::PubSub]
+
+[source,bash]
+----
+$ curl -s localhost:3000/api/v1/reviews/next &      # waits for the next review
+$ curl -s -d 'Dune: 5 stars' localhost:3000/api/v1/reviews
+published
+Dune: 5 stars
+----
+
+Redis pub/sub is *fire-and-forget*: a subscriber that is disconnected at the moment of publishing misses the message.
+That is acceptable for live notifications; for events that must not be lost, use Redis Streams (`XADD`/`XREADGROUP`)
+or a message broker (see xref:backend/messaging/index.adoc[Messaging]). The relay task should reconnect with backoff
+when its loop ends.
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*, chapter 2) caches with an in-memory `HashMap` behind a mutex, which grows without bound and is
+per instance; moka and Redis provide eviction and sharing. Older redis-rs examples (0.2x) open a dedicated connection per
+request with `get_async_connection`; current redis-rs (1.x) provides `get_multiplexed_async_connection` and
+`ConnectionManager`, which share one connection and reconnect automatically.
+
+== References
+
+* https://docs.rs/redis/1.7.1/redis/[redis-rs 1.7.1] and https://docs.rs/deadpool-redis/0.23.1/deadpool_redis/[deadpool-redis 0.23.1]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/tokio-redis[axum example: tokio-redis]
+* https://docs.rs/moka/0.12.16/moka/[moka 0.12.16]
+* https://redis.io/docs/latest/develop/interact/pubsub/[Redis: Pub/Sub] and https://redis.io/docs/latest/commands/set/[SET]
+* https://www.rfc-editor.org/rfc/rfc9111.html[RFC 9111: HTTP Caching]
+* https://link.springer.com/book/10.1007/979-8-8688-2631-3[Indo Yoon, Beginning Axum (Apress, 2026)]
