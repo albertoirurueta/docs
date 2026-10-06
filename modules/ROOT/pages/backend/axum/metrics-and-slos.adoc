@@ -1,0 +1,300 @@
+= Metrics & SLOs
+:description: Metrics for axum 0.8 services -- the metrics facade with metrics-exporter-prometheus behind a /metrics endpoint on an internal port, RED metrics per route from a middleware using MatchedPath, histogram buckets and label cardinality, tower-http's in-flight request counter, database pool gauges and business KPIs, OpenTelemetry metrics as the alternative, liveness and readiness endpoints, and SLIs, SLOs, error budgets and multi-window burn-rate alerts in Prometheus.
+:keywords: axum, metrics, metrics crate, metrics-exporter-prometheus, PrometheusBuilder, PrometheusHandle, run_upkeep, /metrics, Prometheus, Grafana, RED method, USE method, counter, gauge, histogram, buckets, cardinality, MatchedPath, InFlightRequestsLayer, tower-http metrics, database pool metrics, business KPIs, OpenTelemetry metrics, health check, liveness, readiness, SLI, SLO, error budget, burn rate, multi-window alert, Alertmanager
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against metrics 0.24.6 and metrics-exporter-prometheus 0.18.3 with axum 0.8.9, tower-http 0.7.1
+and sqlx 0.9 on Rust 1.99 (edition 2024), checked on 2026-10-06. Traces explain *one* request; metrics answer "how is
+the service doing" for *all* of them, cheaply enough to keep every data point and to alert on. *Bookshelf* exposes
+Prometheus metrics, and its reliability targets are expressed as SLOs computed from them. This site's
+xref:database/prometheus/index.adoc[Prometheus] section covers the server, PromQL and Alertmanager; this page covers the
+axum side.
+
+== What to measure
+
+* *RED* for every request-driven service: **R**ate (requests per second), **E**rrors (the share that fail) and
+  **D**uration (the latency distribution) -- per route and method.
+* *USE* for every resource: **U**tilisation, **S**aturation and **E**rrors -- the database pool (connections in use,
+  time waiting for one), in-flight requests against a concurrency limit, queue depth for background jobs.
+* *Business KPIs*: loans created, sign-ups, failed payments. They often reveal an incident (a broken button returns
+  `200` but nobody borrows a book) that technical metrics miss.
+
+== The `metrics` facade and a Prometheus endpoint
+
+The `metrics` crate is a facade like `log`: code records with `+counter!+`, `+gauge!+` and `+histogram!+`, and one
+installed *recorder* decides where the values go. metrics-exporter-prometheus keeps them in memory and renders the
+Prometheus text format on demand:
+
+[source,rust]
+----
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use axum::{
+    Router,
+    extract::{MatchedPath, Request, State},
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use metrics::{counter, describe_counter, describe_histogram, gauge, histogram};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use sqlx::PgPool;
+use tower_http::metrics::InFlightRequestsLayer;
+
+#[derive(Clone)]
+struct AppState {
+    pool: PgPool,
+    shutting_down: Arc<AtomicBool>,
+}
+
+fn install_recorder() -> PrometheusHandle {
+    // latency buckets in seconds, chosen around the SLO threshold (300 ms)
+    const LATENCY: &[f64] = &[0.005, 0.01, 0.025, 0.05, 0.1, 0.2, 0.3, 0.5, 1.0, 2.5, 5.0];
+    let handle = PrometheusBuilder::new()
+        .set_buckets_for_metric(Matcher::Full("http_server_request_duration_seconds".into()), LATENCY)
+        .expect("non-empty buckets")
+        .add_global_label("service", "bookshelf-web")
+        .install_recorder()
+        .expect("metrics recorder");
+    describe_counter!("http_server_requests_total", "HTTP requests by route, method and status");
+    describe_histogram!("http_server_request_duration_seconds", "HTTP request latency");
+    handle
+}
+
+/// RED metrics: rate and errors (counter by status) and duration (histogram) per route.
+async fn track_metrics(req: Request, next: Next) -> Response {
+    let start = Instant::now();
+    // the route template, never the raw path: /books/{isbn}, not /books/9781718503106
+    let route = req.extensions().get::<MatchedPath>().map_or("unmatched", MatchedPath::as_str).to_owned();
+    let method = req.method().to_string();
+
+    let response = next.run(req).await;
+
+    let status = response.status().as_u16().to_string();
+    let labels = [("method", method), ("route", route), ("status", status)];
+    counter!("http_server_requests_total", &labels).increment(1);
+    histogram!("http_server_request_duration_seconds", &labels[..2]).record(start.elapsed().as_secs_f64());
+    response
+}
+
+async fn book() -> &'static str {
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    "a book\n"
+}
+
+async fn create_loan() -> StatusCode {
+    counter!("bookshelf_loans_created_total").increment(1); // a business KPI
+    StatusCode::CREATED
+}
+
+/// Liveness: the process is up and not deadlocked. Never checks dependencies.
+async fn health() -> &'static str {
+    "ok\n"
+}
+
+/// Readiness: this instance can serve traffic now.
+async fn ready(State(state): State<AppState>) -> Response {
+    if state.shutting_down.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "shutting down\n").into_response();
+    }
+    let ping = tokio::time::timeout(Duration::from_secs(1), sqlx::query("SELECT 1").execute(&state.pool));
+    match ping.await {
+        Ok(Ok(_)) => "ready\n".into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "database unavailable\n").into_response(),
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let handle = install_recorder();
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).await.unwrap();
+    let state = AppState { pool: pool.clone(), shutting_down: Arc::default() };
+
+    // USE metrics for the pool and saturation of the service, sampled every 5 s
+    let (in_flight_layer, in_flight) = InFlightRequestsLayer::pair();
+    tokio::spawn(in_flight.run_emitter(Duration::from_secs(5), |n| async move {
+        gauge!("http_server_active_requests").set(n as f64);
+    }));
+    let upkeep = handle.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            gauge!("db_client_connections", "state" => "used").set((pool.size() as usize - pool.num_idle()) as f64);
+            gauge!("db_client_connections", "state" => "idle").set(pool.num_idle() as f64);
+            upkeep.run_upkeep(); // install_recorder leaves histogram upkeep to the caller
+        }
+    });
+
+    let app = Router::new()
+        .route("/books/{isbn}", get(book))
+        .route("/loans", post(create_loan))
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .layer(middleware::from_fn(track_metrics))
+        .layer(in_flight_layer)
+        .with_state(state);
+
+    // /metrics on a separate, internal port: scraped by Prometheus, not exposed through the ingress
+    let metrics_app = Router::new().route("/metrics", get(move || std::future::ready(handle.render())));
+    let metrics_listener = tokio::net::TcpListener::bind("127.0.0.1:9000").await.unwrap();
+    tokio::spawn(async move { axum::serve(metrics_listener, metrics_app).await.unwrap() });
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/metrics/0.24.6/metrics/[metrics 0.24.6], https://docs.rs/metrics-exporter-prometheus/0.18.3/metrics_exporter_prometheus/[metrics-exporter-prometheus 0.18.3], https://docs.rs/tower-http/0.7.1/tower_http/metrics/index.html[tower-http: metrics] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/prometheus-metrics[axum example: prometheus-metrics]
+
+[source,bash]
+----
+$ curl -s localhost:3000/books/9781718503106   # three times, then POST /loans and GET /nope
+$ curl -s localhost:9000/metrics
+# TYPE http_server_requests_total counter
+http_server_requests_total{service="bookshelf-web",method="GET",route="/books/{isbn}",status="200"} 3
+http_server_requests_total{service="bookshelf-web",method="POST",route="/loans",status="201"} 1
+http_server_requests_total{service="bookshelf-web",method="GET",route="unmatched",status="404"} 1
+# TYPE bookshelf_loans_created_total counter
+bookshelf_loans_created_total{service="bookshelf-web"} 1
+# TYPE db_client_connections gauge
+db_client_connections{service="bookshelf-web",state="idle"} 1
+db_client_connections{service="bookshelf-web",state="used"} 0
+# TYPE http_server_active_requests gauge
+http_server_active_requests{service="bookshelf-web"} 0
+# TYPE http_server_request_duration_seconds histogram
+http_server_request_duration_seconds_bucket{service="bookshelf-web",method="GET",route="/books/{isbn}",le="0.025"} 0
+http_server_request_duration_seconds_bucket{service="bookshelf-web",method="GET",route="/books/{isbn}",le="0.05"} 3
+...
+http_server_request_duration_seconds_sum{service="bookshelf-web",method="GET",route="/books/{isbn}"} 0.12394215
+http_server_request_duration_seconds_count{service="bookshelf-web",method="GET",route="/books/{isbn}"} 3
+----
+
+* *Route templates as labels*: the middleware reads `MatchedPath`, so all books share one series. Labelling with the
+  raw path (`/books/9781718503106`) creates a series per book -- a *cardinality explosion* that slows Prometheus and
+  inflates its memory. Never put user ids, ISBNs, emails or trace ids in labels; they belong in traces and logs.
+  Requests that match no route are grouped as `unmatched`. The axum `prometheus-metrics` example adds its middleware
+  with `route_layer`, which never sees unmatched requests; `Router::layer` (used here) counts them too, and
+  `MatchedPath` is still available to it for matched ones.
+* *Histograms need buckets*: without `set_buckets` or `set_buckets_for_metric`, the exporter renders histograms as
+  *summaries* with client-side quantiles, which cannot be aggregated across instances. Choose buckets around the SLO
+  threshold (here 300 ms) so the SLI can be read straight from a bucket.
+* *Upkeep*: `install_recorder` returns a handle and leaves `run_upkeep` to the caller; call it periodically (as the
+  sampling task above does) or histogram data accumulates between scrapes. `PrometheusBuilder::install` with its own
+  HTTP listener spawns an upkeep task itself.
+* *A separate port*: `/metrics` listens on `127.0.0.1:9000` (`0.0.0.0:9000` in a container), which Prometheus scrapes
+  inside the cluster and which the ingress never exposes. Metrics reveal routes, traffic and business volumes.
+* *Gauges sampled on a timer*: the in-flight counter from tower-http's `InFlightRequestsLayer` and the sqlx pool's
+  `size()` and `num_idle()` are read every 5 s. Time spent waiting for a pool connection is the most useful saturation
+  signal for a database-backed service; record it as a histogram around `pool.acquire()` in the repository layer.
+* `with_recommended_naming(true)` appends `+_total+` to counters and unit suffixes from `+describe_*!+` units, following
+  the Prometheus naming guidelines; the example names its metrics explicitly instead.
+
+=== OpenTelemetry metrics instead
+
+With an OpenTelemetry pipeline already in place (see
+xref:backend/axum/opentelemetry-and-distributed-tracing.adoc[OpenTelemetry & Distributed Tracing]), the same
+instruments can be created from an `SdkMeterProvider` with a periodic OTLP exporter and sent through the Collector,
+which forwards them to Prometheus (remote write) or another backend. The OpenTelemetry HTTP semantic conventions name
+the latency histogram `http.server.request.duration` -- the Prometheus names on this page follow it. Choose one API per
+service: the `metrics` facade is lighter and pull-based; OpenTelemetry metrics share resource attributes and exemplars
+with traces.
+
+== Liveness and readiness
+
+* `/health` (*liveness*) answers whether the process should be restarted. It must not check the database: if the
+  database is down, restarting every web pod makes things worse.
+* `/ready` (*readiness*) answers whether this instance should receive traffic now: the pool can reach the database
+  (with a short timeout), migrations have run, and shutdown has not started. Failing readiness takes the pod out of the
+  load balancer without restarting it.
+* Keep both cheap and unauthenticated, and exclude them from request-rate dashboards and SLOs if their volume distorts
+  them. Probe configuration is covered in
+  xref:backend/kubernetes/health-probes-and-lifecycle.adoc[Health Probes and Lifecycle].
+
+== SLIs, SLOs and error budgets
+
+An *SLI* is a measured ratio of good events to all events; an *SLO* is the target for it over a window; the *error
+budget* is what the target leaves over. For *Bookshelf*:
+
+[cols="1,2,1,1",options="header"]
+|===
+| SLO | SLI (good / valid events) | Target (30 days) | Error budget
+
+| Availability
+| requests that did not return `5xx` / all requests (excluding `/health`, `/ready`)
+| 99.9 %
+| 43 min of total failure, or 0.1 % of requests
+
+| Latency
+| requests served in 300 ms or less / all successful requests
+| 99 %
+| 1 % of requests may be slower
+|===
+
+[source,yaml]
+----
+groups:
+  - name: bookshelf-slo
+    rules:
+      - record: slo:http_errors:ratio_rate5m
+        expr: |
+          sum(rate(http_server_requests_total{service="bookshelf-web",status=~"5..",route!~"/health|/ready"}[5m]))
+          / sum(rate(http_server_requests_total{service="bookshelf-web",route!~"/health|/ready"}[5m]))
+      - record: slo:http_errors:ratio_rate1h
+        expr: |
+          sum(rate(http_server_requests_total{service="bookshelf-web",status=~"5..",route!~"/health|/ready"}[1h]))
+          / sum(rate(http_server_requests_total{service="bookshelf-web",route!~"/health|/ready"}[1h]))
+      - record: slo:http_latency:good_ratio_rate5m
+        expr: |
+          sum(rate(http_server_request_duration_seconds_bucket{service="bookshelf-web",le="0.3"}[5m]))
+          / sum(rate(http_server_request_duration_seconds_count{service="bookshelf-web"}[5m]))
+      # page: at 14.4x the allowed error rate the 30-day budget is gone in about 2 days
+      - alert: BookshelfErrorBudgetFastBurn
+        expr: slo:http_errors:ratio_rate1h > (14.4 * 0.001) and slo:http_errors:ratio_rate5m > (14.4 * 0.001)
+        labels:
+          severity: page
+        annotations:
+          summary: bookshelf-web is burning its availability error budget 14x too fast
+----
+
+Source: https://sre.google/workbook/alerting-on-slos/[Google SRE Workbook: Alerting on SLOs] and https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/[Prometheus: recording rules]
+
+* *Burn rate* is the error rate divided by the budget rate (0.1 %). A burn rate of 1 uses the budget exactly over 30
+  days; 14.4 uses 2 % of it in one hour.
+* *Multi-window*: the long window (1 h) makes the alert significant, the short window (5 m) makes it stop soon after
+  the problem is fixed. Add a slower pair (6 h and 30 min at 6x) for pages and (3 days and 6 h at 1x) for tickets, as the
+  SRE Workbook describes.
+* Alert on the SLO burn, not on every symptom: CPU at 90 % that does not hurt users is a dashboard panel, not a page.
+  Gangappa & Rangaraj (*Mastering Distributed Observability in Rust*, chapter 8) build SLOs and burn-rate alerts for
+  their axum services in the same way.
+* Count only *valid* events: exclude probes, and decide whether client errors (`4xx`) count against the service (they
+  usually do not, except `429` from the service's own rate limiter).
+* Recording, alerting rules and Alertmanager routing are covered in
+  xref:database/prometheus/recording-and-alerting-rules.adoc[Recording and Alerting Rules] and
+  xref:database/prometheus/alertmanager.adoc[Alertmanager]; instrumenting applications in general in
+  xref:database/prometheus/instrumenting-applications.adoc[Instrumenting Applications].
+
+== Where the books are outdated
+
+Gangappa & Rangaraj (chapters 6-8) record metrics through OpenTelemetry 0.31 and use tower-http 0.6; current
+versions are opentelemetry 0.33 and tower-http 0.7, whose `InFlightRequestsLayer` is unchanged. Material using
+metrics-exporter-prometheus before 0.18 calls `set_enable_unit_suffix`, deprecated in 0.18 in favour of
+`with_recommended_naming`.
+
+== References
+
+* https://docs.rs/metrics/0.24.6/metrics/[metrics 0.24.6] and https://docs.rs/metrics-exporter-prometheus/0.18.3/metrics_exporter_prometheus/[metrics-exporter-prometheus 0.18.3]
+* https://docs.rs/tower-http/0.7.1/tower_http/metrics/index.html[tower-http: metrics]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/prometheus-metrics[axum example: prometheus-metrics]
+* https://prometheus.io/docs/practices/naming/[Prometheus: Metric and label naming], https://prometheus.io/docs/practices/histograms/[Histograms and summaries] and https://prometheus.io/docs/practices/instrumentation/[Instrumentation]
+* https://opentelemetry.io/docs/specs/semconv/http/http-metrics/[OpenTelemetry semantic conventions: HTTP metrics]
+* https://sre.google/sre-book/service-level-objectives/[Google SRE Book: Service Level Objectives] and https://sre.google/workbook/alerting-on-slos/[SRE Workbook: Alerting on SLOs]
+* https://www.packtpub.com/product/mastering-distributed-observability-in-rust/9781806671793[Manjunath Gangappa and Rajkumar Rangaraj, Mastering Distributed Observability in Rust (Packt, 2026)]
