@@ -1,0 +1,238 @@
+= WebSockets
+:description: Real-time communication with WebSockets in axum 0.8 -- the WebSocketUpgrade extractor and on_upgrade, Message with Utf8Bytes and Bytes (0.8), splitting the socket into sink and stream with separate reader and writer tasks, ping/pong and idle timeouts, broadcast fan-out with tokio::sync::broadcast and lagging slow consumers, Redis pub/sub across instances, subprotocol negotiation (0.8.9), WebSockets over HTTP/2 with any(), authenticating browser clients with cookies and Origin checks, and testing.
+:keywords: axum, WebSocket, WebSockets, WebSocketUpgrade, on_upgrade, Message, Utf8Bytes, Bytes, split, SinkExt, StreamExt, reader task, writer task, ping, pong, idle timeout, broadcast, tokio::sync::broadcast, Lagged, slow consumer, backpressure, Redis pub/sub, subprotocol, Sec-WebSocket-Protocol, requested_protocols, set_selected_protocol, HTTP/2, RFC 8441, any, Origin, authentication, ticket, testing websockets, chat
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against axum 0.8.9 (feature `ws`, built on tokio-tungstenite 0.26) on Rust 1.99 (edition 2024)
+with tokio 1.53, checked on 2026-10-06. *Bookshelf* pushes newly posted reviews to every open catalogue page through a
+WebSocket. For one-way server-to-client updates, Server-Sent Events are often simpler; the comparison is on
+xref:backend/axum/server-sent-events-and-streaming.adoc[Server-Sent Events & Streaming].
+
+== The upgrade handshake and the connection lifecycle
+
+A WebSocket starts as an HTTP `GET` with `Upgrade: websocket`. The `WebSocketUpgrade` extractor validates the handshake
+headers; the handler returns `ws.on_upgrade(callback)`, which sends `101 Switching Protocols` and later runs the
+callback with the upgraded `WebSocket` on its own task. Everything after that is frames, not HTTP:
+
+[mermaid]
+....
+sequenceDiagram
+    participant B as Browser
+    participant H as ws handler
+    participant W as writer task
+    participant R as reader task
+    participant X as broadcast channel
+    B->>H: GET /ws (Upgrade: websocket, Origin, Cookie)
+    H->>H: check Origin + session, pick subprotocol
+    H-->>B: 101 Switching Protocols
+    H->>W: spawn: subscribe(), forward + ping every 30 s
+    H->>R: spawn: read frames, enforce idle timeout
+    X-->>W: "new review" (from POST /api/v1/reviews)
+    W-->>B: Text frame
+    B->>R: Pong / Text
+    Note over R: no frame for 60 s -> stop
+    R-->>H: finished: abort writer, connection closed
+....
+
+== The *Bookshelf* review feed
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    Router,
+    extract::{
+        State,
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    },
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+    routing::{any, post},
+};
+use futures::{SinkExt, StreamExt};
+use tokio::sync::broadcast;
+
+const PING_EVERY: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const ALLOWED_ORIGINS: [&str; 2] = ["https://bookshelf.example", "http://localhost:3000"];
+
+#[derive(Clone)]
+struct AppState {
+    // one Sender, cloned into state: broadcast::Sender is already cheap to clone and thread-safe
+    reviews: broadcast::Sender<String>,
+}
+
+async fn ws_handler(State(state): State<AppState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    // Browsers send Origin on the upgrade; reject cross-site pages (CORS does not apply to WebSockets).
+    let origin = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok());
+    if origin.is_some_and(|o| !ALLOWED_ORIGINS.contains(&o)) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    // (authenticate here with the session cookie or a one-time ticket; see below)
+    ws.protocols(["bookshelf.reviews.v1"]) // subprotocol negotiation
+        .max_message_size(64 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut sink, mut stream) = socket.split();
+    let mut feed = state.reviews.subscribe();
+
+    // writer: broadcast messages and periodic pings -> client
+    let mut writer = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(PING_EVERY);
+        loop {
+            tokio::select! {
+                msg = feed.recv() => match msg {
+                    Ok(review) => {
+                        if sink.send(Message::Text(Utf8Bytes::from(review))).await.is_err() {
+                            break; // client gone
+                        }
+                    }
+                    // a slow client missed messages: tell it, keep going (or close it)
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        let notice = format!("{{\"type\":\"lagged\",\"missed\":{n}}}");
+                        if sink.send(Message::Text(notice.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(axum::body::Bytes::from_static(b"keepalive"))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // reader: client -> server, with an idle timeout (pongs count as activity)
+    let mut reader = tokio::spawn(async move {
+        loop {
+            match tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => tracing::debug!(%text, "client message"),
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
+                Ok(Some(Ok(_))) => {} // Ping (answered automatically), Pong, Binary
+                Err(_) => break,      // idle for too long
+            }
+        }
+    });
+
+    // when either side finishes, stop the other
+    tokio::select! {
+        _ = &mut writer => reader.abort(),
+        _ = &mut reader => writer.abort(),
+    }
+}
+
+async fn post_review(State(state): State<AppState>, body: String) -> StatusCode {
+    let _ = state.reviews.send(body); // Err only if nobody is subscribed
+    StatusCode::ACCEPTED
+}
+
+#[tokio::main]
+async fn main() {
+    let (reviews, _) = broadcast::channel(256);
+    let app = Router::new()
+        .route("/ws", any(ws_handler)) // any(): HTTP/1.1 GET upgrades and HTTP/2 CONNECT (RFC 8441)
+        .route("/api/v1/reviews", post(post_review))
+        .with_state(AppState { reviews });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/extract/ws/index.html[axum: extract::ws], https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/websockets[axum example: websockets] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/chat[chat]
+
+[source,bash]
+----
+$ python3 -c '
+import asyncio, websockets
+async def main():
+    async with websockets.connect("ws://localhost:3000/ws", subprotocols=["bookshelf.reviews.v1"]) as ws:
+        print("subprotocol:", ws.subprotocol)
+        print("received:", await ws.recv())
+asyncio.run(main())' &
+$ curl -s -d 'Dune: 5 stars' localhost:3000/api/v1/reviews
+subprotocol: bookshelf.reviews.v1
+received: Dune: 5 stars
+----
+
+== Messages
+
+`Message` has five variants: `Text(Utf8Bytes)`, `Binary(Bytes)`, `Ping(Bytes)`, `Pong(Bytes)` and `Close(Option<CloseFrame>)`.
+In axum 0.8, `Text` holds a `Utf8Bytes` and `Binary` a `Bytes` instead of `String` and `Vec<u8>`: messages can be cloned
+and sent to many clients without copying. Convert with `.into()` from `String`/`+&'static str+`, and read with
+`text.as_str()`. Ping frames from the client are answered with pongs automatically; you only send pings yourself, as
+the writer does, to detect dead connections behind proxies that drop idle TCP connections silently. Axum 0.8 also
+removed `WebSocket::close`: send a `Message::Close` frame to close cleanly.
+
+== Splitting into reader and writer
+
+A `WebSocket` is both a `Stream` of incoming messages and a `Sink` of outgoing ones. `split()` (from
+`futures::StreamExt`) separates the two halves, so one task can read while another writes -- the standard structure
+for anything more than echo. `tokio::select!` on the two ``JoinHandle``s ends the connection as soon as either side
+stops, and `abort()` cancels the other; otherwise a closed client would leave a writer task subscribed forever.
+
+== Fan-out: broadcast, slow consumers and several instances
+
+`tokio::sync::broadcast` delivers every message to every subscriber, with a bounded buffer per channel. A subscriber
+that falls more than the capacity behind gets `RecvError::Lagged(n)` and continues from the oldest retained message;
+the writer above notifies the client, which can reload the list. Dropping slow clients instead (`break`) is equally
+valid. This bounded behaviour is the backpressure strategy: one slow phone on a bad network can never make the server
+buffer unboundedly or slow down everyone else.
+
+The `Sender` is placed in state directly; it is `Clone`, `Send` and `Sync`, so it needs no `+Arc<Mutex<...>>+`. With
+several replicas behind a load balancer, each process has its own channel; bridge them with Redis pub/sub as shown on
+xref:backend/axum/redis-and-caching.adoc[Redis & Caching].
+
+== Subprotocols (0.8.9)
+
+Clients can propose application protocols in `Sec-WebSocket-Protocol`. `+ws.protocols([...])+` selects the first
+server-supported protocol the client offered and echoes it in the response; if none matches, the upgrade still succeeds
+without one. Since 0.8.9, `ws.requested_protocols()` and `+ws.set_selected_protocol(...)+` allow custom selection logic
+(for example by version number).
+
+== WebSockets over HTTP/2
+
+axum 0.8 supports RFC 8441 WebSockets over HTTP/2, where the upgrade is an extended `CONNECT` request rather than a
+`GET`. Route the endpoint with `any(handler)` instead of `get(handler)` and enable the `http2` feature; HTTP/1.1
+clients keep working. The official `websockets-http2` example shows a browser connecting through TLS with ALPN `h2`.
+
+== Authenticating browser clients
+
+The browser `WebSocket` API cannot set an `Authorization` header. Use one of:
+
+* the *session cookie*, which the browser sends with the upgrade request: extract the session (or `CurrentUser`) in
+  `ws_handler` exactly as in an HTTP handler, and *check `Origin`* as above -- otherwise any website could open a
+  socket with the user's cookies ("cross-site WebSocket hijacking");
+* a short-lived *ticket*: an authenticated `POST /api/v1/ws-ticket` returns a random single-use token, the client
+  connects to `+/ws?ticket=...+`, and the handler validates and deletes it before upgrading.
+
+Authentication happens *before* `on_upgrade`, while you can still answer with an HTTP status. Long-lived tokens in the
+URL leak into logs; tickets expire within seconds.
+
+== Testing
+
+The official `testing-websockets` example tests a WebSocket handler in two ways: against a real server bound to port 0
+with `tokio-tungstenite` as the client, and in process by writing the socket logic against generic `Sink`/`Stream`
+traits so it can be fed by channels. The xref:backend/axum/testing.adoc[Testing] page shows both.
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*, chapter 5) wraps the `broadcast::Sender` in `+Arc<Mutex<...>>+`, which is unnecessary (the
+sender is already shareable) and adds lock contention; it also authenticates the socket with an `Authorization` header,
+which browsers cannot send. Code written for axum 0.7 must change `Message::Text(String)` to `Utf8Bytes` and
+`Message::Binary(Vec<u8>)` to `Bytes`, and replace `WebSocket::close()` with sending a close frame.
+
+== References
+
+* https://docs.rs/axum/0.8.9/axum/extract/ws/index.html[axum: extract::ws] and https://docs.rs/axum/0.8.9/axum/extract/ws/struct.WebSocketUpgrade.html[WebSocketUpgrade]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/websockets[axum example: websockets], https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/chat[chat], https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/websockets-http2[websockets-http2] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/testing-websockets[testing-websockets]
+* https://docs.rs/tokio/1.53.2/tokio/sync/broadcast/index.html[tokio::sync::broadcast]
+* https://www.rfc-editor.org/rfc/rfc6455.html[RFC 6455: The WebSocket Protocol] and https://www.rfc-editor.org/rfc/rfc8441.html[RFC 8441: Bootstrapping WebSockets with HTTP/2]
+* https://cheatsheetseries.owasp.org/cheatsheets/WebSocket_Security_Cheat_Sheet.html[OWASP WebSocket Security Cheat Sheet]
+* https://link.springer.com/book/10.1007/979-8-8688-2631-3[Indo Yoon, Beginning Axum (Apress, 2026)]
