@@ -159,30 +159,30 @@ Parallelizable: no — the landing page, cheat sheet and nav list every page, so
 
 Parallelizable: yes — distinct files
 
-- [ ] Task 61. `backend/axum/introduction-and-architecture.adoc` ★ — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 62. `backend/axum/tower-service-model.adoc` ★ — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 63. `backend/axum/getting-started.adoc` ★ — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 64. `backend/axum/project-structure.adoc` — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 65. `backend/axum/routing.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 66. `backend/axum/routing-composition.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 67. `backend/axum/handlers.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 68. `backend/axum/extractors.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 69. `backend/axum/custom-extractors.adoc` — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 70. `backend/axum/axum-extra.adoc` — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 71. `backend/axum/responses.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 72. `backend/axum/error-handling.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 73. `backend/axum/state-and-dependency-injection.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 74. `backend/axum/writing-middleware.adoc` ★ — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 75. `backend/axum/applying-middleware-and-ordering.adoc` ★ — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 76. `backend/axum/tower-http-catalog.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 77. `backend/axum/request-limits-and-timeouts.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 78. `backend/axum/cors-and-compression.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 79. `backend/axum/rate-limiting-and-load-shedding.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 80. `backend/axum/json-rest-apis.adoc` ★ — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 81. `backend/axum/validation.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 82. `backend/axum/openapi-with-utoipa.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 83. `backend/axum/forms-and-content-negotiation.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 84. `backend/axum/graphql-and-grpc.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2)
+- [x] Task 61. `backend/axum/introduction-and-architecture.adoc` ★ — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 62. `backend/axum/tower-service-model.adoc` ★ — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 63. `backend/axum/getting-started.adoc` ★ — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 64. `backend/axum/project-structure.adoc` — write per Part 2 outline, "Foundations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 65. `backend/axum/routing.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 66. `backend/axum/routing-composition.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 67. `backend/axum/handlers.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 68. `backend/axum/extractors.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 69. `backend/axum/custom-extractors.adoc` — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 70. `backend/axum/axum-extra.adoc` — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 71. `backend/axum/responses.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 72. `backend/axum/error-handling.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 73. `backend/axum/state-and-dependency-injection.adoc` ★ — write per Part 2 outline, "Routing, handlers, extractors and responses"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 74. `backend/axum/writing-middleware.adoc` ★ — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 75. `backend/axum/applying-middleware-and-ordering.adoc` ★ — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 76. `backend/axum/tower-http-catalog.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 77. `backend/axum/request-limits-and-timeouts.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 78. `backend/axum/cors-and-compression.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 79. `backend/axum/rate-limiting-and-load-shedding.adoc` — write per Part 2 outline, "Middleware and HTTP concerns"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 80. `backend/axum/json-rest-apis.adoc` ★ — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 81. `backend/axum/validation.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 82. `backend/axum/openapi-with-utoipa.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 83. `backend/axum/forms-and-content-negotiation.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
+- [x] Task 84. `backend/axum/graphql-and-grpc.adoc` — write per Part 2 outline, "Building APIs"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run in scratch workspace
 
 ### Group 8 — Axum: data, security, web UI and real-time (slice 5)
 
