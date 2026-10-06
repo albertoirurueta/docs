@@ -83,6 +83,20 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   Optionally also check that every `image::` target exists in `modules/ROOT/images/`, and that every image is
   referenced.
 
+## Mermaid diagrams
+
+- `@sntke/antora-mermaid-extension` copies a `[mermaid]` block into the page as **raw HTML**, and Mermaid then reads
+  the element's `innerHTML` and decodes its entities. So **anything that looks like an HTML tag is parsed by the
+  browser, not passed to Mermaid**. Class-diagram stereotypes are the usual case: `<<interface>>` becomes an
+  `<interface>` element. Its closing `</interface>` is appended after the diagram's last line, and if that line is a
+  relationship (`A <|-- B`) the diagram renders as Mermaid's error graphic. The Antora build still reports nothing.
+- **Write stereotypes/annotations (`<<interface>>`, `<<enumeration>>`, `<<data class>>`, …) as entities:
+  `&lt;&lt;interface&gt;&gt;`.** Mermaid decodes them and renders `<<interface>>`. Do the same for any other `<`
+  directly followed by a letter, `/`, `!` or `?` inside a diagram. Arrows such as `<|--`, `<<->>` and `-->` are safe.
+- Verify with `npm run validate:mermaid`, after a one-off `npm i --no-save mermaid@11 jsdom`. It must report every
+  diagram as parsed. The script validates the text after the browser's HTML parsing, so it catches this problem; a
+  plain `mermaid.parse` of the source does not.
+
 ## `.claude/skills/`
 
 This repo carries a shared catalog of Claude Code skills used across this GitHub account's repositories
