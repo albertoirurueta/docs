@@ -83,6 +83,26 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   Optionally also check that every `image::` target exists in `modules/ROOT/images/`, and that every image is
   referenced.
 
+## Inline code
+
+- Plain backtick code (`` `x` ``) still gets Asciidoctor's normal substitutions, and the Antora build reports none of
+  them: `->`, `=>`, `<=` and `<-` become arrows, `...` an ellipsis, `'` between letters a curly apostrophe, and
+  `__name__`, `#[...]`, `*`, `~` and `^` pair with a later one in the same paragraph or table cell into italics,
+  highlight, bold, subscript or superscript. A `{name}` that matches a defined attribute is replaced.
+- **Write inline code that contains `->`, `=>`, `<=`, `<-`, `__`, `#[`, `~`, `*`, `^`, `...`, `'` or `{` as a
+  constrained passthrough, `` `+$book->author+` ``.** The content is shown exactly as written (with `<`, `>` and `&`
+  escaped). Inside `+...+` a `{plus}` is shown literally and a `+` can end the passthrough, so **code that contains a
+  `+` uses `` `pass:c[$a + $b]` ``** instead, with any `]` in it written as `\]`. Names with `__` outside backticks,
+  in headings or link text, need the same `+__construct()+` passthrough.
+- Verification for doc changes, after a build (quote the `--include` pattern, as above). It must print nothing for
+  the sections you changed; other sections still have pre-existing matches, so pass their `build/site/<section>`
+  directories rather than the whole of `build/site`:
+  ```bash
+  grep -rnE '<code>[^<]*(<(em|strong|mark|sub|sup)>|&#8594;|&#8658;|&#8656;|&#8592;|&#8230;|&#8217;|&#8203;|\{plus\})' \
+    build/site/<section> --include='*.html'                                 # substitutions inside inline code
+  ```
+  It checks inline `<code>` only; a pair of `__` in a heading or link text shows as stray italics in the page.
+
 ## Mermaid diagrams
 
 - `@sntke/antora-mermaid-extension` copies a `[mermaid]` block into the page as **raw HTML**, and Mermaid then reads
