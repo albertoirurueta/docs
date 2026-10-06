@@ -188,24 +188,24 @@ Parallelizable: yes — distinct files
 
 Parallelizable: yes — distinct files
 
-- [ ] Task 85. `backend/axum/databases-with-sqlx.adoc` ★ — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 86. `backend/axum/migrations-and-transactions.adoc` ★ — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 87. `backend/axum/seaorm-and-diesel.adoc` — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 88. `backend/axum/redis-and-caching.adoc` — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 89. `backend/axum/sessions-and-cookies.adoc` ★ — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 90. `backend/axum/password-authentication.adoc` ★ — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 91. `backend/axum/jwt-and-bearer-tokens.adoc` ★ — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 92. `backend/axum/oauth2-and-openid-connect.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 93. `backend/axum/authorization.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 94. `backend/axum/csrf-and-security-hardening.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 95. `backend/axum/tls-and-https.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 96. `backend/axum/server-side-templates.adoc` ★ — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 97. `backend/axum/htmx.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 98. `backend/axum/static-files-and-spas.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 99. `backend/axum/websockets.adoc` ★ — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 100. `backend/axum/server-sent-events-and-streaming.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 101. `backend/axum/file-uploads.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 102. `backend/axum/fullstack-leptos-and-dioxus.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2)
+- [x] Task 85. `backend/axum/databases-with-sqlx.adoc` ★ — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 86. `backend/axum/migrations-and-transactions.adoc` ★ — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 87. `backend/axum/seaorm-and-diesel.adoc` — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 88. `backend/axum/redis-and-caching.adoc` — write per Part 2 outline, "Data"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 89. `backend/axum/sessions-and-cookies.adoc` ★ — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 90. `backend/axum/password-authentication.adoc` ★ — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 91. `backend/axum/jwt-and-bearer-tokens.adoc` ★ — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 92. `backend/axum/oauth2-and-openid-connect.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 93. `backend/axum/authorization.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 94. `backend/axum/csrf-and-security-hardening.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 95. `backend/axum/tls-and-https.adoc` — write per Part 2 outline, "Security"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 96. `backend/axum/server-side-templates.adoc` ★ — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 97. `backend/axum/htmx.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 98. `backend/axum/static-files-and-spas.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 99. `backend/axum/websockets.adoc` ★ — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 100. `backend/axum/server-sent-events-and-streaming.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 101. `backend/axum/file-uploads.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
+- [x] Task 102. `backend/axum/fullstack-leptos-and-dioxus.adoc` — write per Part 2 outline, "Web UI and real-time"; examples compiled in the scratch workspace (Task 2) — done: examples compiled (clippy -D warnings) and run against Postgres/Redis where relevant
 
 ### Group 9 — Axum: operations (slice 6, part 1)
 
