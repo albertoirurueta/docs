@@ -1,0 +1,283 @@
+= HTTP Clients & Proxies
+:description: Calling other services from axum 0.8 -- one shared reqwest client in state with connect and request timeouts, retries with exponential backoff and trace-context propagation through reqwest-middleware, reqwest-retry and reqwest-tracing, a backend-for-frontend that fans out concurrent upstream calls, a caching proxy with moka, and a reverse proxy built on the hyper-util client.
+:keywords: axum, HTTP client, reqwest, reqwest 0.13, shared client, connection pool, timeout, connect_timeout, reqwest-middleware, reqwest-retry, exponential backoff, transient errors, reqwest-tracing, trace context propagation, traceparent, BFF, backend for frontend, API gateway, tokio::join, fan-out, caching proxy, moka, reverse proxy, hyper-util, legacy Client, circuit breaker, SSRF
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against reqwest 0.13.5, reqwest-middleware 0.5.2, reqwest-retry 0.9.1, reqwest-tracing 0.7.1 and
+hyper-util 0.1.21 with axum 0.8.9 on Rust 1.99 (edition 2024), checked on 2026-10-06. *Bookshelf* calls an external
+cover-image service and, in its microservice variant, a separate reviews service. Outgoing calls are where latency and
+failures enter a service, so they need the same care as incoming ones. Circuit breakers, bulkheads and retry theory are
+covered in this site's xref:backend/resilience/index.adoc[Resilience] section.
+
+== One shared client, with timeouts, retries and tracing
+
+A `reqwest::Client` owns a connection pool, so create it *once* at start-up and share it through state -- a client per
+request throws away keep-alive connections and TLS sessions. Wrap it with `reqwest-middleware` to add cross-cutting
+behaviour:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+use reqwest_tracing::TracingMiddleware;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+struct AppState {
+    http: ClientWithMiddleware,
+    upstream: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Book {
+    isbn: String,
+    title: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Review {
+    rating: u8,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct BookPage {
+    book: Book,
+    reviews: Vec<Review>,
+}
+
+/// Backend-for-frontend: one call from the browser, two concurrent calls upstream.
+async fn book_page(State(state): State<AppState>, Path(isbn): Path<String>) -> Result<Json<BookPage>, StatusCode> {
+    let book_url = format!("{}/books/{isbn}", state.upstream);
+    let reviews_url = format!("{}/books/{isbn}/reviews", state.upstream);
+    let (book, reviews) = tokio::join!(state.http.get(book_url).send(), state.http.get(reviews_url).send());
+
+    let book: Book = match book {
+        Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Err(StatusCode::NOT_FOUND),
+        Ok(resp) => resp.error_for_status().map_err(|_| StatusCode::BAD_GATEWAY)?.json().await.map_err(|_| StatusCode::BAD_GATEWAY)?,
+        Err(err) => {
+            tracing::warn!(%err, "catalogue service failed");
+            return Err(StatusCode::BAD_GATEWAY);
+        }
+    };
+    // reviews are optional: degrade gracefully instead of failing the page
+    let reviews = match reviews {
+        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Ok(Json(BookPage { book, reviews }))
+}
+
+fn http_client() -> ClientWithMiddleware {
+    let inner = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5)) // per attempt, whole request
+        .pool_idle_timeout(Duration::from_secs(90))
+        .user_agent("bookshelf/1.0")
+        .build()
+        .expect("valid client configuration");
+    let retry = ExponentialBackoff::builder()
+        .retry_bounds(Duration::from_millis(100), Duration::from_secs(2))
+        .build_with_max_retries(3);
+    ClientBuilder::new(inner)
+        .with(TracingMiddleware::default()) // a client span per request + W3C traceparent header
+        .with(RetryTransientMiddleware::new_with_policy(retry)) // retries timeouts, 5xx, 429 -- not 4xx
+        .build()
+}
+
+// --- a stand-in upstream service, so the example runs on its own ---
+async fn upstream() {
+    let app = Router::new()
+        .route("/books/{isbn}", get(|Path(isbn): Path<String>| async move { Json(Book { isbn, title: "Dune".into() }) }))
+        .route("/books/{isbn}/reviews", get(|| async { Json(vec![Review { rating: 5, text: "A classic.".into() }]) }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+#[tokio::main]
+async fn main() {
+    tokio::spawn(upstream());
+    let state = AppState { http: http_client(), upstream: "http://127.0.0.1:3001".into() };
+    let app = Router::new().route("/bff/books/{isbn}", get(book_page)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/reqwest/0.13.5/reqwest/struct.ClientBuilder.html[reqwest: ClientBuilder], https://docs.rs/reqwest-middleware/0.5.2/reqwest_middleware/[reqwest-middleware], https://docs.rs/reqwest-retry/0.9.1/reqwest_retry/[reqwest-retry] and https://docs.rs/reqwest-tracing/0.7.1/reqwest_tracing/[reqwest-tracing]
+
+[source,bash]
+----
+$ curl -s localhost:3000/bff/books/9780441013593
+{"book":{"isbn":"9780441013593","title":"Dune"},"reviews":[{"rating":5,"text":"A classic."}]}
+----
+
+* *Timeouts on everything*: `connect_timeout` bounds TCP and TLS setup, `timeout` the whole request. Without them a hung
+  upstream holds the handler -- and its pool connections, locks and memory -- forever. Keep the total (attempts times
+  timeout plus backoff) below the incoming request's own timeout.
+* *Retries only for transient failures and idempotent requests*: `RetryTransientMiddleware` retries connection errors,
+  timeouts, `5xx`, `408` and `429`, with exponential backoff and jitter. Retrying a `POST` that may already have taken
+  effect needs an idempotency key agreed with the upstream.
+* *Trace propagation*: `TracingMiddleware` creates a client span with the semantic-convention attributes and injects
+  the W3C `traceparent` header, so the upstream's spans join the same trace (see
+  xref:backend/axum/opentelemetry-and-distributed-tracing.adoc[OpenTelemetry & Distributed Tracing]). Gangappa &
+  Rangaraj (*Mastering Distributed Observability in Rust*, chapter 4) build the same client stack.
+* *Concurrency*: `tokio::join!` sends both upstream calls at once, so the page costs the slower of the two, not the sum.
+  `futures::future::join_all` does the same for a list.
+* *Degradation*: the reviews call is optional; the page still renders without it. Decide per dependency whether a
+  failure is fatal, degrades the response, or is served from a cache.
+
+The backend-for-frontend (BFF) pattern -- one tailored endpoint per client screen, aggregating several services -- is
+discussed with its API-gateway relatives on this site's xref:backend/architecture/index.adoc[Architecture] pages;
+Gangappa & Rangaraj (chapter 3) build it in Rust.
+
+== A caching proxy
+
+When an upstream is slow or rate-limited and its data changes rarely -- cover metadata from a public book API, for
+example -- cache its responses. Yoon (*Beginning Axum*, chapter 2) builds such a proxy; with moka, concurrent requests
+for the same key share one upstream call:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::get,
+};
+use moka::future::Cache;
+
+#[derive(Clone)]
+struct AppState {
+    http: reqwest::Client,
+    cache: Cache<String, String>,
+}
+
+async fn cover_info(State(state): State<AppState>, Path(isbn): Path<String>) -> Result<String, StatusCode> {
+    if !isbn.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(StatusCode::BAD_REQUEST); // never forward unvalidated input into an upstream URL
+    }
+    let url = format!("http://127.0.0.1:3001/covers/{isbn}");
+    state
+        .cache
+        .try_get_with(isbn, async move { state.http.get(url).send().await?.error_for_status()?.text().await })
+        .await
+        .map_err(|err| {
+            tracing::warn!(%err, "cover service failed");
+            StatusCode::BAD_GATEWAY
+        })
+}
+
+#[tokio::main]
+async fn main() {
+    tokio::spawn(async {
+        let upstream = Router::new().route(
+            "/covers/{isbn}",
+            get(|Path(isbn): Path<String>| async move {
+                tokio::time::sleep(Duration::from_millis(300)).await; // a slow third-party API
+                format!("cover for {isbn}: 600x900 jpeg\n")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await.unwrap();
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let state = AppState {
+        http: reqwest::Client::builder().timeout(Duration::from_secs(3)).build().unwrap(),
+        cache: Cache::builder().max_capacity(10_000).time_to_live(Duration::from_secs(3600)).build(),
+    };
+    let app = Router::new().route("/covers/{isbn}", get(cover_info)).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/moka/0.12.16/moka/future/struct.Cache.html#method.try_get_with[moka: Cache::try_get_with]
+
+`try_get_with` caches only successes; errors are returned to every waiting caller and the next request tries again.
+Validating the ISBN before building the URL prevents *server-side request forgery*: user input must never choose the
+host, scheme or path of an outgoing request.
+
+== A reverse proxy with hyper-util
+
+Migrating a legacy service route by route (the strangler-fig pattern, see
+xref:programming-languages/rust/incremental-adoption-and-refactoring.adoc[Incremental Adoption & Refactoring]) needs a
+proxy that forwards some paths unchanged. The official `reverse-proxy` example uses hyper-util's client, which streams
+bodies in both directions without buffering:
+
+[source,rust]
+----
+use axum::{
+    Router,
+    body::Body,
+    extract::{Request, State},
+    http::{StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use hyper_util::{client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor};
+
+type ProxyClient = Client<HttpConnector, Body>;
+
+async fn forward(State(client): State<ProxyClient>, mut req: Request) -> Result<Response, StatusCode> {
+    let path_query = req.uri().path_and_query().map_or("/", |pq| pq.as_str());
+    let target = format!("http://127.0.0.1:3001{path_query}");
+    *req.uri_mut() = Uri::try_from(target).map_err(|_| StatusCode::BAD_REQUEST)?;
+    // hop-by-hop headers (Connection, Keep-Alive, ...) should be removed here in production
+    Ok(client.request(req).await.map_err(|_| StatusCode::BAD_GATEWAY)?.into_response())
+}
+
+#[tokio::main]
+async fn main() {
+    tokio::spawn(async {
+        let legacy = Router::new().route("/legacy/books", get(|| async { "books from the legacy service\n" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:3001").await.unwrap();
+        axum::serve(listener, legacy).await.unwrap();
+    });
+
+    let client: ProxyClient = Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+    let app = Router::new()
+        .route("/api/v2/books", get(|| async { "books from the new Rust service\n" })) // migrated
+        .fallback(forward) // everything else still goes to the legacy service
+        .with_state(client);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/reverse-proxy[axum example: reverse-proxy] and https://docs.rs/hyper-util/0.1.21/hyper_util/client/legacy/struct.Client.html[hyper-util: legacy::Client]
+
+[source,bash]
+----
+$ curl -s localhost:3000/api/v2/books
+books from the new Rust service
+$ curl -s localhost:3000/legacy/books
+books from the legacy service
+----
+
+A production proxy also sets `X-Forwarded-For`/`Forwarded`, strips hop-by-hop headers, applies timeouts, and adds TLS
+to the upstream (`hyper-rustls` connector). The official `http-proxy` example goes further and implements an HTTP
+`CONNECT` forward proxy with upgrades. For anything beyond a migration aid, a dedicated proxy (Envoy, nginx, Traefik)
+is usually the better tool.
+
+== References
+
+* https://docs.rs/reqwest/0.13.5/reqwest/[reqwest 0.13.5]
+* https://docs.rs/reqwest-middleware/0.5.2/reqwest_middleware/[reqwest-middleware], https://docs.rs/reqwest-retry/0.9.1/reqwest_retry/[reqwest-retry] and https://docs.rs/reqwest-tracing/0.7.1/reqwest_tracing/[reqwest-tracing]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/reverse-proxy[axum example: reverse-proxy] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/http-proxy[http-proxy]
+* https://docs.rs/hyper-util/0.1.21/hyper_util/[hyper-util 0.1.21]
+* https://www.w3.org/TR/trace-context/[W3C Trace Context]
+* https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html[OWASP SSRF Prevention Cheat Sheet]
+* https://link.springer.com/book/10.1007/979-8-8688-2631-3[Indo Yoon, Beginning Axum (Apress, 2026)]
+* https://www.packtpub.com/product/mastering-distributed-observability-in-rust/9781806671793[Manjunath Gangappa and Rajkumar Rangaraj, Mastering Distributed Observability in Rust (Packt, 2026)]
