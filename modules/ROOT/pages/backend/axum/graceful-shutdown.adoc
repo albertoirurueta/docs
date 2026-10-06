@@ -1,0 +1,182 @@
+= Graceful Shutdown
+:description: Stopping an axum 0.8 service without dropping requests -- axum::serve's with_graceful_shutdown and a signal future that handles SIGTERM and Ctrl+C, the shutdown order (stop accepting, drain in-flight requests bounded by TimeoutLayer, stop background workers with CancellationToken and TaskTracker, close database pools, flush telemetry), a hard deadline, Kubernetes terminationGracePeriodSeconds, preStop and readiness, and the upcoming axum 0.9 change to serve's output type.
+:keywords: axum, graceful shutdown, with_graceful_shutdown, SIGTERM, SIGINT, Ctrl+C, tokio::signal, CancellationToken, TaskTracker, draining connections, in-flight requests, TimeoutLayer, PgPool::close, flush telemetry, OpenTelemetry shutdown, Kubernetes, terminationGracePeriodSeconds, preStop, readiness probe, rolling update, axum 0.9
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against axum 0.8.9 with tokio 1.53 and tokio-util 0.7.19 on Rust 1.99 (edition 2024), checked on
+2026-10-06. Every deployment, autoscaling event and node drain stops processes. A service that exits immediately on
+`SIGTERM` cuts off requests in flight, loses queued background work and drops unflushed traces. Graceful shutdown is
+the sequence that avoids all three. The Kubernetes side is covered on this site's
+xref:backend/kubernetes/health-probes-and-lifecycle.adoc[Health Probes and Lifecycle] page.
+
+== The shutdown order
+
+[mermaid]
+....
+sequenceDiagram
+    participant K as Kubernetes / systemd
+    participant M as main
+    participant S as axum::serve
+    participant W as background workers
+    participant P as PgPool / telemetry
+    K->>M: SIGTERM
+    M->>M: mark not ready (readiness probe fails)
+    M->>S: shutdown signal resolves
+    S->>S: stop accepting, close idle keep-alive connections
+    S->>S: in-flight requests finish (bounded by TimeoutLayer)
+    S-->>M: serve().await returns
+    M->>W: cancel token, wait for TaskTracker
+    W-->>M: workers finished current jobs
+    M->>P: close pool, shut down tracer provider
+    M-->>K: exit 0 (before the grace period ends)
+....
+
+== `with_graceful_shutdown`
+
+`+axum::serve(...).with_graceful_shutdown(signal)+` takes any future; when it resolves, the server stops accepting new
+connections, tells hyper to close idle keep-alive connections, waits for in-flight requests to finish, and then the
+`serve` future completes. The signal future usually listens for both `SIGTERM` (sent by orchestrators) and `SIGINT`
+(Ctrl+C in a terminal):
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{Router, http::StatusCode, routing::get};
+use tokio::signal;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tower_http::timeout::TimeoutLayer;
+
+/// Resolves on Ctrl+C or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async { signal::ctrl_c().await.expect("failed to install Ctrl+C handler") };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate()).expect("failed to install SIGTERM handler").recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    println!("shutdown signal received");
+}
+
+async fn slow_report() -> &'static str {
+    tokio::time::sleep(Duration::from_secs(3)).await; // an in-flight request during shutdown
+    "report finished\n"
+}
+
+#[tokio::main]
+async fn main() {
+    let tracker = TaskTracker::new();
+    let cancel = CancellationToken::new();
+
+    // a background worker that stops when told to
+    let worker_cancel = cancel.clone();
+    tracker.spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = worker_cancel.cancelled() => { println!("worker: finishing"); break; }
+                _ = tick.tick() => { /* process a batch */ }
+            }
+        }
+    });
+
+    let app = Router::new()
+        .route("/reports/slow", get(slow_report))
+        // bounds how long any single request can delay shutdown
+        .layer(TimeoutLayer::with_status_code(StatusCode::SERVICE_UNAVAILABLE, Duration::from_secs(10)));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await.unwrap();
+    println!("server stopped: no request in flight");
+
+    cancel.cancel(); // 1. stop background work
+    tracker.close();
+    if tokio::time::timeout(Duration::from_secs(5), tracker.wait()).await.is_err() {
+        println!("workers did not stop in time");
+    }
+    // 2. close pools: pool.close().await;  3. flush telemetry: tracer_provider.shutdown()
+    println!("clean exit");
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/serve/struct.Serve.html#method.with_graceful_shutdown[axum: Serve::with_graceful_shutdown], https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/graceful-shutdown[axum example: graceful-shutdown] and https://tokio.rs/tokio/topics/shutdown[Tokio: Graceful Shutdown]
+
+[source,bash]
+----
+$ curl -s localhost:3000/reports/slow & sleep 1; kill -TERM $(pgrep bookshelf-web)
+shutdown signal received
+report finished                      # the in-flight request completed
+server stopped: no request in flight
+worker: finishing
+clean exit
+----
+
+* `with_graceful_shutdown` waits *indefinitely* for in-flight requests. Bound them with `TimeoutLayer` (and the body
+  deadline layers for slow uploads and downloads, see xref:backend/axum/request-limits-and-timeouts.adoc[Request
+  Limits & Timeouts]), so a stuck request cannot block shutdown forever.
+* Long-lived connections -- WebSockets and SSE streams -- are not "requests in flight" that end by themselves. Give
+  their tasks the `CancellationToken` too and close them (a WebSocket close frame, the end of the event stream) when it
+  is cancelled, or they will hold shutdown until the orchestrator's hard kill.
+* Everything after `+serve(...).await+` runs only once the server has stopped, which is the right moment to stop
+  workers: requests can no longer enqueue jobs.
+* `PgPool::close().await` waits for checked-out connections to return and closes them, so the database sees clean
+  disconnects; an OpenTelemetry `TracerProvider` must be shut down explicitly to export the last batch of spans (see
+  xref:backend/axum/opentelemetry-and-distributed-tracing.adoc[OpenTelemetry & Distributed Tracing]).
+
+== Kubernetes
+
+When Kubernetes terminates a pod it removes the pod from Service endpoints *and* sends `SIGTERM` at about the same time
+-- not one after the other. For a few seconds, load balancers may still send new requests to a process that is
+shutting down. The usual configuration:
+
+[source,yaml]
+----
+spec:
+  terminationGracePeriodSeconds: 30        # SIGKILL after this; must exceed preStop + drain + cleanup
+  containers:
+    - name: bookshelf-web
+      lifecycle:
+        preStop:
+          sleep:
+            seconds: 5                     # keep serving while endpoints are updated (sleep action, Kubernetes 1.30+)
+      readinessProbe:
+        httpGet: { path: /ready, port: 3000 }
+        periodSeconds: 2
+----
+
+* The `preStop` sleep delays `SIGTERM` until traffic has been routed away; with distroless images the built-in `sleep`
+  action avoids needing a shell.
+* Failing the readiness probe as soon as shutdown starts (a flag in state checked by `/ready`) helps load balancers
+  that rely on health checks rather than endpoint updates.
+* Budget: preStop (5 s) + request drain (up to the `TimeoutLayer`, 10 s) + workers and flush (5 s) < 30 s.
+
+See xref:backend/kubernetes/health-probes-and-lifecycle.adoc[Health Probes and Lifecycle] and
+xref:backend/axum/deployment.adoc[Deployment] for probes and manifests.
+
+== Upcoming in axum 0.9
+
+The unreleased axum 0.9 changes the output type of the `serve` future (and of `with_graceful_shutdown`), so code that
+names those types or matches on the result needs adjusting when upgrading, and adds `Serve::with_executor` for custom
+executors. The behaviour described on this page is unchanged.
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*, chapter 6) handles only Ctrl+C. In containers the signal is `SIGTERM`, which a Ctrl+C handler
+never sees -- the process is then killed after the grace period with requests still in flight. Material written for
+axum 0.6 uses `hyper::Server::with_graceful_shutdown`; since 0.7 it is a method on ``axum::serve``'s `Serve`.
+
+== References
+
+* https://docs.rs/axum/0.8.9/axum/serve/struct.Serve.html[axum: serve::Serve] and https://docs.rs/axum/0.8.9/axum/serve/struct.WithGracefulShutdown.html[WithGracefulShutdown]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/graceful-shutdown[axum example: graceful-shutdown]
+* https://tokio.rs/tokio/topics/shutdown[Tokio: Graceful Shutdown] and https://docs.rs/tokio/1.53.2/tokio/signal/index.html[tokio::signal]
+* https://docs.rs/tokio-util/0.7.19/tokio_util/sync/struct.CancellationToken.html[tokio-util: CancellationToken]
+* https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination[Kubernetes: Termination of Pods] and https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/[Container Lifecycle Hooks]
+* https://link.springer.com/book/10.1007/979-8-8688-2631-3[Indo Yoon, Beginning Axum (Apress, 2026)]
