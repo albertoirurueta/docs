@@ -44,7 +44,79 @@ Choices made during planning (challenge them in review):
 5. **Versions and retirement dates are re-verified first (Group 1) and reused by every page.** The issue's baseline
    tables are dated 2026-10-06 and mark several items "re-verify": QnA Maker, Personalizer and Metrics Advisor
    dates, and the single-service `--kind` values. Group 1 checks each item once against Microsoft Learn and the
-   package registries. It writes the confirmed values into the `## Verified baseline
+   package registries. It writes the confirmed values into the `## Verified baseline` section of this file, so pages
+   written in parallel agree. Where something can't be verified, the page says so ("check the release notes") rather
+   than asserting a value.
+6. **Examples target current GA packages and api-versions, not stale quickstarts.** Where a Learn quickstart pins a
+   beta package or an older api-version, the page uses the GA one. It says so in one sentence, linking the
+   quickstart as `Source:`.
+7. **Retired features never appear as current.** They are mentioned only in migration notes and in the retirement
+   table on page 21.
+8. **The cheat-sheet PDF uses this container's tooling.** Plan #192 used macOS Chrome and PyMuPDF. Here the tools are
+   headless Chromium at `/opt/pw-browsers/chromium-1194/chrome-linux/chrome`, `pypdf` for the page count and A4 size,
+   and `pypdfium2` for the PNG preview. PyMuPDF is not installed.
+9. **Placement is a sub-section.** The issue's "Placement decision" is accepted as written: `*****` nav entries one
+   level below *Azure*, like `web/aspnet/web-forms/`. All pages reuse `partial$azure-disclaimer.adoc`. No new
+   partial is created.
+
+## Current code state
+
+- **No `modules/ROOT/pages/cloud/azure/foundry-tools/` directory exists.** There are also no `azure-foundry-*.svg`
+  images and no `attachments/azure-foundry-tools-cheat-sheet.pdf`.
+- **Partial:** `modules/ROOT/partials/azure-disclaimer.adoc` is an `[IMPORTANT]` block. It holds the AI-assistance
+  sentence and `xref:cloud/azure/index.adoc#_bibliography[the section bibliography]`. Every page includes it as
+  `include::partial$azure-disclaimer.adoc[]`. It stays unchanged.
+- **`modules/ROOT/nav.adoc`:** the Azure block runs from `*** xref:cloud/azure/index.adoc[Azure]` (around line 1425) to
+  `**** xref:cloud/azure/cheat-sheet.adoc[Cheat Sheet (PDF)]` (around line 1461).
+  `**** xref:cloud/azure/ai-data-and-iot-overview.adoc[AI, Data and IoT Services Overview]` (around line 1459) is
+  followed by `**** xref:cloud/azure/developer-tools-and-devops.adoc[...]`. The new `**** ...foundry-tools/index.adoc`
+  line and its 23 `*****` children go between those two. Match on the text, not on line numbers.
+- **`modules/ROOT/pages/cloud/azure/index.adoc`** (about 400 lines):
+  - header and baseline prose
+  - `== The Bookshelf scenario`, with a `[cols="1,2"]` Concern / Name table that ends at the `acs-bookshelf` row
+  - `== Reading path`
+  - `== What's covered`, with 8 `===` groups; the last is `=== Operations, governance and beyond`, followed by the
+    cheat-sheet paragraph and a `mindmap` Mermaid block, `root((Azure))`
+  - `== Where related material lives elsewhere on this site`, a table
+  - `== Bibliography`: the two books, then official docs grouped as `*General:*`, … with link-text bullets
+- **`modules/ROOT/pages/cloud/azure/ai-data-and-iot-overview.adoc`:**
+  - lines ~20–45 hold an old-name to new-name rename table: Cognitive Services → Azure AI services / Foundry Tools,
+    and AI Studio → Microsoft Foundry
+  - `== Microsoft Foundry, Azure OpenAI and Azure AI services` (~line 165) describes Azure OpenAI with
+    `--kind OpenAI`, lists retired members (Anomaly Detector, Content Moderator, LUIS, Metrics Advisor,
+    Personalizer, QnA Maker) and has a first-step `az cognitiveservices account create ... --kind CognitiveServices`
+    block (~lines 180–198)
+  - `=== Azure AI Search` (~line 203) follows
+- **`modules/ROOT/pages/cloud/azure/cheat-sheet.adoc`:** intro, a bullet list describing the PDF, then grouped
+  `*Group* -- xref:..., and xref:...` back-link paragraphs. `azure-cheat-sheet.pdf` stays unchanged.
+- **Templates to mirror:**
+  - `cloud/azure/*.adoc` for page shape: header with `:description:` and `:keywords:`, the disclaimer, a lead
+    paragraph with the version baseline, `=== In the Azure portal` / `=== With the Azure CLI`, `== Clean up`,
+    `== Related pages` and `== References`
+  - `ai/voice-agents/index.adoc` and `cheat-sheet.adoc` for a sub-section landing page and cheat sheet
+  - `web/aspnet/web-forms/` for `*****` nesting
+- **Existing link targets** (all verified present):
+  - `ai/voice-agents/`: `speech-to-text`, `text-to-speech`, `realtime-apis`, `voice-architectures`,
+    `turn-taking-and-interruptions`, `production-voice-agents`
+  - `ai/rag-systems/`: `document-parsing`, `multimodal-rag`, `guardrails-and-prompt-injection`,
+    `hallucination-detection-and-correction`, `ingestion-pipelines-and-freshness`
+  - `ai/security/`: `prompt-injection`, `guardrails`, `sensitive-information-and-hidden-context`,
+    `responsible-ai-practices`
+  - `ai/mcp/index`, `ai/agents/tool-design`
+  - `database/vector-rag/comparing-vector-databases`, `integrating-with-spring-ai`
+  - `cloud/aws/ai-data-and-analytics-overview`, `cloud/google-cloud/ai-data-and-analytics-overview`
+  - `cloud/azure/virtual-networks`, `monitoring-and-observability`, `cost-management`, `identity-and-access`,
+    `key-vault-and-secrets`, `container-apps`, `blob-storage`, `front-door-and-cdn`, `infrastructure-as-code`
+- **Tooling:**
+  - `npx antora antora-playbook.yml` builds into `build/site`
+  - `npm run validate:mermaid` needs a one-off `npm i --no-save mermaid@11 jsdom`
+  - the CLAUDE.md grep checks for images, inline code and alt text
+  - Node v22
+- **Precedents:** `.archive/implementation_plan_192.md` (the Azure section: conventions, Bookshelf, the PDF
+  pipeline, wiring and verify groups, the brace and leading-digit gotchas) and `.archive/implementation_plan_210.md`
+  (a sub-section delivered in one PR).
+
+## Verified baseline
 
 _Filled in by Task 1 on 2026-10-06. Package versions were checked directly against PyPI, NuGet, Maven Central and npm
 (registry JSON/metadata), and SDK changelogs against the `Azure/azure-sdk-for-python` repository on GitHub.
