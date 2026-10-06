@@ -1,0 +1,293 @@
+= OAuth2 & OpenID Connect
+:description: "Sign in with GitHub" for an axum 0.8 application with the oauth2 5.0 crate -- the authorization-code flow with PKCE, the state parameter and PKCE verifier kept in a private cookie, the callback that exchanges the code, fetching the user and linking it to a local account, starting a session, and validating OpenID Connect ID tokens with the openidconnect 4 crate.
+:keywords: axum, OAuth2, OAuth 2.0, oauth2 crate, oauth2 5.0, authorization code flow, PKCE, PkceCodeChallenge, code_verifier, state, CSRF, CsrfToken, redirect URI, callback, exchange_code, BasicClient, GitHub login, social login, account linking, OpenID Connect, OIDC, openidconnect, ID token, nonce, discovery, CoreClient, PrivateCookieJar
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against oauth2 5.0.0 and openidconnect 4.0.1 with axum 0.8.9 and axum-extra 0.12.6 on Rust 1.99
+(edition 2024), checked on 2026-10-06. *Bookshelf* lets members sign in with GitHub. The protocol itself -- roles,
+grants, why PKCE, what `state` and `nonce` protect against -- is explained on this site's
+xref:backend/oauth/authorization-code-and-pkce.adoc[Authorization Code and PKCE] and
+xref:backend/oauth/openid-connect.adoc[OpenID Connect] pages; this page shows the axum implementation.
+
+== The flow
+
+[mermaid]
+....
+sequenceDiagram
+    participant U as Browser
+    participant B as Bookshelf (axum)
+    participant G as GitHub
+    U->>B: GET /auth/github
+    B->>B: generate state + PKCE verifier/challenge
+    B-->>U: 303 to GitHub authorize URL (client_id, state, code_challenge)<br/>Set-Cookie: oauth_flow (private, encrypted: state + verifier)
+    U->>G: log in, approve "read:user"
+    G-->>U: 302 to /auth/github/callback?code=...&state=...
+    U->>B: GET /auth/github/callback (+ oauth_flow cookie)
+    B->>B: compare state with cookie
+    B->>G: POST token endpoint (code + code_verifier + client secret)
+    G-->>B: access token
+    B->>G: GET /user (Bearer access token)
+    G-->>B: GitHub user id and login
+    B->>B: find or create local account, start session (new session id)
+    B-->>U: 303 to /account, clear oauth_flow cookie
+....
+
+== Implementation
+
+[source,toml]
+----
+[dependencies]
+oauth2 = "5.0.0"   # default features: reqwest 0.12 client with rustls
+axum-extra = { version = "0.12.6", features = ["cookie-private"] }
+----
+
+[source,rust]
+----
+use axum::{
+    Router,
+    extract::{FromRef, Query, State},
+    http::StatusCode,
+    response::{IntoResponse, Redirect, Response},
+    routing::get,
+};
+use axum_extra::extract::{
+    PrivateCookieJar,
+    cookie::{Cookie, Key, SameSite},
+};
+use oauth2::{
+    AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl, basic::BasicClient,
+};
+use serde::{Deserialize, Serialize};
+
+type GitHubClient = BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+
+#[derive(Clone)]
+struct AppState {
+    oauth: GitHubClient,
+    http: oauth2::reqwest::Client,
+    user_api: String,
+    cookie_key: Key,
+}
+
+impl FromRef<AppState> for Key {
+    fn from_ref(state: &AppState) -> Self {
+        state.cookie_key.clone()
+    }
+}
+
+/// What we must remember between the redirect and the callback.
+#[derive(Serialize, Deserialize)]
+struct Flow {
+    state: String,
+    pkce_verifier: String,
+}
+
+const FLOW_COOKIE: &str = "oauth_flow";
+
+async fn start(State(app): State<AppState>, jar: PrivateCookieJar) -> (PrivateCookieJar, Redirect) {
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let (url, csrf_state) = app
+        .oauth
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("read:user".into()))
+        .set_pkce_challenge(challenge)
+        .url();
+
+    let flow = Flow { state: csrf_state.secret().clone(), pkce_verifier: verifier.secret().clone() };
+    let cookie = Cookie::build((FLOW_COOKIE, serde_json::to_string(&flow).expect("serialisable")))
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax) // must survive the top-level redirect back from GitHub
+        .path("/auth")
+        .max_age(time::Duration::minutes(10))
+        .build();
+    (jar.add(cookie), Redirect::to(url.as_str()))
+}
+
+#[derive(Deserialize)]
+struct Callback {
+    code: String,
+    state: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct GitHubUser {
+    id: u64,
+    login: String,
+}
+
+async fn callback(State(app): State<AppState>, jar: PrivateCookieJar, Query(cb): Query<Callback>) -> Response {
+    // 1. the flow cookie must exist and its state must match: otherwise this is a forged or replayed callback
+    let Some(flow) = jar.get(FLOW_COOKIE).and_then(|c| serde_json::from_str::<Flow>(c.value()).ok()) else {
+        return (StatusCode::BAD_REQUEST, "login expired, please try again\n").into_response();
+    };
+    let jar = jar.remove(Cookie::build(FLOW_COOKIE).path("/auth"));
+    if flow.state != cb.state {
+        return (jar, (StatusCode::BAD_REQUEST, "state mismatch\n")).into_response();
+    }
+
+    // 2. exchange the code, proving possession of the PKCE verifier
+    let token = match app
+        .oauth
+        .exchange_code(AuthorizationCode::new(cb.code))
+        .set_pkce_verifier(PkceCodeVerifier::new(flow.pkce_verifier))
+        .request_async(&app.http)
+        .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            tracing::warn!(%err, "code exchange failed");
+            return (jar, StatusCode::BAD_GATEWAY).into_response();
+        }
+    };
+
+    // 3. who is this? (GitHub is OAuth2-only, so we call its API instead of reading an ID token)
+    let user: GitHubUser = match app
+        .http
+        .get(&app.user_api)
+        .bearer_auth(token.access_token().secret())
+        .header("user-agent", "bookshelf")
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        // oauth2's reqwest is built without the `json` feature: parse the bytes with serde_json
+        Ok(resp) => match resp.bytes().await.ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            Some(user) => user,
+            None => return (jar, StatusCode::BAD_GATEWAY).into_response(),
+        },
+        Err(_) => return (jar, StatusCode::BAD_GATEWAY).into_response(),
+    };
+
+    // 4. link to a local account by the provider's immutable id (not by e-mail or login name),
+    //    then start a session with session.cycle_id() as on the Sessions page
+    tracing::info!(github_id = user.id, login = %user.login, "signed in with GitHub");
+    (jar, Redirect::to("/account")).into_response()
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let env = |k: &str, default: &str| std::env::var(k).unwrap_or_else(|_| default.to_owned());
+    let oauth = BasicClient::new(ClientId::new(env("GITHUB_CLIENT_ID", "placeholder-client-id")))
+        .set_client_secret(ClientSecret::new(std::env::var("GITHUB_CLIENT_SECRET").unwrap_or_default()))
+        .set_auth_uri(AuthUrl::new(env("OAUTH_AUTH_URL", "https://github.com/login/oauth/authorize"))?)
+        .set_token_uri(TokenUrl::new(env("OAUTH_TOKEN_URL", "https://github.com/login/oauth/access_token"))?)
+        .set_redirect_uri(RedirectUrl::new(env("OAUTH_REDIRECT_URL", "http://localhost:3000/auth/github/callback"))?);
+
+    let http = oauth2::reqwest::ClientBuilder::new()
+        .redirect(oauth2::reqwest::redirect::Policy::none()) // never follow redirects on token requests
+        .build()?;
+
+    let state = AppState {
+        oauth,
+        http,
+        user_api: env("GITHUB_USER_API", "https://api.github.com/user"),
+        cookie_key: Key::generate(), // load a persistent 64-byte key from a secret store in production
+    };
+    let app = Router::new()
+        .route("/auth/github", get(start))
+        .route("/auth/github/callback", get(callback))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/oauth2/5.0.0/oauth2/[oauth2 5.0.0] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/oauth[axum example: oauth]
+
+[source,bash]
+----
+$ curl -si localhost:3000/auth/github | grep -i -E '^HTTP|^location|^set-cookie' | cut -c1-120
+HTTP/1.1 303 See Other
+location: https://github.com/login/oauth/authorize?response_type=code&client_id=...&state=...&code_challenge=...
+set-cookie: oauth_flow=6ADLyrbu...; HttpOnly; SameSite=Lax; Secure; Path=/auth; Max-Age=600
+----
+
+Design notes:
+
+* *PKCE everywhere.* OAuth 2.1 and the current security BCP require PKCE for all clients, including confidential ones
+  with a client secret. `PkceCodeChallenge::new_random_sha256()` creates the `S256` challenge; the verifier is sent
+  only with the token request.
+* *State in an encrypted cookie.* The `state` value and the PKCE verifier must survive the round trip through GitHub
+  and be bound to *this* browser. A `PrivateCookieJar` cookie does that without a server-side store; it is
+  `SameSite=Lax` so it is sent on the top-level redirect back, scoped to `/auth`, and short-lived. Removing it in the
+  callback makes the code single-use from our side.
+* *Typed client.* oauth2 5.0 tracks at compile time which endpoints are configured (`EndpointSet`/`EndpointNotSet`),
+  so calling `exchange_code` on a client without a token URL does not compile. It also no longer ships its own HTTP
+  client functions: you pass a `reqwest::Client` (re-exported as `oauth2::reqwest`, version 0.12) and should disable
+  redirects on it to avoid SSRF through redirecting token endpoints.
+* *Link by provider id.* Store `(provider = "github", subject = 12345)` in an `identities` table pointing at the local
+  user. E-mail addresses and logins can change and, for some providers, are not verified.
+* *Then use your own session.* The GitHub access token is only used once, to read the profile; the user's session is a
+  normal *Bookshelf* session (see xref:backend/axum/sessions-and-cookies.adoc[Sessions & Cookies]), started with a new
+  session id.
+
+== OpenID Connect: validating ID tokens
+
+Providers that implement OpenID Connect (Google, Microsoft Entra ID, Keycloak, Auth0, ...) return an *ID token*, a JWT
+describing the user, alongside the access token. Its validation is subtle -- issuer, audience, signature against the
+provider's rotating JWKS keys, expiry, and the `nonce` that binds it to this login attempt -- so use the `openidconnect`
+crate, which implements discovery and all of these checks:
+
+[source,rust]
+----
+use openidconnect::{
+    AuthenticationFlow, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge, RedirectUrl, Scope,
+    core::{CoreClient, CoreProviderMetadata, CoreResponseType},
+};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let http = openidconnect::reqwest::ClientBuilder::new()
+        .redirect(openidconnect::reqwest::redirect::Policy::none())
+        .build()?;
+
+    // Discovery: fetches https://accounts.example.com/.well-known/openid-configuration and the JWKS
+    let issuer = IssuerUrl::new(std::env::var("OIDC_ISSUER").unwrap_or_else(|_| "https://accounts.example.com".into()))?;
+    let metadata = CoreProviderMetadata::discover_async(issuer, &http).await?;
+
+    let client = CoreClient::from_provider_metadata(
+        metadata,
+        ClientId::new(std::env::var("OIDC_CLIENT_ID")?),
+        Some(ClientSecret::new(std::env::var("OIDC_CLIENT_SECRET")?)),
+    )
+    .set_redirect_uri(RedirectUrl::new("https://bookshelf.example/auth/oidc/callback".into())?);
+
+    let (challenge, _verifier) = PkceCodeChallenge::new_random_sha256();
+    let (url, _state, _nonce) = client
+        .authorize_url(AuthenticationFlow::<CoreResponseType>::AuthorizationCode, CsrfToken::new_random, Nonce::new_random)
+        .add_scope(Scope::new("email".into()))
+        .set_pkce_challenge(challenge)
+        .url();
+    println!("redirect the browser to {url}");
+
+    // In the callback, after exchange_code(...).set_pkce_verifier(...).request_async(&http):
+    //   let id_token = token.id_token().ok_or("no ID token")?;
+    //   let claims = id_token.claims(&client.id_token_verifier(), &nonce)?;  // signature, iss, aud, exp, nonce
+    //   let subject = claims.subject();                                      // the stable user id
+    Ok(())
+}
+----
+
+Source: https://docs.rs/openidconnect/4.0.1/openidconnect/[openidconnect 4.0.1]
+
+Store the `nonce` next to `state` and the PKCE verifier in the flow cookie, and link accounts by `(issuer, sub)`. The
+claims carry `email` and `email_verified`; only trust the e-mail when the provider says it is verified.
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*) does not cover OAuth2. Tutorials written for oauth2 4.x use `oauth2::reqwest::async_http_client`
+and an untyped `BasicClient::new(id, secret, auth_url, token_url)`; oauth2 5.0 replaced both with the builder above and
+caller-supplied HTTP clients. The axum `oauth` example at `axum-v0.8.9` uses Discord; the flow is identical for GitHub.
+
+== References
+
+* https://docs.rs/oauth2/5.0.0/oauth2/[oauth2 5.0.0] and https://github.com/ramosbugs/oauth2-rs/blob/main/UPGRADE.md[oauth2 upgrade guide]
+* https://docs.rs/openidconnect/4.0.1/openidconnect/[openidconnect 4.0.1]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/oauth[axum example: oauth]
+* https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps[GitHub: Authorizing OAuth apps]
+* https://www.rfc-editor.org/rfc/rfc6749.html[RFC 6749: OAuth 2.0], https://www.rfc-editor.org/rfc/rfc7636.html[RFC 7636: PKCE] and https://www.rfc-editor.org/rfc/rfc9700.html[RFC 9700: OAuth 2.0 Security Best Current Practice]
+* https://openid.net/specs/openid-connect-core-1_0.html[OpenID Connect Core 1.0]
