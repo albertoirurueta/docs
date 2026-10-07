@@ -211,16 +211,16 @@ Parallelizable: yes — distinct files
 
 Parallelizable: yes — distinct files
 
-- [ ] Task 103. `backend/axum/background-jobs-and-tasks.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 104. `backend/axum/http-clients-and-proxies.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 105. `backend/axum/graceful-shutdown.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 106. `backend/axum/configuration.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 107. `backend/axum/logging-and-tracing.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 108. `backend/axum/opentelemetry-and-distributed-tracing.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 109. `backend/axum/metrics-and-slos.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 110. `backend/axum/testing.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 111. `backend/axum/performance-tuning.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
-- [ ] Task 112. `backend/axum/deployment.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2)
+- [x] Task 103. `backend/axum/background-jobs-and-tasks.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled and run (job queue on Postgres)
+- [x] Task 104. `backend/axum/http-clients-and-proxies.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled and run; reqwest-tracing otel-feature note corrected
+- [x] Task 105. `backend/axum/graceful-shutdown.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: example compiled and run with SIGTERM
+- [x] Task 106. `backend/axum/configuration.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled and run (config, figment, envy)
+- [x] Task 107. `backend/axum/logging-and-tracing.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: examples compiled and run
+- [x] Task 108. `backend/axum/opentelemetry-and-distributed-tracing.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: example compiled and run; pipeline SVG
+- [x] Task 109. `backend/axum/metrics-and-slos.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: example compiled and run against Postgres; SLO rules YAML-validated
+- [x] Task 110. `backend/axum/testing.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: tests run in scratch crate (11 passed incl. sqlx::test, WebSocket, insta)
+- [x] Task 111. `backend/axum/performance-tuning.adoc` — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: example compiled; blocking vs spawn_blocking measured with oha
+- [x] Task 112. `backend/axum/deployment.adoc` ★ — write per Part 2 outline, "Operations"; examples compiled in the scratch workspace (Task 2) — done: lambda_http example clippy-clean; Dockerfile/K8s/fly.toml syntax-checked; build-stages SVG
 
 ### Group 10 — Axum: reference pages, landing, cheat sheet, nav at two sites, index bullets, back-links (slice 6, part 2)
 
