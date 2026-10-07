@@ -39,8 +39,7 @@ messaging and database theory — link instead); #196/#184/#201 in prose only.
    `database`; none fit AsciiDoc / Mermaid / SVG / PDF authoring, so tasks are implemented directly. JavaScript/TypeScript
    in pages is illustrative content, but every example is run in a scratch project (Task 2).
 3. **The books appear only in `== Bibliography`** and in prose notes on outdated material. No text, listing, figure or
-   sample project is copied; the PDFs are never staged. (`node1.pdf` carries an "OceanofPDF.com" watermark; it is a
-   private reading copy only and is never referenced in the published pages.)
+   sample project is copied; the PDFs are never staged.
 4. **Disclaimer:** `partials/nodejs-disclaimer.adoc` is a single `[IMPORTANT]` block (AI-assistance disclosure +
    `xref:backend/nodejs/index.adoc#_bibliography[…]`). No other admonition in the section; deprecations, stability levels,
    security caveats and "book is outdated" remarks are prose or table rows.
