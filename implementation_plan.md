@@ -226,17 +226,17 @@ Parallelizable: yes — distinct files
 
 Parallelizable: no — landing, cheat sheet and nav depend on all Axum pages; nav/index/back-link edits touch shared files
 
-- [ ] Task 113. Axum `migration-and-framework-comparison.adoc` — 0.7→0.8 and older-tutorial migration, version-pairing pitfalls, upcoming 0.9 items flagged as upcoming, comparison table (actix-web, Rocket, poem, warp, Loco) with official links
-- [ ] Task 114. Axum `index.adoc` — landing page per Part 2 outline with `== Bibliography` (books, axum/tokio/tower docs, crates and services, specifications and standards — each linked to its official site)
-- [ ] Task 115. Axum `cheat-sheet.adoc` and `modules/ROOT/attachments/axum-cheat-sheet.pdf` (same procedure and one-page check as the Rust sheet, covering the issue's Axum cheat-sheet list)
-- [ ] Task 116. `modules/ROOT/partials/nav-axum.adoc` and two includes in `nav.adoc`, each right after a `nav-rust.adoc` include (Backend Development and Web Development); add an **Axum** bullet in `backend/index.adoc` and `web/index.adoc`; mention Rust and Axum in the root `modules/ROOT/pages/index.adoc` `:description:`/`:keywords:`
-- [ ] Task 117. Back-links in existing pages (verify each target with `ls` first; add only what the page lacks)
-  - [ ] Task 117.1. `ai/cli-for-agents/frameworks-go-and-rust.adoc`: replace the "planned and is not linked yet" sentence with an `xref:` to the Rust Reference; one-line links in `packaging-and-distribution.adoc` (→ `cargo-and-workspaces`) and `testing-clis.adoc` (→ `testing-and-benchmarking`)
-  - [ ] Task 117.2. `ai/mcp/index.adoc` (Rust SDK row) and `ai/agents/frameworks-landscape.adoc` (Rig row): link to the Rust Reference
-  - [ ] Task 117.3. `backend/fastapi/performance-and-observability.adoc` (PyO3/maturin) → `python-interop-with-pyo3`; `web/django/deployment.adoc` (Granian) → Axum introduction; `database/prometheus/instrumenting-applications.adoc` → Axum `metrics-and-slos`
-  - [ ] Task 117.4. `backend/architecture/decisions-and-migrations/starting-a-new-project.adoc`: add a `| Rust / Axum` row to the "Backend framework" table
-  - [ ] Task 117.5. `programming-languages/swift/memory-safety-and-unsafe-pointers.adoc` → `borrowing-and-references`; `apps/kotlin-multiplatform/web-with-kotlin-wasm-and-js.adoc` and `web/aspnet/core/blazor-webassembly-hybrid-and-deployment.adoc` gain a one-line link back to `webassembly`
-  - [ ] Task 117.6. Check the C, C++, C#, Swift, concurrency and `backend/oauth/*` pages named in the issue's "What already exists" table are linked **from** the new Rust/Axum pages (done in the page tasks), and add reverse links only where the issue lists them
+- [x] Task 113. Axum `migration-and-framework-comparison.adoc` — 0.7→0.8 and older-tutorial migration, version-pairing pitfalls, upcoming 0.9 items flagged as upcoming, comparison table (actix-web, Rocket, poem, warp, Loco) with official links — done: 0.6/0.7 contrast blocks + compiled and run 0.8 example; framework dates from crates.io
+- [x] Task 114. Axum `index.adoc` — landing page per Part 2 outline with `== Bibliography` (books, axum/tokio/tower docs, crates and services, specifications and standards — each linked to its official site) — done: landing page with architecture SVG, mindmap, related table and bibliography
+- [x] Task 115. Axum `cheat-sheet.adoc` and `modules/ROOT/attachments/axum-cheat-sheet.pdf` (same procedure and one-page check as the Rust sheet, covering the issue's Axum cheat-sheet list) — done: cheat-sheet page; PDF 1 A4 page (pdfinfo)
+- [x] Task 116. `modules/ROOT/partials/nav-axum.adoc` and two includes in `nav.adoc`, each right after a `nav-rust.adoc` include (Backend Development and Web Development); add an **Axum** bullet in `backend/index.adoc` and `web/index.adoc`; mention Rust and Axum in the root `modules/ROOT/pages/index.adoc` `:description:`/`:keywords:` — done: nav-axum.adoc included after nav-rust in Web and Backend; bullets and root keywords
+- [x] Task 117. Back-links in existing pages (verify each target with `ls` first; add only what the page lacks) — done: back-links added
+  - [x] Task 117.1. `ai/cli-for-agents/frameworks-go-and-rust.adoc`: replace the "planned and is not linked yet" sentence with an `xref:` to the Rust Reference; one-line links in `packaging-and-distribution.adoc` (→ `cargo-and-workspaces`) and `testing-clis.adoc` (→ `testing-and-benchmarking`) — done
+  - [x] Task 117.2. `ai/mcp/index.adoc` (Rust SDK row) and `ai/agents/frameworks-landscape.adoc` (Rig row): link to the Rust Reference — done
+  - [x] Task 117.3. `backend/fastapi/performance-and-observability.adoc` (PyO3/maturin) → `python-interop-with-pyo3`; `web/django/deployment.adoc` (Granian) → Axum introduction; `database/prometheus/instrumenting-applications.adoc` → Axum `metrics-and-slos` — done
+  - [x] Task 117.4. `backend/architecture/decisions-and-migrations/starting-a-new-project.adoc`: add a `| Rust / Axum` row to the "Backend framework" table — done
+  - [x] Task 117.5. `programming-languages/swift/memory-safety-and-unsafe-pointers.adoc` → `borrowing-and-references`; `apps/kotlin-multiplatform/web-with-kotlin-wasm-and-js.adoc` and `web/aspnet/core/blazor-webassembly-hybrid-and-deployment.adoc` gain a one-line link back to `webassembly` — done
+  - [x] Task 117.6. Check the C, C++, C#, Swift, concurrency and `backend/oauth/*` pages named in the issue's "What already exists" table are linked **from** the new Rust/Axum pages (done in the page tasks), and add reverse links only where the issue lists them — done: outbound links verified; Java/C++ concurrency links added to the Rust async page; MCP/agents row added to the Axum index
 
 ### Group 11 — Final verification
 
