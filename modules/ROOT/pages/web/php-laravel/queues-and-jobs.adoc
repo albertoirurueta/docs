@@ -1,0 +1,485 @@
+= Queues and Jobs
+:description: Background work in Laravel 13 -- queue connections and drivers, job classes with the Tries, Backoff, Timeout and UniqueFor attributes, what a payload holds, running a job at once with dispatchSync, running queue:work and reading its output, retries and failed jobs, retry multiplication with the HTTP client, dispatching inside transactions and afterCommit on Redis versus the database driver, fail() for errors that retrying cannot fix, job middleware, unique and debounced jobs, chains and batches with allowFailures, Queue::route, Supervisor, Horizon, idempotency and testing with Queue::fake and Bus::fake, all run in a Laravel 13.34 application.
+:keywords: Laravel, queues, jobs, ShouldQueue, Queueable, make:job, dispatch, dispatchSync, database queue, Redis queue, SQS, Beanstalkd, queue:work, queue:listen, failed jobs, queue:failed, queue:retry, Tries, Backoff, Timeout, MaxExceptions, UniqueFor, DebounceFor, ShouldBeUnique, SerializesModels, ModelNotFoundException, afterCommit, after_commit, transactions, fail, release, job middleware, WithoutOverlapping, RateLimited, ThrottlesExceptions, chains, Bus::chain, batches, Bus::batch, allowFailures, Batchable, Queue::route, Supervisor, Horizon, horizon:status, idempotency, Queue::fake, Bus::fake
+
+include::partial$php-laravel-disclaimer.adoc[]
+
+This page is written against Laravel 13.x (13.34.0) on PHP 8.3 to 8.5, checked on 2026-10-05. A request should
+answer in milliseconds, so anything slow or unreliable goes to a *queue*: a job is stored, the response is sent, and a
+separate *worker* process runs the job later and retries it if it fails. Bookshelf queues a sync with the external
+catalogue service from xref:web/php-laravel/http-client.adoc[HTTP Client], which runs locally on port 8030 and can be
+switched into a 503 "maintenance" mode. The patterns behind queues (delivery guarantees, dead-lettering, idempotent
+consumers) are on xref:backend/messaging/index.adoc[Messaging].
+
+[mermaid]
+....
+flowchart LR
+    R[HTTP request] -->|dispatch| Q[(queue: jobs table or Redis list)]
+    R -->|response sent| U[user]
+    Q -->|reserve| W[queue:work / Horizon worker]
+    W -->|handle succeeds| D[deleted]
+    W -->|exception, attempts < tries| B[released with backoff]
+    B --> Q
+    W -->|tries exhausted, fail or timeout| F[(failed_jobs)]
+    F -->|queue:retry| Q
+....
+
+== Connections and drivers
+
+`config/queue.php` defines *connections* (a driver plus its settings). Each connection holds any number of named
+*queues*. A new application uses the `database` driver, with the `jobs`, `job_batches` and `failed_jobs` tables
+created by its first migration, so queues work with no extra service. Redis is the usual production choice, with
+SQS and Beanstalkd as alternatives. The `sync` driver runs jobs immediately in the request, and it is what
+`phpunit.xml` sets for tests. Bookshelf uses `database` by default and the Redis container
+(xref:web/php-laravel/redis-mongodb-and-search.adoc[Redis, MongoDB and Search]) for Horizon.
+
+== A job class
+
+`php artisan make:job SyncBookWithCatalogue` creates the class. Retry behaviour is declared with attributes (new in
+Laravel 13; earlier versions used `$tries`, `$backoff` and `$timeout` properties, which still work):
+
+[source,php]
+----
+<?php
+// app/Jobs/SyncBookWithCatalogue.php
+namespace App\Jobs;
+
+use App\Models\Book;
+use App\Services\CatalogueClient;
+use Illuminate\Bus\Batchable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Queue\Queueable;
+use Illuminate\Queue\Attributes\Backoff;
+use Illuminate\Queue\Attributes\Timeout;
+use Illuminate\Queue\Attributes\Tries;
+use Illuminate\Queue\Middleware\WithoutOverlapping;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+#[Tries(3)]
+#[Backoff([1, 5])]          // seconds before the 2nd and 3rd attempts
+#[Timeout(10)]
+class SyncBookWithCatalogue implements ShouldQueue
+{
+    use Batchable, Queueable;
+
+    public function __construct(public Book $book) {}       // serialized as the model's id, reloaded in the worker
+
+    public function middleware(): array
+    {
+        return [(new WithoutOverlapping($this->book->id))->releaseAfter(5)];
+    }
+
+    public function handle(CatalogueClient $catalogue): void
+    {
+        if ($this->batch()?->cancelled()) {
+            return;
+        }
+
+        $found = $catalogue->lookup(str_replace('-', '', $this->book->isbn));   // throws after the client's own retries
+
+        if ($found === null) {
+            $this->fail("No catalogue record for {$this->book->isbn}");        // retrying cannot help
+            return;
+        }
+
+        $this->book->update(['meta' => ['pages' => $found['pages'] ?? null, 'synced_at' => now()->toIso8601String()]]);
+    }
+
+    public function failed(?Throwable $e): void
+    {
+        Log::warning('catalogue sync failed', ['book' => $this->book->id, 'error' => $e?->getMessage()]);
+    }
+}
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#max-attempts[Laravel -- Max Attempts] and https://laravel.com/framework/docs/13.x/queues#preventing-job-overlaps[Preventing Job Overlaps]
+
+Dispatching it and reading the stored row:
+
+[source,php]
+----
+<?php
+SyncBookWithCatalogue::dispatch(Book::find(1));
+
+$payload = json_decode(DB::table('jobs')->first()->payload, true);
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#dispatching-jobs[Laravel -- Dispatching Jobs]
+
+[source,text]
+----
+queue: default, attempts: 0
+payload keys: uuid, displayName, job, maxTries, maxExceptions, failOnTimeout, countCrashesAsExceptions, backoff, timeout, retryUntil, deleteWhenMissingModels, data, createdAt, delay
+maxTries: 3, backoff: 1,5, timeout: 10
+command contains: ModelIdentifier (id only), length 236
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#class-structure[Laravel -- Class Structure]
+
+The attributes are copied into the payload, so they win over the worker's `--tries` option. The `Book` is stored as
+a `ModelIdentifier` (class, id, connection and loaded relations) and is loaded again from the database when the job
+runs, so the job sees the current row, not the one at dispatch time.
+
+`dispatchSync()` runs a job at once, in the current process, without a queue. It suits a command or a request that
+needs the result before it carries on, and code paths that must not depend on a worker. With the catalogue faked to
+answer once and then return `503`:
+
+[source,php]
+----
+<?php
+Http::fake(['*' => Http::sequence()->push(['pages' => 264])->push('unavailable', 503)->whenEmpty(Http::response('', 503))]);
+
+SyncBookWithCatalogue::dispatchSync($book);
+echo 'dispatchSync: pages ', $book->fresh()->meta['pages'], ', jobs table +', $jobs() - $before, ', requests ', count(Http::recorded()), PHP_EOL;
+
+try {
+    SyncBookWithCatalogue::dispatchSync($book);
+} catch (Throwable $e) {
+    echo 'dispatchSync failure: ', get_class($e), ' (', $e->getCode(), '), requests ', count(Http::recorded()), PHP_EOL;
+}
+
+SyncBookWithCatalogue::dispatch($book);
+echo 'dispatch: jobs table +', $jobs() - $before, PHP_EOL;
+----
+
+[source,text]
+----
+dispatchSync: pages 264, jobs table +0, requests 1
+  log: catalogue sync failed {"book":1,"error":"HTTP request returned status code 503"}
+dispatchSync failure: Illuminate\Http\Client\RequestException (503), requests 4
+dispatch: jobs table +1
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#synchronous-dispatching[Laravel -- Synchronous Dispatching]
+
+The first call updated the book without writing to the `jobs` table. The second shows what a synchronous job does
+not have: the HTTP client's own retries made three more requests, but `+#[Tries(3)]+` and `+#[Backoff]+` did not apply,
+because there is no queue to release the job back to. The job's `failed()` method ran (the log line), and the
+exception then reached the caller, so a controller using `dispatchSync()` answers 500 unless it catches it. Only
+`dispatch()` added a row. Internally, `dispatchSync()` sends the job to the `sync` connection whatever
+`QUEUE_CONNECTION` says, which is why the job's middleware and `failed()` still run, unlike a direct call to
+`handle()`.
+
+== Running workers
+
+`php artisan queue:work` runs jobs until it is stopped. One run with the catalogue up, and one with it in
+maintenance mode:
+
+[source,console]
+----
+$ php artisan queue:work --stop-when-empty
+ 2026-10-05 22:09:15 App\Jobs\SyncBookWithCatalogue .. RUNNING
+ 2026-10-05 22:09:15 App\Jobs\SyncBookWithCatalogue .. 48.71ms DONE
+ 2026-10-05 22:09:18 Worker STOPPED Queue empty
+
+$ php artisan queue:work --max-time=12 --sleep=1        # catalogue answering 503
+ 2026-10-05 22:09:24 App\Jobs\SyncBookWithCatalogue .. RUNNING
+ 2026-10-05 22:09:25 App\Jobs\SyncBookWithCatalogue .. 440.71ms FAIL
+ 2026-10-05 22:09:26 App\Jobs\SyncBookWithCatalogue .. RUNNING
+ 2026-10-05 22:09:26 App\Jobs\SyncBookWithCatalogue .. 413.43ms FAIL
+ 2026-10-05 22:09:31 App\Jobs\SyncBookWithCatalogue .. RUNNING
+ 2026-10-05 22:09:32 App\Jobs\SyncBookWithCatalogue .. 416.65ms FAIL
+ 2026-10-05 22:09:37 Worker STOPPED Maximum run time exceeded
+
+$ php artisan queue:failed
+ 2026-10-05 22:09:32 5ad2ff5b-5095-4266-89d8-f6a011935975 database@default App\Jobs\SyncBookWithCatalogue
+$ php artisan queue:retry all                           # after the catalogue came back
+ 1193dd91-3f29-4b8b-9a2f-639eb6f188ba .. 10.17ms DONE
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#the-queue-work-command[Laravel -- The queue:work Command] and https://laravel.com/framework/docs/13.x/queues#dealing-with-failed-jobs[Dealing With Failed Jobs]
+
+The timestamps show the backoff: one second before the second attempt and five before the third. After the third
+failure, `failed()` logged `+catalogue sync failed {"book":1,"error":"HTTP request returned status code 503: …"}+` and
+the job moved to `failed_jobs`.
+
+*Retries multiply.* Each attempt took about 420 ms because the catalogue client retries twice itself (100 ms and
+300 ms waits). The mock service counted *9 requests* for one job: three job attempts times three HTTP attempts. Retry
+in one layer, or make the inner layer short. Here the HTTP client's retries handle brief network errors, and the
+job's backoff handles outages.
+
+A worker is a long-running PHP process. It boots the application once, so code changes are not picked up until it
+restarts. `php artisan queue:restart` (run on every deploy) tells workers to exit after their current job. Supervisor
+or systemd starts them again:
+
+[source,ini]
+----
+; /etc/supervisor/conf.d/bookshelf-worker.conf
+[program:bookshelf-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=php /srv/bookshelf/current/artisan queue:work --sleep=3 --max-time=3600
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+user=www-data
+numprocs=4
+redirect_stderr=true
+stdout_logfile=/srv/bookshelf/shared/worker.log
+stopwaitsecs=3600                 ; longer than the longest job
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#configuring-supervisor[Laravel -- Configuring Supervisor]
+
+`--max-time` and `--max-jobs` make a worker exit regularly, which limits memory growth. `--queue=high,default`
+gives priorities: the worker empties `high` before it looks at `default`. The production setup with systemd units is
+on xref:web/php-laravel/deployment.adoc[Deployment].
+
+== Failing on purpose
+
+One of the books in the batch below has an ISBN that the catalogue does not know. Retrying a 404 three times only
+delays the same answer, so the job calls `+$this->fail(...)+`. That marks it failed at once, runs `failed()`, and skips
+the remaining tries. `+$this->release(30)+` does the opposite: it puts the job back with a delay without counting a
+failure. `ModelNotFoundException`, raised when the model behind a job has been deleted, also fails the job at once.
+`+#[DeleteWhenMissingModels]+` deletes such jobs silently instead.
+
+== Dispatching inside transactions
+
+A job dispatched inside a database transaction can be picked up before the transaction commits, or after it rolls
+back. Bookshelf created a book in a transaction, dispatched the sync and then threw, so the book was rolled back:
+
+[source,php]
+----
+<?php
+DB::transaction(function () use ($connection, $afterCommit) {
+    $book = Book::create(['author_id' => 1, 'title' => 'Bloodchild', 'isbn' => '978-1-58322-…']);
+    $pending = SyncBookWithCatalogue::dispatch($book)->onConnection($connection);
+    if ($afterCommit) {
+        $pending->afterCommit();
+    }
+    unset($pending);                                  // PendingDispatch pushes the job when it is destroyed
+    throw new RuntimeException('payment failed');     // rolls the book back
+});
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#jobs-and-database-transactions[Laravel -- Jobs and Database Transactions]
+
+[source,text]
+----
+redis    afterCommit=false queued after rollback: 1
+redis    afterCommit=true  queued after rollback: 0
+database afterCommit=false queued after rollback: 0
+database afterCommit=true  queued after rollback: 0
+
+$ php artisan queue:work redis --once
+ 2026-10-05 22:10:08 App\Jobs\SyncBookWithCatalogue .. 8.51ms FAIL
+Illuminate\Database\Eloquent\ModelNotFoundException: No query results for model [App\Models\Book].
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#specifying-commit-dispatch-behavior-inline[Laravel -- Specifying Commit Dispatch Behavior Inline]
+
+With the `database` driver on the same connection, the job's `INSERT` is part of the transaction and is rolled back
+with it. This hides the problem in development. On Redis, the job was already in the list and failed in the worker,
+looking for a book that never existed. `afterCommit()`, or `+'after_commit' => true+` on the connection in
+`config/queue.php`, holds the dispatch until the outermost transaction commits and drops it on rollback. The same
+applies to queued listeners, mail and notifications
+(xref:web/php-laravel/events-and-listeners.adoc[Events and Listeners]).
+
+== Unique, debounced and rate-limited jobs
+
+`ShouldBeUnique` takes a cache lock keyed on `uniqueId()` when the job is dispatched. A second dispatch with the same
+key is dropped while the first one is pending:
+
+[source,php]
+----
+<?php
+// app/Jobs/RebuildAuthorIndex.php
+#[UniqueFor(600)]           // the lock expires after ten minutes even if the job never runs
+class RebuildAuthorIndex implements ShouldBeUnique, ShouldQueue
+{
+    use Queueable;
+
+    public function __construct(public Author $author) {}
+
+    public function uniqueId(): string
+    {
+        return (string) $this->author->id;
+    }
+
+    public function handle(): void
+    {
+        $this->author->books()->searchable();          // Scout, from the search page
+    }
+}
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#unique-jobs[Laravel -- Unique Jobs]
+
+Dispatching it twice for one author and once for another left two rows in `jobs`, as the test below checks.
+`ShouldBeUniqueUntilProcessing` releases the lock when the job starts instead of when it ends. `+#[DebounceFor(30)]+`
+does the reverse of uniqueness: the *latest* dispatch within the window runs, and the earlier ones are removed.
+
+Job middleware wraps `handle()`. `WithoutOverlapping($key)` stops two workers from running the same book at once (the
+`releaseAfter(5)` above puts the second one back for five seconds). `RateLimited('catalogue')` applies a named
+limiter from xref:web/php-laravel/cache-and-rate-limiting.adoc[Cache and Rate Limiting].
+`+ThrottlesExceptions(3, 5 * 60)+` stops calling a failing service for five minutes after three exceptions, which is a
+circuit breaker for jobs (xref:backend/resilience/circuit-breaker.adoc[Circuit Breaker]). Overlap and unique locks
+need a cache store that every worker shares, such as Redis or the database, not `array` or `file` on separate servers.
+
+== Chains and batches
+
+`+Bus::chain([...])->dispatch()+` runs jobs one after another and stops at the first failure. `Bus::batch()` runs jobs
+in parallel and tracks them in `job_batches`. The nightly sync is one batch:
+
+[source,php]
+----
+<?php
+$batch = Bus::batch(Book::whereIn('id', [1, 2, 24])->get()->map(fn ($book) => new SyncBookWithCatalogue($book)))
+    ->name('nightly catalogue sync')
+    ->allowFailures()                              // one bad ISBN must not cancel the rest
+    ->then(fn (Batch $batch) => Log::info('batch then (no failures)'))
+    ->catch(fn (Batch $batch, Throwable $e) => Log::info('batch catch: '.$e->getMessage()))
+    ->finally(fn (Batch $batch) => Log::info("batch finally: {$batch->processedJobs()} processed, {$batch->failedJobs} failed"))
+    ->dispatch();
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#dispatching-batches[Laravel -- Dispatching Batches] and https://laravel.com/framework/docs/13.x/queues#allowing-failures[Allowing Failures]
+
+[source,text]
+----
+ 2026-10-05 22:10:24 App\Jobs\SyncBookWithCatalogue .. 38.49ms DONE
+ 2026-10-05 22:10:24 App\Jobs\SyncBookWithCatalogue .. 8.77ms DONE
+ 2026-10-05 22:10:24 App\Jobs\SyncBookWithCatalogue .. 10.61ms FAIL
+ 2026-10-05 22:10:24 App\Jobs\SyncBookWithCatalogue .. 13.41ms DONE
+local.INFO: batch catch: No catalogue record for import-9d05ace6d1e8e7a4e795c5f1b8a0bbe6
+local.INFO: batch finally: 2 processed, 1 failed
+Bus::findBatch($id): {"name":"nightly catalogue sync","totalJobs":3,"pendingJobs":1,"failedJobs":1,"progress":67,"finished":false}
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#inspecting-batches[Laravel -- Inspecting Batches]
+
+Three details from the run:
+
+* *`fail()` prints FAIL and then DONE* for the same job. The worker reports the job as handled because `handle()`
+  returned normally, but it is in `failed_jobs`.
+* *`finally` ran while `finished` is still `false`.* A failed job still counts as pending, because
+  `php artisan queue:retry-batch` can retry it. `finally` means every job has run once, and `then` only fires when
+  none failed.
+* *`progress` is 67*, which is two of three, rounded. A route can return the batch as JSON for a progress bar.
+
+== Routing jobs to queues
+
+`Queue::route()` in a service provider sends a job class, or every class with an interface or trait, to a connection
+and queue, so dispatch calls do not repeat it:
+
+[source,php]
+----
+<?php
+// AppServiceProvider::boot()
+Queue::route(SyncBookWithCatalogue::class, connection: 'redis', queue: 'catalogue');
+Queue::route(ShouldBroadcast::class, queue: 'broadcasts');
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#queue-routing[Laravel -- Queue Routing]
+
+== Horizon
+
+Horizon (`composer require laravel/horizon`, `php artisan horizon:install`) replaces `queue:work` for Redis queues.
+One `php artisan horizon` process starts and scales the workers from `config/horizon.php`, and a dashboard at
+`/horizon` shows throughput, wait times, failures and tags. The installed default has one supervisor balancing the
+`default` queue. It starts three processes locally and ten in production. Five syncs dispatched to Redis while it ran:
+
+[source,console]
+----
+$ php artisan horizon:status
+ INFO Horizon is running.
+$ php artisan horizon:supervisors
++----------------------+-------+---------+-------------------+-----------+
+| Name                 | PID   | Status  | Workers           | Balancing |
++----------------------+-------+---------+-------------------+-----------+
+| vm-XYho:supervisor-1 | 24902 | running | redis:default (1) | auto      |
++----------------------+-------+---------+-------------------+-----------+
+$ curl -s localhost:8000/horizon/api/stats
+{"failedJobs":2,"jobsPerMinute":3,"pausedMasters":0,"periods":{"failedJobs":10080,"recentJobs":60},"processes":1,"queueWithMaxRuntime":"default","queueWithMaxThroughput":"default","recentJobs":5,"status":"running","wait":{"redis:default":0}}
+----
+
+Source: https://laravel.com/framework/docs/13.x/horizon#running-horizon[Laravel -- Running Horizon]
+
+The two failures are factory books with `979-` ISBNs, which the mock catalogue does not know. The dashboard answered
+200 because the environment is `local`. In other environments, the `viewHorizon` gate in
+`app/Providers/HorizonServiceProvider.php` decides who may see it. The default allows nobody, and it should list the
+operators. On deploy, `php artisan horizon:terminate` replaces `queue:restart`.
+
+== Idempotency
+
+Queues deliver *at least once*. A worker killed after the side effect and before it deletes the job runs that job
+again, and so does a timeout that fires while the work is finishing. A job must therefore be safe to run twice. The
+sync is safe because it writes the same `meta` each time. A job that charges a card or sends an email needs a guard:
+a unique key stored with the result, a status column checked in a `lockForUpdate()` transaction, or the provider's
+own idempotency key. The general treatment is on
+xref:backend/messaging/delivery-guarantees.adoc[Delivery Guarantees].
+
+== Testing
+
+`Queue::fake()` records pushed jobs without running them. `Bus::fake()` does the same for chains and batches:
+
+[source,php]
+----
+<?php
+// tests/Feature/QueueTest.php
+use App\Jobs\{RebuildAuthorIndex, SyncBookWithCatalogue};
+use App\Models\{Author, Book};
+use Illuminate\Bus\PendingBatch;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\{Bus, DB, Queue};
+
+uses(RefreshDatabase::class);
+
+test('saving a book queues a sync', function () {
+    Queue::fake();
+
+    $book = Book::factory()->create();
+    SyncBookWithCatalogue::dispatch($book)->afterCommit();
+
+    Queue::assertPushed(SyncBookWithCatalogue::class, fn ($job) => $job->book->is($book));
+    Queue::assertCount(1);
+});
+
+test('the nightly sync is one batch', function () {
+    Bus::fake();
+    Book::factory()->count(3)->create();
+
+    Bus::batch(Book::all()->map(fn ($b) => new SyncBookWithCatalogue($b)))->name('nightly catalogue sync')->dispatch();
+
+    Bus::assertBatched(fn (PendingBatch $batch) => $batch->name === 'nightly catalogue sync' && $batch->jobs->count() === 3);
+});
+
+test('a unique job is queued once while the first is pending', function () {
+    config(['queue.default' => 'database']);
+    $author = Author::factory()->create();
+
+    RebuildAuthorIndex::dispatch($author);
+    RebuildAuthorIndex::dispatch($author);
+    RebuildAuthorIndex::dispatch(Author::factory()->create());
+
+    expect(DB::table('jobs')->count())->toBe(2);
+});
+----
+
+Source: https://laravel.com/framework/docs/13.x/queues#testing[Laravel -- Queue Testing]
+
+All three pass. The job's `handle()` is tested by calling it directly with a faked HTTP client, as on
+xref:web/php-laravel/http-client.adoc[HTTP Client]. A test with the `sync` driver runs jobs inline, which tests the
+code but not the queue behaviour, such as serialization, `afterCommit` and retries.
+
+== Where older books and tutorials are outdated
+
+* *`public $tries = 3;` and `public $timeout`* (Stauffer ch. 16) still work, but Laravel 13 declares them with
+  `+#[Tries]+`, `+#[Backoff]+` and `+#[Timeout]+`.
+* *`use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;`* in every job became the single `Queueable`
+  trait in Laravel 11.
+* *`QUEUE_CONNECTION=sync` in a new `.env`* was replaced by `database` in Laravel 11, so jobs really are queued from
+  the first day.
+* *`queue:listen` in production* boots the framework for every job. `queue:work` and Horizon boot once.
+* *A cron job calling `queue:work --once` every minute* is replaced by Supervisor or systemd keeping workers running.
+* *Assuming exactly-once delivery* was never right. Jobs must be idempotent.
+
+== References
+
+* https://laravel.com/framework/docs/13.x/queues[Laravel -- Queues]
+* https://laravel.com/framework/docs/13.x/queues#job-batching[Laravel -- Job Batching]
+* https://laravel.com/framework/docs/13.x/queues#job-middleware[Laravel -- Job Middleware]
+* https://laravel.com/framework/docs/13.x/horizon[Laravel -- Horizon]
+* http://supervisord.org/configuration.html[Supervisor -- Configuration File]
+* https://www.oreilly.com/library/view/laravel-up/9781492041207/[Matt Stauffer -- Laravel: Up & Running, 2nd ed. (O'Reilly, 2019)]

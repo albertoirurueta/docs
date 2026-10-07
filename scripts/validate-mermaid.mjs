@@ -70,6 +70,18 @@ function extractBlocks(text) {
   return blocks
 }
 
+// The extension writes the diagram source into the page as raw HTML, and Mermaid then reads the element's
+// `innerHTML` and decodes its entities. So `<<interface>>` is parsed by the browser as an `<interface>` tag,
+// whose closing tag lands after the last line of the diagram. Validate what the browser hands to Mermaid,
+// not the source as written.
+const container = document.createElement('div')
+const decoder = document.createElement('textarea')
+function asBrowserSeesIt(src) {
+  container.innerHTML = src
+  decoder.innerHTML = container.innerHTML
+  return decoder.value
+}
+
 let total = 0
 const failures = []
 
@@ -78,7 +90,7 @@ for await (const file of adocFiles(ROOT)) {
   for (const { line, src } of extractBlocks(text)) {
     total++
     try {
-      await mermaid.parse(src)
+      await mermaid.parse(asBrowserSeesIt(src))
     } catch (error) {
       const message = String(error?.message ?? error).split('\n').slice(0, 6).join('\n      ')
       failures.push(`${relative(process.cwd(), file)}:${line}\n      ${message}`)
