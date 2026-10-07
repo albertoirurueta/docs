@@ -1,0 +1,285 @@
+= Request Limits & Timeouts
+:description: Protecting an axum 0.8 service from oversized and slow requests -- DefaultBodyLimit (the 2 MB default, max, disable, per-route limits) versus tower-http's RequestBodyLimitLayer, handler timeouts with TimeoutLayer::with_status_code, idle body timeouts and the tower-http 0.7 body deadline layers, the missing header-read timeout in axum::serve 0.8 and how to set one with hyper-util, serve::ListenerExt::tap_io, connection limits in the upcoming axum 0.9, and slow-loris protection.
+:keywords: axum, DefaultBodyLimit, body limit, 2MB, 413 Payload Too Large, RequestBodyLimitLayer, TimeoutLayer, with_status_code, RequestBodyTimeoutLayer, RequestBodyDeadlineLayer, ResponseBodyDeadlineLayer, header_read_timeout, hyper-util, TokioTimer, ListenerExt, tap_io, limit_connections, TCP_NODELAY, slow loris, denial of service, tower-http 0.7
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against axum 0.8.9 on Rust 1.99 (edition 2024) with tower-http 0.7.1, hyper 1.12 and hyper-util
+0.1.21, checked on 2026-10-06. Every public service must bound three things: how *large* a request may be, how *long*
+the application may take to answer, and how *slowly* a client may send or receive. Unbounded, each is a cheap
+denial-of-service vector.
+
+== Body size: `DefaultBodyLimit`
+
+axum refuses request bodies larger than *2 MB* in every extractor built on `Bytes` -- `Bytes`, `String`, `Json`, `Form`
+-- with `413 Payload Too Large`. The `DefaultBodyLimit` layer changes that limit, globally or for one route:
+
+[source,rust]
+----
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    routing::{post, put},
+};
+
+async fn create_review(body: String) -> String {
+    format!("review of {} bytes\n", body.len())
+}
+
+async fn upload_cover(body: axum::body::Bytes) -> String {
+    format!("cover of {} bytes\n", body.len())
+}
+
+fn app() -> Router {
+    Router::new()
+        .route("/api/v1/books/{isbn}/reviews", post(create_review))
+        // this route: up to 10 MiB
+        .route("/api/v1/books/{isbn}/cover", put(upload_cover).layer(DefaultBodyLimit::max(10 * 1024 * 1024)))
+        // every route above: 16 KiB unless overridden
+        .layer(DefaultBodyLimit::max(16 * 1024))
+}
+
+#[tokio::main]
+async fn main() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app()).await.unwrap();
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/extract/struct.DefaultBodyLimit.html[axum: DefaultBodyLimit]
+
+[source,bash]
+----
+$ head -c 20000 /dev/zero | curl -s --data-binary @- localhost:3000/api/v1/books/1/reviews
+Failed to buffer the request body: length limit exceeded
+$ head -c 20000 /dev/zero | curl -s -X PUT --data-binary @- localhost:3000/api/v1/books/1/cover
+cover of 20000 bytes
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/extract/struct.DefaultBodyLimit.html[axum: DefaultBodyLimit]
+
+The innermost `DefaultBodyLimit` wins, so a route's own layer overrides the router-wide one. `DefaultBodyLimit` is not
+a middleware that inspects bodies: it only stores a setting in the request extensions, and *extractors that honour it*
+apply the limit. Two consequences:
+
+* An extractor that reads the body itself -- `Request`, `Multipart` streaming, a third-party extractor -- is not limited
+  unless it calls `RequestExt::with_limited_body`. axum's `Multipart` does honour the limit, and since 0.8.9 reports
+  exceeding it with a specific error message.
+* `DefaultBodyLimit::disable()` removes the limit entirely; only do that together with `RequestBodyLimitLayer`.
+
+== Body size: `RequestBodyLimitLayer`
+
+tower-http's `RequestBodyLimitLayer` is a real middleware: it rejects requests whose `Content-Length` exceeds the
+limit before the handler runs, and wraps the body so that a chunked body is cut off when it crosses the limit,
+whatever consumes it. Use it when you accept raw bodies or third-party extractors, and to bound the whole service:
+
+[source,rust]
+----
+use axum::{Router, body::Body, extract::DefaultBodyLimit, routing::post};
+use futures::StreamExt;
+use tower_http::limit::RequestBodyLimitLayer;
+
+async fn import(body: Body) -> String {
+    // stream the body: no Bytes extractor, so DefaultBodyLimit would not apply
+    let mut stream = body.into_data_stream();
+    let mut total = 0usize;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => total += bytes.len(),
+            Err(err) => return format!("aborted after {total} bytes: {err}\n"),
+        }
+    }
+    format!("imported {total} bytes\n")
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/api/v1/imports", post(import))
+        .layer(DefaultBodyLimit::disable())                // the extractor-level limit is replaced...
+        .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)); // ...by a hard 50 MiB limit for everything
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/tower-http/0.7.1/tower_http/limit/index.html[tower-http: limit]
+
+If both are present, the *smaller* limit applies to `Bytes`-based extractors. Pick limits per endpoint from the
+largest legitimate payload (a JSON review: kilobytes; a cover image: megabytes), not one generous global value.
+
+== Handler time: `TimeoutLayer`
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{Router, http::StatusCode, routing::get};
+use tower::ServiceBuilder;
+use tower_http::timeout::{RequestBodyDeadlineLayer, RequestBodyTimeoutLayer, ResponseBodyDeadlineLayer, TimeoutLayer};
+
+async fn report() -> &'static str {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    "report\n"
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new().route("/api/v1/reports/loans", get(report)).layer(
+        ServiceBuilder::new()
+            // at most 5 min to send the response body (downloads, streams) (0.7); outermost, see below
+            .layer(ResponseBodyDeadlineLayer::new(Duration::from_secs(300)))
+            // the handler (and extractors) must produce a response within 2 s, or 408
+            .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(2)))
+            // at most 10 s without a new request-body frame (idle timeout, resets on progress)
+            .layer(RequestBodyTimeoutLayer::new(Duration::from_secs(10)))
+            // at most 60 s for the whole request body, however steadily it arrives (0.7)
+            .layer(RequestBodyDeadlineLayer::new(Duration::from_secs(60))),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/tower-http/0.7.1/tower_http/timeout/index.html[tower-http: timeout]
+
+[source,bash]
+----
+$ curl -si localhost:3000/api/v1/reports/loans | head -1
+HTTP/1.1 408 Request Timeout
+----
+
+Source: https://docs.rs/tower-http/0.7.1/tower_http/timeout/index.html[tower-http: timeout]
+
+* Response-body layers wrap the response body in a new type, and `TimeoutLayer` needs a body type that implements
+  `Default` (to build its empty `408`). Put `ResponseBodyDeadlineLayer` and `ResponseBodyTimeoutLayer` *outside*
+  `TimeoutLayer`, or the stack fails to compile with "the trait `Default` is not implemented for
+  `DeadlineBody<Body>`".
+* `TimeoutLayer` measures until the *response head* is produced. It cannot interrupt a streaming body that is already
+  being sent; the response-body layers do that.
+* When the timeout fires, the handler's future is *dropped*: work in progress stops at its current `.await`. Code that
+  must not be interrupted -- a multi-step database write -- belongs in a transaction or in a spawned task (see
+  xref:backend/axum/background-jobs-and-tasks.adoc[Background Jobs & Tasks]).
+* `408 Request Timeout` signals "the client was too slow"; many APIs prefer `503` or `504` when the *server* was slow.
+  `with_status_code` lets you choose.
+* Endpoints with long legitimate work (exports, uploads) get their own longer timeout through `MethodRouter::layer`.
+* Use tower's generic `tower::timeout::TimeoutLayer` only with `HandleErrorLayer` (see
+  xref:backend/axum/error-handling.adoc[Error Handling]).
+
+== Header time: the slow-loris gap in `axum::serve` 0.8
+
+A *slow-loris* client opens many connections and sends request headers a few bytes at a time, never finishing, to
+exhaust the server's connections or file descriptors. hyper can defend against this with a *header-read timeout*, but
+the timeout needs a timer, and `axum::serve` in 0.8 configures none: a connection that never completes its headers stays
+open indefinitely (verified against 0.8.9 by sending a partial request head and waiting). The unreleased 0.9 changes
+`serve` to apply hyper's header-read timeout by default.
+
+Until then, either terminate client connections at a reverse proxy or load balancer that enforces header timeouts (the
+usual production setup, see xref:backend/axum/deployment.adoc[Deployment]), or drive hyper-util yourself:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{Router, extract::Request, routing::get};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder,
+    service::TowerToHyperService,
+};
+use tower::ServiceExt;
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new().route("/", get(|| async { "ok\n" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                eprintln!("accept error: {err}");
+                continue;
+            }
+        };
+        let router = app.clone();
+        tokio::spawn(async move {
+            // hyper hands us Request<Incoming>; axum wants Request<axum::body::Body>
+            let service = TowerToHyperService::new(router.map_request(|req: Request<hyper::body::Incoming>| {
+                req.map(axum::body::Body::new)
+            }));
+            let mut builder = Builder::new(TokioExecutor::new());
+            builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(5));
+            if let Err(err) = builder.serve_connection_with_upgrades(TokioIo::new(stream), service).await {
+                eprintln!("connection error: {err}"); // "read header from client timeout" for slow clients
+            }
+        });
+    }
+}
+----
+
+Source: https://docs.rs/hyper-util/0.1.21/hyper_util/server/conn/auto/struct.Builder.html[hyper-util: auto::Builder] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/serve-with-hyper[axum example: serve-with-hyper]
+
+This loop omits graceful shutdown; the full pattern, including connection tracking, is on
+xref:backend/axum/performance-tuning.adoc[Performance Tuning] and xref:backend/axum/graceful-shutdown.adoc[Graceful
+Shutdown].
+
+== Connections: `ListenerExt`
+
+axum 0.8 lets you wrap the listener. `serve::ListenerExt::tap_io` runs a closure on every accepted connection, which is
+the supported way to set socket options now that `Serve::tcp_nodelay` is gone (removed in 0.8):
+
+[source,rust]
+----
+use axum::{Router, routing::get, serve::ListenerExt};
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new().route("/", get(|| async { "ok\n" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap().tap_io(|tcp| {
+        if let Err(err) = tcp.set_nodelay(true) {
+            tracing::trace!("failed to set TCP_NODELAY: {err}");
+        }
+    });
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/serve/trait.ListenerExt.html[axum: serve::ListenerExt]
+
+The unreleased 0.9 adds `ListenerExt::limit_connections(n)`, which stops accepting when `n` connections are open. In
+0.8, bound *requests* in flight with tower's `ConcurrencyLimitLayer` and `LoadShedLayer` (see
+xref:backend/axum/rate-limiting-and-load-shedding.adoc[Rate Limiting & Load Shedding]), and bound *connections* at the
+proxy or with the OS (`ulimit -n`, container limits).
+
+== A checklist
+
+[cols="2,3",options="header"]
+|===
+|Threat |Defence
+|huge JSON or form bodies |`DefaultBodyLimit` sized per route (default 2 MB)
+|huge raw or streamed bodies |`RequestBodyLimitLayer`
+|slow handlers or stuck dependencies |`TimeoutLayer::with_status_code`, plus timeouts on database and HTTP clients
+|clients trickling the body |`RequestBodyTimeoutLayer` (idle) and `RequestBodyDeadlineLayer` (total, 0.7)
+|clients never finishing headers |reverse proxy timeouts, or hyper-util with `header_read_timeout` (default in axum 0.9)
+|clients reading the response slowly |`ResponseBodyDeadlineLayer` (0.7)
+|too many concurrent requests |`ConcurrencyLimitLayer` + `LoadShedLayer`, rate limiting per client
+|===
+
+The OWASP REST Security cheat sheet lists the same controls under "Denial of service".
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*, chapter 4) sets timeouts with tower-http 0.6's `TimeoutLayer::new`, deprecated since 0.6.7,
+and does not cover body deadlines, which only exist since tower-http 0.7. Code that calls `Serve::tcp_nodelay` must
+switch to `ListenerExt::tap_io` since axum 0.8.
+
+== References
+
+* https://docs.rs/axum/0.8.9/axum/extract/struct.DefaultBodyLimit.html[axum: DefaultBodyLimit] and https://docs.rs/axum/0.8.9/axum/extract/index.html#request-body-limits[Request body limits]
+* https://docs.rs/tower-http/0.7.1/tower_http/limit/index.html[tower-http: limit] and https://docs.rs/tower-http/0.7.1/tower_http/timeout/index.html[timeout]
+* https://docs.rs/axum/0.8.9/axum/serve/trait.ListenerExt.html[axum: serve::ListenerExt]
+* https://docs.rs/hyper/1.12.0/hyper/server/conn/http1/struct.Builder.html#method.header_read_timeout[hyper: http1::Builder::header_read_timeout]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/serve-with-hyper[axum example: serve-with-hyper]
+* https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html[OWASP REST Security Cheat Sheet]
+* https://link.springer.com/book/10.1007/979-8-8688-2631-3[Indo Yoon, Beginning Axum (Apress, 2026)]

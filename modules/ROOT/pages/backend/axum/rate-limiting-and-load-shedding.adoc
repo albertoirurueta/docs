@@ -1,0 +1,318 @@
+= Rate Limiting & Load Shedding
+:description: Protecting an axum service from abuse and overload -- per-client rate limiting with tower_governor (GCRA, per-IP keys from ConnectInfo or forwarded headers, rate-limit headers and the tower-http 0.6 duplication caveat), tower's ConcurrencyLimit, LoadShed, RateLimit and Buffer layers with HandleErrorLayer, a Redis-backed distributed limiter for multiple instances, 429 Too Many Requests with Retry-After, and spotting abuse in traces.
+:keywords: axum, rate limiting, tower_governor, governor, GCRA, PeerIpKeyExtractor, SmartIpKeyExtractor, KeyExtractor, ConnectInfo, X-Forwarded-For, 429 Too Many Requests, Retry-After, x-ratelimit headers, ConcurrencyLimitLayer, LoadShedLayer, RateLimitLayer, BufferLayer, HandleErrorLayer, 503, load shedding, Redis, distributed rate limiter, fixed window, abuse detection
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against axum 0.8.9 on Rust 1.99 (edition 2024) with tower 0.5.3, tower_governor 0.8.0 and redis
+1.7, checked on 2026-10-06. *Rate limiting* caps how often one client may call the service; *load shedding* rejects
+work the service as a whole cannot absorb right now. Both answer quickly with an error instead of letting queues grow
+until everything is slow. The algorithms -- token bucket, leaky bucket, GCRA, sliding windows -- are explained on
+xref:backend/resilience/rate-limiter.adoc[Rate Limiter] and, for Java, on the Bucket4j pages of the
+xref:backend/resilience/index.adoc[Resilience] section; this page shows the axum side.
+
+== Per-client limits with `tower_governor`
+
+`tower_governor` wraps the `governor` crate, which implements the *Generic Cell Rate Algorithm* (GCRA) -- a token
+bucket that stores a single timestamp per key, so it is cheap in memory and lock-free. Its configuration is a
+replenish period and a burst size:
+
+[source,toml]
+----
+[dependencies]
+tower_governor = "0.8.0" # depends on tower-http 0.6: a second tower-http compiles alongside 0.7
+----
+
+Source: https://docs.rs/tower_governor/0.8.0/tower_governor/[tower_governor 0.8.0] and https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html[Cargo: specifying dependencies]
+
+[source,rust]
+----
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{Router, routing::get};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor};
+
+#[tokio::main]
+async fn main() {
+    // Bursts of up to 5 requests per client, then one more every 2 seconds.
+    let config = Arc::new(
+        GovernorConfigBuilder::default()
+            .per_second(2)
+            .burst_size(5)
+            .key_extractor(SmartIpKeyExtractor) // X-Forwarded-For / X-Real-IP / Forwarded, else the peer address
+            .use_headers() // x-ratelimit-* headers on every response
+            .finish()
+            .expect("valid rate-limit configuration"),
+    );
+
+    // The limiter keeps one entry per key; purge idle keys periodically.
+    let limiter = config.limiter().clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            limiter.retain_recent();
+        }
+    });
+
+    let app = Router::new().route("/api/v1/books", get(|| async { "books\n" })).layer(GovernorLayer::new(config));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    // the peer-IP extractors need the connection's address
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+}
+----
+
+Source: https://docs.rs/tower_governor/0.8.0/tower_governor/[tower_governor 0.8.0]
+
+[source,bash]
+----
+$ for i in $(seq 7); do curl -s -o /dev/null -w '%{http_code} ' localhost:3000/api/v1/books; done; echo
+200 200 200 200 200 429 429
+$ curl -si localhost:3000/api/v1/books | grep -i -E '^HTTP|retry-after|x-ratelimit'
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-after: 1
+retry-after: 1
+x-ratelimit-limit: 5
+x-ratelimit-remaining: 0
+----
+
+Source: https://docs.rs/tower_governor/0.8.0/tower_governor/[tower_governor 0.8.0]
+
+* *Which key?* `PeerIpKeyExtractor` (the default) uses the TCP peer address from `ConnectInfo` -- correct only when
+  clients connect directly. Behind a reverse proxy every request comes from the proxy, so use `SmartIpKeyExtractor`,
+  which reads `X-Forwarded-For`, `X-Real-IP` and `Forwarded`. Those headers are client-controlled unless your proxy
+  *overwrites* them: configure the proxy to set them, and never trust them on a directly exposed service, or an
+  attacker rotates fake IPs to evade the limit.
+* *Authenticated clients* should be limited by user or API key rather than by IP (many users share one NAT address);
+  implement `KeyExtractor` for a type that reads the token, and stack two ``GovernorLayer``s with different quotas.
+* Limits are per process. With three replicas the effective limit is three times higher; use a shared store for strict
+  global limits (below).
+* `tower_governor` 0.8 depends on tower-http 0.6 while this section uses 0.7, so `cargo tree -d` shows two tower-http
+  versions. It works -- the layers are independent -- at the cost of compile time. The same applies to `leptos_axum`.
+
+== Load shedding and concurrency limits with tower
+
+tower ships generic layers that protect the service as a whole:
+
+[cols="1,3",options="header"]
+|===
+|Layer |Behaviour
+|`ConcurrencyLimitLayer::new(n)` |at most `n` requests in flight; others *wait* (back-pressure via `poll_ready`)
+|`LoadShedLayer` |when the inner service is not ready, *fail immediately* with `Overloaded` instead of waiting
+|`RateLimitLayer::new(n, period)` |at most `n` requests per period for the whole service (not per client)
+|`BufferLayer::new(n)` |a bounded queue in front of a service, making it `Clone` and shareable
+|===
+
+`ConcurrencyLimit` + `LoadShed` is the useful pair: the first defines capacity, the second turns "wait" into a fast `503`
+so clients can retry elsewhere (the rejected requests finish first in the output below). Both fail with `BoxError`, so a `HandleErrorLayer` must sit outside them, and both
+must wrap the whole router (axum's router is always ready, see xref:backend/axum/tower-service-model.adoc[Tower Service
+Model]):
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    BoxError, Router,
+    error_handling::HandleErrorLayer,
+    http::{StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
+use tower::ServiceBuilder;
+
+async fn overloaded(err: BoxError) -> impl IntoResponse {
+    if err.is::<tower::load_shed::error::Overloaded>() {
+        (StatusCode::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "1")], "server busy, retry shortly\n")
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, [(header::RETRY_AFTER, "5")], "internal error\n")
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/api/v1/reports/heavy", get(|| async {
+            tokio::time::sleep(Duration::from_millis(500)).await; // simulate expensive work
+            "report\n"
+        }))
+        .layer(
+            ServiceBuilder::new()
+                .layer(HandleErrorLayer::new(overloaded))
+                .load_shed()
+                .concurrency_limit(2), // capacity: two concurrent reports per instance
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    // into_make_service() builds the layer stack once, so all connections share one limit (see below)
+    axum::serve(listener, app.into_make_service()).await.unwrap();
+}
+----
+
+Source: https://docs.rs/tower/0.5.3/tower/load_shed/index.html[tower: load_shed] and https://docs.rs/tower/0.5.3/tower/limit/index.html[tower: limit]
+
+[source,bash]
+----
+$ for i in 1 2 3 4; do curl -s -o /dev/null -w '%{http_code} ' localhost:3000/api/v1/reports/heavy & done; wait; echo
+503 503 200 200
+----
+
+Source: https://docs.rs/tower/0.5.3/tower/load_shed/index.html[tower: load_shed] and https://docs.rs/tower/0.5.3/tower/limit/index.html[tower: limit]
+
+*Pitfall: per-connection layer state.* `ConcurrencyLimitLayer`, `RateLimitLayer` and `BufferLayer` create their
+semaphore, counter or queue in `Layer::layer`. When a router without state is passed directly to
+`axum::serve(listener, app)`, axum finishes building its routes -- and calls `Layer::layer` -- once *per connection*, so
+each connection gets its own limit and the stack above lets every request through (verified with axum 0.8.9: six
+concurrent requests on six connections all succeeded). Build the routes once with `app.into_make_service()` or
+`app.with_state(())` (routers that already called `with_state(state)` are built at that point and are not affected).
+Layers that keep their state behind an `Arc` created *before* the layer -- `GovernorLayer`, `InFlightRequestsLayer` --
+are shared either way.
+
+Choose the concurrency limit from measurements -- roughly the throughput at which latency starts to climb, per
+instance -- and keep it per expensive route group rather than global. Kubernetes readiness probes should report
+"not ready" while an instance sheds load for long periods (see xref:backend/axum/metrics-and-slos.adoc[Metrics &
+SLOs]).
+
+== A distributed limiter with Redis
+
+When several instances must share one limit -- "100 searches per API key per minute, across the fleet" -- keep the
+counters in Redis. A *fixed window* counter is the simplest correct scheme: `INCR` a key named after the client and the
+current minute, set its expiry on first use, and reject when the count exceeds the limit. It allows up to twice the
+limit across a window boundary; sliding-window or GCRA scripts in Lua remove that at the cost of complexity.
+
+[source,rust]
+----
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::{
+    Router,
+    extract::{Request, State},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::get,
+};
+use redis::aio::ConnectionManager;
+
+const LIMIT: u64 = 3;
+const WINDOW_SECS: u64 = 60;
+
+#[derive(Clone)]
+struct AppState {
+    redis: ConnectionManager,
+}
+
+async fn rate_limit(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let client = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("anonymous")
+        .to_owned();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs();
+    let window = now / WINDOW_SECS;
+    let key = format!("ratelimit:{client}:{window}");
+
+    let mut redis = state.redis.clone();
+    let count: redis::RedisResult<(u64,)> =
+        redis::pipe().atomic().incr(&key, 1u64).expire(&key, WINDOW_SECS as i64).ignore().query_async(&mut redis).await;
+
+    match count {
+        Ok((n,)) if n > LIMIT => {
+            let retry_after = WINDOW_SECS - now % WINDOW_SECS;
+            (StatusCode::TOO_MANY_REQUESTS, [(header::RETRY_AFTER, retry_after.to_string())], "rate limit exceeded\n")
+                .into_response()
+        }
+        Ok((n,)) => {
+            let mut response = next.run(req).await;
+            let remaining = HeaderValue::from(LIMIT - n);
+            response.headers_mut().insert("ratelimit-remaining", remaining);
+            response
+        }
+        Err(err) => {
+            // fail open: a Redis outage must not take the API down
+            tracing::warn!(%err, "rate limiter unavailable");
+            next.run(req).await
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_owned());
+    let client = redis::Client::open(url).expect("valid Redis URL");
+    let state = AppState { redis: ConnectionManager::new(client).await.expect("Redis reachable") };
+
+    let app = Router::new()
+        .route("/api/v1/search", get(|| async { "results\n" }))
+        .route_layer(middleware::from_fn_with_state(state.clone(), rate_limit))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/redis/1.7.1/redis/aio/struct.ConnectionManager.html[redis: ConnectionManager] and https://redis.io/docs/latest/commands/incr/#pattern-rate-limiter[Redis: INCR rate limiter pattern]
+
+[source,bash]
+----
+$ for i in 1 2 3 4; do curl -s -H 'x-api-key: demo' localhost:3000/api/v1/search; done
+results
+results
+results
+rate limit exceeded
+----
+
+Source: https://docs.rs/redis/1.7.1/redis/aio/struct.ConnectionManager.html[redis: ConnectionManager] and https://redis.io/docs/latest/commands/incr/#pattern-rate-limiter[Redis: INCR rate limiter pattern]
+
+* `MULTI`/`EXEC` (`.atomic()`) makes `INCR` and `EXPIRE` one step, so a crash cannot leave a counter without expiry.
+* Decide explicitly whether to *fail open* (allow traffic when Redis is down, as here) or *fail closed* (reject); login
+  and payment endpoints usually fail closed.
+* The `+RateLimit-*+` header fields are being standardised by the IETF HTTPAPI working group; `Retry-After` (RFC 9110) is
+  the one every client understands today.
+
+Redis setup and connection management are covered on xref:backend/axum/redis-and-caching.adoc[Redis & Caching].
+
+== `429` or `503`?
+
+[cols="1,3",options="header"]
+|===
+|Status |Meaning
+|`429 Too Many Requests` |*this client* exceeded *its* quota; retrying sooner will not help. Include `Retry-After`.
+|`503 Service Unavailable` |*the service* is overloaded or degraded for everyone; a retry, possibly to another instance,
+may succeed. `Retry-After` is optional.
+|===
+
+Clients should retry `503` and `429` with exponential backoff and jitter, honouring `Retry-After` when present.
+
+== Spotting abuse
+
+Rate limits stop volumetric abuse; slower abuse -- credential stuffing at a few requests per minute, scraping by many
+IPs, enumeration of IDs -- shows up in telemetry instead. Gangappa & Rangaraj (*Mastering Distributed Observability in
+Rust*, chapter 13) recommend recording security-relevant attributes on request spans and alerting on patterns:
+
+* failed logins per account and per IP (span attributes `enduser.id`, `client.address`, `auth.outcome`);
+* `404` and `403` rates per client, which reveal ID enumeration;
+* unusual request mixes (many `+GET /books/{isbn}+` with sequential ISBNs, no static assets);
+* responses with `429`, to tune limits and detect clients that ignore them.
+
+Log the *matched route* (`+/api/v1/books/{isbn}+`), not the raw path, to keep cardinality bounded; see
+xref:backend/axum/logging-and-tracing.adoc[Logging & Tracing].
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*) and Gangappa & Rangaraj use `tower_governor` with tower-http 0.6, which matches what
+`tower_governor` 0.8 still depends on; with an application on tower-http 0.7, expect the duplicate-version caveat
+above. The rate-limiting theory in this site's Resilience section applies unchanged.
+
+== References
+
+* https://docs.rs/tower_governor/0.8.0/tower_governor/[tower_governor] and https://docs.rs/governor/0.10.4/governor/[governor]
+* https://docs.rs/tower/0.5.3/tower/load_shed/index.html[tower: load_shed], https://docs.rs/tower/0.5.3/tower/limit/index.html[limit] and https://docs.rs/tower/0.5.3/tower/buffer/index.html[buffer]
+* https://docs.rs/axum/0.8.9/axum/error_handling/index.html#applying-fallible-middleware[axum: Applying fallible middleware]
+* https://redis.io/docs/latest/commands/incr/[Redis: INCR]
+* https://www.rfc-editor.org/rfc/rfc6585.html#section-4[RFC 6585: 429 Too Many Requests] and https://www.rfc-editor.org/rfc/rfc9110.html#name-retry-after[RFC 9110: Retry-After]
+* https://cheatsheetseries.owasp.org/cheatsheets/REST_Security_Cheat_Sheet.html[OWASP REST Security Cheat Sheet]
+* https://www.packtpub.com/product/mastering-distributed-observability-in-rust/9781806671793[Manjunath Gangappa and Rajkumar Rangaraj, Mastering Distributed Observability in Rust (Packt, 2026)]
