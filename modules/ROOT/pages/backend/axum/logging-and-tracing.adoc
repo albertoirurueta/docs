@@ -1,0 +1,330 @@
+= Logging & Tracing
+:description: Structured logging and tracing for axum 0.8 with the tracing ecosystem -- spans, events and levels, a tracing-subscriber registry with EnvFilter, pretty or JSON output and a filter that can be changed at runtime, tower-http's TraceLayer customised with make_span_with, on_response and on_failure using MatchedPath, request IDs, #[instrument] with skip and fields, correlating logs by request and trace id, sampling, redacting personal data, and logging anti-patterns.
+:keywords: axum, logging, tracing, tracing-subscriber, span, event, level, EnvFilter, RUST_LOG, JSON logs, fmt layer, registry, reload, TraceLayer, make_span_with, on_response, on_failure, MatchedPath, request id, SetRequestIdLayer, PropagateRequestIdLayer, instrument, skip, fields, structured logging, correlation, trace_id, sampling, PII, redaction, tokio tracing
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against tracing 0.1.44, tracing-subscriber 0.3.23 and tower-http 0.7.1 with axum 0.8.9 on Rust
+1.99 (edition 2024), checked on 2026-10-06. Rust services log with the `tracing` crate rather than `log`: besides
+*events* (log lines) it records *spans*, periods of time with fields that every event inside inherits. A request span
+with the method, route and request id makes every log line of that request attributable, without passing ids around.
+Exporting the same spans to a distributed tracing backend is the next page,
+xref:backend/axum/opentelemetry-and-distributed-tracing.adoc[OpenTelemetry & Distributed Tracing].
+
+== Where it runs in the request
+
+Logging is not one step of the
+xref:backend/axum/introduction-and-architecture.adoc#_the_request_lifecycle[request lifecycle] (tokio, hyper, tower
+layers, router, extractors, handler, response) but a frame around most of it:
+
+* The *subscriber* is process-wide and installed in `main` before the runtime accepts connections, so tokio, hyper and
+  every library log through it.
+* `SetRequestIdLayer` and `TraceLayer` are *tower layers*. Applied with `Router::layer`, as below, they run after the
+  router has matched (so `MatchedPath` is available for the span name) and before the extractors. The request span is
+  entered before the first extractor and stays current until the response body has been sent, so extractor
+  rejections, handler events and database spans all become its children.
+* `+#[instrument]+` spans are opened *inside* the handler and the services it calls; `on_response` and `on_failure`
+  run on the way back out, after the handler returned. Unmatched requests (`404`) and anything rejected by layers
+  outside `TraceLayer` never get the request span -- wrap the whole router (`ServiceBuilder` around `app`) if they
+  must be traced, at the cost of `MatchedPath`.
+
+== Spans, events and levels
+
+* *Events* -- `trace!`, `debug!`, `info!`, `warn!`, `error!` -- record something that happened, with structured
+  fields: `info!(isbn = %isbn, copies, "book lent")`. `%` uses `Display`, `?` uses `Debug`, a bare name a `Value`.
+* *Spans* -- `info_span!("lend", member_id)` or `+#[instrument]+` -- cover a unit of work. Entering a span (or
+  instrumenting a future with it) makes it the parent of every event and span created inside, across `.await` points.
+* *Levels* filter by importance: `ERROR` needs attention, `WARN` is unexpected but handled, `INFO` marks business-level
+  milestones, `DEBUG`/`TRACE` are for developers. Each crate logs under its module path as *target* (`sqlx::query`,
+  `tower_http::trace`, `axum::rejection`), which filters select.
+
+== The subscriber
+
+A *subscriber* decides what happens to spans and events. The modern idiom -- Azam (*Advanced Rust*, chapter 2) uses it
+too -- composes *layers* on a `Registry`: an `EnvFilter` for levels, a formatting layer for output, and later an
+OpenTelemetry layer. Wrapping the filter in `reload::Layer` lets an admin endpoint change the level without a restart:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    Router,
+    body::Body,
+    extract::{MatchedPath, State},
+    http::{Request, Response, StatusCode, header::HeaderName},
+    routing::{get, put},
+};
+use tower::ServiceBuilder;
+use tower_http::{
+    classify::ServerErrorsFailureClass,
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::TraceLayer,
+};
+use tracing::{Span, info, info_span, instrument, warn};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt};
+
+type FilterHandle = reload::Handle<EnvFilter, Registry>;
+
+fn init_tracing(json: bool) -> FilterHandle {
+    // RUST_LOG=bookshelf=debug,tower_http=info,sqlx=warn ... default below
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,tower_http=debug,axum::rejection=trace"));
+    let (filter, handle) = reload::Layer::new(filter);
+    let registry = tracing_subscriber::registry().with(filter);
+    if json {
+        // one JSON object per line, with the current span and its parents
+        registry.with(tracing_subscriber::fmt::layer().json().with_current_span(true).with_span_list(true)).init();
+    } else {
+        registry.with(tracing_subscriber::fmt::layer().compact()).init();
+    }
+    handle
+}
+
+#[instrument(skip_all, fields(isbn = %isbn, outcome))]
+async fn lend(axum::extract::Path(isbn): axum::extract::Path<String>) -> StatusCode {
+    info!(member_id = 42, "lending book");
+    Span::current().record("outcome", "lent");
+    StatusCode::NO_CONTENT
+}
+
+/// PUT /admin/log-level with a body such as "debug,sqlx=info"
+async fn set_level(State(handle): State<FilterHandle>, directives: String) -> Result<String, (StatusCode, String)> {
+    let filter = EnvFilter::try_new(directives.trim()).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    handle.reload(filter).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    warn!(directives = %directives.trim(), "log level changed");
+    Ok("ok\n".into())
+}
+
+#[tokio::main]
+async fn main() {
+    let handle = init_tracing(std::env::var("LOG_JSON").is_ok());
+    let request_id = HeaderName::from_static("x-request-id");
+
+    let trace = TraceLayer::new_for_http()
+        // one span per request, named after the route template (never the raw path: cardinality)
+        .make_span_with(|req: &Request<Body>| {
+            let route = req.extensions().get::<MatchedPath>().map_or("unmatched", MatchedPath::as_str);
+            let id = req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("-");
+            info_span!("http_request", method = %req.method(), route, request_id = %id, status = tracing::field::Empty)
+        })
+        .on_response(|res: &Response<Body>, latency: Duration, span: &Span| {
+            span.record("status", res.status().as_u16());
+            info!(latency_ms = latency.as_millis(), "response");
+        })
+        .on_failure(|class: ServerErrorsFailureClass, latency: Duration, _span: &Span| {
+            tracing::error!(%class, latency_ms = latency.as_millis(), "request failed");
+        });
+
+    let app = Router::new()
+        .route("/api/v1/books/{isbn}/loans", put(lend))
+        .route("/admin/log-level", put(set_level))
+        .route("/health", get(|| async { "ok" }))
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::new(request_id.clone(), MakeRequestUuid))
+                .layer(trace)
+                .layer(PropagateRequestIdLayer::new(request_id)),
+        )
+        .with_state(handle);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/[tracing-subscriber], https://docs.rs/tower-http/0.7.1/tower_http/trace/index.html[tower-http: trace] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/tracing-aka-logging[axum example: tracing-aka-logging]
+
+[source,bash]
+----
+$ cargo run &
+$ curl -s -X PUT localhost:3000/api/v1/books/9780441013593/loans
+... DEBUG http_request: tower_http::trace::on_request: started processing request method=PUT route="/api/v1/books/{isbn}/loans" request_id=15897168-...
+...  INFO http_request:lend: bookshelf_web: lending book member_id=42 method=PUT route="/api/v1/books/{isbn}/loans" request_id=15897168-... isbn=9780441013593
+...  INFO http_request: bookshelf_web: response latency_ms=0 method=PUT route="/api/v1/books/{isbn}/loans" request_id=15897168-... status=204
+$ curl -s -X PUT -d 'warn' localhost:3000/admin/log-level    # from now on only WARN and above
+ok
+$ LOG_JSON=1 cargo run &
+$ curl -s -X PUT localhost:3000/api/v1/books/9780441013593/loans
+{"timestamp":"...","level":"INFO","fields":{"message":"lending book","member_id":42},"target":"bookshelf_web",
+ "span":{"isbn":"9780441013593","name":"lend"},"spans":[{"method":"PUT","request_id":"d0654f75-...",
+ "route":"/api/v1/books/{isbn}/loans","name":"http_request"},{"isbn":"9780441013593","name":"lend"}]}
+----
+
+Source: https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/fmt/format/struct.Json.html[tracing-subscriber: Json format] and https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/reload/index.html[tracing-subscriber: reload]
+
+* `EnvFilter` directives (`info,tower_http=debug,sqlx::query=warn`) come from `RUST_LOG`; the reload handle changes
+  them at runtime -- protect such an endpoint like any admin route.
+* The subscriber must be installed before anything logs, at the top of `main`; libraries never install one.
+* JSON output is what log pipelines (Loki, Elasticsearch, CloudWatch) parse. Keep the pretty format for local
+  development.
+
+== `TraceLayer` and request IDs
+
+`TraceLayer::new_for_http()` records a span per request and events at request start, response and failure.
+`make_span_with` controls the span: here it names the route *template* from `MatchedPath` (available because the
+layer is applied with `Router::layer`, which runs after routing) and attaches the request id. `on_response` records the
+status into the span, `on_failure` fires for `5xx` responses (classified by `ServerErrorsFailureClass`).
+
+`SetRequestIdLayer` generates an `x-request-id` (a UUID) unless the client or an upstream proxy supplied one, and
+`PropagateRequestIdLayer` copies it to the response; the order in the `ServiceBuilder` puts the id in place before the
+trace span is created. Clients report the id with bug reports, and support finds every log line of that request. See
+the official `request-id` example and xref:backend/axum/applying-middleware-and-ordering.adoc[Applying Middleware &
+Ordering] for the full stack.
+
+== `+#[instrument]+`
+
+`+#[tracing::instrument]+` wraps a function (sync or async) in a span named after it, recording its arguments as
+fields. In handlers and services:
+
+* `skip(state, pool, password)` -- never record large values or secrets; `skip_all` and then `+fields(...)+` is the safest
+  default;
+* `fields(isbn = %isbn, outcome)` -- add fields, including *empty* ones filled later with `+Span::current().record(...)+`;
+* `err` -- record the returned `Err` as an error event; `ret` -- record the return value;
+* `+level = "debug"+` -- lower the span's level for hot paths.
+
+== Correlating logs and traces
+
+When OpenTelemetry is set up, every span has a `trace_id`. Adding it to log lines lets you jump from a log entry to the
+whole distributed trace in Grafana or Jaeger. Gangappa & Rangaraj (*Mastering Distributed Observability in Rust*,
+chapter 7) record `trace_id` and `span_id` as fields in the request span and configure the JSON layer to emit them; the
+OpenTelemetry page shows how to obtain them from the current span context.
+
+== Sampling, cost and privacy
+
+* *Volume*: `DEBUG` in production for one module is fine; for everything it is expensive. Prefer dynamic filters
+  (above) to temporary redeploys, and sample high-volume `INFO` events (log one in N successful health checks, or none
+  at all).
+* *Personal data*: never log passwords, tokens, full request bodies, or personal data that your privacy policy does not
+  allow you to keep; log ids instead of e-mail addresses. `SetSensitiveHeadersLayer` hides `Authorization` and cookies
+  from `TraceLayer` (see xref:backend/axum/csrf-and-security-hardening.adoc[CSRF & Security Hardening]).
+* *Anti-patterns* (Gangappa & Rangaraj, chapter 7): string-formatting values into the message instead of fields
+  (`+info!("lent {isbn}")+` cannot be queried by `isbn`); logging the same error at every layer it passes through (log
+  once, where it is handled -- the `AppError` response mapping is a good place); `println!` in services (bypasses
+  filters, levels and spans); unbounded field values such as raw paths or user agents in span names.
+
+== Redacting personal data, and spans across `.await`
+
+The cheapest redaction is a type that cannot print its content. Wrapping e-mail addresses, tokens and similar values
+in a `Redacted` newtype makes the safe behaviour the default: a derived `Debug` of the containing struct, `?member` and
+`%member.email` all print `[redacted]`, and the code that needs the real value calls `expose()`, which is easy to find
+in a review. The example also shows how to keep a span current across `.await`: attach it to the future with
+`Instrument::instrument` instead of holding the guard returned by `span.enter()`.
+
+[source,rust]
+----
+use std::fmt;
+
+use tracing::{Instrument, info, info_span};
+
+/// Wraps personal data so that neither `Debug` nor `Display` can print it into a log.
+struct Redacted<T>(T);
+
+impl<T> fmt::Debug for Redacted<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl<T> fmt::Display for Redacted<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl<T> Redacted<T> {
+    /// The one, greppable, place where the real value is read.
+    fn expose(&self) -> &T {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
+struct Member {
+    id: i64,
+    email: Redacted<String>,
+}
+
+async fn send_reminder(member: &Member) {
+    let _to: &str = member.email.expose(); // handed to the mailer, never to a log macro
+    tokio::task::yield_now().await; // an await point: the span below must still be current after it
+    info!(member_id = member.id, email = %member.email, "reminder queued");
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt().with_target(false).without_time().init();
+    let member = Member { id: 42, email: Redacted("ursula@bookshelf.example".into()) };
+    info!(?member, "member loaded");
+    // attach the span to the future; a `span.enter()` guard held across `.await` would leak into other tasks
+    send_reminder(&member).instrument(info_span!("reminder_job", job = "loan-due")).await;
+}
+----
+
+Source: https://docs.rs/tracing/0.1.44/tracing/trait.Instrument.html[tracing: Instrument] and https://docs.rs/tracing/0.1.44/tracing/span/struct.Span.html#in-asynchronous-code[tracing: Span::enter in asynchronous code]
+
+[source,bash]
+----
+$ NO_COLOR=1 cargo run
+ INFO member loaded member=Member { id: 42, email: [redacted] }
+ INFO reminder_job{job="loan-due"}: reminder queued member_id=42 email=[redacted]
+----
+
+Source: https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/fmt/index.html[tracing-subscriber: fmt]
+
+The `secrecy` crate offers the same idea for secrets (`SecretString`, with zeroing on drop) and is a good fit for
+configuration values such as database passwords.
+
+== Common errors and pitfalls
+
+[cols="2,3",options="header"]
+|===
+|Symptom |Cause and fix
+
+|Nothing is logged at all
+|No subscriber was installed, or it was installed after the first events (they are dropped). Call `init()` first in
+`main`; in tests, use `try_init()` because a second global `init()` panics.
+
+|`RUST_LOG` has no effect
+|The filter was built with `EnvFilter::new(..)` instead of from the environment, or `RUST_LOG` contains an invalid
+directive: `try_from_default_env()` then returns `Err` and the code above silently uses its fallback filter
+(`from_default_env()` would instead skip only the bad directive and print "ignoring ..." on stderr). Log the active
+filter at start-up.
+
+|Events from `log`-based crates are missing
+|tracing-subscriber's `tracing-log` feature (on by default) installs a `log` bridge when you call `init()`. With
+`set_global_default` you must call `tracing_log::LogTracer::init()` yourself.
+
+|Span fields appear on the wrong request, or a span never closes
+|A `span.enter()` guard was held across `.await`; another task polled on the same thread then inherits the span.
+Use `.instrument(span)` or `+#[instrument]+` for async code.
+
+|Every request span is named `unmatched` (or has no `route`)
+|`TraceLayer` wraps the router from outside (`ServiceBuilder` around `app`), where `MatchedPath` does not exist yet.
+Apply it with `Router::layer`.
+
+|JSON lines lack the request id or route
+|The JSON formatter omits span fields unless `with_current_span(true)` / `with_span_list(true)` are set, as in the
+example above.
+
+|A field recorded later never shows up
+|`Span::record` only works for fields declared when the span was created; declare it as `tracing::field::Empty` (or
+list it in `+#[instrument(fields(outcome))]+`).
+|===
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*, chapter 6) initialises logging with `tracing_subscriber::fmt::init()`, which is fine for a
+start; production services need the layered registry above for JSON output, runtime filters and OpenTelemetry.
+Gangappa & Rangaraj use tower-http 0.6, whose `TraceLayer` API is unchanged in 0.7 (0.7 parents the default
+callbacks' events to the request span explicitly and includes gRPC error messages).
+
+== References
+
+* https://docs.rs/tracing/0.1.44/tracing/[tracing 0.1.44] and https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/[tracing-subscriber 0.3.23]
+* https://tokio.rs/tokio/topics/tracing[Tokio: Getting started with Tracing]
+* https://docs.rs/tower-http/0.7.1/tower_http/trace/index.html[tower-http: trace] and https://docs.rs/tower-http/0.7.1/tower_http/request_id/index.html[request_id]
+* https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/tracing-aka-logging[axum example: tracing-aka-logging] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/request-id[request-id]
+* https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html[OWASP Logging Cheat Sheet]
+* https://link.springer.com/book/10.1007/979-8-8688-2992-5[Nouman Azam, Advanced Rust (Apress, 2026)]
+* https://www.packtpub.com/product/mastering-distributed-observability-in-rust/9781806671793[Manjunath Gangappa and Rajkumar Rangaraj, Mastering Distributed Observability in Rust (Packt, 2026)]
+* https://link.springer.com/book/10.1007/979-8-8688-2631-3[Indo Yoon, Beginning Axum (Apress, 2026)]

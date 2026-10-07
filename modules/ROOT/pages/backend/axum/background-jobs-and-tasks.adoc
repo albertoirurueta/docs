@@ -1,0 +1,281 @@
+= Background Jobs & Tasks
+:description: Running work outside the request in an axum 0.8 service -- spawning tasks from handlers safely and the pitfalls of detached tasks, spawn_blocking for CPU-bound work, an mpsc worker queue owned by state with bounded capacity, supervising workers with JoinSet and TaskTracker, scheduled jobs with tokio-cron-scheduler, durable queues in Postgres with FOR UPDATE SKIP LOCKED and with apalis, and coordinating shutdown with CancellationToken.
+:keywords: axum, background jobs, background tasks, tokio::spawn, detached task, JoinHandle, spawn_blocking, mpsc, worker queue, bounded channel, backpressure, JoinSet, TaskTracker, CancellationToken, tokio-util, tokio-cron-scheduler, cron, scheduled jobs, durable queue, Postgres queue, FOR UPDATE SKIP LOCKED, apalis, retries, shutdown, reminders
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against tokio 1.53, tokio-util 0.7.19, tokio-cron-scheduler 0.15.1 and sqlx 0.9 with axum 0.8.9 on
+Rust 1.99 (edition 2024), checked on 2026-10-06. *Bookshelf* sends loan-due reminders every morning, resizes uploaded
+covers, and emails members after they post a review -- none of which should make an HTTP request wait. tokio's task
+model is covered on xref:programming-languages/rust/async-runtimes-and-tokio.adoc[Async Runtimes & Tokio]; scheduling
+and messaging in general on this site's xref:backend/scheduling/index.adoc[Scheduling] and
+xref:backend/messaging/index.adoc[Messaging] sections.
+
+== Choosing a mechanism
+
+[cols="2,2,3",options="header"]
+|===
+|Need |Mechanism |Survives a restart?
+|fire-and-forget work for this request (send an e-mail) |`tokio::spawn`, ideally through a worker queue |no
+|CPU-heavy work in a request (hash, resize, parse) |`tokio::task::spawn_blocking` (awaited) |n/a
+|steady stream of jobs with limited concurrency |`mpsc` channel + worker tasks |no
+|periodic jobs (nightly reminders) |`tokio::time::interval` or tokio-cron-scheduler |the schedule, not the work
+|jobs that must not be lost (payments, important mail) |a durable queue: Postgres table, Redis, apalis, a broker |yes
+|===
+
+== Spawning from handlers -- and its pitfalls
+
+`tokio::spawn` runs a future concurrently and returns immediately. It is tempting to spawn from a handler and return
+`202 Accepted`:
+
+* a *detached* task (its `JoinHandle` dropped) keeps running, but if it panics or fails nobody notices -- log inside the
+  task;
+* the task is lost if the process stops: deployments, crashes and autoscaling kill in-flight work;
+* nothing limits how many tasks a burst of requests creates; a thousand concurrent e-mail sends exhaust the SMTP
+  server's limits;
+* the task cannot borrow from the request: move owned data in (`async move`), and clone handles from state.
+
+A bounded *worker queue* addresses the last three points for in-process work.
+
+== A worker queue owned by state
+
+The handler sends a job into a bounded `mpsc` channel stored in state; a fixed number of worker tasks process jobs.
+If the queue is full, the handler can answer `503` immediately instead of accepting more work than it can do --
+backpressure in its simplest form:
+
+[source,rust]
+----
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use serde::Deserialize;
+use tokio::sync::mpsc;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+
+#[derive(Debug, Deserialize)]
+struct ReviewPosted {
+    member_email: String,
+    title: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    jobs: mpsc::Sender<ReviewPosted>,
+}
+
+async fn post_review(State(state): State<AppState>, Json(job): Json<ReviewPosted>) -> StatusCode {
+    match state.jobs.try_send(job) {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(mpsc::error::TrySendError::Full(_)) => StatusCode::SERVICE_UNAVAILABLE, // shed load, client retries
+        Err(mpsc::error::TrySendError::Closed(_)) => StatusCode::SERVICE_UNAVAILABLE, // shutting down
+    }
+}
+
+async fn send_thank_you(job: &ReviewPosted) -> Result<(), String> {
+    tokio::time::sleep(Duration::from_millis(100)).await; // pretend to call the mail API
+    println!("thanked {} for reviewing {}", job.member_email, job.title);
+    Ok(())
+}
+
+/// N workers share one receiver; each takes the next job when it is free.
+fn start_workers(rx: mpsc::Receiver<ReviewPosted>, workers: usize, tracker: &TaskTracker, cancel: CancellationToken) {
+    let rx = Arc::new(tokio::sync::Mutex::new(rx)); // async mutex: held across recv().await on purpose
+    for id in 0..workers {
+        let (rx, cancel) = (Arc::clone(&rx), cancel.clone());
+        tracker.spawn(async move {
+            loop {
+                let job = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    job = async { rx.lock().await.recv().await } => match job {
+                        Some(job) => job,
+                        None => break, // every sender dropped
+                    },
+                };
+                if let Err(err) = send_thank_you(&job).await {
+                    eprintln!("worker {id}: job {job:?} failed: {err}"); // never fail silently
+                }
+            }
+        });
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let (tx, rx) = mpsc::channel(100); // at most 100 queued jobs
+    let tracker = TaskTracker::new();
+    let cancel = CancellationToken::new();
+    start_workers(rx, 4, &tracker, cancel.clone());
+
+    let app = Router::new().route("/api/v1/reviews", post(post_review)).with_state(AppState { jobs: tx });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.expect("signal handler") })
+        .await
+        .unwrap();
+
+    // after the server stopped accepting requests: stop the workers, then wait for them
+    cancel.cancel();
+    tracker.close();
+    tracker.wait().await;
+}
+----
+
+Source: https://tokio.rs/tokio/tutorial/channels[Tokio tutorial: Channels] and https://docs.rs/tokio-util/0.7.19/tokio_util/task/task_tracker/struct.TaskTracker.html[tokio-util: TaskTracker]
+
+[source,bash]
+----
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'content-type: application/json' \
+    -d '{"member_email":"ana@example.com","title":"Dune"}' localhost:3000/api/v1/reviews
+202
+thanked ana@example.com for reviewing Dune
+----
+
+Source: https://tokio.rs/tokio/tutorial/channels[Tokio tutorial: Channels] and https://docs.rs/tokio-util/0.7.19/tokio_util/task/task_tracker/struct.TaskTracker.html[tokio-util: TaskTracker]
+
+* `try_send` never waits: a full queue becomes an immediate `503`. `send().await` would make the request wait for a
+  free slot instead -- choose based on whether the client can retry.
+* tokio's `mpsc::Receiver` has a single consumer; the example shares it between workers behind a `tokio::sync::Mutex`
+  that is held across `recv().await` -- the legitimate use of an async mutex. The `async-channel` or `flume` crates
+  provide multi-consumer channels directly. Cancelling stops workers after their current job; jobs still queued are
+  dropped, which is why work that must not be lost belongs in a durable queue (below).
+* `TaskTracker` (tokio-util) records every spawned task so shutdown can wait for them; `JoinSet` is the alternative
+  when you also need each task's result or want to abort them all at once (`join_next`, `abort_all`).
+* `CancellationToken` broadcasts "stop" to any number of tasks; they `select!` on `cancelled()` alongside their work.
+
+== CPU-bound work: `spawn_blocking`
+
+Resizing a cover or hashing a password takes milliseconds of CPU. On a tokio worker thread that delays every other task
+scheduled on it; `spawn_blocking` moves the closure to a separate pool of up to 512 threads and returns a future:
+
+[source,rust]
+----
+async fn checksum_upload(bytes: Vec<u8>) -> u64 {
+    tokio::task::spawn_blocking(move || {
+        // stand-in for image decoding/resizing: pure CPU work
+        bytes.iter().fold(0u64, |acc, b| acc.rotate_left(5) ^ u64::from(*b))
+    })
+    .await
+    .expect("blocking task panicked")
+}
+
+#[tokio::main]
+async fn main() {
+    let sum = checksum_upload(vec![42; 5_000_000]).await;
+    println!("checksum {sum:x}");
+}
+----
+
+Source: https://docs.rs/tokio/1.53.2/tokio/task/fn.spawn_blocking.html[tokio::task::spawn_blocking]
+
+For sustained parallel computation, a `rayon` pool is better than many `spawn_blocking` calls (see
+xref:programming-languages/rust/data-parallelism-with-rayon.adoc[Data Parallelism with Rayon]). Gangappa & Rangaraj
+(*Mastering Distributed Observability in Rust*, chapter 10) show how to find blocking calls that should have been moved
+with tokio-console; see xref:backend/axum/performance-tuning.adoc[Performance Tuning].
+
+== Scheduled jobs with tokio-cron-scheduler
+
+For "every day at 07:00 UTC, remind members of loans due in two days", a cron expression is clearer than an interval:
+
+[source,rust]
+----
+use tokio_cron_scheduler::{Job, JobScheduler};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scheduler = JobScheduler::new().await?;
+
+    // sec min hour day-of-month month day-of-week (UTC)
+    scheduler
+        .add(Job::new_async("0 0 7 * * *", |_id, _scheduler| {
+            Box::pin(async {
+                println!("sending loan-due reminders"); // query loans due in 2 days, enqueue e-mails
+            })
+        })?)
+        .await?;
+
+    // every 2 seconds, to see it work
+    scheduler.add(Job::new_async("*/2 * * * * *", |_id, _scheduler| Box::pin(async { println!("tick") }))?).await?;
+
+    scheduler.start().await?;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    scheduler.shutdown().await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/tokio-cron-scheduler/0.15.1/tokio_cron_scheduler/[tokio-cron-scheduler 0.15.1]
+
+With several replicas, every instance runs every schedule. Either run the scheduler in exactly one place (a dedicated
+deployment with one replica, or a Kubernetes `CronJob` that calls an internal endpoint), or make the job take a lock
+first (`pg_try_advisory_lock`, a Redis `SET NX` with expiry) so only one instance does the work.
+
+== Durable queues: Postgres `FOR UPDATE SKIP LOCKED`
+
+Jobs that must survive restarts go into a table in the same database, inserted *in the same transaction* as the change
+that caused them -- so a job exists if and only if the change committed (the transactional outbox pattern). Workers
+claim jobs with `FOR UPDATE SKIP LOCKED`, which lets many workers poll one table without waiting on each other's locks:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use sqlx::PgPool;
+
+/// Claims one due job, runs it, marks it done -- all in one transaction, so a crash releases the claim.
+async fn work_one(pool: &PgPool) -> sqlx::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let job = sqlx::query!(
+        r#"SELECT id, kind, payload FROM jobs
+           WHERE done_at IS NULL AND run_at <= now()
+           ORDER BY run_at
+           LIMIT 1
+           FOR UPDATE SKIP LOCKED"#
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(job) = job else { return Ok(false) };
+
+    println!("running job {} ({}): {}", job.id, job.kind, job.payload);
+    // on failure: UPDATE jobs SET attempts = attempts + 1, run_at = now() + backoff ... and commit
+
+    sqlx::query!("UPDATE jobs SET done_at = now() WHERE id = $1", job.id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    sqlx::query!("INSERT INTO jobs (kind, payload) VALUES ('loan-reminder', '{\"loan_id\": 1}')").execute(&pool).await?;
+
+    // a worker loop: drain due jobs, then sleep a little (or LISTEN/NOTIFY for instant wake-ups)
+    for _ in 0..3 {
+        while work_one(&pool).await? {}
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(())
+}
+----
+
+Source: https://www.postgresql.org/docs/16/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL 16: The Locking Clause]
+
+Keep job handlers *idempotent* (safe to run twice), because a worker can crash after doing the work but before
+committing `done_at`. The `apalis` crate packages this pattern -- storage backends for Postgres, Redis and others,
+retries with backoff, concurrency limits, tower middleware around jobs and graceful shutdown; for cross-service events,
+use a message broker such as Kafka or RabbitMQ (see xref:backend/messaging/index.adoc[Messaging]).
+
+== Shutdown coordination
+
+On `SIGTERM`, the order matters: stop accepting requests, let in-flight requests finish (they may still enqueue jobs),
+then signal workers through the `CancellationToken`, wait for them with the `TaskTracker`, and finally close pools and
+flush telemetry. The xref:backend/axum/graceful-shutdown.adoc[Graceful Shutdown] page builds the complete sequence.
+
+== References
+
+* https://docs.rs/tokio/1.53.2/tokio/task/index.html[tokio::task] (spawn, spawn_blocking, JoinSet) and https://tokio.rs/tokio/tutorial/spawning[Tokio tutorial: Spawning]
+* https://docs.rs/tokio-util/0.7.19/tokio_util/sync/struct.CancellationToken.html[tokio-util: CancellationToken] and https://docs.rs/tokio-util/0.7.19/tokio_util/task/task_tracker/struct.TaskTracker.html[TaskTracker]
+* https://docs.rs/tokio-cron-scheduler/0.15.1/tokio_cron_scheduler/[tokio-cron-scheduler 0.15.1]
+* https://docs.rs/apalis/0.7.4/apalis/[apalis 0.7.4]
+* https://www.postgresql.org/docs/16/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL 16: SKIP LOCKED]
+* https://www.packtpub.com/product/mastering-distributed-observability-in-rust/9781806671793[Manjunath Gangappa and Rajkumar Rangaraj, Mastering Distributed Observability in Rust (Packt, 2026)]

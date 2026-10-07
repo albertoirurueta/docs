@@ -1,0 +1,318 @@
+= Tower Service Model
+:description: The abstraction underneath axum -- tower's Service trait with poll_ready and call, back-pressure and why axum's Router is always ready, the Layer trait and ServiceBuilder, ServiceExt helpers such as oneshot and map_request, BoxError and fallible services, the difference between services and handlers, route_service and nest_service, and why the same middleware runs under axum, tonic, hyper and lambda_http.
+:keywords: axum, tower, Service, poll_ready, call, back-pressure, backpressure, Layer, ServiceBuilder, ServiceExt, oneshot, service_fn, BoxError, HandleErrorLayer, Infallible, route_service, nest_service, middleware, tonic, hyper, lambda_http, tower 0.5
+
+include::partial$axum-disclaimer.adoc[]
+
+This page is written against axum 0.8.9 on Rust 1.99 (edition 2024), with tower 0.5.3, tower-http 0.7.1 and tokio 1.53,
+checked on 2026-10-06. axum has no middleware system of its own: routing, handlers and middleware are all expressed in
+terms of one trait from the `tower` crate. Understanding that trait explains axum's compiler errors, its error-handling
+rules for middleware and why so much of the Rust networking ecosystem can share code.
+
+== Where it runs in the request
+
+In the xref:backend/axum/introduction-and-architecture.adoc#_the_request_lifecycle[request lifecycle] (tokio accepts
+the connection, hyper parses the request, tower layers wrap the router, the router matches a route, middleware and
+extractors run, the handler runs, the response travels back out), `Service` and `Layer` are the *plumbing of every
+step after hyper*:
+
+* hyper calls one `Service` per request -- your `Router`, possibly wrapped in outer layers. Everything from there on is
+  a chain of `Service::call`s: outer tower layers, the router, the middleware added with `Router::layer`, and finally
+  the handler, which axum turns into a `Service` too.
+* Each layer is a `Service` that wraps the next one, so it sees the request on the way in and the response on the way
+  out. `poll_ready` back-pressure and the `Infallible` error type described below apply at every link of that chain.
+
+== The `Service` trait
+
+A `tower::Service<Request>` is "an asynchronous function from a request to a response, which can say when it is ready":
+
+[source,rust]
+----
+use std::future::Future;
+use std::task::{Context, Poll};
+
+pub trait Service<Request> {
+    type Response;
+    type Error;
+    type Future: Future<Output = Result<Self::Response, Self::Error>>;
+
+    /// Returns `Ready(Ok(()))` when the service can accept a request.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>>;
+
+    /// Processes the request. Must only be called after `poll_ready` returned `Ready(Ok(()))`.
+    fn call(&mut self, req: Request) -> Self::Future;
+}
+----
+
+Source: https://docs.rs/tower/0.5.3/tower/trait.Service.html[tower::Service]
+
+* `Request` is a type *parameter*, not an associated type, so one value can be a service for several request types. In
+  axum the request type is `+http::Request<axum::body::Body>+` (aliased as `axum::extract::Request`).
+* `Response` and `Error` are associated types; axum requires `Response: IntoResponse` and, for services routed
+  directly, `Error = Infallible` (see below).
+* `Future` is the future returned by `call`. Hand-written services usually set it to
+  `+Pin<Box<dyn Future<Output = ...> + Send>>+`, because an `async` block's type cannot be named.
+* `call` takes `&mut self`, so a service can keep per-connection state. To process requests concurrently, the server
+  *clones* the service once per connection (or per request), which is why every axum service and piece of state must be
+  `Clone` -- and cheap to clone.
+
+== `poll_ready` and back-pressure
+
+`poll_ready` lets a service refuse work before it is handed any. A concurrency limiter returns `Pending` while all its
+permits are taken; a buffer returns `Pending` when its queue is full. The caller must wait for `Ready(Ok(()))` before
+calling `call`, so the pressure propagates back towards the client instead of piling requests up in memory.
+
+axum's `Router` always reports `Ready`. Routing happens inside `call` -- the router does not know which inner service
+will handle a request until it has seen its path -- so it cannot ask a specific route whether it is ready. The axum
+documentation and practice draw these consequences:
+
+* middleware that relies on back-pressure (`ConcurrencyLimitLayer`, `RateLimitLayer`, `BufferLayer`) must be applied
+  *around the whole router* with `Router::layer`, or on a single route's service, where its readiness is checked;
+* such middleware usually creates its shared state (a semaphore, a queue) in `Layer::layer`, so the router must be
+  built *once*: serve it with `app.into_make_service()` or call `+with_state(...)+` first, because
+  `axum::serve(listener, app)` finishes building a stateless router per connection (see
+  xref:backend/axum/rate-limiting-and-load-shedding.adoc[Rate Limiting & Load Shedding]); and
+* when such middleware can fail (`LoadShed` rejects with an error when not ready, `Timeout` fails with `Elapsed`), its
+  errors must be converted into responses with `HandleErrorLayer`.
+
+Source: https://docs.rs/axum/0.8.9/axum/middleware/index.html#routing-to-servicesmiddleware-and-backpressure[axum: Routing to services/middleware and backpressure]
+
+== Layers and `ServiceBuilder`
+
+A `tower::Layer<S>` wraps a service in another service. It is a factory: `+fn layer(&self, inner: S) -> Self::Service+`.
+`ServiceBuilder` stacks layers in reading order -- the first layer added is the *outermost* one, the first to see the
+request.
+
+[mermaid]
+....
+flowchart LR
+    REQ(["request"]) --> T
+    subgraph T["TraceLayer (outermost)"]
+        direction LR
+        subgraph TO["TimeoutLayer"]
+            direction LR
+            subgraph C["CompressionLayer"]
+                direction LR
+                S["Router / handler service"]
+            end
+        end
+    end
+    T --> RES(["response"])
+....
+
+The request travels inwards through each layer's `call`, the innermost service produces a response, and the response
+travels outwards through the same layers. A layer can short-circuit at any point -- a timeout or an authorisation
+check returns a response without calling the inner service.
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{BoxError, Router, error_handling::HandleErrorLayer, http::StatusCode, routing::get};
+use tower::{ServiceBuilder, timeout::TimeoutLayer};
+use tower_http::trace::TraceLayer;
+
+async fn slow_report() -> &'static str {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    "report"
+}
+
+async fn on_timeout(err: BoxError) -> (StatusCode, String) {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        (StatusCode::REQUEST_TIMEOUT, "request took too long".to_owned())
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("unhandled internal error: {err}"))
+    }
+}
+
+fn app() -> Router {
+    Router::new().route("/reports/loans", get(slow_report)).layer(
+        ServiceBuilder::new()
+            .layer(TraceLayer::new_for_http())         // outermost: sees everything
+            .layer(HandleErrorLayer::new(on_timeout))  // turns BoxError into a response
+            .layer(TimeoutLayer::new(Duration::from_secs(2))), // fallible: Error = BoxError
+    )
+}
+
+#[tokio::main]
+async fn main() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app()).await.unwrap();
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/error_handling/index.html#applying-fallible-middleware[axum: Applying fallible middleware]
+
+`tower::timeout::TimeoutLayer` is the generic tower layer: its service fails with a `BoxError` when the deadline passes,
+which is why `HandleErrorLayer` must sit outside it. tower-http has its own `TimeoutLayer`
+(`TimeoutLayer::with_status_code`) that answers with a status code instead of an error and needs no `HandleErrorLayer`;
+see
+xref:backend/axum/request-limits-and-timeouts.adoc[Request Limits & Timeouts].
+
+== `BoxError` and why routed services must be infallible
+
+`axum::BoxError` is an alias for `+Box<dyn std::error::Error + Send + Sync>+`, the error type most tower middleware
+uses. axum's routing, however, requires `+Service<Request, Error = Infallible>+`: a router has to produce a response for
+every request, and there is no sensible HTTP response for an arbitrary error value. If you try to route a fallible
+service or apply a fallible layer without handling its error, the compiler reports an unsatisfied
+`+Infallible: From<...>+` or `+Error = Infallible+` bound -- the fix is always `HandleErrorLayer` (for layers) or
+`HandleError` (for a single service).
+
+Source: https://docs.rs/axum/0.8.9/axum/error_handling/index.html[axum: error_handling]
+
+== Writing a `Service` by hand
+
+Most applications never implement `Service` themselves -- handlers and `middleware::from_fn` are far easier -- but doing
+it once demystifies the trait. This service answers every request with the catalogue's size and is mounted with
+`route_service`:
+
+[source,rust]
+----
+use std::convert::Infallible;
+use std::future::{Ready, ready};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
+
+use axum::{Router, extract::Request, response::{IntoResponse, Response}};
+use tower::Service;
+
+#[derive(Clone)]
+struct CatalogSize {
+    books: Arc<AtomicUsize>,
+}
+
+impl Service<Request> for CatalogSize {
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Ready<Result<Response, Infallible>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        Poll::Ready(Ok(())) // no limited resource: always ready
+    }
+
+    fn call(&mut self, _req: Request) -> Self::Future {
+        let n = self.books.load(Ordering::Relaxed);
+        ready(Ok(format!("{n} books\n").into_response()))
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let size = CatalogSize { books: Arc::new(AtomicUsize::new(42)) };
+    let app = Router::new().route_service("/stats/size", size);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/axum/0.8.9/axum/routing/struct.Router.html#method.route_service[axum: Router::route_service]
+
+`route_service` mounts a service at a path for *every* HTTP method; to restrict methods, wrap it in a method router with
+`+get_service(service)+`. `nest_service` mounts a service under a path prefix and is the usual way to serve
+`tower_http::services::ServeDir` (see xref:backend/axum/static-files-and-spas.adoc[Static Files & SPAs]).
+
+For anything asynchronous, `tower::service_fn` builds a service from a closure, which is shorter than a struct:
+
+[source,rust]
+----
+use std::convert::Infallible;
+
+use axum::{Router, body::Body, extract::Request, http::Response, routing::get_service};
+use tower::service_fn;
+
+#[tokio::main]
+async fn main() {
+    let echo_path = service_fn(|req: Request| async move {
+        Ok::<_, Infallible>(Response::new(Body::from(format!("you asked for {}\n", req.uri().path()))))
+    });
+    let app = Router::new().route_service("/echo/{*rest}", get_service(echo_path));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+Source: https://docs.rs/tower/0.5.3/tower/fn.service_fn.html[tower::service_fn]
+
+== Services vs handlers
+
+[cols="1,2,2",options="header"]
+|===
+| |Handler |Service
+|Shape |`async fn` with extractor parameters, returning `impl IntoResponse` |a type implementing
+`+Service<Request, Error = Infallible>+` with `+Response: IntoResponse+`
+|Request access |typed, through extractors |the raw `+http::Request<Body>+`
+|State |`State<S>` extractor, supplied by `with_state` |owned by the service value
+|Mounted with |`route(path, get(handler))` |`route_service`, `nest_service`, `fallback_service`, `+get_service(...)+`
+|Typical use |application endpoints |static files, proxies, gRPC servers, other frameworks' apps
+|===
+
+The two are interchangeable: axum turns a handler into a service internally (`Handler::with_state` returns a
+`HandlerService`), and `HandlerWithoutStateExt::into_service` lets you use a stateless handler anywhere a service is
+expected, for example as a `ServeDir` fallback (see xref:backend/axum/handlers.adoc[Handlers]).
+
+== `ServiceExt`: calling services directly
+
+`tower::ServiceExt` adds combinators to every service: `ready` (wait for `poll_ready`), `oneshot` (ready + call, consuming
+the service), `call_all` for a stream of requests, and adapters such as `map_request`, `map_response`, `map_err` and
+`boxed_clone`. `oneshot` is how axum applications are tested without a network socket:
+
+[source,rust]
+----
+use axum::{Router, body::Body, http::{Request, StatusCode}, routing::get};
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+fn app() -> Router {
+    Router::new().route("/health", get(|| async { "ok" }))
+}
+
+#[tokio::main]
+async fn main() {
+    let response = app()
+        .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap(); // Router's error type is Infallible
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"ok");
+    println!("health check passed");
+}
+----
+
+Source: https://docs.rs/tower/0.5.3/tower/trait.ServiceExt.html#method.oneshot[tower::ServiceExt::oneshot]
+
+The xref:backend/axum/testing.adoc[Testing] page builds on this pattern.
+
+== One middleware ecosystem for many servers
+
+Because tower describes request/response processing independently of transport, the same layer value can wrap:
+
+* an axum `Router` served by `axum::serve`;
+* a tonic gRPC server (`+tonic::transport::Server::builder().layer(...)+`), see
+  xref:backend/axum/graphql-and-grpc.adoc[GraphQL & gRPC];
+* a raw hyper connection (through `hyper_util::service::TowerToHyperService`), see
+  xref:backend/axum/performance-tuning.adoc[Performance Tuning];
+* an AWS Lambda function: `lambda_http::run(router)` accepts an axum `Router` because it is a `Service`, see
+  xref:backend/axum/deployment.adoc[Deployment].
+
+A `TraceLayer` or a `TimeoutLayer` written once therefore serves every protocol in a polyglot Rust deployment. This is
+also why axum's own `middleware::from_fn` produces an ordinary tower layer (see
+xref:backend/axum/writing-middleware.adoc[Writing Middleware]).
+
+== Where the books are outdated
+
+Yoon (*Beginning Axum*, chapter 4) and Gangappa & Rangaraj (*Mastering Distributed Observability in Rust*) use tower 0.5
+and tower-http 0.6. The tower API is unchanged. On the tower-http side, `TimeoutLayer::new(duration)` has been deprecated since 0.6.7 in
+favour of `TimeoutLayer::with_status_code(status, duration)`, and 0.7 added `CsrfLayer` and the body-deadline layers --
+see
+xref:backend/axum/tower-http-catalog.adoc[tower-http Catalog].
+
+== References
+
+* https://docs.rs/tower/0.5.3/tower/trait.Service.html[tower::Service], https://docs.rs/tower/0.5.3/tower/trait.Layer.html[tower::Layer], https://docs.rs/tower/0.5.3/tower/struct.ServiceBuilder.html[tower::ServiceBuilder] and https://docs.rs/tower/0.5.3/tower/trait.ServiceExt.html[tower::ServiceExt]
+* https://docs.rs/axum/0.8.9/axum/middleware/index.html[axum: middleware]
+* https://docs.rs/axum/0.8.9/axum/error_handling/index.html[axum: error_handling]
+* https://docs.rs/axum/0.8.9/axum/routing/struct.Router.html[axum: Router]
+* https://tokio.rs/blog/2021-05-14-inventing-the-service-trait[Tokio blog: Inventing the Service trait]
+* https://docs.rs/tower-http/0.7.1/tower_http/[tower-http 0.7.1]
