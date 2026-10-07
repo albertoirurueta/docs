@@ -4,11 +4,12 @@
 
 include::partial$axum-disclaimer.adoc[]
 
-This page is written against tower-sessions 0.14.0 (with tower-sessions-redis-store 0.16.0) and axum-extra 0.12.6 with
-axum 0.8.9 on Rust 1.99 (edition 2024), checked on 2026-10-06. *Bookshelf*'s server-rendered pages sign users in with
-a session cookie; its JSON API uses bearer tokens instead (see xref:backend/axum/jwt-and-bearer-tokens.adoc[JWT &
-Bearer Tokens]). The protocol background -- why sessions, cookie security, fixation -- is in the OWASP Session
-Management cheat sheet and on this site's xref:backend/oauth/index.adoc[OAuth] pages.
+This page is written against tower-sessions 0.14.0 (with tower-sessions-redis-store 0.16.0, and notes on 0.15.0) and
+axum-extra 0.12.6 with axum 0.8.9 on Rust 1.99 (edition 2024), checked on 2026-10-06. *Bookshelf*'s server-rendered
+pages sign users in with a session cookie; its JSON API uses bearer tokens instead (see
+xref:backend/axum/jwt-and-bearer-tokens.adoc[JWT & Bearer Tokens]). The protocol background -- why sessions, cookie
+security, fixation -- is in the OWASP Session Management cheat sheet and on this site's
+xref:backend/oauth/index.adoc[OAuth] pages.
 
 == Version pairing first
 
@@ -19,9 +20,17 @@ tower-sessions 0.15 is the newest release, but at the time of writing its ecosys
 * `tower-sessions-sqlx-store` 0.15 requires tower-sessions **0.14** *and* sqlx **0.8**, so it cannot share a `PgPool`
   with an application on sqlx 0.9 (Cargo builds both sqlx versions, and the two pool types are unrelated).
 
+What 0.15 changed is small: it moved to rand 0.9 for session-id generation and fixed a memory-ordering race in the
+`Session` handle; the public API is the same as 0.14. The problem is purely one of type identity. `Session`,
+`SessionStore` and `SessionManagerLayer` from tower-sessions-core 0.15 are different types from the 0.14 ones, so a
+0.15 layer cannot serve a store or an `AuthSession` built on 0.14, and the compiler error ("the trait `SessionStore`
+is not implemented for `RedisStore`") names two types that look identical.
+
 *Bookshelf* therefore pins tower-sessions 0.14 and stores sessions in Redis. Check `cargo tree -d` after every
 upgrade: two copies of tower-sessions in the build mean a layer from one version and an extractor from the other, and
-the `Session` extractor then fails at runtime with a missing-extension `500`.
+the `Session` extractor then fails at runtime with a missing-extension `500`. Move to 0.15 when axum-login and the
+store you use have released versions depending on it; until then, `cargo update` keeps you on 0.14.x because the
+`0.14.0` requirement does not match 0.15.
 
 [source,toml]
 ----
@@ -31,23 +40,77 @@ tower-sessions-redis-store = "0.16.0"
 time = "0.3"                            # Expiry uses time::Duration
 ----
 
+Source: https://github.com/maxcountryman/tower-sessions/blob/main/CHANGELOG.md[tower-sessions CHANGELOG] and https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#default-requirements[Cargo: default requirements]
+
+== Where it runs in the request
+
+Sessions are spread over two points of the
+xref:backend/axum/introduction-and-architecture.adoc#_the_request_lifecycle[request lifecycle] (tokio accepts the
+connection, hyper parses the request, tower layers wrap the router, the router matches, extractors run, the handler
+runs, the response travels back out through the layers):
+
+. *On the way in, in the tower layers.* `SessionManagerLayer` (with the `CookieManager` from tower-cookies that it
+  installs) parses the `Cookie` header, reads the session id and puts a `Session` handle into the request extensions.
+  It does not touch the store yet. A malformed id is logged at `warn` ("possibly suspicious activity") and treated as
+  no session.
+. *In the extractor phase.* `Session` is a `FromRequestParts` extractor that clones the handle out of the extensions;
+  if the layer is missing it rejects with `500` and "Can't extract session. Is `SessionManagerLayer` enabled?". The
+  record is loaded from the store *lazily*, on the first `get`, `insert` or `remove` in the handler.
+. *On the way out, in the same layer.* After the handler has produced its response, the layer saves a modified (or,
+  with `with_always_save(true)`, any) non-empty session and adds the `Set-Cookie` header; an emptied session gets a
+  removal cookie. The save is skipped when the response is a `5xx`, and a failing save *replaces* the handler's
+  response with an empty `500`.
+
+Two consequences follow. Layers added outside the session layer (tracing, timeouts, rate limiting) run without a
+session; and a store outage shows up as `500` responses *after* the handler ran, so make the store's health part of
+the readiness probe.
+
 == A session layer and the `Session` extractor
+
+The example signs a user in by checking an Argon2id hash (as on
+xref:backend/axum/password-authentication.adoc[Password Authentication]), rotates the session id, and stores one
+typed value, `SignedIn`, instead of loose keys. `SignedIn` carries the sign-in time, so the handler can enforce an
+*absolute* timeout of 12 hours on top of the layer's 8-hour *inactivity* timeout:
 
 [source,rust]
 ----
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
+};
 use axum::{
     Form, Router,
+    extract::State,
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use tower_sessions::{
     Expiry, Session, SessionManagerLayer,
     cookie::{SameSite, time::Duration},
 };
 use tower_sessions_redis_store::{RedisStore, fred::prelude::*};
 
-const USER_KEY: &str = "user_id";
+/// Everything the application keeps in the session, under one key.
+#[derive(Serialize, Deserialize)]
+struct SignedIn {
+    user_id: i64,
+    since: i64, // unix seconds, for the absolute timeout
+}
+
+impl SignedIn {
+    const KEY: &'static str = "signed_in";
+    const ABSOLUTE_TIMEOUT_SECS: i64 = 12 * 60 * 60;
+}
+
+#[derive(Clone)]
+struct AppState {
+    users: Arc<HashMap<String, (i64, String)>>, // username -> (id, Argon2id PHC string)
+}
 
 #[derive(Deserialize)]
 struct Login {
@@ -55,22 +118,38 @@ struct Login {
     password: String,
 }
 
-async fn login(session: Session, Form(form): Form<Login>) -> impl IntoResponse {
-    // verify the password here (see the Password Authentication page)
-    let user_id: i64 = match (form.username.as_str(), form.password.as_str()) {
-        ("ursula", "correct horse battery staple") => 42,
-        _ => return Redirect::to("/login?error=1"),
+async fn verify(password: String, phc: String) -> bool {
+    tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&phc).is_ok_and(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+    })
+    .await
+    .unwrap_or(false)
+}
+
+async fn login(State(state): State<AppState>, session: Session, Form(form): Form<Login>) -> Redirect {
+    let Some((user_id, phc)) = state.users.get(&form.username).cloned() else {
+        return Redirect::to("/login?error=1"); // see Password Authentication for the timing-safe version
     };
-    // Rotate the session ID on privilege change: defeats session fixation.
-    if session.cycle_id().await.is_err() || session.insert(USER_KEY, user_id).await.is_err() {
+    if !verify(form.password, phc).await {
+        return Redirect::to("/login?error=1");
+    }
+    // new id on every privilege change: defeats session fixation
+    let signed_in = SignedIn { user_id, since: OffsetDateTime::now_utc().unix_timestamp() };
+    if session.cycle_id().await.is_err() || session.insert(SignedIn::KEY, signed_in).await.is_err() {
         return Redirect::to("/login?error=2");
     }
     Redirect::to("/account")
 }
 
 async fn account(session: Session) -> impl IntoResponse {
-    match session.get::<i64>(USER_KEY).await {
-        Ok(Some(id)) => Html(format!("<p>signed in as user {id}</p>")).into_response(),
+    match session.get::<SignedIn>(SignedIn::KEY).await {
+        Ok(Some(s)) if OffsetDateTime::now_utc().unix_timestamp() - s.since < SignedIn::ABSOLUTE_TIMEOUT_SECS => {
+            Html(format!("<p>signed in as user {}</p>", s.user_id)).into_response()
+        }
+        Ok(Some(_)) => {
+            let _ = session.flush().await; // absolute timeout reached: sign out
+            Redirect::to("/login?expired=1").into_response()
+        }
         _ => Redirect::to("/login").into_response(),
     }
 }
@@ -83,10 +162,16 @@ async fn logout(session: Session) -> Redirect {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // REDIS_URL is not a secret here; production URLs with a password come from a secret store
     let config = Config::from_url(&std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into()))?;
     let pool = Pool::new(config, None, None, None, 4)?;
     let _connection_task = pool.connect();
     pool.wait_for_connect().await?;
+
+    // demo user table: production reads the PHC string from the `users` table
+    let password = std::env::var("DEMO_PASSWORD").expect("DEMO_PASSWORD must be set");
+    let phc = Argon2::default().hash_password(password.as_bytes()).expect("hash").to_string();
+    let state = AppState { users: Arc::new(HashMap::from([("ursula".to_owned(), (42, phc))])) };
 
     let sessions = SessionManagerLayer::new(RedisStore::new(pool))
         .with_name("__Host-bookshelf")      // __Host-: Secure, Path=/, no Domain enforced by browsers
@@ -94,13 +179,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_http_only(true)               // the default; JavaScript cannot read the cookie
         .with_same_site(SameSite::Lax)      // sent on top-level navigation, not on cross-site POSTs
         .with_path("/")
-        .with_expiry(Expiry::OnInactivity(Duration::hours(8)));
+        .with_expiry(Expiry::OnInactivity(Duration::hours(8)))
+        .with_always_save(true);            // slide the inactivity deadline on every request
 
     let app = Router::new()
         .route("/login", post(login))
         .route("/account", get(account))
         .route("/logout", post(logout))
-        .layer(sessions);
+        .layer(sessions)
+        .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -111,22 +198,206 @@ Source: https://docs.rs/tower-sessions/0.14.0/tower_sessions/[tower-sessions 0.1
 
 [source,bash]
 ----
-$ curl -si -d 'username=ursula&password=correct horse battery staple' localhost:3000/login | grep -i -E '^HTTP|location|set-cookie'
+$ export DEMO_PASSWORD=$(openssl rand -base64 18)
+$ cargo run &
+$ curl -si --data-urlencode username=ursula --data-urlencode "password=$DEMO_PASSWORD" localhost:3000/login |
+    grep -i -E '^HTTP|location|set-cookie'
 HTTP/1.1 303 See Other
 location: /account
-set-cookie: __Host-bookshelf=CvnGyttAULOyvLg_x_0biw; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=28800
+set-cookie: __Host-bookshelf=IMTM5q9pBSX2ErTxcENx7Q; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=28800
+$ curl -s -H 'cookie: __Host-bookshelf=IMTM5q9pBSX2ErTxcENx7Q' localhost:3000/account
+<p>signed in as user 42</p>
+$ redis-cli --scan; redis-cli ttl IMTM5q9pBSX2ErTxcENx7Q
+IMTM5q9pBSX2ErTxcENx7Q
+28799
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'cookie: __Host-bookshelf=IMTM5q9pBSX2ErTxcENx7Q' -X POST localhost:3000/logout
+303
+$ redis-cli --scan | wc -l
+0
 ----
+
+Source: https://docs.rs/tower-sessions/0.14.0/tower_sessions/struct.Session.html#method.flush[tower-sessions: Session::flush] and https://redis.io/docs/latest/commands/scan/[Redis: SCAN]
 
 How it works:
 
-* `SessionManagerLayer` reads the session ID from the cookie, and the `Session` extractor loads the record from the
-  store *lazily* -- only when a handler calls `get` or `insert`. Requests that never touch the session cost nothing.
-* At the end of the request the layer saves modified sessions and sets the cookie; unmodified sessions are not
-  rewritten unless `with_always_save(true)` (useful to slide the expiry on every request).
-* The cookie contains only a random 128-bit ID; all data stays in Redis, so it can hold more than a cookie and can be
-  revoked server-side (delete the record).
-* `Expiry::OnInactivity(d)` expires the session after `d` without activity; `Expiry::AtDateTime` sets an absolute
-  deadline; `Expiry::OnSessionEnd` makes a browser-session cookie. Stores expire records too (Redis uses its TTL).
+* The cookie contains only a random 128-bit id; all data stays in Redis, so it can hold more than a cookie and can be
+  revoked server-side (delete the record). The Redis key is the id itself, with an `EXAT` expiry set from the record.
+* `Session::get` and `insert` take any `serde` type. Keep *one* typed struct per concern (`SignedIn` above) rather than
+  many loose keys: a rename then becomes a compile error, and an old record that no longer deserialises returns `Err`
+  instead of half-filled data -- treat that as "not signed in".
+* `Expiry::OnInactivity(d)` expires the session `d` after the last *save*; `Expiry::AtDateTime` sets an absolute
+  deadline; `Expiry::OnSessionEnd` makes a browser-session cookie (the stored record still gets a two-week expiry).
+  Without `with_always_save(true)` an unmodified session is not saved, so "inactivity" would really mean "time since
+  the last change". The example therefore enables it, and pays one store write per request for it.
+* OWASP recommends *both* an idle and an absolute timeout. tower-sessions has one expiry per session, so the absolute
+  limit is enforced in code, from the `since` field.
+* `session.clear()` empties the data but keeps the record and id; `session.flush()` also deletes the record and
+  removes the cookie; `session.delete()` deletes the record only. Log out with `flush`.
+
+== Choosing a store
+
+[cols="1,2,2",options="header"]
+|===
+|Store |Use it for |Watch out for
+|`MemoryStore` (built in) |tests and single-process development |lost on restart; not shared between replicas;
+grows until records expire
+|`tower-sessions-redis-store` 0.16 (fred 10) |*Bookshelf*'s production store; many replicas |Redis must be
+persistent enough for your logout semantics; `maxmemory-policy` must not evict live sessions (`volatile-ttl` or
+`noeviction`)
+|`tower-sessions-sqlx-store` 0.15 |a SQL database you already run |depends on *sqlx 0.8*: on sqlx 0.9 it pulls a
+second sqlx and a second pool; run its `migrate()` and `continuously_delete_expired` task
+|`tower-sessions-moka-store` + `CachingSessionStore` |an in-process cache in front of a remote store |the cache is
+per replica, so a logout on one replica is seen late by the others
+|your own `SessionStore` |reusing an existing pool or database (below) |`create` must never overwrite another
+session
+|===
+
+=== A Postgres store on the application's sqlx 0.9 pool
+
+Because the official sqlx store is still on sqlx 0.8, *Bookshelf*'s Postgres variant implements the four methods of
+`SessionStore` itself (the trait uses `async_trait`). The record's data is a `HashMap` of JSON values, so it maps
+naturally onto a `jsonb` column. Besides tower-sessions 0.14 it needs `+async-trait = "0.1"+`, `serde_json` and sqlx 0.9
+with the `postgres`, `json` and `time` features:
+
+[source,rust]
+----
+use async_trait::async_trait;
+use axum::{Router, routing::get};
+use sqlx::{PgPool, types::Json};
+use time::OffsetDateTime;
+use tower_sessions::{
+    Session, SessionManagerLayer, SessionStore,
+    session::{Id, Record},
+    session_store,
+};
+
+/// tower-sessions store on the application's own sqlx 0.9 pool (no second sqlx in the build).
+#[derive(Debug, Clone)]
+struct PgSessionStore {
+    pool: PgPool,
+}
+
+type Data = std::collections::HashMap<String, serde_json::Value>;
+
+fn backend(err: sqlx::Error) -> session_store::Error {
+    session_store::Error::Backend(err.to_string())
+}
+
+#[async_trait]
+impl SessionStore for PgSessionStore {
+    async fn create(&self, record: &mut Record) -> session_store::Result<()> {
+        // `create` must never overwrite another session: on an id collision, draw a new id
+        loop {
+            let inserted = sqlx::query(
+                "insert into sessions (id, data, expiry_date) values ($1, $2, $3) on conflict (id) do nothing",
+            )
+            .bind(record.id.to_string())
+            .bind(Json(&record.data))
+            .bind(record.expiry_date)
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+            if inserted.rows_affected() == 1 {
+                return Ok(());
+            }
+            record.id = Id::default();
+        }
+    }
+
+    async fn save(&self, record: &Record) -> session_store::Result<()> {
+        sqlx::query(
+            "insert into sessions (id, data, expiry_date) values ($1, $2, $3)
+             on conflict (id) do update set data = excluded.data, expiry_date = excluded.expiry_date",
+        )
+        .bind(record.id.to_string())
+        .bind(Json(&record.data))
+        .bind(record.expiry_date)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn load(&self, id: &Id) -> session_store::Result<Option<Record>> {
+        let row: Option<(Json<Data>, OffsetDateTime)> =
+            sqlx::query_as("select data, expiry_date from sessions where id = $1 and expiry_date > now()")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(backend)?;
+        Ok(row.map(|(Json(data), expiry_date)| Record { id: *id, data, expiry_date }))
+    }
+
+    async fn delete(&self, id: &Id) -> session_store::Result<()> {
+        sqlx::query("delete from sessions where id = $1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(backend)?;
+        Ok(())
+    }
+}
+
+async fn visits(session: Session) -> String {
+    let n: u32 = session.get("visits").await.ok().flatten().unwrap_or(0) + 1;
+    let _ = session.insert("visits", n).await;
+    format!("visit {n}\n")
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let pool = PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
+    // normally a migration (see Migrations & Transactions)
+    sqlx::query(
+        "create table if not exists sessions (
+             id text primary key, data jsonb not null, expiry_date timestamptz not null)",
+    )
+    .execute(&pool)
+    .await?;
+
+    // expired rows are invisible to `load` but still take space: purge them periodically
+    let purge = pool.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            every.tick().await;
+            if let Err(err) = sqlx::query("delete from sessions where expiry_date < now()").execute(&purge).await {
+                tracing::warn!(%err, "session purge failed");
+            }
+        }
+    });
+
+    let sessions = SessionManagerLayer::new(PgSessionStore { pool }).with_secure(false); // dev: plain HTTP
+    let app = Router::new().route("/visits", get(visits)).layer(sessions);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+----
+
+Source: https://docs.rs/tower-sessions/0.14.0/tower_sessions/trait.SessionStore.html[tower-sessions: SessionStore] and https://github.com/maxcountryman/tower-sessions-stores/blob/main/sqlx-store/src/postgres_store.rs[tower-sessions-sqlx-store: PostgresStore]
+
+[source,bash]
+----
+$ curl -s -c jar -b jar localhost:3000/visits; curl -s -c jar -b jar localhost:3000/visits
+visit 1
+visit 2
+$ psql "$DATABASE_URL" -c 'select id, data, expiry_date from sessions'
+           id           |     data      |          expiry_date
+------------------------+---------------+-------------------------------
+ SaNlyD3_AaOXSnvSTbPAoQ | {"visits": 2} | 2026-10-21 09:26:09.535418+00
+(1 row)
+----
+
+Source: https://www.postgresql.org/docs/16/datatype-json.html[PostgreSQL 16: JSON types]
+
+* `create` is called for a new session and after `cycle_id`; tower-sessions 0.12 split it from `save` so that a store
+  can refuse to overwrite an existing id (a session takeover, however unlikely with 128 random bits). `on conflict do
+  nothing` plus a retry with a fresh `Id` is the race-free way to do that in Postgres.
+* `load` filters out expired rows itself; the purge task only reclaims space. The official store does the same with
+  `continuously_delete_expired`.
+* The store errors become `500` responses (see the lifecycle above). Instrument the queries like any other database
+  access (see xref:backend/axum/databases-with-sqlx.adoc[Databases with sqlx]).
 
 == Cookie attributes
 
@@ -162,6 +433,122 @@ OAuth `state` parameter during a login redirect -- axum-extra's `SignedCookieJar
 `PrivateCookieJar` (encrypted) keep it in the cookie itself. They are shown on xref:backend/axum/axum-extra.adoc[axum-extra]
 and used for the PKCE verifier on xref:backend/axum/oauth2-and-openid-connect.adoc[OAuth2 & OpenID Connect]. Cookie
 state cannot be revoked server-side and is limited to about 4 KB, so authentication sessions belong in a store.
+
+== Testing sessions
+
+`MemoryStore` makes session tests self-contained: build the router once (so all requests share the store), send
+requests with `tower::ServiceExt::oneshot`, copy the `Set-Cookie` value into the next request's `Cookie` header, and
+assert on what the session does -- here, that login replaces a planted id:
+
+[source,rust]
+----
+use axum::{
+    Router,
+    body::Body,
+    http::{Request, header},
+    routing::{get, post},
+};
+use tower::ServiceExt; // for `oneshot`
+use tower_sessions::{MemoryStore, Session, SessionManagerLayer};
+
+async fn sign_in(session: Session) -> &'static str {
+    session.cycle_id().await.expect("cycle id");
+    session.insert("user_id", 42_i64).await.expect("insert");
+    "ok"
+}
+
+async fn whoami(session: Session) -> String {
+    format!("{:?}", session.get::<i64>("user_id").await.expect("load"))
+}
+
+fn app() -> Router {
+    let layer = SessionManagerLayer::new(MemoryStore::default()).with_secure(false);
+    Router::new().route("/sign-in", post(sign_in)).route("/whoami", get(whoami)).layer(layer)
+}
+
+/// The `name=value` part of the response's Set-Cookie header.
+fn session_cookie(res: &axum::response::Response) -> String {
+    let set_cookie = res.headers()[header::SET_COOKIE].to_str().expect("ascii");
+    set_cookie.split(';').next().expect("name=value").to_owned()
+}
+
+async fn body(res: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(res.into_body(), 1024).await.expect("body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+#[tokio::main]
+async fn main() {
+    let app = app(); // one Router, so one MemoryStore, shared by every request below
+
+    // an attacker-planted (well-formed) session id: login must not keep it
+    let planted = "id=AAAAAAAAAAAAAAAAAAAAAA";
+    let req = Request::post("/sign-in").header(header::COOKIE, planted).body(Body::empty()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let cookie = session_cookie(&res);
+    assert_ne!(cookie, planted, "session id must change on login");
+
+    let req = Request::get("/whoami").header(header::COOKIE, &cookie).body(Body::empty()).unwrap();
+    assert_eq!(body(app.clone().oneshot(req).await.unwrap()).await, "Some(42)");
+
+    let req = Request::get("/whoami").body(Body::empty()).unwrap(); // no cookie: anonymous
+    assert_eq!(body(app.oneshot(req).await.unwrap()).await, "None");
+    println!("session tests passed ({cookie})");
+}
+----
+
+Source: https://docs.rs/tower/0.5.3/tower/trait.ServiceExt.html#method.oneshot[tower: ServiceExt::oneshot] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/testing[axum example: testing]
+
+[source,bash]
+----
+$ cargo run --example session_tests
+session tests passed (id=7VtwP5NxuvzKqAezA5Gweg)
+----
+
+Source: https://doc.rust-lang.org/cargo/commands/cargo-run.html[cargo run]
+
+The same assertions fit in `+#[tokio::test]+` functions; xref:backend/axum/testing.adoc[Testing] shows axum-test, whose
+`TestServer` can keep cookies between requests for you.
+
+== Common errors and pitfalls
+
+[cols="2,3",options="header"]
+|===
+|Symptom |Cause and fix
+
+|`500` with "Can't extract session. Is `SessionManagerLayer` enabled?"
+|The route is not inside the session layer: it was added after `.layer(sessions)`, or merged from a router that never
+got the layer. Apply the layer last, on the router that holds every session route.
+
+|The trait `SessionStore` is not implemented for a store that obviously implements it
+|Two tower-sessions versions in the build (0.14 for the store, 0.15 for the layer). Pin `+tower-sessions = "0.14.0"+`;
+check with `cargo tree -i tower-sessions-core`.
+
+|The login works with `curl` but the browser never sends the cookie back
+|`Secure` (or the `+__Host-+` prefix) over plain `http://` on a host other than `localhost`, or `SameSite=Strict` on a
+cross-site redirect back from an identity provider. Use HTTPS in every shared environment and `Lax` for the session.
+
+|Users are signed out after exactly 8 hours although they were active
+|`Expiry::OnInactivity` without `with_always_save(true)`: the deadline only moves when the session is modified.
+
+|Session data written by a handler is lost
+|The handler returned a `5xx` (the layer skips the save), or two concurrent requests from the same browser both
+modified the session and the last save won. Keep session writes small and idempotent; put shared state in the
+database.
+
+|Random `500` responses with an empty body
+|The store failed while *saving* after the handler ran; the layer logs "failed to save session" at `error`. Watch the
+store's latency and errors, and add it to the readiness probe.
+
+|"possibly suspicious activity: malformed session id" in the logs
+|A cookie value that is not a valid id: a cookie from an older application on the same host and name, or tampering.
+It is treated as no session; rename the cookie if an old one keeps colliding.
+
+|Logout does not take effect on other tabs
+|`session.remove(..)` or `clear()` was used and the record survived, or an in-process cache sits in front of the
+store. Use `flush()`; on password change, also delete the user's other sessions (axum-login does this through
+`session_auth_hash`).
+|===
 
 == Where the books are outdated
 

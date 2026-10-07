@@ -1,6 +1,6 @@
 = Performance Tuning
 :description: Making an axum 0.8 service fast and keeping it fast -- measure first with oha or k6 against a release build, release profile settings, mimalloc or jemalloc, keeping CPU-bound and blocking work off the async workers with spawn_blocking and a span bridge, finding blocked or starved tasks with tokio-console, CPU flamegraphs, database pool sizing, Bytes and zero-copy responses, compression trade-offs, HTTP/1.1 keep-alive and HTTP/2, and per-connection settings through hyper-util.
-:keywords: axum, performance, tuning, release profile, lto, codegen-units, panic abort, opt-level, allocator, mimalloc, jemalloc, tikv-jemallocator, global_allocator, spawn_blocking, block_in_place, blocking the runtime, task starvation, tokio-console, console-subscriber, tokio_unstable, flamegraph, cargo-flamegraph, perf, samply, pool sizing, max_connections, Bytes, zero-copy, compression, keep-alive, HTTP/2, hyper-util, TCP_NODELAY, load testing, oha, k6, latency percentiles
+:keywords: axum, performance, tuning, lock contention, Mutex, RwLock, sharding, continuous profiling, Pyroscope, Parca, pprof-rs, release profile, lto, codegen-units, panic abort, opt-level, allocator, mimalloc, jemalloc, tikv-jemallocator, global_allocator, spawn_blocking, block_in_place, blocking the runtime, task starvation, tokio-console, console-subscriber, tokio_unstable, flamegraph, cargo-flamegraph, perf, samply, pool sizing, max_connections, Bytes, zero-copy, compression, keep-alive, HTTP/2, hyper-util, TCP_NODELAY, load testing, oha, k6, latency percentiles
 
 include::partial$axum-disclaimer.adoc[]
 
@@ -31,6 +31,8 @@ codegen-units = 1            # better optimisation, slower compile
 debug = "line-tables-only"   # symbols for flamegraphs and panic backtraces, small binary cost
 # panic = "abort"            # do NOT use in servers: one panicking handler would kill the whole process
 ----
+
+Source: https://doc.rust-lang.org/cargo/reference/profiles.html#release[Cargo: the release profile]
 
 * Keep `+panic = "unwind"+` (the default) for a server. With unwinding, a panic in a handler aborts that one request's task
   (and `CatchPanicLayer` can turn it into a `500`); with `abort` every in-flight request dies with it.
@@ -131,6 +133,8 @@ $ oha -n 200 -c 1 http://127.0.0.1:3000/ping
   99.00% in      1.7052 ms
 ----
 
+Source: https://github.com/hatoo/oha[oha] and https://docs.rs/tokio/1.53.2/tokio/task/fn.spawn_blocking.html[tokio: spawn_blocking]
+
 * The hashing throughput is about the same either way (the CPU is the limit); what changes is that `spawn_blocking`
   keeps the latency of *everything else* unaffected -- a median of 26 ms against 0.01 ms for `/ping` here.
 * `spawn_blocking` runs the closure on a separate pool (up to 512 threads by default). For CPU-bound work, bound the
@@ -157,10 +161,125 @@ $ RUSTFLAGS="--cfg tokio_unstable" cargo run
 $ cargo install --locked tokio-console && tokio-console   # connects to 127.0.0.1:6669
 ----
 
+Source: https://github.com/tokio-rs/console#instrumenting-your-program[tokio-console: Instrumenting your program] and https://docs.rs/console-subscriber/0.5.0/console_subscriber/[console-subscriber 0.5.0]
+
 * A task with a long *busy* time and few polls is blocking its worker. Many tasks with long *scheduled* times
   (waiting to run) mean the runtime is starved -- usually by such a blocker.
 * `tokio_unstable` and the console layer add overhead; enable them in development or a staging build, not in the
   production binary.
+
+== Lock contention
+
+Shared state behind a lock -- an in-process cache, a rate-limit table, per-book counters -- is correct but can become
+the bottleneck: every request that needs the lock waits for the one that holds it, so latency grows with concurrency
+while CPU usage stays low. The rules for axum handlers:
+
+* *`std::sync::Mutex` is the right default* for state that is locked briefly and never across an `.await`. Lock,
+  update, drop the guard. Clippy's `await_holding_lock` lint catches a guard held across an `.await`, which can block a
+  worker thread and, with a `!Send` guard, fails to compile in a handler anyway.
+* *Keep hold times short.* Compute outside the lock (serialisation, hashing, formatting), and never do I/O or logging
+  inside it. Contention is proportional to *hold time* times *request rate*.
+* *`tokio::sync::Mutex`* is only for the rare case where the lock really must be held across an `.await` (a single
+  shared connection, for example); it is slower than the std mutex and lets tasks queue for a long time.
+* *`RwLock`* helps when reads vastly outnumber writes and the read section is not trivially short; for configuration
+  that changes rarely, an `arc-swap` `ArcSwap` or a `tokio::sync::watch` channel gives readers no lock at all.
+* *Shard* a hot map into N independently locked parts chosen by key hash (or use a concurrent map such as `dashmap`,
+  or `moka` for caches), so requests for different keys rarely meet.
+
+The example measures the same workload -- eight threads incrementing per-book view counters -- with one mutex and with
+sixteen shards, and records how long the threads spent *waiting* to acquire a lock:
+
+[source,rust]
+----
+use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Per-book view counters behind ONE lock: every request serialises on it.
+#[derive(Default)]
+struct Global(Mutex<HashMap<u32, u64>>);
+
+/// The same counters split over N independently locked shards.
+struct Sharded {
+    shards: Vec<Mutex<HashMap<u32, u64>>>,
+    hasher: RandomState,
+}
+
+impl Sharded {
+    fn new(n: usize) -> Self {
+        Self { shards: (0..n).map(|_| Mutex::default()).collect(), hasher: RandomState::new() }
+    }
+    fn shard(&self, book: u32) -> &Mutex<HashMap<u32, u64>> {
+        &self.shards[self.hasher.hash_one(book) as usize % self.shards.len()]
+    }
+}
+
+trait Counter: Send + Sync + 'static {
+    fn lock_for(&self, book: u32) -> &Mutex<HashMap<u32, u64>>;
+}
+impl Counter for Global {
+    fn lock_for(&self, _book: u32) -> &Mutex<HashMap<u32, u64>> {
+        &self.0
+    }
+}
+impl Counter for Sharded {
+    fn lock_for(&self, book: u32) -> &Mutex<HashMap<u32, u64>> {
+        self.shard(book)
+    }
+}
+
+/// Runs 8 threads x 200 000 increments; reports the wall time and the time spent waiting for locks.
+fn run(name: &str, counter: Arc<dyn Counter>) {
+    let started = Instant::now();
+    let handles: Vec<_> = (0..8u32)
+        .map(|t| {
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let mut waited = Duration::ZERO;
+                for i in 0..200_000u32 {
+                    let book = (i * 7 + t) % 1_000;
+                    let asked = Instant::now();
+                    let mut map = counter.lock_for(book).lock().expect("poisoned");
+                    waited += asked.elapsed(); // time spent acquiring = contention
+                    *map.entry(book).or_default() += 1;
+                } // guard dropped here: hold the lock for the update only
+                waited
+            })
+        })
+        .collect();
+    let waited: Duration = handles.into_iter().map(|h| h.join().expect("thread")).sum();
+    println!("{name:<10} {:>8.1?} wall, {waited:>8.1?} waiting for locks", started.elapsed());
+}
+
+fn main() {
+    run("one mutex", Arc::new(Global::default()));
+    run("16 shards", Arc::new(Sharded::new(16)));
+}
+----
+
+Source: https://doc.rust-lang.org/std/sync/struct.Mutex.html[std::sync::Mutex] and https://docs.rs/tokio/1.53.2/tokio/sync/struct.Mutex.html#which-kind-of-mutex-should-you-use[tokio: Which kind of mutex should you use?]
+
+[source,bash]
+----
+$ cargo run --release      # 8 threads on a 4-core machine
+one mutex   493.1ms wall,     2.5s waiting for locks
+16 shards   186.7ms wall,     1.0s waiting for locks
+----
+
+Source: https://rust-lang.github.io/rust-clippy/stable/index.html#await_holding_lock[Clippy: await_holding_lock]
+
+To find contention in a running service:
+
+* *Time the acquisition*, as the example does, around the few hot locks, and export it as a histogram (see
+  xref:backend/axum/metrics-and-slos.adoc[Metrics & SLOs]); rising acquire times under load are the signature.
+* *tokio-console* lists tokio's synchronisation primitives (`tokio::sync::Mutex`, `RwLock`, `Semaphore`) as
+  *resources*, with the tasks waiting on each; a resource with a long queue is contended. std mutexes do not appear
+  there.
+* In a CPU profile, contention shows up as time in `futex` system calls and parking functions rather than in your code
+  -- or, for an async lock, as low CPU usage with high latency.
+* Database row locks are the same problem one level down; see
+  xref:backend/axum/databases-with-sqlx.adoc[Databases with sqlx] for `FOR UPDATE SKIP LOCKED` and `lock_timeout`.
 
 == CPU flamegraphs
 
@@ -171,10 +290,129 @@ $ cargo flamegraph --release --bin bookshelf-web    # run load with oha meanwhil
 $ samply record ./target/release/bookshelf-web      # alternative with an interactive Firefox Profiler view
 ----
 
+Source: https://github.com/flamegraph-rs/flamegraph[cargo-flamegraph] and https://github.com/mstange/samply[samply]
+
 Wide frames are where the CPU time goes. Typical findings in axum services: JSON serialisation of large responses,
 regex compilation inside handlers (compile once, store in a `LazyLock`), cloning large state instead of sharing it in an
 `Arc`, logging at `debug` level in production, and TLS handshakes when clients do not reuse connections. `debug =
 "line-tables-only"` in the release profile gives readable frames.
+
+== Continuous profiling
+
+A flamegraph recorded on a laptop answers the question you thought to ask. *Continuous profiling* samples production
+all the time at a low rate (around 100 Hz, typically 1-2 % CPU), stores the profiles with labels such as service,
+version and region, and lets you compare "this morning" with "last week", or one release with the previous one. It is
+the fourth signal next to traces, metrics and logs. The options for a Rust service are third-party tools, not part of
+axum or tokio:
+
+[cols="1,2,2",options="header"]
+|===
+|Tool |How it collects |Notes
+|*Parca* (Polar Signals) |an eBPF agent on each node samples every process; no code changes |needs frame pointers or
+DWARF unwinding for good Rust stacks (`-C force-frame-pointers=yes` helps) and symbols kept in the binary
+|*Grafana Pyroscope* |the `pyroscope` crate (2.x, feature `backend-pprof-rs`) samples in-process and pushes profiles
+every 10 seconds; Grafana Alloy can also collect with eBPF |profiles can be tagged per request type and linked
+from traces in Grafana
+|*pprof-rs* (`pprof` crate) |an in-process sampling profiler (`SIGPROF`) that produces pprof protobufs or SVG
+flamegraphs |the building block of the Pyroscope Rust agent; also usable for on-demand profiles (below)
+|===
+
+The `pyroscope` 2.1.1 agent is started before the server and stopped after it:
+
+[source,rust]
+----
+use pyroscope::{
+    backend::{BackendConfig, PprofConfig, pprof_backend},
+    pyroscope::PyroscopeAgentBuilder,
+};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = std::env::var("PYROSCOPE_URL").unwrap_or_else(|_| "http://localhost:4040".into());
+    let agent = PyroscopeAgentBuilder::new(
+        url,
+        "bookshelf-web",
+        100, // samples per second
+        "pyroscope-rs",
+        env!("CARGO_PKG_VERSION"),
+        pprof_backend(PprofConfig::default(), BackendConfig::default()),
+    )
+    .tags(vec![("env", "staging"), ("region", "eu-west-1")])
+    .build()?
+    .start()?;
+
+    // ... build the runtime and run axum::serve(...) here; profiles are pushed every 10 s ...
+
+    agent.stop()?.shutdown(); // flush the last profile on shutdown
+    Ok(())
+}
+----
+
+Source: https://docs.rs/pyroscope/2.1.1/pyroscope/[pyroscope 2.1.1] and https://grafana.com/docs/pyroscope/latest/configure-client/language-sdks/rust/[Grafana Pyroscope: Rust SDK]
+
+When continuous profiling is not available, an *on-demand* endpoint on the internal port gives the same insight for
+one incident: it profiles the live process for a few seconds and returns a flamegraph. pprof-rs 0.15 with the
+`flamegraph` feature:
+
+[source,rust]
+----
+use std::time::Duration;
+
+use axum::{
+    Router,
+    extract::Query,
+    http::{StatusCode, header},
+    response::IntoResponse,
+    routing::get,
+};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct ProfileParams {
+    seconds: Option<u64>,
+}
+
+/// GET /debug/pprof/flamegraph?seconds=10 -- samples every thread of the process at 99 Hz
+/// for a few seconds and returns an SVG flamegraph. Serve it on the internal port only.
+async fn flamegraph(Query(params): Query<ProfileParams>) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let seconds = params.seconds.unwrap_or(10).clamp(1, 60);
+    let svg = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, pprof::Error> {
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(99)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()?;
+        std::thread::sleep(Duration::from_secs(seconds)); // the request keeps being served meanwhile
+        let mut svg = Vec::new();
+        guard.report().build()?.flamegraph(&mut svg)?;
+        Ok(svg)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(([(header::CONTENT_TYPE, "image/svg+xml")], svg))
+}
+
+#[tokio::main]
+async fn main() {
+    let internal = Router::new().route("/debug/pprof/flamegraph", get(flamegraph));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:9000").await.unwrap();
+    axum::serve(listener, internal).await.unwrap();
+}
+----
+
+Source: https://docs.rs/pprof/0.15.0/pprof/[pprof 0.15.0]
+
+[source,bash]
+----
+$ curl -s -o bookshelf.svg 'localhost:9000/debug/pprof/flamegraph?seconds=10'   # while the service is under load
+----
+
+Source: https://github.com/tikv/pprof-rs[pprof-rs repository]
+
+* The profiler samples *every thread*, so the profile shows what the service did during those seconds, not just the
+  profiling request; an idle process yields an empty flamegraph.
+* Profiling uses `SIGPROF` and stack unwinding in a signal handler; only one profile can run at a time, and the
+  blocklist skips frames inside libc and the dynamic loader that cannot be unwound safely.
+* Keep the endpoint (and the Pyroscope agent's credentials) away from the public port, like `/metrics`.
 
 == Database and pools
 
@@ -239,7 +477,7 @@ and tokio-console still needs the `tokio_unstable` cfg. Material that recommends
 == References
 
 * https://docs.rs/tokio/1.53.2/tokio/task/fn.spawn_blocking.html[tokio: spawn_blocking] and https://ryhl.io/blog/async-what-is-blocking/[Async: What is blocking?]
-* https://github.com/tokio-rs/console[tokio-console] and https://docs.rs/console-subscriber/latest/console_subscriber/[console-subscriber]
+* https://github.com/tokio-rs/console[tokio-console] and https://docs.rs/console-subscriber/0.5.0/console_subscriber/[console-subscriber 0.5.0]
 * https://github.com/flamegraph-rs/flamegraph[cargo-flamegraph] and https://github.com/mstange/samply[samply]
 * https://docs.rs/mimalloc/0.1.52/mimalloc/[mimalloc] and https://docs.rs/tikv-jemallocator/0.7.0/tikv_jemallocator/[tikv-jemallocator]
 * https://doc.rust-lang.org/cargo/reference/profiles.html[Cargo: Profiles] and https://nnethercote.github.io/perf-book/[The Rust Performance Book]

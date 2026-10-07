@@ -10,17 +10,56 @@ checked on 2026-10-06. The *Bookshelf* JSON API authenticates clients with beare
 lifetimes are explained on this site's xref:backend/oauth/jwt-and-jose.adoc[JWT and JOSE] and
 xref:backend/oauth/access-and-refresh-tokens.adoc[Access and Refresh Tokens] pages; this page shows the Rust side.
 
+== Where it runs in the request
+
+In the xref:backend/axum/introduction-and-architecture.adoc#_the_request_lifecycle[request lifecycle] (tokio accepts
+the connection, hyper parses the request, tower layers wrap the router, the router matches a route, extractors run,
+the handler runs, the response travels back out), token checking sits *after routing and before the handler*:
+
+* `Claims` is a `FromRequestParts` extractor, so it runs in the extractor phase and only reads headers. A missing or
+  invalid token is rejected with `401` before any body extractor (`Json`) buffers the request body.
+* `+route_layer(from_extractor_with_state::<Claims, _>(..))+` runs the same extractor as middleware on the matched
+  routes only. Unmatched paths still get `404` (not `401`), and global layers added with `Router::layer`, such as
+  `TraceLayer`, `CorsLayer` or a rate limiter, run *before* it -- so CORS preflights and rejected requests are still
+  traced and limited.
+* Issuing tokens is ordinary handler work. The Argon2 verification inside `token` is the expensive part, which is why
+  it runs on tokio's blocking pool and why the token endpoint belongs behind a rate limiter.
+
 == jsonwebtoken 11 needs a crypto provider
 
 Since version 10, jsonwebtoken delegates cryptography to a *provider*, chosen with exactly one Cargo feature:
 `aws_lc_rs` (AWS-LC, fast, needs a C compiler and CMake to build) or `rust_crypto` (the pure-Rust RustCrypto crates).
-Without one, every sign or verify call fails at runtime.
+The provider is resolved lazily, on the first `encode` or `decode`: with neither feature enabled (or with both), and no
+provider installed by hand, that first call *panics* with "Could not automatically determine the process-level
+CryptoProvider from jsonwebtoken crate features". The program compiles fine, so the panic surfaces in the first request
+that issues or checks a token -- run one token round-trip in a start-up smoke test.
 
 [source,toml]
 ----
 [dependencies]
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] } # or features = ["rust_crypto"]
 ----
+
+Source: https://docs.rs/crate/jsonwebtoken/11.1.0/features[jsonwebtoken 11.1.0: feature flags]
+
+The alternative to the provider features is to choose the provider in code. `jsonwebtoken::crypto::CryptoProvider`
+has an `install_default()` method, modelled on rustls, that sets the process-wide provider; it succeeds at most once
+per process and must run before the first token is signed or verified. The built-in providers are the
+`DEFAULT_PROVIDER` statics in `jsonwebtoken::crypto::aws_lc` and `jsonwebtoken::crypto::rust_crypto` (each behind its
+feature), and a custom `CryptoProvider` (for example one backed by a hardware security module) can be installed the
+same way. Installing explicitly also settles the ambiguity when two dependencies enable *different* provider features:
+
+[source,rust]
+----
+use jsonwebtoken::crypto::aws_lc;
+
+fn main() {
+    // first thing in main, before any encode/decode; Err means another provider was installed first
+    aws_lc::DEFAULT_PROVIDER.install_default().expect("jsonwebtoken crypto provider already installed");
+}
+----
+
+Source: https://docs.rs/jsonwebtoken/11.1.0/jsonwebtoken/crypto/struct.CryptoProvider.html[jsonwebtoken 11.1.0: CryptoProvider]
 
 Version 11 (July 2026) also removed `Validation::insecure_disable_signature_validation` (use the `dangerous` module),
 made `Algorithm` non-exhaustive and turned optional dependencies into explicit features.
@@ -36,23 +75,27 @@ sequenceDiagram
     participant B as GET /api/v1/me/loans
     C->>A: username + password
     A-->>C: access token (JWT, 15 min) + refresh token (opaque, 30 days)
-    C->>B: Authorization: Bearer <access token>
+    C->>B: Authorization: Bearer &lt;access token&gt;
     B-->>C: 200 loans
     Note over C,B: 15 minutes later
-    C->>B: Authorization: Bearer <expired token>
+    C->>B: Authorization: Bearer &lt;expired token&gt;
     B-->>C: 401 + WWW-Authenticate: Bearer error="invalid_token"
     C->>R: refresh token
     R-->>C: new access token + NEW refresh token (old one revoked)
-    C->>B: Authorization: Bearer <new access token>
+    C->>B: Authorization: Bearer &lt;new access token&gt;
     B-->>C: 200 loans
 ....
 
 [source,rust]
 ----
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
+};
 use axum::{
     Json, Router,
     extract::{FromRef, FromRequestParts, State},
@@ -95,9 +138,16 @@ impl Keys {
     }
 }
 
+/// A row of the `users` table: the password is only ever stored as an Argon2id PHC string.
+struct StoredUser {
+    id: String,
+    password_hash: String,
+}
+
 #[derive(Clone, FromRef)]
 struct AppState {
     keys: Keys,
+    users: Arc<HashMap<String, StoredUser>>, // username -> user (a `users` table in production)
     refresh_tokens: Arc<Mutex<HashMap<String, String>>>, // refresh token -> user id (a table in production)
 }
 
@@ -179,12 +229,29 @@ fn issue(state: &AppState, user_id: &str) -> Result<TokenResponse, StatusCode> {
     Ok(TokenResponse { access_token, token_type: "Bearer", expires_in: ACCESS_TTL_SECS, refresh_token })
 }
 
+/// Verified against when the username is unknown, so both failures cost one Argon2 verification.
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    Argon2::default().hash_password(b"dummy password for timing").expect("hash").to_string()
+});
+
+/// The same check as on the Password Authentication page, off the async executor.
+async fn verify_password(password: String, phc: String) -> Result<bool, StatusCode> {
+    tokio::task::spawn_blocking(move || {
+        PasswordHash::new(&phc)
+            .is_ok_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 async fn token(State(state): State<AppState>, Json(req): Json<TokenRequest>) -> Result<Json<TokenResponse>, StatusCode> {
-    // verify the password with argon2 here (see Password Authentication); demo user only
-    if req.username != "ursula" || req.password != "correct horse battery staple" {
-        return Err(StatusCode::UNAUTHORIZED);
+    let user = state.users.get(&req.username);
+    let stored = user.map_or_else(|| DUMMY_HASH.clone(), |u| u.password_hash.clone());
+    let valid = verify_password(req.password, stored).await?;
+    match user {
+        Some(user) if valid => issue(&state, &user.id).map(Json),
+        _ => Err(StatusCode::UNAUTHORIZED), // one answer for "no such user" and "wrong password"
     }
-    issue(&state, "42").map(Json)
 }
 
 #[derive(Deserialize)]
@@ -204,9 +271,20 @@ async fn my_loans(claims: Claims) -> String {
 
 #[tokio::main]
 async fn main() {
-    // e.g. JWT_SECRET=$(openssl rand -base64 48); the fallback is a placeholder for local runs only
-    let secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "dev-only-placeholder-change-me".to_owned());
-    let state = AppState { keys: Keys::from_secret(secret.as_bytes()), refresh_tokens: Arc::default() };
+    // e.g. JWT_SECRET=$(openssl rand -base64 48); no fallback: a missing secret stops the process here
+    let secret = std::env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    assert!(secret.len() >= 32, "JWT_SECRET must be at least 32 bytes (256 bits) for HS256");
+
+    // demo user table: production loads `password_hash` from the database instead
+    let demo_password = std::env::var("DEMO_PASSWORD").expect("DEMO_PASSWORD must be set");
+    let demo_hash = Argon2::default().hash_password(demo_password.as_bytes()).expect("hash").to_string();
+    let users = HashMap::from([("ursula".to_owned(), StoredUser { id: "42".into(), password_hash: demo_hash })]);
+
+    let state = AppState {
+        keys: Keys::from_secret(secret.as_bytes()),
+        users: Arc::new(users),
+        refresh_tokens: Arc::default(),
+    };
 
     let protected = Router::new()
         .route("/api/v1/me/loans", get(my_loans))
@@ -224,13 +302,32 @@ async fn main() {
 
 Source: https://docs.rs/jsonwebtoken/11.1.0/jsonwebtoken/[jsonwebtoken 11.1.0] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/jwt[axum example: jwt]
 
+The token endpoint verifies the password exactly as the
+xref:backend/axum/password-authentication.adoc[Password Authentication] page does: it looks up the stored Argon2id
+PHC string, parses it with `PasswordHash::new` and calls `Argon2::default().verify_password` on the blocking pool, and
+it verifies against a dummy hash when the username is unknown, so both failures take the same time and return the same
+`401`. The demo builds its one-row user table at start-up from a `DEMO_PASSWORD` variable; a real deployment reads
+`password_hash` from the `users` table and never sees a plain-text password outside the request body. Both
+`JWT_SECRET` and `DEMO_PASSWORD` are required: a missing variable stops the process at start-up instead of silently
+signing tokens with a well-known fallback key.
+
 [source,bash]
 ----
-$ TOKENS=$(curl -s -H 'content-type: application/json' \
-    -d '{"username":"ursula","password":"correct horse battery staple"}' localhost:3000/api/v1/auth/token)
+$ cargo run
+thread 'main' (3931) panicked at src/main.rs:185:46:
+JWT_SECRET must be set: NotPresent
+$ export JWT_SECRET=$(openssl rand -base64 48) DEMO_PASSWORD=$(openssl rand -base64 18)
+$ cargo run &
+$ login() { jq -n --arg u "$1" --arg p "$2" '{username: $u, password: $p}' |
+    curl -s -H 'content-type: application/json' -d @- "${@:3}" localhost:3000/api/v1/auth/token; }
+$ TOKENS=$(login ursula "$DEMO_PASSWORD")
 $ ACCESS=$(echo "$TOKENS" | jq -r .access_token)
 $ curl -s -H "authorization: Bearer $ACCESS" localhost:3000/api/v1/me/loans
 loans of user 42 (roles ["member"])
+$ login ursula "x$DEMO_PASSWORD" -o /dev/null -w '%{http_code}\n'   # wrong password
+401
+$ login nobody "$DEMO_PASSWORD" -o /dev/null -w '%{http_code}\n'     # unknown user
+401
 $ curl -si -H "authorization: $ACCESS" localhost:3000/api/v1/me/loans | grep -i -E '^HTTP|www-authenticate'
 HTTP/1.1 401 Unauthorized
 www-authenticate: Bearer realm="bookshelf"
@@ -240,6 +337,8 @@ Bearer
 $ curl -s -o /dev/null -w '%{http_code}\n' -H 'content-type: application/json' -d "{\"refresh_token\":\"$REFRESH\"}" localhost:3000/api/v1/auth/refresh
 401
 ----
+
+Source: https://www.rfc-editor.org/rfc/rfc6750.html#section-3[RFC 6750, section 3: The WWW-Authenticate Response Header Field] and https://github.com/tokio-rs/axum/tree/axum-v0.8.9/examples/jwt[axum example: jwt]
 
 == What the validation checks
 
@@ -293,13 +392,46 @@ xref:backend/axum/oauth2-and-openid-connect.adoc[OAuth2 & OpenID Connect] page v
 its signature*. They exist for debugging and for routing decisions made before verification (such as picking a tenant's
 key), and their name is a warning: never authorise anything based on their output.
 
+== Common errors and pitfalls
+
+[cols="2,3",options="header"]
+|===
+| Symptom | Cause and fix
+
+| Panic "Could not automatically determine the process-level CryptoProvider" on the first request
+| No provider feature (or both) is enabled. Enable exactly one of `aws_lc_rs` and `rust_crypto`, or call
+`install_default()` at start-up.
+
+| Every token is rejected with `InvalidAudience`
+| `validate_aud` is on by default, and a token that carries an `aud` claim is rejected when the `Validation` lists no
+audience. Call `set_audience` with the value the issuer puts in the token; turn `validate_aud` off only if the
+audience is checked some other way.
+
+| Every token is rejected with `InvalidAlgorithm`
+| The `Validation` algorithm list does not contain the token's `alg`, for example a provider signing with `RS256`
+while the code builds `Validation::new(Algorithm::HS256)`. Pin the algorithm the issuer actually uses.
+
+| Tokens fail for a few seconds after issue on another host
+| Clock skew between issuer and verifier. Keep a small `leeway` (30--60 seconds) and run NTP; do not raise it to
+minutes.
+
+| The extractor works in a handler but `from_extractor_with_state` does not compile
+| The state passed to the layer does not satisfy `Keys: FromRef<S>`. Pass the same `AppState` as `with_state`, and
+derive `FromRef` on it.
+
+| A request with `Authorization: Token abc` gets `401` with no `error=`
+| `TypedHeader<Authorization<Bearer>>` only accepts the `Bearer` scheme (case-insensitive). This is intended: RFC
+6750 defines no other scheme.
+|===
+
 == Where the books are outdated
 
 Yoon (*Beginning Axum*, chapter 4) uses jsonwebtoken 9, keeps the secret in a `lazy_static!` global and accepts the
-`Authorization` header with *or* without the `Bearer ` prefix. With jsonwebtoken 11 a crypto-provider feature is
-mandatory; keys belong in state (or, if a global is really needed, `std::sync::LazyLock` since Rust 1.80, not
-`lazy_static!`); and the extractor must require the `Bearer` scheme defined by RFC 6750. Crossley (*Rust in Action*)
-protects an API with a hard-coded token over plain HTTP; tokens must be random, stored securely and sent only over TLS.
+`Authorization` header with *or* without the `Bearer ` prefix. With jsonwebtoken 11 a crypto provider is mandatory (a
+feature or `install_default()`); keys belong in state (or, if a global is really needed, `std::sync::LazyLock` since
+Rust 1.80, not `lazy_static!`); and the extractor must require the `Bearer` scheme defined by RFC 6750. Crossley et al.
+(*Rust for Scientific Computing*, ch. 15) protects an API with a hard-coded token over plain HTTP; tokens must be
+random, stored securely and sent only over TLS.
 
 == References
 
