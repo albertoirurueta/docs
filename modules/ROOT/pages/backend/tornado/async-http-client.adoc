@@ -1,0 +1,977 @@
+= Async HTTP Client
+:description: Tornado's AsyncHTTPClient in depth: the per-IOLoop pseudo-singleton, force_instance, max_clients and defaults, fetch and raise_error, every HTTPRequest option, HTTPClientError and the 599 timeout code, streaming downloads and body_producer uploads, concurrent fetches with gather, the curl implementation and proxies, the blocking HTTPClient restriction, security and a comparison with HTTPX and aiohttp.
+:keywords: Tornado, AsyncHTTPClient, HTTPClient, HTTPRequest, HTTPResponse, HTTPClientError, HTTPTimeoutError, fetch, raise_error, force_instance, max_clients, defaults, configure, curl_httpclient, pycurl, simple_httpclient, proxy_host, streaming_callback, header_callback, body_producer, validate_cert, follow_redirects, request_timeout, connect_timeout, gather, HTTPX, aiohttp
+
+include::partial$tornado-disclaimer.adoc[]
+
+This page is written against Tornado 6.5.10 on Python 3.13, checked on 2026-10-07. Tornado 6.6 is only available as an
+alpha (6.6a1) at the time of writing, so everything described as "6.6" below is upcoming and may still change. Every
+runnable example on this page was executed with those versions, always against a throw-away server bound to a loopback
+port (or through `AsyncHTTPTestCase`): the "external" cover-metadata service of the _Bookshelf Live_ scenario is a small
+local fake, and no example touches the network. The two examples that need `pycurl` or an HTTP proxy are shown but not
+run, and are marked as such.
+
+An application that serves requests will sooner or later have to make requests: Bookshelf Live asks a cover-metadata
+service for the cover of each book, calls an OAuth provider, posts a webhook when a loan is created. Tornado ships its
+own non-blocking HTTP client for this, `tornado.httpclient.AsyncHTTPClient`, built on the same event loop as the server
+(see xref:backend/tornado/asynchronous-io-and-the-event-loop.adoc[Asynchronous I/O & the Event Loop]). Because
+`fetch()` returns an awaitable, a handler that calls an upstream service does not block other requests while it waits,
+and several upstream calls can be overlapped with `asyncio.gather` (see
+xref:backend/tornado/coroutines-and-asyncio.adoc[Coroutines & asyncio]). The client is deliberately small: it has no
+cookie jar, no connection pool and no retry logic, which is the main thing to weigh against HTTPX and aiohttp (the
+comparison is at the end of the page).
+
+For the Flask counterpart, where outgoing calls are usually made with a blocking library such as `requests`, see
+xref:backend/flask/async-gevent-and-quart.adoc[Flask: Async, gevent & Quart]; for FastAPI, which leaves the choice of
+client to you, see xref:backend/fastapi/introduction-and-architecture.adoc[FastAPI]. The Tornado pages xref:backend/tornado/websockets.adoc[WebSockets], xref:backend/tornado/streaming-long-polling-and-sse.adoc[Streaming, Long Polling & SSE]
+and xref:backend/tornado/tcp-servers-iostream-and-low-level-networking.adoc[TCP Servers, IOStream & Low-level Networking] cover those topics.
+
+== How a Fetch Travels
+
+`AsyncHTTPClient` is a facade. Calling `AsyncHTTPClient()` does not create an instance of that class: it returns an
+instance of an _implementation_ subclass, `SimpleAsyncHTTPClient` by default, which is written in pure Python on top of
+Tornado's `IOStream`, or `CurlAsyncHTTPClient`, which delegates to `libcurl` through the optional `pycurl` package. The
+facade also owns the two pieces of policy that are the same for both: the `defaults` applied to every request and the
+`max_clients` limit on how many fetches run at once on one event loop. A fetch that arrives when the limit is reached
+waits in a queue.
+
+.One handler awaiting a fetch: the shared client, the max_clients queue and the two implementations
+image::tornado-async-http-client.svg["A request handler awaits AsyncHTTPClient.fetch. The client is shared per event loop, merges its defaults into the HTTPRequest, and limits concurrency with max_clients: requests beyond the limit wait in a queue, and a request timeout also counts the time spent waiting. Active requests are executed by SimpleAsyncHTTPClient in pure Python, or by CurlAsyncHTTPClient through pycurl, which adds proxies and connection reuse, and reach the upstream service. The result is an HTTPResponse, or an HTTPClientError whose code is 599 for timeouts",width=720]
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html[Tornado: tornado.httpclient]
+
+== The Fixture: a Fake Cover Service
+
+The examples share one fixture, in the same style as the other Tornado pages: a fake upstream bound to an unused
+loopback port. Besides the cover lookups used elsewhere in the section it has a handful of routes that exist only to
+demonstrate client behaviour (redirects, status codes, a chunked download, an upload sink and a header echo).
+
+[source,python]
+----
+import asyncio
+import contextlib
+import time
+
+from tornado import gen, httpclient, httpserver, ioloop, netutil, web
+from tornado.escape import json_decode, json_encode
+
+
+class CoverHandler(web.RequestHandler):
+    async def get(self, isbn):
+        try:
+            default_delay = "3" if isbn.startswith("slow") else "0.05"
+            await gen.sleep(float(self.get_query_argument("delay", default_delay)))
+        except asyncio.CancelledError:
+            return  # the client gave up: nothing left to answer
+        if isbn.startswith("bad"):
+            raise web.HTTPError(502, reason="upstream failure")
+        self.write({"isbn": isbn, "cover_url": f"https://covers.example/{isbn}.jpg"})
+
+
+class StatusHandler(web.RequestHandler):
+    def get(self, code):
+        self.set_status(int(code))
+        self.write({"status": int(code)})
+
+
+class MovedHandler(web.RequestHandler):
+    def get(self):
+        self.redirect("/covers/moved-978-0")
+
+
+class EchoHeadersHandler(web.RequestHandler):
+    def get(self):
+        self.write({k.lower(): v for k, v in self.request.headers.get_all()})
+
+
+class ChunkHandler(web.RequestHandler):
+    async def get(self):
+        self.set_header("X-Total-Chunks", "3")
+        for i in range(3):
+            self.write(f"chunk-{i};")
+            await self.flush()
+
+
+class UploadHandler(web.RequestHandler):
+    def post(self):
+        self.write({"received": len(self.request.body), "type": self.request.headers.get("Content-Type")})
+
+
+def make_upstream():
+    return web.Application(
+        [
+            (r"/covers/([^/]+)", CoverHandler),
+            (r"/status/(\d+)", StatusHandler),
+            (r"/moved", MovedHandler),
+            (r"/headers", EchoHeadersHandler),
+            (r"/chunks", ChunkHandler),
+            (r"/upload", UploadHandler),
+        ]
+    )
+
+
+@contextlib.asynccontextmanager
+async def fake_upstream():
+    sockets = netutil.bind_sockets(0, address="127.0.0.1")
+    server = httpserver.HTTPServer(make_upstream())
+    server.add_sockets(sockets)
+    port = sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.stop()
+        await server.close_all_connections()
+----
+
+Source: https://www.tornadoweb.org/en/stable/web.html[Tornado: tornado.web]
+
+== Fetching and Reading the Response
+
+`fetch()` accepts either a URL string, in which case extra keyword arguments become `HTTPRequest` arguments, or a
+ready-made `HTTPRequest` (in which case extra keyword arguments are rejected with `ValueError`). It returns a future
+for an `HTTPResponse`. The response carries `code`, `reason`, `headers` (a `tornado.httputil.HTTPHeaders`), `body` (bytes,
+built on demand from `buffer`), `effective_url` (the final URL after redirects), `request_time` (seconds from the start
+of the request to the last byte, excluding queueing) and `error`.
+
+[source,python]
+----
+async def demo_basic():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient()
+        response = await client.fetch(f"{base}/covers/978-0-13-468599-1")
+        data = json_decode(response.body)
+        print(response.code, response.reason, data["cover_url"])
+        print(response.headers["Content-Type"], response.effective_url == f"{base}/covers/978-0-13-468599-1")
+        print("fast enough:", response.request_time < 1.0)
+
+        # string URL + kwargs, or an HTTPRequest object (but not both)
+        request = httpclient.HTTPRequest(f"{base}/headers", headers={"X-Request-Id": "req-42"})
+        echoed = json_decode((await client.fetch(request)).body)
+        print(echoed["x-request-id"])
+        try:
+            await client.fetch(request, request_timeout=1)
+        except ValueError as exc:
+            print("ValueError:", exc)
+
+
+asyncio.run(demo_basic())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.AsyncHTTPClient.fetch[Tornado: AsyncHTTPClient.fetch]
+
+Since Tornado 6.0 `fetch()` returns only a future; the old `callback=` argument was removed.
+
+== The Pseudo-Singleton, `force_instance`, `max_clients` and `defaults`
+
+The documentation describes the constructor as magic: instances are reused as a kind of pseudo-singleton, _one per
+`IOLoop`_. `AsyncHTTPClient()` called twice on the same loop returns the same object, which is what you usually want:
+the object holds the queue and the limit, so one shared instance is how `max_clients` is enforced across the whole
+application. The pitfalls follow from that.
+
+* **Constructor arguments are not meant to be used on the shared instance.** The documentation says that unless
+  `force_instance=True` is used, no arguments should be passed to the `AsyncHTTPClient` constructor: a later call
+  returns the instance that already exists, so its arguments could not apply anyway. The implementation class and the
+  arguments of its constructor (`max_clients`, `defaults`...) are set once, at start-up, with `configure()`.
+* **`force_instance=True` creates a private instance** that does not share the queue, the limit or the defaults, and
+  that accepts the `defaults` argument directly. It is the caller's job to `close()` it. It exists mostly for tests and
+  for code that needs different defaults or a different `max_clients` than the rest of the process.
+* **One per loop** also means that a client created on one `IOLoop` is not usable from another; every thread that runs
+  its own loop gets its own instance.
+
+The module-level knob is the classmethod `+AsyncHTTPClient.configure(impl, **kwargs)+`: `impl` is a class, its dotted
+name, or `None` for the default `SimpleAsyncHTTPClient`, and the keyword arguments are passed to the constructor of
+every instance created from then on, `max_clients` and `defaults` among them. Call it once, before the first
+`AsyncHTTPClient()`.
+
+[source,python]
+----
+async def demo_singleton():
+    a = httpclient.AsyncHTTPClient()
+    b = httpclient.AsyncHTTPClient()
+    private = httpclient.AsyncHTTPClient(force_instance=True, defaults=dict(user_agent="bookshelf-batch/1.0"))
+    print(a is b, a is private, type(a).__name__)
+    print(a.defaults["request_timeout"], private.defaults["user_agent"])
+    private.close()
+
+
+asyncio.run(demo_singleton())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.AsyncHTTPClient[Tornado: AsyncHTTPClient]
+
+The built-in defaults of an `HTTPRequest` are 20 seconds for both `connect_timeout` and `request_timeout`,
+`follow_redirects=True`, `max_redirects=5`, `decompress_response=True` and `validate_cert=True`. Anything you put in
+`defaults` is merged over those, and anything set on a request wins over the defaults. Here is the application's
+start-up configuration for Bookshelf Live: a shorter timeout and a user agent that identifies the service, a lower
+`max_clients` than the default of 10, and one fetch that overrides a default.
+
+[source,python]
+----
+httpclient.AsyncHTTPClient.configure(
+    None,  # SimpleAsyncHTTPClient, the default
+    max_clients=2,
+    defaults=dict(request_timeout=5.0, user_agent="bookshelf-live/1.0"),
+)
+
+
+async def demo_defaults_and_limit():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient()
+        print(client.max_clients, client.defaults["request_timeout"])
+        sent = json_decode((await client.fetch(f"{base}/headers")).body)
+        print(sent["user-agent"])
+        sent = json_decode((await client.fetch(f"{base}/headers", user_agent="one-off/2.0")).body)
+        print(sent["user-agent"])
+
+        # four requests of about 0.3 s each, but only two run at a time
+        started = time.perf_counter()
+        responses = await asyncio.gather(
+            *(client.fetch(f"{base}/covers/book-{i}?delay=0.3") for i in range(4))
+        )
+        elapsed = time.perf_counter() - started
+        print(f"4 fetches with max_clients=2 took {elapsed:.1f}s")
+        print("each request itself took", [round(r.request_time, 1) for r in responses], "(queueing excluded)")
+
+
+asyncio.run(demo_defaults_and_limit())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.AsyncHTTPClient.configure[Tornado: AsyncHTTPClient.configure]
+
+With `max_clients=2` the four 0.3 second fetches take about 0.6 seconds in total: the second pair waited for a slot,
+while the `request_time` of each response stays near 0.3 to 0.4 seconds because it does not include the time spent in the queue. The
+`time_info` dictionary of a response is filled in only by the curl implementation (libcurl timings, plus the queue
+delay); with the simple client it is empty, so measure queueing with a stopwatch around the fetch.
+
+The limit has one sharp edge. A request that is still waiting in the queue is subject to a timeout too: the
+`SimpleAsyncHTTPClient` starts a timer of the smaller of `connect_timeout` and `request_timeout` when the request is
+queued, and a request that has not got a slot by then fails with the same 599 timeout error as a slow upstream,
+reporting that it timed out "in request queue". A burst of requests bigger than `max_clients` times the timeout allows
+therefore fails even though the upstream was never slow. Size `max_clients` for the expected concurrency, and bound
+the number of in-flight fetches yourself (with a semaphore, see below) when a burst is possible.
+
+== Errors: `raise_error` and `HTTPClientError`
+
+By default `fetch()` raises for any non-2xx outcome, and for transport failures:
+
+* An `HTTPClientError` (`tornado.httpclient.HTTPClientError`, still importable under its old name
+  `tornado.httpclient.HTTPError`, which was renamed in Tornado 5.1 to avoid a clash with `tornado.web.HTTPError`)
+  carries `code` (the HTTP status, or 599 when no response was received), `message` and `response` (the
+  `HTTPResponse`, or `None`). Its `str()` is `HTTP 404: Not Found`.
+* A timeout is an `HTTPTimeoutError` from `tornado.simple_httpclient`, a subclass of `HTTPClientError` with code 599 and
+  no response. A connection dropped mid-response is an `HTTPStreamClosedError`, also with code 599.
+* A refused connection or an unresolvable name surfaces as the underlying exception (`ConnectionRefusedError`,
+  `socket.gaierror`, `ssl.SSLError`...), not as an `HTTPClientError`.
+
+`raise_error=False` changes only the first case: a response with a non-2xx code is returned instead of raised, and
+`response.error` still describes it. Timeouts and connection errors are raised regardless (the behaviour changed in
+Tornado 6.0; before that `raise_error=False` suppressed every error). A 3xx response that is not followed (for
+example with `follow_redirects=False`) also counts as an error response.
+
+[source,python]
+----
+async def demo_errors():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient()
+
+        try:
+            await client.fetch(f"{base}/status/404")
+        except httpclient.HTTPClientError as exc:
+            print(exc, "| code", exc.code, "| body", exc.response.body)
+
+        response = await client.fetch(f"{base}/status/503", raise_error=False)
+        print(response.code, type(response.error).__name__, response.error)
+
+        try:
+            await client.fetch(f"{base}/covers/slow?delay=2", request_timeout=0.2, raise_error=False)
+        except httpclient.HTTPClientError as exc:
+            print("timeout:", type(exc).__name__, exc.code, exc.response)
+
+        try:
+            await client.fetch("http://127.0.0.1:1/")
+        except OSError as exc:
+            print("transport:", type(exc).__name__)
+
+
+asyncio.run(demo_errors())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#exceptions[Tornado: httpclient exceptions]
+
+A handler should translate these errors rather than let them become a 500: a timeout of an upstream is a 504 for the
+caller, an upstream error status is a 502, and a refused connection is a 502 or 503. The section on handlers below does
+that, and xref:backend/tornado/error-handling.adoc[Error Handling] shows where such a mapping belongs in the
+`write_error` pipeline.
+
+== `HTTPRequest` Options
+
+Every keyword of `fetch()` is an `HTTPRequest` argument; the table groups them. Only `url` is required.
+
+[cols="2,3,3",options="header"]
+|===
+|Option |Meaning |Notes
+
+|`method`, `body`, `headers`
+|HTTP method (default `GET`), request body (`str` or `bytes`) and extra headers (`dict` or `HTTPHeaders`).
+|`str` bodies are UTF-8 encoded. A body with a method that normally has none, or no body with `POST`, `PUT` or `PATCH`,
+raises `ValueError` unless
+`allow_nonstandard_methods=True`. CR or LF in a header is rejected (since 6.4.1 in both implementations).
+
+|`auth_username`, `auth_password`, `auth_mode`
+|HTTP authentication.
+|`basic` for both implementations; `digest` only with curl.
+
+|`connect_timeout`, `request_timeout`
+|Seconds for the TCP/TLS connection and for the whole request. Default 20; `0` means no timeout.
+|`request_timeout` covers connecting, sending, waiting and receiving the body. A queued request also uses the smaller of
+the two while it waits for a slot.
+
+|`follow_redirects`, `max_redirects`
+|Follow 301, 302, 303, 307 and 308 up to `max_redirects` (default 5).
+|With `follow_redirects=False` a 3xx response is an error response (`raise_error=False` returns it).
+
+|`if_modified_since`
+|Adds an `If-Modified-Since` header from a `datetime` or timestamp.
+|A 304 response is an error unless `raise_error=False`.
+
+|`user_agent`
+|Value of the `User-Agent` header.
+|The simple client sends `Tornado/<version>` when none is set; put your own in `defaults` so every request is
+identifiable.
+
+|`decompress_response` (`use_gzip` is a deprecated alias)
+|Ask for `gzip` and decode the body. Default `True`.
+|`max_body_size` applies to the decompressed size since 6.5.6 (simple) and 6.5.9 (curl).
+
+|`validate_cert`, `ca_certs`, `client_cert`, `client_key`, `ssl_options`
+|TLS verification and client certificates.
+|`ssl_options` takes an `ssl.SSLContext` and overrides the other four; it is supported only by the simple client.
+With curl, `ca_certs`, `client_cert`, `client_key` and `network_interface` can stick to the curl handle, so pass them on
+every request if you use them at all.
+
+|`streaming_callback`, `header_callback`
+|Receive body chunks and header lines as they arrive, instead of buffering.
+|`response.body` and `response.headers` are empty afterwards. See the next section.
+
+|`body_producer`, `expect_100_continue`
+|Send a body lazily; wait for `100 Continue` before sending it.
+|Simple client only. Pass a `Content-Length` with `body_producer`, otherwise the request uses chunked encoding, which
+many servers refuse.
+
+|`proxy_host`, `proxy_port`, `proxy_username`, `proxy_password`, `proxy_auth_mode`
+|Send the request through an HTTP proxy.
+|curl only. The simple client raises `NotImplementedError`.
+
+|`network_interface`, `prepare_curl_callback`, `allow_ipv6`
+|Source address or interface; a hook that receives the `pycurl.Curl` object; IPv6 toggle.
+|`prepare_curl_callback` and `network_interface` are curl only.
+
+|`allow_nonstandard_methods`
+|Accept methods outside the standard list and the body/method combinations mentioned above.
+|Default `False`; with the simple client an unknown method raises `KeyError`.
+|===
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#request-objects[Tornado: HTTPRequest]
+
+Redirects, authentication and a JSON `POST` are the options used daily. The example below follows the redirect from the
+fake service, then shows that with `follow_redirects=False` the response is an error response whose `Location` header
+tells where it pointed, and finally posts JSON the way a webhook sender would. Header names in an `HTTPHeaders` are
+case-insensitive.
+
+[source,python]
+----
+import base64
+import secrets
+
+
+async def demo_request_options():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient()
+
+        followed = await client.fetch(f"{base}/moved")
+        print(followed.code, followed.effective_url.replace(base, ""))
+
+        raw = await client.fetch(f"{base}/moved", follow_redirects=False, raise_error=False)
+        print(raw.code, raw.headers["Location"])
+
+        # Basic authentication sends an Authorization header
+        password = secrets.token_hex(8)  # in production: read it from the environment or a secrets store
+        sent = json_decode(
+            (await client.fetch(f"{base}/headers", auth_username="bookshelf", auth_password=password)).body
+        )
+        print(base64.b64decode(sent["authorization"].split()[1]).decode().split(":")[0])
+
+        # POST a JSON document
+        reply = await client.fetch(
+            f"{base}/upload",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            body=json_encode({"event": "loan.created", "isbn": "978-0-13-468599-1"}),
+        )
+        print(json_decode(reply.body))
+
+
+asyncio.run(demo_request_options())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: HTTPRequest]
+
+The password above is generated on the spot for the demonstration. In a real application read credentials and API tokens from the environment or a
+secrets store, for example `os.environ["COVERS_API_TOKEN"]`, and send them in an `Authorization` header you build.
+
+For HTTPS, certificate validation is on by default and `validate_cert=False` turns it off. Do not use it outside a
+throw-away experiment. To trust a private CA, give the request a `ca_certs` file (PEM) or, with the simple client, an
+`ssl.SSLContext` built with `+ssl.create_default_context(cafile=...)+`. A client certificate for mutual TLS is
+`client_cert` plus `client_key`, or an `SSLContext` loaded with `load_cert_chain()`.
+
+[source,python]
+----
+import ssl
+
+
+def tls_request_for_internal_api():
+    context = ssl.create_default_context()  # verifies against the system trust store
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    # context.load_verify_locations(cafile="/etc/bookshelf/internal-ca.pem")
+    # context.load_cert_chain("/etc/bookshelf/client.pem", "/etc/bookshelf/client.key")
+    return httpclient.HTTPRequest("https://covers.internal.example/v1/covers/1", ssl_options=context)
+
+
+request = tls_request_for_internal_api()
+print(request.url, type(request.ssl_options).__name__)
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: HTTPRequest]
+
+== Streaming Downloads and Uploads
+
+By default the whole response body is held in memory and `fetch()` returns it in `response.body`. Two limits bound
+that: `max_buffer_size` (default 100 MB) for how much is read into memory at once, and `max_body_size`, the largest body
+accepted, which defaults to `max_buffer_size` and is a constructor argument of the implementation, passed through
+`configure()`. A body above the limit fails the fetch instead of exhausting memory. To handle large downloads, give
+`streaming_callback` a function that receives each chunk as it arrives; with it only `max_body_size` applies, and the
+final `HTTPResponse` has an empty `body`. `header_callback` receives each header line, including the status line and the
+terminating blank line, and is the only way to see headers while a streamed transfer is still running. Both callbacks
+are ordinary functions, not coroutines: a callback must not block, and anything slow belongs in a queue it feeds (see
+xref:backend/tornado/queues-and-locks.adoc[Queues & Locks]).
+
+[source,python]
+----
+async def demo_streaming_download():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient()
+        chunks, header_lines = [], []
+        response = await client.fetch(
+            f"{base}/chunks",
+            streaming_callback=chunks.append,
+            header_callback=header_lines.append,
+        )
+        print(b"".join(chunks).decode(), len(response.body))
+        print(header_lines[0].strip(), "|", [h.strip() for h in header_lines if h.startswith("X-Total")])
+
+
+asyncio.run(demo_streaming_download())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: HTTPRequest streaming_callback and header_callback]
+
+For uploads, `body_producer` is called with a `write` function and must return a future. The producer calls `write()`
+with each piece, awaits the future that `write()` returns for flow control (the client does not read ahead of what the
+socket accepts), and finishes by returning. Provide `Content-Length` when you know it, because chunked request bodies
+are rejected by many servers. `body_producer` is not supported by the curl implementation, and cannot be combined with
+`body`.
+
+[source,python]
+----
+async def demo_streaming_upload():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient()
+        pieces = [b"%PDF-1.7 " + b"x" * 1000 for _ in range(3)]
+
+        async def producer(write):
+            for piece in pieces:
+                await write(piece)  # awaiting gives flow control
+
+        reply = await client.fetch(
+            f"{base}/upload",
+            method="POST",
+            headers={"Content-Type": "application/pdf", "Content-Length": str(sum(map(len, pieces)))},
+            body_producer=producer,
+        )
+        print(json_decode(reply.body))
+
+
+asyncio.run(demo_streaming_upload())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: HTTPRequest body_producer]
+
+The server side of the same problem (receiving a large upload without buffering it) is `stream_request_body`, covered
+in xref:backend/tornado/streaming-long-polling-and-sse.adoc[Streaming, Long Polling & SSE].
+
+== Concurrent Fetches
+
+Because `fetch()` returns a future, several fetches are overlapped by awaiting them together. `asyncio.gather` returns
+the results in order and raises the first exception; with `return_exceptions=True` it returns exceptions as values so
+one failing lookup does not discard the others. Tornado's own `tornado.gen.multi` is the equivalent. Remember that a
+global `max_clients` still limits the real parallelism, and that a `Semaphore` (from `tornado.locks` or `asyncio`) is the
+way to bound a loop of fetches to a limit smaller than the client's own.
+
+[source,python]
+----
+from tornado import locks
+
+
+async def fetch_cover(client, base, isbn):
+    response = await client.fetch(f"{base}/covers/{isbn}", request_timeout=2)
+    return json_decode(response.body)["cover_url"]
+
+
+async def demo_gather():
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient(force_instance=True, max_clients=10)
+        isbns = ["978-0-13-468599-1", "bad-978-0-00", "978-1-49-195-0"]
+
+        started = time.perf_counter()
+        results = await asyncio.gather(*(fetch_cover(client, base, i) for i in isbns), return_exceptions=True)
+        print(f"{time.perf_counter() - started:.2f}s", [r if isinstance(r, str) else f"error {r.code}" for r in results])
+
+        # bound a large batch to 3 simultaneous upstream calls
+        gate = locks.Semaphore(3)
+
+        async def limited(isbn):
+            async with gate:
+                return await fetch_cover(client, base, isbn)
+
+        covers = await asyncio.gather(*(limited(f"book-{n}") for n in range(12)))
+        print(len(covers), "covers fetched")
+        client.close()
+
+
+asyncio.run(demo_gather())
+----
+
+Source: https://www.tornadoweb.org/en/stable/guide/coroutines.html#parallelism[Tornado: Coroutines, parallelism]
+
+There is no retry or backoff in the client. A retry loop is a few lines around `fetch()`; retry only idempotent
+requests (`GET`, `PUT`, `DELETE`) and only on timeouts, connection errors and 502, 503 and 504, with a bounded number
+of attempts, exponential delay and jitter, because retrying a `POST` that may already have been processed duplicates its
+effect.
+
+== Calling an Upstream from a Handler
+
+The shape that matters in a real application: one shared client, a short timeout, upstream failures translated to the
+status a caller should see, and the result written as JSON. The handler below returns the cover for a book. It maps an
+upstream timeout to 504 and any other upstream failure to 502, and the test drives it through `AsyncHTTPTestCase`, the
+class from `tornado.testing` that starts the application on a loopback port; its own `fetch()` is the _test's_ client
+and, unlike the production one, returns error responses instead of raising.
+
+[source,python]
+----
+import unittest
+
+from tornado.testing import AsyncHTTPTestCase
+
+
+class BookCoverHandler(web.RequestHandler):
+    async def get(self, isbn):
+        upstream = self.settings["covers_url"]
+        client = httpclient.AsyncHTTPClient()
+        try:
+            response = await client.fetch(f"{upstream}/covers/{isbn}", request_timeout=0.5)
+        except httpclient.HTTPClientError as exc:
+            if exc.code == 599:
+                raise web.HTTPError(504, reason="cover service timed out") from exc
+            raise web.HTTPError(502, reason="cover service failed") from exc
+        except OSError as exc:
+            raise web.HTTPError(502, reason="cover service unreachable") from exc
+        self.write({"isbn": isbn, "cover": json_decode(response.body)["cover_url"]})
+
+
+class BookCoverTest(AsyncHTTPTestCase):
+    def get_app(self):
+        # the fake upstream is served by the same test server, under /up
+        app = web.Application(
+            [(r"/books/([^/]+)/cover", BookCoverHandler), (r"/up/covers/([^/]+)", CoverHandler)],
+            covers_url=f"http://127.0.0.1:{self.get_http_port()}/up",
+        )
+        return app
+
+    def test_cover(self):
+        response = self.fetch("/books/978-0-13-468599-1/cover")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(json_decode(response.body)["isbn"], "978-0-13-468599-1")
+
+    def test_upstream_error_is_502(self):
+        self.assertEqual(self.fetch("/books/bad-1/cover").code, 502)
+
+    def test_upstream_timeout_is_504(self):
+        self.assertEqual(self.fetch("/books/slow-1/cover").code, 504)
+
+
+import logging
+
+# the tests provoke 502 and 504 on purpose: keep the log quiet
+logging.getLogger("tornado.access").setLevel(logging.CRITICAL)
+logging.getLogger("tornado.application").setLevel(logging.CRITICAL)
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(BookCoverTest)
+result = unittest.TextTestRunner(verbosity=0).run(suite)
+assert result.wasSuccessful()
+----
+
+Source: https://www.tornadoweb.org/en/stable/testing.html[Tornado: tornado.testing]
+
+== Implementations: Simple and curl
+
+[cols="2,3,3",options="header"]
+|===
+|Feature |`SimpleAsyncHTTPClient` (default) |`CurlAsyncHTTPClient`
+
+|Implementation
+|Pure Python on `IOStream`; nothing to install.
+|`libcurl` through `pycurl`; install `pycurl` and a matching libcurl.
+
+|Connection reuse
+|None: every request sends `Connection: close` and opens a new connection (and a new TLS handshake).
+|libcurl reuses connections.
+
+|HTTP proxies
+|Not supported (`NotImplementedError` for `proxy_host`).
+|`proxy_host`, `proxy_port`, optional credentials, `basic` or `digest`.
+
+|Authentication modes
+|`basic`.
+|`basic` and `digest`.
+
+|`body_producer`, `ssl_options`
+|Supported.
+|Not supported.
+
+|`prepare_curl_callback`, `network_interface`
+|Not available.
+|Supported.
+
+|Minimum version note
+|None.
+|The 6.6 alpha raises the minimum supported libcurl to 7.81 (the version shipped with Ubuntu 22.04); this is upcoming.
+|===
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#implementations[Tornado: httpclient implementations]
+
+Because the simple client opens a connection per request, a service that makes many small calls to the same host pays
+for DNS, TCP and TLS each time. Either put a connection-reusing proxy in front of the upstream, switch to the curl
+implementation, or use a client with pooling (see the comparison below).
+
+Switching to curl is a `configure()` call before the first client is created; the same call can set `max_clients`
+(which sizes the pool of curl handles) and `defaults`. Proxies are then per request or in `defaults`:
+
+[source,python]
+----
+# norun -- needs the optional pycurl package (pip install pycurl) and a real proxy
+from tornado import httpclient
+
+httpclient.AsyncHTTPClient.configure(
+    "tornado.curl_httpclient.CurlAsyncHTTPClient",
+    max_clients=20,
+    defaults=dict(proxy_host="proxy.internal.example", proxy_port=3128),
+)
+
+
+async def fetch_through_proxy():
+    client = httpclient.AsyncHTTPClient()  # a CurlAsyncHTTPClient
+    # per-request override, with proxy credentials read from the environment
+    return await client.fetch("https://covers.example/v1/isbn/1", proxy_host="proxy.internal.example", proxy_port=3128)
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: proxy options]
+
+The simple client reports the unsupported option loudly, which is a useful safety net:
+
+[source,python]
+----
+async def demo_proxy_on_simple_client():
+    httpclient.AsyncHTTPClient.configure(None)
+    async with fake_upstream() as base:
+        client = httpclient.AsyncHTTPClient(force_instance=True)
+        try:
+            await client.fetch(f"{base}/headers", proxy_host="127.0.0.1", proxy_port=3128)
+        except NotImplementedError as exc:
+            print("NotImplementedError:", exc)
+        client.close()
+
+
+asyncio.run(demo_proxy_on_simple_client())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#implementations[Tornado: httpclient implementations]
+
+Some deployments use the standard proxy environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`). Tornado's
+client does not read them; the application must map them onto `proxy_host` and `proxy_port` itself (with curl), which
+is one reason a deployment behind a mandatory proxy often chooses the curl implementation.
+
+== The Synchronous `HTTPClient`
+
+`tornado.httpclient.HTTPClient` is a blocking facade, useful in scripts, management commands and tests. It creates a
+private `IOLoop`, runs the asynchronous client on it with `run_sync()`, and returns the response. Since Tornado 5.0 it
+cannot be used while an `IOLoop` is running in the same thread, because asyncio forbids nested loops: constructing it
+inside a coroutine or a handler fails with `RuntimeError` ("Cannot run the event loop while another loop is running").
+Inside a handler always use `AsyncHTTPClient`; calling a blocking `HTTPClient` there would also stall the whole loop even
+if it were permitted. Call `close()` when you are done.
+
+[source,python]
+----
+import threading
+
+
+def run_upstream_in_thread():
+    """Run the fake upstream on its own loop in a worker thread; return (base_url, stop)."""
+    ready = threading.Event()
+    state = {}
+
+    def target():
+        async def main():
+            async with fake_upstream() as base:
+                state["base"], state["stop"] = base, asyncio.Event()
+                state["loop"] = asyncio.get_running_loop()
+                ready.set()
+                await state["stop"].wait()
+
+        asyncio.run(main())
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    ready.wait(5)
+    return state["base"], lambda: (state["loop"].call_soon_threadsafe(state["stop"].set), thread.join(5))
+
+
+base, stop = run_upstream_in_thread()
+sync_client = httpclient.HTTPClient()
+try:
+    print(sync_client.fetch(f"{base}/covers/978-0-13-468599-1").code)
+    try:
+        sync_client.fetch(f"{base}/status/404")
+    except httpclient.HTTPClientError as exc:
+        print("raised:", exc)
+finally:
+    sync_client.close()
+    stop()
+
+
+async def sync_client_inside_a_loop():
+    try:
+        httpclient.HTTPClient()
+    except RuntimeError as exc:
+        print("RuntimeError:", exc)
+
+
+asyncio.run(sync_client_inside_a_loop())
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPClient[Tornado: HTTPClient]
+
+The module can also be run as a command, which uses the synchronous client: `python -m tornado.httpclient URL` prints
+the body, `--print_headers` prints the headers too, and `--follow_redirects`, `--validate_cert`, `--proxy_host` and
+`--proxy_port` are available.
+
+[source,bash]
+----
+python -m tornado.httpclient --print_headers --print_body=false http://localhost:8888/books/1/cover
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#command-line-interface[Tornado: httpclient command-line interface]
+
+== Security
+
+* **Server-side request forgery.** An endpoint that fetches a URL supplied by a user (a cover URL, a webhook target, an
+  avatar) lets the caller reach internal addresses such as `127.0.0.1`, `169.254.169.254` or cluster services. Parse the
+  URL, require `https`, check the host against an allow-list, resolve it yourself and refuse private, loopback and
+  link-local addresses, and set `follow_redirects=False` or validate each hop, because a redirect can lead from an allowed
+  host to an internal one. Resolving and then connecting is still racy (DNS rebinding); the allow-list of hosts is the
+  strong control, and network egress rules are the backstop.
+* **Never disable certificate validation.** Use `ca_certs` or an `SSLContext` for private CAs.
+* **Credentials on redirects.** Since Tornado 6.5.6 `SimpleAsyncHTTPClient` strips the `Authorization` and `Cookie`
+  headers when a redirect leads to a different origin, which is what curl already did; if you need different behaviour,
+  set `follow_redirects=False` and handle the redirect yourself. Applications on older versions leaked these headers.
+* **Bound the response.** Keep `max_body_size` and `request_timeout` at values that match the upstream's contract. Tornado
+  6.5.6 (simple) and 6.5.9 (curl) apply the limit to the _decompressed_ size, which blocks decompression bombs; older
+  versions applied it to the compressed size.
+* **Header injection.** CR and LF in a header value are rejected since 6.4.1, but build headers from validated values
+  anyway, never from raw user input.
+* **Secrets.** Keep tokens in the environment or a secrets store, never in the URL query string (URLs end up in logs),
+  and do not log full request URLs or `Authorization` headers.
+* **Timeouts are not optional.** The 20 second default is long for a call inside a request that has its own deadline;
+  set `request_timeout` to what the caller can afford.
+
+The allow-list check is short enough to keep next to the code that uses it:
+
+[source,python]
+----
+import ipaddress
+import socket
+from urllib.parse import urlsplit
+
+ALLOWED_HOSTS = {"covers.example", "api.covers.example"}
+
+
+def check_outgoing_url(url):
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS:
+        raise ValueError(f"host not allowed: {parts.hostname}")
+    return url
+
+
+def is_public_address(host):
+    for info in socket.getaddrinfo(host, None):
+        address = ipaddress.ip_address(info[4][0])
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_reserved:
+            return False
+    return True
+
+
+for candidate in ("https://covers.example/1.jpg", "https://169.254.169.254/latest/meta-data", "http://covers.example/1.jpg"):
+    try:
+        print("ok:", check_outgoing_url(candidate))
+    except ValueError as exc:
+        print("refused:", exc)
+print(is_public_address("127.0.0.1"))
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: HTTPRequest follow_redirects and validate_cert]
+
+== Comparison with HTTPX and aiohttp
+
+Tornado's client is not a general-purpose HTTP library, and for an application whose main job is calling many different
+APIs it is often the wrong tool. Both alternatives run on the same `asyncio` loop that Tornado uses, so a Tornado
+handler can `await` either of them without any bridge (see
+xref:backend/tornado/coroutines-and-asyncio.adoc[Coroutines & asyncio]).
+
+[cols="2,3,3,3",options="header"]
+|===
+|Aspect |Tornado `AsyncHTTPClient` |HTTPX `AsyncClient` |aiohttp `ClientSession`
+
+|Connection pooling and keep-alive
+|None in the simple client (one connection per request); libcurl reuses connections.
+|Yes, with configurable limits.
+|Yes, through the connector, with a default connection limit.
+
+|HTTP/2
+|No.
+|Optional, with an extra installed.
+|No (HTTP/1.1 client).
+
+|Cookies, sessions
+|No cookie jar: you read `Set-Cookie` and send `Cookie` yourself.
+|Cookie jar on the client.
+|Cookie jar on the session.
+
+|Timeouts
+|`connect_timeout` and `request_timeout`, default 20 seconds each.
+|Granular (connect, read, write, pool); default 5 seconds.
+|`ClientTimeout` (total, connect, socket); default total of 5 minutes.
+
+|Retries
+|None; write your own.
+|Transport-level connection retries only; use a retry library for the rest.
+|None built in; use a retry library.
+
+|Proxies
+|curl only, explicit arguments.
+|Built in, honours the standard environment variables by default.
+|Per request, with an optional environment lookup.
+
+|Streaming
+|`streaming_callback` (callback style), `body_producer`.
+|Async iterators over the body.
+|Async iteration over `response.content`.
+
+|Testing
+|`AsyncHTTPTestCase`, a fake handler on a loopback port.
+|Mock transports and routing helpers.
+|Third-party mocking packages and test servers.
+
+|Extra dependency
+|None (curl needs `pycurl`).
+|Yes.
+|Yes.
+|===
+
+Source: https://www.python-httpx.org/async/[HTTPX: Async support] and https://docs.aiohttp.org/en/stable/client_quickstart.html[aiohttp: Client quickstart]
+
+A reasonable rule for Bookshelf Live: keep `AsyncHTTPClient` for a handful of internal calls, where its zero-dependency
+footprint and the `AsyncHTTPTestCase` test style are an advantage. When the application talks to many external APIs,
+needs HTTP/2, cookies, retries or connection reuse, create one `httpx.AsyncClient` (or aiohttp session) when the
+application starts and close it when it stops; both integrate with the same event loop. Do not create a new client per
+request in any of them: that throws away the pool and leaks sockets.
+
+[source,python]
+----
+# norun -- needs the optional httpx package (pip install httpx)
+import httpx
+from tornado import web
+
+
+class BookCoverHandler(web.RequestHandler):
+    async def get(self, isbn):
+        client: httpx.AsyncClient = self.settings["http"]  # one pooled client, created at start-up
+        response = await client.get(f"/covers/{isbn}", timeout=2.0)
+        response.raise_for_status()
+        self.write(response.json())
+----
+
+Source: https://www.python-httpx.org/async/[HTTPX: Async support]
+
+== Recent Changes
+
+[cols="1,3",options="header"]
+|===
+|Version |Change
+
+|5.0
+|The blocking `HTTPClient` cannot be used while an `IOLoop` is running (asyncio forbids nested loops).
+
+|5.1
+|`HTTPError` renamed `HTTPClientError` (the old name remains as an alias); `request_time` excludes queueing time and
+`HTTPResponse.start_time` was added.
+
+|6.0
+|`fetch()` returns only a future (`callback=` removed); `raise_error=False` affects only non-2xx status errors, not
+timeouts or connection errors.
+
+|6.4.1
+|Both implementations reject CR and LF in HTTP request headers.
+
+|6.5.6
+|`SimpleAsyncHTTPClient` strips `Authorization` and `Cookie` on cross-origin redirects; `max_body_size` applies to the
+decompressed size (security fix).
+
+|6.5.7
+|`CurlAsyncHTTPClient` fully resets a curl handle before reusing it (security fix).
+
+|6.5.9
+|`curl_httpclient` gained `max_body_size`; its memory use when decompressing is bounded; the simple client applies
+`max_body_size` to HTTP/1 responses correctly and rejects floods of `100 Continue` responses.
+
+|6.6 (upcoming, alpha only)
+|Minimum libcurl 7.81 for the curl client; better handling of `asyncio.CancelledError`; Python 3.11 becomes the minimum.
+Check the final release notes before relying on any of this.
+|===
+
+Source: https://www.tornadoweb.org/en/stable/releases.html[Tornado: Release notes]
+
+== References
+
+* https://www.tornadoweb.org/en/stable/httpclient.html[Tornado: tornado.httpclient]
+* https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.AsyncHTTPClient.fetch[Tornado: AsyncHTTPClient.fetch]
+* https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.AsyncHTTPClient.configure[Tornado: AsyncHTTPClient.configure]
+* https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.AsyncHTTPClient[Tornado: AsyncHTTPClient]
+* https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPRequest[Tornado: HTTPRequest]
+* https://www.tornadoweb.org/en/stable/httpclient.html#tornado.httpclient.HTTPClient[Tornado: HTTPClient]
+* https://www.tornadoweb.org/en/stable/httpclient.html#exceptions[Tornado: httpclient exceptions]
+* https://www.tornadoweb.org/en/stable/httpclient.html#implementations[Tornado: httpclient implementations]
+* https://www.tornadoweb.org/en/stable/httpclient.html#command-line-interface[Tornado: httpclient command-line interface]
+* https://www.tornadoweb.org/en/stable/guide/coroutines.html#parallelism[Tornado: Coroutines, parallelism]
+* https://www.tornadoweb.org/en/stable/testing.html[Tornado: tornado.testing]
+* https://www.tornadoweb.org/en/stable/web.html[Tornado: tornado.web]
+* https://www.tornadoweb.org/en/stable/releases.html[Tornado: Release notes]
+* https://www.python-httpx.org/async/[HTTPX: Async support]
+* https://docs.aiohttp.org/en/stable/client_quickstart.html[aiohttp: Client quickstart]

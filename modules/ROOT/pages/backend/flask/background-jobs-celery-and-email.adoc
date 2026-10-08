@@ -1,0 +1,1176 @@
+= Background Jobs, Celery & Email
+:description: How to move slow work out of a Flask request: why threads and asyncio.create_task are the wrong tool, Celery with the official celery_init_app and FlaskTask pattern, results, retries, beat schedules and tests, RQ as the simpler option, and sending e-mail with Flask-Mail, smtplib or a provider API from a task.
+:keywords: Flask, Celery, background jobs, task queue, celery_init_app, FlaskTask, shared_task, delay, apply_async, AsyncResult, retry, autoretry_for, retry_backoff, acks_late, beat, crontab, task_always_eager, RQ, Redis, fakeredis, Flask-Mail, Mail, Message, record_messages, MAIL_SUPPRESS_SEND, smtplib, EmailMessage, copy_current_request_context, app_context, asyncio.create_task, broker, result backend
+
+include::partial$flask-disclaimer.adoc[]
+
+This page is written against Flask 3.1.3 (released 2026-02-18), Werkzeug 3.1.9, Celery 5.6.3, RQ 2.12.0 and Flask-Mail 0.10.0,
+checked on 2026-10-07. Flask 3.2 was not released on that date, so nothing here depends on it. The code uses Python 3.10+
+syntax and every Python block was executed on Python 3.13: Celery runs on its in-memory broker with a worker started inside
+the test process, RQ runs against `fakeredis`, and e-mail goes to a throw-away SMTP server on the loopback interface, so the
+examples need no Redis, no mail server and no network. A web request should answer in milliseconds, but the work that a
+page triggers (sending a message, resizing a cover, building an export, calling a slow API) can take seconds or minutes.
+The answer is always the same: do the minimum inside the request, put a small description of the rest on a queue and let a
+separate process do it. The running scenario is the _Bookshelf_ catalogue that the other pages of this section build on: a
+reader asks for a "review digest" by e-mail, and the application sends it without making the reader wait.
+
+[#why-not-threads]
+== Why Not Just Start a Thread
+
+The first idea is `threading.Thread(target=send_digest).start()` inside the view. It looks like it works in development and
+fails in production for four independent reasons.
+
+* **Context.** `current_app`, `g`, `request` and `session` are proxies over `contextvars` that are bound to the request
+  (see xref:backend/flask/application-and-request-lifecycle.adoc[Application and Request Lifecycle]). A new thread starts
+  with an empty context, so any use of them raises `RuntimeError: Working outside of application context`.
+* **Lifetime.** The thread belongs to a WSGI worker process. When the server recycles the worker (Gunicorn
+  `max_requests`, a deploy, a crash, a restart by the supervisor) the thread dies with the job half-done, and nothing
+  records that the job ever existed.
+* **No control.** There is no retry, no back-off, no limit on how many run at once, no way to see what is pending and no
+  way to run the work on another machine. Ten thousand requests start ten thousand threads.
+* **Shared resources.** The thread shares the process with the request handlers, so a heavy job competes for the same
+  CPU and for the same database connections.
+
+The context problem is easy to see, and easy to fix for short jobs: either copy the request context into the thread with
+`copy_current_request_context`, or open a fresh application context with `app.app_context()`.
+
+[source,python]
+----
+import threading
+
+from flask import Flask, copy_current_request_context, current_app, request
+
+demo = Flask(__name__)
+seen = {}
+
+
+def without_context():
+    try:
+        seen["name"] = current_app.name
+    except RuntimeError as exc:
+        seen["error"] = str(exc).splitlines()[0]
+
+
+worker = threading.Thread(target=without_context)
+worker.start()
+worker.join()
+print(seen)  # {'error': 'Working outside of application context.'}
+
+
+@demo.post("/digest")
+def request_digest():
+    @copy_current_request_context
+    def with_request_context():
+        seen["path"] = request.path  # the request context was copied into the thread
+
+    thread = threading.Thread(target=with_request_context)
+    thread.start()
+    thread.join()  # a real view would not wait; it is joined here only so the example can print
+    return "", 202
+
+
+demo.test_client().post("/digest")
+print(seen["path"])  # /digest
+
+
+def with_fresh_app_context():
+    with demo.app_context():  # enough when the job needs current_app or g, but no request data
+        seen["fresh"] = current_app.name
+
+
+thread = threading.Thread(target=with_fresh_app_context)
+thread.start()
+thread.join()
+print(seen["fresh"])
+----
+
+Source: https://flask.palletsprojects.com/en/stable/api/#flask.copy_current_request_context[Flask API: copy_current_request_context]
+
+The decorated function must run while the request is still alive, which is why it is decorated inside the view: the copy
+is taken when the decorator runs. A thread started this way is acceptable for a job that is cheap and whose loss does not
+matter, such as warming a cache. Anything the reader would complain about if it vanished belongs on a queue.
+
+`asyncio.create_task()` inside an `async def` view is not a background-job mechanism either. Flask runs each async view
+in a fresh event loop in the worker thread (through `asgiref`), waits for the coroutine to finish and closes the loop.
+Whatever is still pending when the view returns is cancelled, so the "background" task never completes. The official
+async page says it plainly: Flask is not suitable for background tasks started from a view.
+
+[source,python]
+----
+import asyncio
+import time
+
+from flask import Flask
+
+async_app = Flask(__name__)
+outcome = []
+
+
+async def slow_job():
+    try:
+        await asyncio.sleep(0.5)
+        outcome.append("finished")
+    except asyncio.CancelledError:
+        outcome.append("cancelled")
+        raise
+
+
+@async_app.get("/fire-and-forget")
+async def fire_and_forget():
+    asyncio.create_task(slow_job())  # nothing keeps the loop alive for it
+    return "accepted", 202
+
+
+print(async_app.test_client().get("/fire-and-forget").status_code)
+time.sleep(0.8)
+print(outcome)  # ['cancelled']
+----
+
+Source: https://flask.palletsprojects.com/en/stable/async-await/[Flask: Using async and await]
+
+How async views work, why they are not faster, and how Quart changes the picture is on the xref:backend/flask/async-gevent-and-quart.adoc[page about async, gevent and
+Quart], later in this section. A queue is the right answer for anything that has to outlive the request.
+
+[#architecture]
+== The Shape of a Queue-based Design
+
+A task queue has three moving parts besides the web application. The **broker** is a message store (Redis, RabbitMQ and
+others) where the web process puts _task messages_: a task name plus its arguments, serialised as JSON. A **worker** is a
+separate, long-running process that takes messages from the broker and runs the matching Python function. Optionally a
+**result backend** stores the return value or the exception, so that the web application can answer "is it done?". A
+scheduler process (Celery _beat_) puts messages on the broker on a clock, which turns the same machinery into periodic jobs.
+
+.A request puts a message on the broker; a worker does the work and may store a result
+[mermaid]
+----
+flowchart LR
+    Browser["Browser"] -->|"1 POST /digests"| Web["Flask in WSGI workers"]
+    Web -->|"2 delay with ids"| Broker[("Broker, for example Redis")]
+    Web -->|"3 202 and task id"| Browser
+    Broker -->|"4 deliver message"| Worker["Celery worker with Flask app context"]
+    Worker -->|"5 query"| DB[("Database")]
+    Worker -->|"6 send mail"| SMTP["SMTP server or mail API"]
+    Worker -->|"7 store state and result"| Results[("Result backend")]
+    Browser -->|"8 GET /tasks/id"| Web
+    Web -->|"9 read state"| Results
+    Beat["Celery beat"] -->|"periodic messages"| Broker
+----
+
+Everything the worker needs must travel inside the message or be loadable from shared storage, because the worker is a
+different process (often a different machine). That has direct consequences: pass identifiers, not objects; make tasks
+idempotent, because a message can be delivered twice; and treat the broker as a hand-off, not as a database.
+
+The table compares the options on a Flask project. The rest of the page builds the Celery and RQ rows and the e-mail
+use case that goes with them.
+
+.Choosing how to run work outside the request
+[cols="2,3,3,3",options="header"]
+|===
+|Option |Good for |Cost |Survives a restart
+
+|Thread or `ThreadPoolExecutor` in the worker
+|Cheap, loss-tolerant work (warm a cache, fire a metric)
+|Context juggling, shares the process, no retry
+|No
+
+|`asyncio.create_task()` in an async view
+|Nothing (see above)
+|Cancelled when the view returns
+|No
+
+|RQ
+|A handful of job types, Redis already in the stack, a small team
+|Redis only, fewer features (no rich workflows), the worker forks one process per job
+|Yes, jobs live in Redis
+
+|Celery
+|Many task types, retries and back-off, schedules, routing, several brokers, workflows, rate limits
+|More settings, a broker, a worker and often a beat process to operate
+|Yes, with `acks_late` and a durable broker
+
+|Platform queue or cron (cloud task queues, Kubernetes jobs)
+|Work that is already a container or a function
+|Vendor-specific; no Python-level integration
+|Yes
+|===
+
+For the messaging concepts underneath (delivery guarantees, dead letters, ordering, at-least-once semantics) see the
+xref:backend/messaging/index.adoc[Messaging] section, in particular its pages about delivery guarantees and messaging
+patterns. For Redis itself (persistence, eviction, why a queue must not share a cache database) see the
+xref:database/redis/index.adoc[Redis] section.
+
+[#celery]
+== Celery with Flask
+
+Celery is the best known task queue for Python. It is not a Flask extension: since Celery 4 there is no integration package,
+and the official Flask documentation shows a small function that creates a Celery application configured from the Flask
+config and makes every task run inside a Flask application context. Install it with `pip install celery` (add the `redis`
+extra, `pip install "celery[redis]"`, when Redis is the broker).
+
+[#celery-init-app]
+=== The celery_init_app Pattern
+
+[source,python]
+----
+from celery import Celery, Task
+from flask import Flask
+
+
+def celery_init_app(app: Flask) -> Celery:
+    class FlaskTask(Task):
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            with app.app_context():
+                return self.run(*args, **kwargs)
+
+    celery_app = Celery(app.name, task_cls=FlaskTask)
+    celery_app.config_from_object(app.config["CELERY"])
+    celery_app.set_default()
+    app.extensions["celery"] = celery_app
+    return celery_app
+----
+
+Source: https://flask.palletsprojects.com/en/stable/patterns/celery/[Flask: Background Tasks with Celery]
+
+Four decisions are packed into those few lines:
+
+* `+FlaskTask.__call__+` wraps every execution in `app.app_context()`, so `current_app`, `g` and extensions such as
+  Flask-SQLAlchemy and Flask-Mail work inside tasks. There is no request context in a worker, because there is no request.
+* `config_from_object(app.config["CELERY"])` takes the Celery settings from one dictionary under the Flask key `CELERY`,
+  using Celery's own lowercase setting names (`broker_url`, `result_backend`, `task_ignore_result`).
+* `set_default()` makes this the "current" Celery app, which is what lets `@shared_task` functions find it.
+* `app.extensions["celery"]` is the usual place to find the object again, for example from a command-line entry point or a
+  test.
+
+The Flask documentation gives the settings used here: a broker, a result backend, and `task_ignore_result=True` so that
+results are stored only for the tasks that ask for them. Secrets and addresses do not belong in the source. The example
+below reads the broker URL from the environment and falls back to Celery's in-memory transport, which is what makes this page
+runnable without Redis; a production deployment sets the environment variable to its Redis (or RabbitMQ) address, with the
+credential taken from the platform's secret store.
+
+[source,python]
+----
+import os
+
+from celery import shared_task
+from flask import Flask, current_app, jsonify
+from flask_mail import Mail
+
+mail = Mail()
+
+
+def create_app(test_config: dict | None = None) -> Flask:
+    app = Flask(__name__)
+    app.config.from_mapping(
+        CELERY=dict(
+            broker_url=os.environ.get("BOOKSHELF_BROKER_URL", "memory://"),
+            result_backend=os.environ.get("BOOKSHELF_RESULT_BACKEND", "cache+memory://"),
+            task_ignore_result=True,
+            broker_connection_retry_on_startup=True,
+        ),
+        MAIL_SERVER=os.environ.get("MAIL_SERVER", "127.0.0.1"),
+        MAIL_PORT=int(os.environ.get("MAIL_PORT", "25")),
+        MAIL_DEFAULT_SENDER=("Bookshelf", "noreply@example.com"),
+    )
+    if test_config:
+        app.config.from_mapping(test_config)
+    app.config.from_prefixed_env()  # FLASK_* variables override the file, see below
+    mail.init_app(app)
+    celery_init_app(app)
+    return app
+
+
+@shared_task(ignore_result=False)
+def add_together(a: int, b: int) -> int:
+    return a + b
+
+
+@shared_task
+def app_name() -> str:
+    return current_app.name  # works: FlaskTask pushed an application context
+
+
+app = create_app()
+celery_app = app.extensions["celery"]
+print(celery_app.conf.task_ignore_result)  # True: results are stored only for tasks that opt in
+----
+
+Source: https://flask.palletsprojects.com/en/stable/patterns/celery/#application-factory[Flask: Background Tasks with Celery, Application Factory]
+
+Two details deserve a comment. First, Flask's `from_prefixed_env()` reads every `+FLASK_*+` variable, parses the value as JSON
+and understands a double underscore as nesting, so an operator can override a single Celery setting without touching code:
+`+FLASK_CELERY__broker_url+` sets `app.config["CELERY"]["broker_url"]`. The case after the prefix is kept, which is why the
+Celery key is spelled in lowercase. Second, the factory returns a Flask application, and the Celery object is found through
+`app.extensions["celery"]`.
+
+[source,python]
+----
+import os
+
+from flask import Flask
+
+os.environ["FLASK_CELERY__result_expires"] = "3600"  # an example override, not a secret
+sample = Flask(__name__)
+sample.config["CELERY"] = {"broker_url": "memory://"}
+sample.config.from_prefixed_env()
+print(sample.config["CELERY"])  # {'broker_url': 'memory://', 'result_expires': 3600}
+del os.environ["FLASK_CELERY__result_expires"]
+----
+
+Source: https://flask.palletsprojects.com/en/stable/config/#configuring-from-environment-variables[Flask: Configuration Handling, Configuring from Environment Variables]
+
+[#celery-worker]
+=== Starting the Worker and the Scheduler
+
+The `celery` command needs an importable object. With an application factory there is none, so the Flask documentation
+adds a tiny module that builds the app and exposes the Celery object, named `make_celery.py` by convention:
+
+[source,python]
+----
+# norun - a separate file next to the package
+from bookshelf import create_app
+
+flask_app = create_app()
+celery_app = flask_app.extensions["celery"]
+----
+
+Source: https://flask.palletsprojects.com/en/stable/patterns/celery/#application-factory[Flask: Background Tasks with Celery, Application Factory]
+
+[source,bash]
+----
+celery -A make_celery worker --loglevel INFO
+celery -A make_celery worker --loglevel INFO --concurrency 4 --queues default,emails
+celery -A make_celery beat --loglevel INFO
+celery -A make_celery status
+celery -A make_celery inspect active
+----
+
+Source: https://docs.celeryq.dev/en/stable/userguide/workers.html[Celery: Workers Guide]
+
+`-A` (`--app`) names the module that holds the Celery object, `--concurrency` sets the number of pool processes,
+`--queues` limits which queues a worker consumes, and `status` and `inspect` ask the running workers questions through the
+broker. `worker -B` embeds the beat scheduler in a worker, which is acceptable for development and wrong for production,
+where exactly one beat process must run: two schedulers send every periodic task twice.
+
+The worker process imports your code once at start-up, so a change to a task needs a worker restart (the Flask development
+server's reloader does not restart Celery). The module that defines tasks must be imported when the worker starts, which is
+why `@shared_task` functions live in modules that the application factory (or the `imports` Celery setting) loads.
+
+[#celery-tasks]
+=== Defining and Calling Tasks
+
+With an application factory, `@celery_app.task` cannot be used because the Celery object does not exist when the module is
+imported. `@shared_task` creates a task that binds to whichever Celery app is current, which is what `set_default()` arranged.
+It also keeps tasks usable from tests that build several apps with different configuration. A task is called in the
+background with `+delay(*args, **kwargs)+`, or with `+apply_async(args, kwargs, **options)+` when options are needed.
+
+A web view then follows a fixed shape: validate the input, enqueue with identifiers, answer `202 Accepted` with a way to
+ask about the outcome. The code below starts a real Celery worker inside the process (the helper Celery ships for its own
+test-suite) so that the whole round trip is visible:
+
+[source,python]
+----
+from celery.contrib.testing.worker import start_worker
+from celery.result import AsyncResult
+from flask import request
+
+
+@app.post("/add")
+def start_add():
+    a = request.form.get("a", type=int)
+    b = request.form.get("b", type=int)
+    result = add_together.delay(a, b)
+    return jsonify(result_id=result.id), 202
+
+
+@app.get("/result/<id>")
+def task_result(id: str):
+    result = AsyncResult(id)
+    return jsonify(
+        ready=result.ready(),
+        successful=result.successful(),
+        value=result.result if result.ready() else None,
+    )
+
+
+client = app.test_client()
+with start_worker(celery_app, perform_ping_check=False, pool="solo", loglevel="ERROR"):
+    started = client.post("/add", data={"a": 2, "b": 3})
+    print(started.status_code)
+    task_id = started.get_json()["result_id"]
+    AsyncResult(task_id).get(timeout=10)  # a test may block; a view must not
+    print(client.get(f"/result/{task_id}").get_json())
+    print(app_name.delay().id is not None)
+----
+
+Source: https://flask.palletsprojects.com/en/stable/patterns/celery/#calling-tasks[Flask: Background Tasks with Celery, Calling Tasks]
+
+The view never waits: it returns the task id, and the browser (or another service) polls the second endpoint or receives a
+notification some other way (a webhook, Server-Sent Events, a WebSocket). A view that calls `result.get()` turns the queue
+back into a slow synchronous call and ties up a WSGI worker while it waits.
+
+`apply_async` accepts per-call options. The most useful ones are:
+
+.Common options of `apply_async`
+[cols="2,5",options="header"]
+|===
+|Option |Effect
+
+|`countdown`
+|Run no sooner than this many seconds from now.
+
+|`eta`
+|Run no sooner than this `datetime` (timezone-aware).
+
+|`expires`
+|Drop the task if it has not started by this time or this many seconds from now; useful for work that is worthless when late.
+
+|`queue`
+|Send it to a named queue instead of the default one (`celery` is the default name).
+
+|`retry`, `retry_policy`
+|How the _publisher_ retries when the broker is unreachable; this is not task retry.
+
+|`priority`
+|Message priority, honoured only by brokers that support it.
+
+|`task_id`
+|Choose the id yourself, for instance to make enqueueing idempotent.
+|===
+
+Source: https://docs.celeryq.dev/en/stable/userguide/calling.html[Celery: Calling Tasks]
+
+Passing data deserves the Flask documentation's own rule: pass the minimum that lets the task fetch or rebuild everything
+else. Arguments are serialised (JSON by default), so a SQLAlchemy object, a request, a file object or a lock cannot be sent,
+and even when it can, it would be stale by the time the worker runs. Send the id and load the row in the task.
+
+[source,python]
+----
+@shared_task
+def build_review_digest(book_id: int) -> str:
+    # the task loads the row itself, inside the application context FlaskTask provides
+    return f"digest for book {book_id}"
+
+
+print(build_review_digest.apply(args=(7,)).get())  # apply() runs the task locally, in this process
+----
+
+Source: https://flask.palletsprojects.com/en/stable/patterns/celery/#passing-data-to-tasks[Flask: Background Tasks with Celery, Passing Data to Tasks]
+
+[#celery-after-commit]
+=== Enqueue After the Commit
+
+A classic race: the view inserts a row, calls `.delay(row.id)` and only then commits. The worker can pick the message up
+before the commit is visible and find no row. The cure is to commit first and enqueue afterwards, so that a message exists
+only for data that exists:
+
+[source,python]
+----
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+db = SQLAlchemy(model_class=Base)
+
+
+class Review(db.Model):
+    id: Mapped[int] = mapped_column(primary_key=True)
+    text: Mapped[str]
+
+
+@shared_task
+def index_review(review_id: int) -> bool:
+    return db.session.get(Review, review_id) is not None
+
+
+db_app = Flask("bookshelf-db")
+db_app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite://"
+db_app.config["CELERY"] = {"broker_url": "memory://", "broker_connection_retry_on_startup": True}
+db.init_app(db_app)
+celery_init_app(db_app)  # tasks now run inside db_app's application context
+
+with db_app.app_context():
+    db.create_all()
+    review = Review(text="Great")
+    db.session.add(review)
+    db.session.commit()  # first make the row durable ...
+    print(index_review.apply(args=(review.id,)).get())  # ... then enqueue (apply() stands in for delay())
+celery_app.set_default()  # restore the first application as the default
+----
+
+Source: https://docs.celeryq.dev/en/stable/userguide/tasks.html#database-transactions[Celery: Tasks, Database Transactions]
+
+If the process dies between the commit and the enqueue, the message is lost. A stricter design writes an _outbox_ row in
+the same transaction and has a periodic task publish unsent rows; the same idea is described in the
+xref:backend/messaging/index.adoc[Messaging] section. The database side of the example is covered on
+xref:backend/flask/flask-sqlalchemy.adoc[Flask-SQLAlchemy].
+
+[#celery-retries]
+=== Retries, Idempotency and Acknowledgement
+
+External calls fail. Celery can retry a task with exponential back-off, declared on the decorator: `autoretry_for` names
+the exceptions to retry, `retry_backoff=True` doubles the delay each time (1, 2, 4 seconds and so on), `retry_backoff_max`
+caps it, `retry_jitter` randomises it to avoid a stampede, and `max_retries` (default 3) bounds the attempts. A task
+declared with `bind=True` receives itself as `self`, which exposes `self.request.retries` and `self.retry()` for manual control.
+
+[source,python]
+----
+class TemporaryFailure(Exception):
+    pass
+
+
+attempts: list[int] = []
+
+
+@shared_task(
+    bind=True,
+    ignore_result=False,
+    autoretry_for=(TemporaryFailure,),
+    retry_backoff=True,
+    retry_backoff_max=60,
+    retry_jitter=False,
+    max_retries=3,
+)
+def call_isbn_service(self, isbn: str) -> str:
+    attempts.append(self.request.retries)
+    if self.request.retries < 2:
+        raise TemporaryFailure("the service answered 503")
+    return f"details for {isbn}"
+
+
+with start_worker(celery_app, perform_ping_check=False, pool="solo", loglevel="ERROR"):
+    print(call_isbn_service.delay("9781804611104").get(timeout=30))
+print(attempts)  # [0, 1, 2]
+----
+
+Source: https://docs.celeryq.dev/en/stable/userguide/tasks.html#automatic-retry-for-known-exceptions[Celery: Tasks, Automatic retry for known exceptions]
+
+Retrying is only safe for **idempotent** tasks, meaning that running them twice has the same effect as running them once.
+That is not a luxury: Celery's default is to acknowledge a message _before_ the task runs, so a crashed worker loses the
+task (at most once). Setting `task_acks_late` (or `acks_late=True` on one task) acknowledges after the task finishes, so a
+crashed worker causes a redelivery (at least once), and `task_reject_on_worker_lost` controls what happens when the
+process running the task is killed. Choose at-least-once and make the task idempotent: use a unique key (an order id, a
+digest id), check "already done?" first, and let the database enforce uniqueness. These are the same delivery guarantees
+that are discussed in the xref:backend/messaging/index.adoc[Messaging] section.
+
+With Redis as broker the _visibility timeout_ interacts with this: if a task is not acknowledged within the timeout (one
+hour by default) the message is delivered to another worker. A task with a long `countdown` or `eta`, or a long-running
+task with late acknowledgement, can therefore run twice; raise the timeout through `broker_transport_options` or prefer
+RabbitMQ for such workloads.
+
+The settings that matter most in production, all spelled as keys of the `CELERY` dictionary:
+
+.Frequently used Celery settings
+[cols="3,2,5",options="header"]
+|===
+|Setting |Default |Purpose
+
+|`broker_url`
+|none
+|Where messages go (`redis://`, `amqp://`, `sqs://`, ...). Never commit one that holds a password.
+
+|`result_backend`
+|none
+|Where results and states are stored. Without one, `AsyncResult.get()` raises and states stay `PENDING`.
+
+|`task_ignore_result`
+|`False`
+|Skip storing results unless a task opts in with `ignore_result=False`. Recommended for fire-and-forget tasks.
+
+|`result_expires`
+|1 day
+|How long results are kept before they are deleted.
+
+|`task_serializer`, `accept_content`
+|`json`, `json` only
+|Keep JSON. Enabling `pickle` lets anyone who can write to the broker execute code on the workers.
+
+|`task_acks_late`
+|`False`
+|Acknowledge after execution (at-least-once).
+
+|`task_time_limit`, `task_soft_time_limit`
+|none
+|Hard limit kills the pool process; soft limit raises `SoftTimeLimitExceeded` inside the task so it can clean up.
+
+|`worker_prefetch_multiplier`
+|`4`
+|Messages reserved per pool process. `1` gives fair dispatch for long tasks.
+
+|`worker_max_tasks_per_child`
+|none
+|Replace a pool process after N tasks, which contains memory leaks.
+
+|`task_default_queue`, `task_routes`
+|`celery`, none
+|Name the default queue and route tasks to others (for example a separate `emails` queue with its own workers).
+
+|`broker_connection_retry_on_startup`
+|Enabled
+|Whether a worker keeps retrying the broker connection at start-up. In Celery 6.0 the older `broker_connection_retry`
+ stops controlling start-up retries, so set this one explicitly.
+
+|`beat_schedule`, `timezone`, `enable_utc`
+|`+{}+`, none, `True`
+|Periodic tasks and the time zone their crontabs use.
+
+|`task_always_eager`, `task_eager_propagates`
+|`False`, `False`
+|Run tasks synchronously in the caller and, optionally, re-raise their exceptions. Tests only.
+|===
+
+Source: https://docs.celeryq.dev/en/stable/userguide/configuration.html[Celery: Configuration and defaults]
+
+[#celery-beat]
+=== Periodic Tasks with Beat
+
+`celery beat` is a scheduler that sends tasks to the broker at configured times; the workers run them as usual. The schedule
+is the `beat_schedule` setting, so it fits in the same `CELERY` dictionary. `crontab` and a plain number of seconds are the
+common schedule types.
+
+[source,python]
+----
+from celery.schedules import crontab
+
+beat_config = dict(
+    timezone="Europe/Madrid",
+    beat_schedule={
+        "monday-review-digest": {
+            "task": "bookshelf.tasks.send_weekly_digest",
+            "schedule": crontab(hour=7, minute=30, day_of_week="mon"),
+            "args": (50,),
+        },
+        "purge-expired-sessions": {
+            "task": "bookshelf.tasks.purge_sessions",
+            "schedule": 3600.0,  # every hour, in seconds
+        },
+    },
+)
+scheduler_demo = Flask("beat-demo")
+scheduler_demo.config["CELERY"] = {"broker_url": "memory://", **beat_config}
+beat_celery = celery_init_app(scheduler_demo)
+print(sorted(beat_celery.conf.beat_schedule))
+print(beat_celery.conf.beat_schedule["monday-review-digest"]["schedule"])
+app.extensions["celery"].set_default()  # make the earlier application the default again
+----
+
+Source: https://docs.celeryq.dev/en/stable/userguide/periodic-tasks.html[Celery: Periodic Tasks]
+
+Run exactly one beat process per schedule and keep its schedule file (`celerybeat-schedule` by default) on a writable path.
+Beat only _sends_ messages; if no worker is running the messages wait on the broker, and a task that took longer than its
+interval will overlap with the next one unless you guard it with a lock. Schedules kept in the code are deployed with the
+code; a schedule that operators change at run time needs a database-backed scheduler from a separate package. For
+the difference between in-process schedulers, cron and distributed schedulers (clustering, misfires, calendars) see the
+xref:backend/scheduling/index.adoc[Scheduling] section, which also explains why a job that must not overlap needs a lock.
+
+[#celery-testing]
+=== Testing Tasks
+
+Three levels cover most needs:
+
+* **Unit test the function.** A task is a function; call it directly (`+task.run(...)+`, or `+task(...)+` for a call through
+  `FlaskTask` with an application context). No broker is needed.
+* **Eager mode.** `task_always_eager=True` makes `.delay()` run the task synchronously in the caller and return an
+  `EagerResult`; add `task_eager_propagates=True` so that exceptions are raised in the test instead of being hidden in the
+  result. Eager mode skips the broker, serialisation and acknowledgement, so it proves the logic, not the integration.
+* **A real worker in the test.** `celery.contrib.testing.worker.start_worker` (used above) runs a worker thread against the
+  in-memory broker, and Celery's pytest plugin offers `celery_app` and `celery_worker` fixtures built on it.
+
+[source,python]
+----
+eager = Flask("eager-demo")
+eager.config["CELERY"] = dict(
+    broker_url="memory://",
+    result_backend="cache+memory://",
+    task_always_eager=True,
+    task_eager_propagates=True,
+    task_store_eager_result=True,
+)
+eager_celery = celery_init_app(eager)
+
+value = add_together.delay(20, 22)
+print(type(value).__name__, value.get())  # EagerResult 42
+@shared_task
+def always_fails() -> None:
+    raise TemporaryFailure("the service answered 503")
+
+
+try:
+    always_fails.delay()
+except TemporaryFailure as exc:
+    print("propagated:", exc)
+celery_app.set_default()  # restore the real application for the next examples
+----
+
+Source: https://docs.celeryq.dev/en/stable/userguide/testing.html[Celery: Testing with Celery]
+
+Mind the test isolation: because `@shared_task` binds to the current default app, a test that builds its own app and calls
+`celery_init_app()` changes that default, and must restore it (or use a fixture that builds the app per test). The general
+testing material for a Flask application is on the xref:backend/flask/testing.adoc[testing] page, later in this section.
+
+[#celery-pitfalls]
+=== Celery Pitfalls and Security
+
+* **Unserialisable arguments.** A model instance, a `datetime` in old setups, a `Decimal` or a file object fails at
+  `.delay()` or comes back wrong. Send ids, ISO strings and plain numbers.
+* **Missing app context.** Code that is not inside `+FlaskTask.__call__+` (for instance a callback or a signal handler)
+  does not have one. Wrap it in `app.app_context()` yourself.
+* **Database sessions.** Flask-SQLAlchemy ties the session to the application context, so a task gets a fresh session and
+  it is released when `+FlaskTask.__call__+` leaves the context. Never share an engine across the prefork boundary: let each
+  pool process create its own connections (the default for Flask-SQLAlchemy because engines are created lazily per app).
+* **Results nobody reads.** Storing every result in Redis fills it. Keep `task_ignore_result=True` and opt in.
+* **Pickle.** Do not add `pickle` to `accept_content`. A broker that anyone but the application can write to is remote code
+  execution on the workers with pickle, and a denial of service without it.
+* **Exposed brokers.** Redis and RabbitMQ must not be reachable from the internet; use TLS and authentication
+  (`rediss://` and a password from the environment, or a RabbitMQ user per application) and a network policy.
+* **Secrets in messages.** Task arguments end up in broker memory, in logs and in monitoring tools. Pass an id, not a
+  password reset token or a card number.
+* **Duplicate beat.** Two beat processes mean every periodic task runs twice.
+* **Result `get()` in a view.** It blocks a WSGI worker and can deadlock when a task waits for another task.
+
+Source: https://docs.celeryq.dev/en/stable/userguide/security.html[Celery: Security]
+
+[#rq]
+== RQ, the Simpler Option
+
+RQ (Redis Queue) is a small library with one broker, Redis, and one idea: a job is a function plus arguments, stored in a
+Redis list and executed by a worker that forks a "work horse" process per job. There is no routing language, no beat
+and no result-backend choice; there are queues, jobs, workers, retries (`+Retry(max=..., interval=[...])+`), result
+retention (`result_ttl`), timeouts (`job_timeout`) and a scheduler for delayed and repeated jobs. When the stack already
+has Redis and the needs are "run this function later and tell me how it went", RQ is a smaller thing to operate than Celery.
+
+RQ has no official Flask integration. The wrapper packages of the Flask-RQ family are stale (Flask-RQ2's last release, 18.3, dates from 2018), so the
+maintained approach is to use `rq` directly, keep the Redis connection in the application's configuration, and give the
+job function its own application context. The job function must be importable by the worker (not defined in `+__main__+`),
+and its arguments must be picklable by RQ's serialiser, so, as with Celery, pass ids.
+
+The example uses `fakeredis`, an in-process implementation of the Redis protocol, so no server is needed. In production the
+connection comes from `redis.Redis.from_url(os.environ["REDIS_URL"])`, with the URL (and any password in it) held in the
+environment. The job module is written into a temporary directory so that the worker, which imports jobs by name, can find it.
+
+[source,python]
+----
+import pathlib
+import sys
+import tempfile
+
+import fakeredis
+from rq import Queue, Retry, SimpleWorker
+
+jobs_dir = tempfile.mkdtemp()
+sys.path.insert(0, jobs_dir)
+pathlib.Path(jobs_dir, "bookshelf_jobs.py").write_text(
+    "def make_digest(book_id):\n"
+    "    return f'digest for book {book_id}'\n"
+)
+import bookshelf_jobs  # noqa: E402
+
+connection = fakeredis.FakeStrictRedis()  # production: redis.Redis.from_url(os.environ["REDIS_URL"])
+
+inline = Queue("default", connection=connection, is_async=False)  # runs jobs inline: handy in tests
+job = inline.enqueue(bookshelf_jobs.make_digest, 7)
+print(job.get_status(), job.return_value())
+
+emails = Queue("emails", connection=connection)
+job = emails.enqueue(
+    bookshelf_jobs.make_digest,
+    8,
+    retry=Retry(max=3, interval=[10, 30, 60]),  # retry after 10, 30 and 60 seconds
+    job_timeout=60,
+    result_ttl=500,  # keep the return value for 500 seconds
+)
+print(job.get_status(), len(emails))  # queued 1
+SimpleWorker([emails], connection=connection).work(burst=True)  # burst: stop when the queue is empty
+print(job.get_status(), job.return_value())
+----
+
+Source: https://python-rq.org/docs/[RQ: Documentation]
+
+The real worker is started from a shell with `rq worker emails` (and `rq worker-pool` for several workers); `SimpleWorker`
+runs the job in the same process instead of forking, which is why it is used in the example. Because the worker is a separate
+process, a job that needs Flask runs this way:
+
+[source,python]
+----
+# norun - jobs.py, imported by the RQ worker
+from bookshelf import create_app
+
+_app = create_app()
+
+
+def make_digest(book_id: int) -> str:
+    with _app.app_context():
+        ...  # query, render, send
+        return f"digest for book {book_id}"
+----
+
+Source: https://python-rq.org/docs/workers/[RQ: Workers]
+
+[source,bash]
+----
+export REDIS_URL=redis://localhost:6379/0   # the real value comes from your secret store
+rq worker --url "$REDIS_URL" emails
+----
+
+Source: https://python-rq.org/docs/workers/[RQ: Workers]
+
+Choose Celery over RQ when you need several brokers, task routing, workflows (chains, groups, chords), rate limits, cron
+beat inside the same system, or very high volume. Choose RQ for a first queue in a small application. Either way the
+Flask side is identical: a view enqueues ids and answers `202`.
+
+[#email]
+== Sending E-mail
+
+E-mail is the textbook background job: an SMTP conversation takes anywhere from a few hundred milliseconds to several
+seconds, the remote server can be down, and the reader does not care when it is sent as long as it is. There are three
+ways to send from Python, and all of them belong in a task, not in the view:
+
+* **Flask-Mail**, an extension (Pallets-Eco) that reads SMTP settings from `app.config`, builds MIME messages and
+  sends them over `smtplib`. It is the smallest step from nothing to working mail and is what the cookbooks use.
+* **`smtplib` with `email.message.EmailMessage`** from the standard library, when you want no dependency.
+* **A provider API** (the HTTP API of a transactional e-mail service), which gives delivery tracking, bounce handling and
+  better deliverability than your own SMTP relay, at the price of a vendor SDK. The pattern is the same: the task builds the
+  payload from ids and calls the SDK, with the API key read from configuration.
+
+[#flask-mail]
+=== Flask-Mail
+
+Create a `Mail` instance, call `init_app(app)` (or pass the app to the constructor), build a `Message` and call
+`mail.send()`. The `Message` needs an application context because it reads `MAIL_DEFAULT_SENDER` from the config, which is
+another reason the task must run inside the context of `FlaskTask`. The settings are plain Flask configuration keys:
+
+.Flask-Mail configuration
+[cols="3,2,5",options="header"]
+|===
+|Key |Default |Meaning
+
+|`MAIL_SERVER`
+|`localhost`
+|SMTP host.
+
+|`MAIL_PORT`
+|`25`
+|SMTP port. Submission with STARTTLS is normally 587, implicit TLS 465.
+
+|`MAIL_USE_TLS`
+|`False`
+|Upgrade the connection with STARTTLS (port 587).
+
+|`MAIL_USE_SSL`
+|`False`
+|Implicit TLS (port 465). Do not enable both TLS options.
+
+|`MAIL_USERNAME`, `MAIL_PASSWORD`
+|`None`
+|Credentials for authenticated SMTP. Read both from the environment or a secret store, never from source.
+
+|`MAIL_DEFAULT_SENDER`
+|`None`
+|Sender used when a `Message` has none; a string or a `(name, address)` tuple.
+
+|`MAIL_MAX_EMAILS`
+|`None`
+|Reconnect after this many messages on one connection (some servers cap it).
+
+|`MAIL_SUPPRESS_SEND`
+|`app.testing`
+|Do not send; only record. Defaults to the value of `TESTING`.
+
+|`MAIL_DEBUG`
+|`app.debug`
+|Turn on `smtplib` debug output.
+
+|`MAIL_ASCII_ATTACHMENTS`
+|`False`
+|Convert attachment file names to ASCII for relays that mangle UTF-8 names.
+|===
+
+Source: https://flask-mail.readthedocs.io/en/latest/[Flask-Mail: Documentation]
+
+To run the next examples without a real mail server, a few lines start an in-process SMTP server on a free loopback port with
+`aiosmtpd` and keep every message it receives in a list. Production never does this; it points `MAIL_SERVER` at a relay or
+the provider's SMTP endpoint.
+
+[source,python]
+----
+import socket
+
+from aiosmtpd.controller import Controller
+
+received: list[dict] = []
+
+
+class Collect:
+    async def handle_DATA(self, server, session, envelope):
+        received.append(
+            {"from": envelope.mail_from, "to": envelope.rcpt_tos, "size": len(envelope.content)}
+        )
+        return "250 Message accepted for delivery"
+
+
+probe = socket.socket()
+probe.bind(("127.0.0.1", 0))
+smtp_port = probe.getsockname()[1]
+probe.close()
+smtp_server = Controller(Collect(), hostname="127.0.0.1", port=smtp_port)
+smtp_server.start()
+print("local SMTP server listening")
+----
+
+Source: https://aiosmtpd.aio-libs.org/en/latest/[aiosmtpd: Documentation]
+
+Now the application sends a real message to that server:
+
+[source,python]
+----
+from flask_mail import Message
+
+mail_app = create_app({"MAIL_PORT": smtp_port, "TESTING": False})
+
+with mail_app.app_context():
+    msg = Message(
+        subject="Your Bookshelf review digest",
+        recipients=["reader@example.com"],
+        body="Three new reviews this week.",
+        html="<p>Three new reviews this week.</p>",
+    )
+    mail.send(msg)
+
+print(received)
+----
+
+Source: https://flask-mail.readthedocs.io/en/latest/#sending-messages[Flask-Mail: Sending messages]
+
+Flask-Mail has useful extras: `mail.connect()` as a context manager keeps one SMTP connection open for a batch
+(`with mail.connect() as conn: conn.send(msg)`), `msg.attach(filename, content_type, data)` adds an attachment, `cc`, `bcc`,
+`reply_to` and `extra_headers` are constructor arguments, and `+mail.send_message(...)+` builds and sends in one call. A
+message with newlines in the subject, the sender or a recipient raises `BadHeaderError`, which is the extension's guard
+against header injection; do not build headers from unvalidated user input anyway.
+
+[#email-task]
+=== Sending from a Celery Task
+
+The task receives an id, loads what it needs and sends. Marking it for retry on `smtplib.SMTPException` and `OSError` covers
+transient server and network failures, and the digest id (not the e-mail address or the text) is what crosses the broker.
+
+[source,python]
+----
+import smtplib
+
+
+@shared_task(
+    bind=True,
+    autoretry_for=(smtplib.SMTPException, OSError),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    max_retries=5,
+    acks_late=True,
+)
+def send_review_digest(self, reader_id: int) -> str:
+    reader_email = f"reader{reader_id}@example.com"  # a real task would load the reader from the database
+    msg = Message(
+        subject="Your Bookshelf review digest",
+        recipients=[reader_email],
+        body="Three new reviews this week.",
+    )
+    mail.send(msg)
+    return reader_email
+
+
+mail_app.extensions["celery"].set_default()
+received.clear()
+with start_worker(mail_app.extensions["celery"], perform_ping_check=False, pool="solo", loglevel="ERROR"):
+    send_review_digest.delay(5)  # in a view: send_review_digest.delay(reader.id)
+    for _ in range(50):
+        if received:
+            break
+        time.sleep(0.1)
+print(received)
+----
+
+Source: https://docs.celeryq.dev/en/stable/userguide/tasks.html#Task.retry[Celery: Tasks, Task.retry]
+
+A weekly digest to many readers is better built as one "coordinator" task that selects the recipients and enqueues one small
+task per reader, so a failure affects one e-mail and retries stay cheap, with the coordinator started by beat (see above).
+Keep a record of what was sent to whom, so a retry after a timeout does not send a second copy: the SMTP server may have
+accepted the message even though the acknowledgement was lost.
+
+[#email-testing]
+=== Testing E-mail Without Sending
+
+When `TESTING` is true (or `MAIL_SUPPRESS_SEND` is set), `mail.send()` does nothing but fire a Blinker signal, and
+`mail.record_messages()` captures the messages that would have been sent. That makes the whole flow testable with eager mode:
+
+[source,python]
+----
+test_app = create_app(
+    {
+        "TESTING": True,
+        "CELERY": dict(broker_url="memory://", task_always_eager=True, task_eager_propagates=True),
+    }
+)
+
+with test_app.app_context():
+    with mail.record_messages() as outbox:
+        send_review_digest.delay(9)
+        print(len(outbox), outbox[0].subject, outbox[0].recipients)
+celery_app.set_default()
+----
+
+Source: https://flask-mail.readthedocs.io/en/latest/#unit-tests-and-suppressing-emails[Flask-Mail: Unit tests and suppressing emails]
+
+The `email_dispatched` signal (sent with the message) is the hook for logging or metrics. Reading the outbox only works
+in-process, so with a real worker (not eager mode) test the e-mail through a fake SMTP server like the one above.
+
+[#smtplib]
+=== Plain smtplib and a Provider API
+
+Without the extension, the standard library does the same job. `EmailMessage` builds a correct MIME message (it chooses
+encodings and sets headers, which hand-concatenated strings do not), and `smtplib.SMTP` sends it. Use `starttls()` for port
+587 and `SMTP_SSL` for 465, then `login()` with credentials read from the environment.
+
+[source,python]
+----
+import os
+import smtplib
+from email.message import EmailMessage
+
+
+def send_with_smtplib(to: str, subject: str, body: str) -> None:
+    message = EmailMessage()
+    message["From"] = "Bookshelf <noreply@example.com>"
+    message["To"] = to
+    message["Subject"] = subject
+    message.set_content(body)
+    with smtplib.SMTP(os.environ.get("MAIL_SERVER", "127.0.0.1"), int(os.environ.get("MAIL_PORT", "25"))) as smtp:
+        if os.environ.get("MAIL_USE_TLS") == "1":
+            smtp.starttls()
+        if os.environ.get("MAIL_USERNAME"):
+            smtp.login(os.environ["MAIL_USERNAME"], os.environ["MAIL_PASSWORD"])
+        smtp.send_message(message)
+
+
+os.environ["MAIL_PORT"] = str(smtp_port)
+received.clear()
+send_with_smtplib("reader@example.com", "Hello", "Plain smtplib works too.")
+print(received)
+del os.environ["MAIL_PORT"]
+smtp_server.stop()
+----
+
+Source: https://docs.python.org/3/library/smtplib.html[Python: smtplib]
+
+A provider's HTTP API follows the same task shape: build the payload from ids, call the SDK with a timeout and the key from
+configuration, retry on the SDK's transient errors, and store the provider's message id so that bounces and complaints can
+be matched later. For e-mail that must arrive, also publish SPF, DKIM and DMARC records for the sending domain, send a
+plain-text part with the HTML one, include an unsubscribe link for bulk mail, and never send e-mail to addresses that
+bounced. Error e-mails from the application itself (the `SMTPHandler` of the logging module) are handled on the xref:backend/flask/debugging-logging-and-profiling.adoc[page about
+debugging and logging], later in this section.
+
+[#security]
+== Security Checklist
+
+* Credentials for the broker, the result backend and SMTP come from the environment or a secret store; no URL in the source
+  contains a password, and the Celery and RQ settings are not printed in logs or error pages.
+* Keep `accept_content` at JSON, and do not deserialise untrusted data from a queue.
+* A task can be started by anyone who can write to the broker, so the broker is private, authenticated and (across hosts)
+  encrypted. Authorise inside the view before enqueueing, and re-check inside the task that the target still exists and the
+  actor may still do it.
+* Do not put personal data in task arguments, in `task_id`s or in e-mail subjects that end up in logs.
+* Validate every e-mail address that a user can supply and never use user input to build headers; rate-limit endpoints
+  that send e-mail (password reset, invitations), or they become a spam relay.
+* Time-limit tasks (`task_time_limit`) and cap queue length or retries, so a flood of work cannot starve the system.
+
+[#books]
+== What the Books Show and What Changed
+
+The Flask Framework Cookbook (third edition 2023, second edition 2019) closes with a chapter of tips that covers background
+work with a thread, Flask-Mail, and Celery with Redis. Reading it today needs these corrections:
+
+* The `make_celery(app)` helper with a `ContextTask` subclass and uppercase `CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND`
+  keys belongs to Celery 3 and 4. Celery 5 reads lowercase settings (`broker_url`, `result_backend`), and the current Flask
+  documentation replaces the helper with `celery_init_app` and a `FlaskTask` subclass that pushes the application context,
+  together with a `CELERY` dictionary in the Flask config and `@shared_task`. Do not start new code with the uppercase names.
+* Sending mail from a bare `threading.Thread` fails with "Working outside of application context" because the context
+  does not travel with the thread. Either copy the request context (`copy_current_request_context`), open
+  `app.app_context()` in the thread, or, preferably, use a queue.
+* The edition that mentions async/await and Quart is right that `async def` views exist, but they are not a way to run
+  work after the response, as shown above.
+* Flask-Mail is still maintained (0.10.0, May 2024, under Pallets-Eco) and its configuration keys are unchanged; the
+  tutorial's `Mail(app)` and `Message` code works as written, but it should be called from a task.
+* Beat schedules in Celery 5 use the `beat_schedule` setting and `crontab` from `celery.schedules`; the old
+  `CELERYBEAT_SCHEDULE` spelling is gone from new documentation.
+
+[#recent-changes]
+== Recent Changes
+
+.Versions that matter on this page
+[cols="2,5",options="header"]
+|===
+|Version |Change
+
+|Flask 2.1
+|`Config.from_prefixed_env()` added, used above to override nested Celery settings.
+
+|Flask 2.0
+|Async views with `flask[async]`. `copy_current_request_context` has existed since Flask 0.10.
+
+|Celery 5.3
+|`broker_connection_retry_on_startup` added; from Celery 6.0 the older `broker_connection_retry` no longer decides whether
+ start-up connections are retried.
+
+|Celery 5.6.3 (2026-03-26)
+|Current release on 2026-10-07; Python 3.9 and newer.
+
+|RQ 2.x
+|Python 3.10 and newer; 2.12.0 current on 2026-10-07.
+
+|Flask-Mail 0.10.0 (2024-05)
+|Current release, maintained under Pallets-Eco; `Mail`, `Message` and the `+MAIL_*+` keys are used as before.
+
+|Flask 3.2 (unreleased)
+|The application and request contexts are being merged; the rules above (copy the request context or open a new application
+ context in a thread) remain the safe way to write code.
+|===
+
+Source: https://docs.celeryq.dev/en/stable/getting-started/introduction.html[Celery: Introduction]
+
+[#summary]
+== Summary
+
+Do the minimum in the request, enqueue identifiers, answer `202`, and let a worker do the rest. Use a thread only for work
+you can afford to lose, and never `asyncio.create_task()` from a view. Wire Celery with `celery_init_app` and `FlaskTask`,
+read its settings from the `CELERY` dictionary and the environment, use `@shared_task`, enqueue after commit, make tasks
+idempotent with late acknowledgement and back-off retries, run exactly one beat process, and test with eager mode and an
+in-process worker. Choose RQ when Redis and a handful of job types are enough. Send e-mail from tasks with Flask-Mail or
+`smtplib`, keep credentials in the environment, and suppress sending in tests.
+
+[#references]
+== References
+
+* https://flask.palletsprojects.com/en/stable/patterns/celery/[Flask: Background Tasks with Celery]
+* https://flask.palletsprojects.com/en/stable/api/#flask.copy_current_request_context[Flask API: copy_current_request_context]
+* https://flask.palletsprojects.com/en/stable/async-await/[Flask: Using async and await]
+* https://flask.palletsprojects.com/en/stable/config/#configuring-from-environment-variables[Flask: Configuration Handling, Configuring from Environment Variables]
+* https://docs.celeryq.dev/en/stable/getting-started/introduction.html[Celery: Introduction]
+* https://docs.celeryq.dev/en/stable/userguide/tasks.html[Celery: Tasks]
+* https://docs.celeryq.dev/en/stable/userguide/calling.html[Celery: Calling Tasks]
+* https://docs.celeryq.dev/en/stable/userguide/configuration.html[Celery: Configuration and defaults]
+* https://docs.celeryq.dev/en/stable/userguide/periodic-tasks.html[Celery: Periodic Tasks]
+* https://docs.celeryq.dev/en/stable/userguide/workers.html[Celery: Workers Guide]
+* https://docs.celeryq.dev/en/stable/userguide/testing.html[Celery: Testing with Celery]
+* https://docs.celeryq.dev/en/stable/userguide/security.html[Celery: Security]
+* https://docs.celeryq.dev/en/stable/getting-started/backends-and-brokers/redis.html[Celery: Using Redis]
+* https://python-rq.org/docs/[RQ: Documentation]
+* https://python-rq.org/docs/workers/[RQ: Workers]
+* https://flask-mail.readthedocs.io/en/latest/[Flask-Mail: Documentation]
+* https://github.com/pallets-eco/flask-mail/[Flask-Mail: Source repository]
+* https://aiosmtpd.aio-libs.org/en/latest/[aiosmtpd: Documentation]
+* https://fakeredis.readthedocs.io/[fakeredis: Documentation]
+* https://docs.python.org/3/library/smtplib.html[Python: smtplib]
+* https://docs.python.org/3/library/email.message.html[Python: email.message]
+* https://www.packtpub.com/en-us/product/flask-framework-cookbook-9781804611104[Flask Framework Cookbook: Enhance your Flask skills with advanced techniques and build dynamic, responsive web applications, Third Edition, Packt (chapter 14)]
+* https://www.packtpub.com/en-us/product/flask-framework-cookbook-9781789951295[Flask Framework Cookbook: Over 80 proven recipes and techniques for Python web development with Flask, Second Edition, Packt (chapter 14)]
