@@ -1,0 +1,848 @@
+= Queues & Locks
+:description: Coordinating coroutines in Tornado with tornado.queues (Queue, PriorityQueue, LifoQueue, task_done and join, async iteration) and tornado.locks (Lock, Event, Condition, Semaphore, BoundedSemaphore), timeouts, a bounded worker pool for the Bookshelf Live cover fetcher, why the primitives are coroutine-safe but not thread-safe, and the asyncio equivalents.
+:keywords: Tornado, tornado.queues, tornado.locks, Queue, PriorityQueue, LifoQueue, QueueFull, QueueEmpty, task_done, join, Lock, Event, Condition, Semaphore, BoundedSemaphore, worker pool, producer consumer, back-pressure, timeout, asyncio.Queue, thread safety, IOLoop.add_callback
+
+include::partial$tornado-disclaimer.adoc[]
+
+This page is written against Tornado 6.5.10 (released 2026-09-15) on Python 3.13, checked on 2026-10-07. Tornado 6.6
+is only available as the alpha 6.6a1 at that date, so everything about 6.6 here (such as its higher minimum Python
+version) is upcoming rather than released. All code runs on
+Tornado's single event loop (an asyncio loop since Tornado 5), which is why the primitives described here exist:
+they let _coroutines_ wait for each other without blocking the loop. The running scenario is _Bookshelf Live_, where
+a bounded pool of workers fetches cover metadata from an external service.
+
+[#why]
+== Why Coroutines Need Their Own Primitives
+
+A coroutine that waits has to hand control back to the event loop, otherwise nothing else, including every other
+request, can run. The classic blocking tools (`queue.Queue.get`, `threading.Lock.acquire`) park the whole thread, and
+in Tornado there is only one thread serving all connections. `tornado.queues` and `tornado.locks` provide the same
+ideas (a producer/consumer queue, mutual exclusion, signalling, rate limiting) as awaitables: `await queue.get()` or
+`async with lock:` suspends only the current coroutine.
+
+Typical uses in a service like _Bookshelf Live_:
+
+* *Back-pressure and background work.* A request handler accepts a job and a bounded pool of worker coroutines drains
+  it at a controlled rate, instead of starting an unlimited number of outbound calls.
+* *Mutual exclusion across `await` points.* Between two `await` expressions nothing else can run, so plain Python code
+  is already atomic; but a read-modify-write that spans an `await` (for example "check the cache, fetch, store") can
+  interleave with another coroutine, and needs a `Lock`.
+* *Signalling.* One coroutine announces "the cache is warm", "shutdown requested" or "a review arrived" and others
+  wake up (`Event`, `Condition`).
+* *Concurrency limits.* At most N simultaneous calls to an upstream service (`Semaphore`).
+
+[mermaid]
+....
+flowchart LR
+  H["Request handlers<br/>and startup code<br/>(producers)"] -- "put / put_nowait" --> Q[("Queue<br/>maxsize = 100")]
+  Q -- "get" --> W1["Worker 1"]
+  Q -- "get" --> W2["Worker 2"]
+  Q -- "get" --> W3["Worker N"]
+  W1 --> S{{"Semaphore<br/>upstream limit"}}
+  W2 --> S
+  W3 --> S
+  S --> U["Metadata service<br/>(AsyncHTTPClient)"]
+  W1 -. "task_done" .-> Q
+  W2 -. "task_done" .-> Q
+  W3 -. "task_done" .-> Q
+  J["await queue.join()"] -. "resumes when every put<br/>has a matching task_done" .-> Q
+....
+
+Source: https://www.tornadoweb.org/en/stable/queues.html[Tornado: tornado.queues - Queues for coroutines]
+
+[#queues]
+== tornado.queues
+
+The module provides a `Queue` base class (first-in first-out) and two subclasses, plus two exceptions. A queue is
+unbounded when `maxsize` is `0` (the default); with a positive `maxsize`, `put` waits while the queue is full, which is
+the built-in back-pressure mechanism.
+
+[cols="2,3",options="header"]
+|===
+| Name | Behaviour
+
+| `Queue(maxsize=0)`
+| FIFO queue. `maxsize=0` means unbounded.
+
+| `PriorityQueue(maxsize=0)`
+| Retrieves entries in priority order, lowest first. Entries are typically `(priority, data)` tuples, compared with
+  the normal tuple ordering (a heap, so the data must be comparable when priorities tie).
+
+| `LifoQueue(maxsize=0)`
+| Retrieves the most recently put item first (a stack).
+
+| `QueueEmpty`, `QueueFull`
+| Raised by `get_nowait()` on an empty queue and by `put_nowait()` on a full one.
+|===
+
+[cols="2,4",options="header"]
+|===
+| Method or property | Behaviour
+
+| `put(item, timeout=None)`
+| Returns a future that completes when the item is queued; waits while the queue is full. Raises
+  `tornado.util.TimeoutError` after the timeout.
+
+| `put_nowait(item)`
+| Queues the item or raises `QueueFull` immediately.
+
+| `get(timeout=None)`
+| Returns an awaitable resolving to the next item; raises `tornado.util.TimeoutError` after the timeout.
+
+| `get_nowait()`
+| Returns an item or raises `QueueEmpty` immediately.
+
+| `task_done()`
+| Called by a consumer after it has finished processing an item it received with `get`. Raises `ValueError` if called
+  more times than items were put.
+
+| `join(timeout=None)`
+| Awaitable that completes when every `put` has a matching `task_done`; raises `tornado.util.TimeoutError` after the
+  timeout.
+
+| `qsize()`, `empty()`, `full()`, `maxsize`
+| Inspection helpers.
+
+| `async for item in queue`
+| Repeatedly awaits `get()`; it never ends by itself, so the consumer is stopped by cancelling its task or by
+  sending a sentinel item.
+|===
+
+Source: https://www.tornadoweb.org/en/stable/queues.html[Tornado: tornado.queues - Queues for coroutines]
+
+=== A Bounded Producer and Consumers
+
+The next example is the shape of the official `Queue` example: a producer fills a bounded queue, consumers iterate
+over it with `async for`, call `task_done()` in a `finally` block, and the main coroutine waits on `join()` before
+cancelling the workers (which loop forever). The `finally` matters: if processing raises and `task_done()` is skipped,
+`join()` never completes.
+
+[source,python]
+----
+import asyncio
+
+from tornado.queues import Queue
+
+async def demo_basic():
+    shelf_jobs = Queue(maxsize=2)           # at most 2 waiting items
+    done = []
+
+    async def worker(name):
+        async for title in shelf_jobs:      # never ends by itself
+            try:
+                await asyncio.sleep(0.01)   # pretend to do I/O
+                done.append((name, title))
+            finally:
+                shelf_jobs.task_done()      # always, even on error
+
+    workers = [asyncio.create_task(worker(f"w{i}")) for i in range(3)]
+    for title in ["Dune", "Emma", "Ulysses", "Kim", "Ivanhoe"]:
+        await shelf_jobs.put(title)         # waits whenever 2 are queued
+    await shelf_jobs.join(timeout=None)     # every put has a task_done
+    for w in workers:                       # workers loop forever: stop them
+        w.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+    return sorted(t for _, t in done)
+
+assert asyncio.run(demo_basic()) == ["Dune", "Emma", "Ivanhoe", "Kim", "Ulysses"]
+print("processed all five titles")
+----
+Source: https://www.tornadoweb.org/en/stable/queues.html#tornado.queues.Queue[Tornado: tornado.queues.Queue]
+
+Several workers consume the same queue and each item is delivered to exactly one of them; with three workers the five
+titles above may finish in any order, so the example compares a sorted list.
+
+=== Priority and LIFO Queues
+
+`PriorityQueue` suits jobs of different urgency, such as a reader's own "refresh my cover" action versus a bulk
+re-index. `LifoQueue` serves the newest item first, useful when stale work is worth less than fresh work.
+
+[source,python]
+----
+import asyncio
+
+from tornado.queues import LifoQueue, PriorityQueue
+
+async def demo_ordering():
+    pq = PriorityQueue()
+    pq.put_nowait((10, "bulk re-index"))
+    pq.put_nowait((0, "reader refresh"))
+    pq.put_nowait((1, "new book"))
+    by_priority = [(await pq.get())[1] for _ in range(3)]
+
+    lq = LifoQueue()
+    for n in (3, 2, 1):
+        lq.put_nowait(n)
+    newest_first = [await lq.get() for _ in range(3)]
+    return by_priority, newest_first
+
+by_priority, newest_first = asyncio.run(demo_ordering())
+assert by_priority == ["reader refresh", "new book", "bulk re-index"]
+assert newest_first == [1, 2, 3]
+print(by_priority, newest_first)
+----
+Source: https://www.tornadoweb.org/en/stable/queues.html#tornado.queues.PriorityQueue[Tornado: tornado.queues.PriorityQueue]
+
+A `PriorityQueue` is a binary heap. Two entries with equal priority are compared by their second element, so a
+dictionary or a custom object as data raises `TypeError` on a tie. Add a monotonically increasing counter as a tie
+breaker (`(priority, next(counter), data)`), which also keeps equal-priority jobs in arrival order.
+
+=== Non-Blocking Calls and Timeouts
+
+`put_nowait` and `get_nowait` never wait. A handler that must answer immediately uses `put_nowait` and turns
+`QueueFull` into a `503` (or `429`) response instead of letting requests pile up behind a full queue.
+
+Every waiting method also takes a `timeout`. Its unit is a Tornado convention that differs from the standard library:
+a plain number is an _absolute deadline_ on the `IOLoop.time` clock (usually `time.time`), and a relative timeout must be
+a `datetime.timedelta`. Passing `5` therefore means "five seconds after the epoch" and times out at once. The
+timeout error is `tornado.util.TimeoutError`, which on current Python versions is the built-in `TimeoutError`.
+
+[source,python]
+----
+import asyncio
+import datetime
+
+from tornado.queues import Queue, QueueEmpty, QueueFull
+from tornado.util import TimeoutError as TornadoTimeoutError
+
+async def demo_timeouts():
+    q = Queue(maxsize=1)
+    q.put_nowait("first")
+    try:
+        q.put_nowait("second")              # full: fails immediately
+    except QueueFull:
+        outcome_full = "QueueFull"
+
+    try:
+        await q.put("second", timeout=datetime.timedelta(milliseconds=50))
+    except TornadoTimeoutError:
+        outcome_put = "put timed out"
+
+    assert q.get_nowait() == "first"
+    try:
+        q.get_nowait()
+    except QueueEmpty:
+        outcome_empty = "QueueEmpty"
+
+    try:
+        await q.get(timeout=datetime.timedelta(milliseconds=50))
+    except TornadoTimeoutError:
+        outcome_get = "get timed out"
+    return outcome_full, outcome_put, outcome_empty, outcome_get
+
+print(asyncio.run(demo_timeouts()))
+assert TornadoTimeoutError is TimeoutError
+----
+Source: https://www.tornadoweb.org/en/stable/queues.html#tornado.queues.Queue.get[Tornado: Queue.get]
+
+[#cover-fetcher]
+== The Bookshelf Live Cover Fetcher
+
+_Bookshelf Live_ fetches cover metadata for newly added books from an external service. Starting one request per book
+would overload the service and the process, so the app uses a bounded queue and a fixed number of workers, with a
+`Semaphore` as a second, global limit. The metadata service is faked by a local Tornado server on a loopback port, so
+the example is self-contained. `AsyncHTTPClient` is described fully in xref:backend/tornado/async-http-client.adoc[Async HTTP Client]; here it is just
+the awaitable HTTP client.
+
+[source,python]
+----
+import asyncio
+import json
+
+from tornado.httpclient import AsyncHTTPClient
+from tornado.httpserver import HTTPServer
+from tornado.locks import Lock, Semaphore
+from tornado.netutil import bind_sockets
+from tornado.queues import Queue
+from tornado.web import Application, RequestHandler
+
+class FakeMetadata(RequestHandler):
+    calls = 0
+    active = 0
+    peak = 0
+
+    async def get(self, isbn):
+        cls = type(self)
+        cls.calls += 1
+        cls.active += 1
+        cls.peak = max(cls.peak, cls.active)
+        await asyncio.sleep(0.02)           # upstream latency
+        cls.active -= 1
+        self.write(json.dumps({"isbn": isbn, "cover": f"/covers/{isbn}.jpg"}))
+
+class CoverFetcher:
+    """Bounded queue + N workers + a global limit on upstream calls."""
+
+    def __init__(self, base_url, workers=4, queue_size=50, upstream_limit=2):
+        self.base_url = base_url
+        self.queue = Queue(maxsize=queue_size)
+        self.upstream = Semaphore(upstream_limit)
+        self.cache_lock = Lock()
+        self.covers = {}
+        self.errors = []
+        self._n_workers = workers
+        self._tasks = []
+
+    def start(self):
+        self._tasks = [asyncio.create_task(self._worker())
+                       for _ in range(self._n_workers)]
+
+    async def stop(self):
+        await self.queue.join()             # finish what was accepted
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def submit(self, isbn):
+        """Called from a handler: never waits; raises QueueFull when saturated."""
+        self.queue.put_nowait(isbn)
+
+    async def _worker(self):
+        client = AsyncHTTPClient()
+        async for isbn in self.queue:
+            try:
+                async with self.cache_lock:         # check-fetch-store is atomic
+                    if isbn in self.covers:
+                        continue                    # finally still runs
+                    self.covers[isbn] = None        # reserve the slot
+                async with self.upstream:           # at most N upstream calls
+                    response = await client.fetch(f"{self.base_url}/meta/{isbn}")
+                self.covers[isbn] = json.loads(response.body)["cover"]
+            except Exception as exc:                # a worker must not die
+                self.errors.append((isbn, repr(exc)))
+            finally:
+                self.queue.task_done()
+
+async def demo_fetcher():
+    sockets = bind_sockets(0, "127.0.0.1")
+    port = sockets[0].getsockname()[1]
+    server = HTTPServer(Application([(r"/meta/(\d+)", FakeMetadata)]))
+    server.add_sockets(sockets)
+
+    fetcher = CoverFetcher(f"http://127.0.0.1:{port}", workers=4, upstream_limit=2)
+    fetcher.start()
+    isbns = [str(9780000000000 + n) for n in range(12)]
+    for isbn in isbns + isbns[:3]:          # three duplicates
+        fetcher.submit(isbn)
+    await fetcher.stop()
+    server.stop()
+    await server.close_all_connections()
+    return fetcher
+
+fetcher = asyncio.run(demo_fetcher())
+assert len(fetcher.covers) == 12 and all(fetcher.covers.values())
+assert not fetcher.errors, fetcher.errors
+assert FakeMetadata.calls == 12             # duplicates never hit upstream
+assert FakeMetadata.peak <= 2               # the Semaphore held
+print("fetched", len(fetcher.covers), "covers; upstream peak =", FakeMetadata.peak)
+----
+Source: https://www.tornadoweb.org/en/stable/queues.html#tornado.queues.Queue[Tornado: tornado.queues.Queue]
+
+Points to notice in the worker:
+
+* `continue` inside `try` still runs the `finally`, so `task_done()` is called for every item, including skipped
+  duplicates. Calling `task_done()` twice for one item raises `ValueError`; never calling it hangs `join()`.
+* The `Exception` handler keeps the worker alive. An uncaught exception ends the task silently (it is only logged
+  when the task is garbage collected), and the pool shrinks one worker at a time.
+* The `Lock` is held only for the in-memory check, not across the network call, so the lock is a few microseconds
+  and does not serialise the workers. The `Semaphore` is what limits the upstream concurrency.
+* `submit` uses `put_nowait`. A handler would catch `QueueFull` and answer `503 Service Unavailable`, rather than
+  suspending the request indefinitely.
+
+=== Starting Workers with the Application
+
+In a real service the pool is created next to the `Application` and lives for the process. Start it from the `async`
+entry point after the event loop is running (not at import time), keep references to the tasks so they are not
+garbage collected, and stop it after the server stops listening, as the example above does with `stop()`. A handler
+reaches the pool through an application setting, so `AsyncHTTPTestCase` can build the same wiring, as in the test
+below. Application and handler details, and testing conventions, are in xref:backend/tornado/applications-and-request-handlers.adoc[Applications & Request Handlers] and xref:backend/tornado/testing.adoc[Testing].
+
+[source,python]
+----
+import json
+import unittest
+
+from tornado.queues import Queue, QueueFull
+from tornado.testing import AsyncHTTPTestCase
+from tornado.web import Application, RequestHandler
+
+class AddBookHandler(RequestHandler):
+    def post(self):
+        jobs = self.application.settings["jobs"]
+        try:
+            jobs.put_nowait(self.get_argument("isbn"))
+        except QueueFull:
+            self.set_status(503)
+            self.set_header("Retry-After", "5")
+            self.write({"error": "busy"})
+            return
+        self.set_status(202)
+        self.write({"queued": jobs.qsize()})
+
+class AddBookTest(AsyncHTTPTestCase):
+    def get_app(self):
+        self.jobs = Queue(maxsize=2)
+        return Application([(r"/books", AddBookHandler)], jobs=self.jobs)
+
+    def test_accepts_then_pushes_back(self):
+        for n in (1, 2):
+            r = self.fetch("/books", method="POST", body=f"isbn=97800{n}")
+            self.assertEqual(r.code, 202)
+        r = self.fetch("/books", method="POST", body="isbn=978003")
+        self.assertEqual(r.code, 503)
+        self.assertEqual(r.headers["Retry-After"], "5")
+        self.assertEqual(self.jobs.qsize(), 2)
+
+result = unittest.TextTestRunner(verbosity=0).run(
+    unittest.defaultTestLoader.loadTestsFromTestCase(AddBookTest))
+assert result.wasSuccessful()
+----
+Source: https://www.tornadoweb.org/en/stable/testing.html[Tornado: tornado.testing - Unit testing support for asynchronous code]
+
+[#locks]
+== tornado.locks
+
+The module mirrors the primitives of `threading`, adapted to coroutines.
+
+[cols="2,4,3",options="header"]
+|===
+| Class | Purpose | Waiting method and timeout result
+
+| `Lock`
+| Mutual exclusion. Starts unlocked; `acquire()` locks it; `release()` unlocks it and raises `RuntimeError` if it is
+  not locked. Use `async with lock:`. Not re-entrant: a coroutine that acquires it twice waits for itself forever.
+| `acquire(timeout=None)`; raises `tornado.util.TimeoutError`.
+
+| `Semaphore(value=1)`
+| A counter: `acquire()` blocks when it is zero, `release()` increments it. Limits concurrency to `value`.
+| `acquire(timeout=None)`; raises `tornado.util.TimeoutError`.
+
+| `BoundedSemaphore(value=1)`
+| A `Semaphore` whose `release()` raises `ValueError` if it would go above the initial value, which surfaces
+  unbalanced `release()` calls as bugs.
+| `acquire(timeout=None)`; raises `tornado.util.TimeoutError`.
+
+| `Event`
+| A boolean flag. `wait()` returns at once when the flag is set; `set()` wakes all waiters; `clear()` resets it;
+  `is_set()` reads it.
+| `wait(timeout=None)`; raises `tornado.util.TimeoutError`.
+
+| `Condition`
+| Waiters wait for a notification; `notify(n=1)` wakes `n` waiters and `notify_all()` wakes all. It has no
+  underlying lock to acquire.
+| `wait(timeout=None)`; returns `True` when notified and *`False`* after the timeout, without raising.
+|===
+
+As with the queue methods, `timeout` is an absolute deadline unless given as a `datetime.timedelta`. A plain `with`
+statement is rejected: `with lock:`, `with semaphore:` and the like raise `RuntimeError` with a message telling you to use `async with`,
+because acquiring is asynchronous.
+Source: https://www.tornadoweb.org/en/stable/locks.html[Tornado: tornado.locks - Synchronization primitives]
+
+=== Lock: Atomic Sections that Contain an await
+
+Without a `Lock`, two coroutines can both see "no cached value", both fetch, and both write. The counter below
+makes the race visible: the unlocked version loses updates because each coroutine reads, awaits and then writes.
+
+[source,python]
+----
+import asyncio
+
+from tornado.locks import Lock
+
+async def demo_lock():
+    counter = {"unlocked": 0, "locked": 0}
+    lock = Lock()
+
+    async def bump_unlocked():
+        value = counter["unlocked"]
+        await asyncio.sleep(0)              # another coroutine runs here
+        counter["unlocked"] = value + 1
+
+    async def bump_locked():
+        async with lock:
+            value = counter["locked"]
+            await asyncio.sleep(0)
+            counter["locked"] = value + 1
+
+    await asyncio.gather(*[bump_unlocked() for _ in range(10)])
+    await asyncio.gather(*[bump_locked() for _ in range(10)])
+    return counter
+
+print(counter := asyncio.run(demo_lock()))
+assert counter["unlocked"] < 10 and counter["locked"] == 10
+----
+Source: https://www.tornadoweb.org/en/stable/locks.html#tornado.locks.Lock[Tornado: tornado.locks.Lock]
+
+Prefer to put as little as possible, and never a long network call, inside a held lock. When you only need to bound
+concurrency rather than exclude, use a `Semaphore`.
+
+=== Event: A One-Shot Announcement
+
+An `Event` is the natural "ready" or "stopping" flag. In _Bookshelf Live_ a background task warms the genre cache and
+request handlers that need it wait on the event, with a deadline so a failed warm-up cannot hang them.
+
+[source,python]
+----
+import asyncio
+import datetime
+
+from tornado.locks import Event
+from tornado.util import TimeoutError as TornadoTimeoutError
+
+async def demo_event():
+    cache_ready = Event()
+
+    async def warm_cache():
+        await asyncio.sleep(0.02)
+        cache_ready.set()                   # wakes every waiter at once
+
+    async def handler(n):
+        await cache_ready.wait(timeout=datetime.timedelta(seconds=1))
+        return n
+
+    asyncio.create_task(warm_cache())
+    served = await asyncio.gather(*[handler(n) for n in range(3)])
+
+    never = Event()
+    try:
+        await never.wait(timeout=datetime.timedelta(milliseconds=30))
+        timed_out = False
+    except TornadoTimeoutError:
+        timed_out = True
+    return served, cache_ready.is_set(), timed_out
+
+served, is_set, timed_out = asyncio.run(demo_event())
+assert served == [0, 1, 2] and is_set and timed_out
+print(served, is_set, timed_out)
+----
+Source: https://www.tornadoweb.org/en/stable/locks.html#tornado.locks.Event[Tornado: tornado.locks.Event]
+
+=== Condition: "Something Changed"
+
+A `Condition` suits repeating notifications, such as the "new reviews" feed: each long-polling client waits, and
+the code that saves a review calls `notify_all()`. Unlike an `Event`, a notification is not remembered: a coroutine
+that calls `wait()` after `notify()` waits for the _next_ one, so check the data you care about in a loop, and use the
+return value to distinguish a timeout.
+
+[source,python]
+----
+import asyncio
+import datetime
+
+from tornado.locks import Condition
+
+async def demo_condition():
+    new_reviews = Condition()
+    reviews = []
+
+    async def long_poll(seen):
+        while len(reviews) <= seen:
+            notified = await new_reviews.wait(
+                timeout=datetime.timedelta(milliseconds=500))
+            if not notified:
+                return "timeout"            # wait() returns False, no exception
+        return reviews[seen]
+
+    pollers = [asyncio.create_task(long_poll(0)) for _ in range(3)]
+    await asyncio.sleep(0.02)
+    reviews.append("Great book")
+    new_reviews.notify_all()
+    got = await asyncio.gather(*pollers)
+
+    quiet = await long_poll(1)              # no review arrives
+    return got, quiet
+
+print(asyncio.run(demo_condition()))
+----
+Source: https://www.tornadoweb.org/en/stable/locks.html#tornado.locks.Condition[Tornado: tornado.locks.Condition]
+
+Since Tornado 5.0 a notified waiter always resumes on the next iteration of the `IOLoop`, never synchronously inside
+`notify()`.
+
+=== Semaphore and BoundedSemaphore
+
+A `Semaphore(2)` lets two coroutines in at once. `BoundedSemaphore` additionally protects against unbalanced
+releases; the plain `Semaphore` silently accepts them, which quietly raises your concurrency limit.
+
+[source,python]
+----
+import asyncio
+import datetime
+
+from tornado.locks import BoundedSemaphore, Lock, Semaphore
+from tornado.util import TimeoutError as TornadoTimeoutError
+
+async def demo_semaphore():
+    sem = Semaphore(2)
+    running = peak = 0
+
+    async def job():
+        nonlocal running, peak
+        async with sem:
+            running += 1
+            peak = max(peak, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+    await asyncio.gather(*[job() for _ in range(8)])
+
+    leaky = Semaphore(1)
+    leaky.release()                         # accepted: limit is now 2
+    bounded = BoundedSemaphore(1)
+    try:
+        bounded.release()                   # more releases than acquires
+    except ValueError as exc:
+        bounded_error = str(exc)
+
+    lock = Lock()
+    try:
+        lock.release()                      # not locked
+    except RuntimeError:
+        lock_error = "RuntimeError"
+
+    await lock.acquire()
+    try:
+        await lock.acquire(timeout=datetime.timedelta(milliseconds=30))
+    except TornadoTimeoutError:
+        reacquire = "timed out (locks are not re-entrant)"
+    try:
+        with lock:                          # wrong: must be `async with`
+            pass
+    except RuntimeError:
+        sync_with = "RuntimeError"
+    return peak, bounded_error, lock_error, reacquire, sync_with
+
+result = asyncio.run(demo_semaphore())
+assert result[0] == 2
+print(result)
+----
+Source: https://www.tornadoweb.org/en/stable/locks.html#tornado.locks.BoundedSemaphore[Tornado: tornado.locks.BoundedSemaphore]
+
+[#choosing]
+== Choosing a Primitive
+
+[cols="3,2",options="header"]
+|===
+| Need | Use
+
+| Hand work from handlers to a pool and slow producers down when workers fall behind
+| `Queue` (bounded)
+
+| Urgent work first / newest work first
+| `PriorityQueue` / `LifoQueue`
+
+| Only one coroutine at a time inside a section that awaits
+| `Lock`
+
+| At most N coroutines at a time (upstream limit, connection budget)
+| `Semaphore`, or `BoundedSemaphore` when releases must balance
+
+| A one-time "ready" or "stop" signal remembered for late arrivals
+| `Event`
+
+| Repeated "state changed, re-check" wake-ups
+| `Condition`
+
+| Wait for all submitted work to finish
+| `Queue.join()`, or `asyncio.gather` / `asyncio.TaskGroup` for a fixed list of tasks
+|===
+
+[#threads]
+== Coroutine-Safe, Not Thread-Safe
+
+These classes are not thread-safe. They are meant to coordinate coroutines in a single-threaded application, not to
+protect shared data in a multi-threaded one and not to replace the `threading` module's primitives. They keep plain
+`deque` and `set` structures and complete futures directly, so calling `queue.put_nowait(item)` from another thread
+can corrupt the queue state or, worse, leave the event loop asleep with the new item never noticed.
+
+The safe pattern is to schedule the call onto the loop's thread with `IOLoop.add_callback` (documented as safe to call
+from other threads) or with `+asyncio's+` `loop.call_soon_threadsafe`:
+
+[source,python]
+----
+import asyncio
+import threading
+
+from tornado.ioloop import IOLoop
+from tornado.queues import Queue
+
+async def demo_threads():
+    q = Queue()
+    loop_thread = threading.get_ident()
+    io_loop = IOLoop.current()
+
+    def blocking_library():
+        # Runs in a worker thread (for example a CPU-bound or blocking call).
+        # WRONG: q.put_nowait("from a thread")
+        # RIGHT: hand the call to the event loop thread.
+        io_loop.add_callback(q.put_nowait, "from a thread")
+        return threading.get_ident()
+
+    worker_thread = await asyncio.to_thread(blocking_library)
+    item = await q.get()
+    return item, worker_thread != loop_thread
+
+print(asyncio.run(demo_threads()))
+----
+Source: https://www.tornadoweb.org/en/stable/ioloop.html#tornado.ioloop.IOLoop.add_callback[Tornado: IOLoop.add_callback]
+
+Two consequences for deployment follow. First, a `tornado.queues.Queue` lives in one process; Tornado is usually run as one
+process per CPU, so each process has its own queue and its own workers, and a job queued in one process is invisible
+to the others. Second, when jobs must survive a restart, be shared across processes or run on other machines, use
+a broker-backed task queue; the Flask section's
+xref:backend/flask/background-jobs-celery-and-email.adoc[Background Jobs, Celery & Email] page shows that model, and
+the message-broker material under xref:backend/messaging/index.adoc[Messaging] applies equally to Tornado. In-process
+queues are for short-lived, loss-tolerant work such as fetching a cover image.
+
+[#asyncio]
+== The asyncio Equivalents
+
+Since Tornado 5 the `IOLoop` is a thin wrapper over the `asyncio` event loop, and Tornado futures are `asyncio` futures,
+so Tornado and asyncio primitives can be mixed in one program. The Tornado classes predate asyncio's and differ in a few
+details, which matter when you copy code between the two or read older examples.
+
+[cols="2,2,3",options="header"]
+|===
+| Tornado | asyncio | Differences
+
+| `tornado.queues.Queue`, `PriorityQueue`, `LifoQueue`
+| `asyncio.Queue`, `PriorityQueue`, `LifoQueue`
+| Both have `task_done()` and `join()`. Tornado's `get`/`put`/`join` accept a `timeout`; with asyncio you wrap the call
+  in `asyncio.timeout()` or `asyncio.wait_for()`. Tornado supports `async for`; `asyncio.Queue` does not (loop on
+  `get()`). Python 3.13 added `asyncio.Queue.shutdown()`, which has no Tornado counterpart.
+
+| `tornado.locks.Lock`
+| `asyncio.Lock`
+| Both are used with `async with`. Tornado's `Lock.acquire` takes a `timeout`; with `asyncio.Lock` the timeout comes
+  from `asyncio.timeout()`.
+
+| `Semaphore`, `BoundedSemaphore`
+| `asyncio.Semaphore`, `asyncio.BoundedSemaphore`
+| Same semantics. Tornado accepts `timeout` in `acquire()`.
+
+| `Event`
+| `asyncio.Event`
+| `Event.wait(timeout)` raises `TimeoutError` in Tornado; asyncio has no timeout parameter.
+
+| `Condition`
+| `asyncio.Condition`
+| Tornado's has no underlying lock and `wait()` returns `False` on timeout; `asyncio.Condition` wraps a `Lock` that
+  must be held while waiting, and its timeout comes from `asyncio.timeout()`.
+|===
+
+New code written for Tornado can use either family, and plain `asyncio` primitives are fine inside a Tornado
+application. Prefer Tornado's classes when you want the built-in `timeout` argument and `async for` on the queue;
+prefer asyncio's when the code must also run outside Tornado. The following example uses the asyncio queue and the
+`asyncio.timeout()` wrapper inside a Tornado request handler test, to show they coexist:
+
+[source,python]
+----
+import asyncio
+import json
+
+from tornado.testing import AsyncHTTPTestCase
+from tornado.web import Application, RequestHandler
+import unittest
+
+import tornado.concurrent
+
+class ReviewFeed(RequestHandler):
+    async def get(self):
+        q = self.application.settings["feed"]       # an asyncio.Queue
+        try:
+            async with asyncio.timeout(1):
+                review = await q.get()
+        except TimeoutError:
+            self.set_status(204)
+            return
+        self.write(json.dumps({"review": review}))
+
+class FeedTest(AsyncHTTPTestCase):
+    def get_app(self):
+        self.feed = asyncio.Queue()
+        return Application([(r"/feed", ReviewFeed)], feed=self.feed)
+
+    def test_mixed_primitives(self):
+        self.feed.put_nowait("Loved it")
+        r = self.fetch("/feed")
+        self.assertEqual(json.loads(r.body), {"review": "Loved it"})
+
+assert tornado.concurrent.Future is asyncio.Future
+result = unittest.TextTestRunner(verbosity=0).run(
+    unittest.defaultTestLoader.loadTestsFromTestCase(FeedTest))
+assert result.wasSuccessful()
+----
+Source: https://docs.python.org/3/library/asyncio-queue.html[Python: asyncio queues]
+
+[#pitfalls]
+== Pitfalls
+
+* *Forgotten or doubled `task_done()`.* Never calling it makes `join()` hang; calling it more often than items were
+  put raises `ValueError`. Put it in a `finally`.
+* *Workers that die.* An unhandled exception ends the worker task and, because nobody awaits it, goes unnoticed.
+  Catch `Exception` in the loop body, log it, and still call `task_done()`.
+* *Workers never stop.* `async for item in queue` and `while True` loops run forever; stop them by cancelling their
+  tasks after `join()`, or enqueue one sentinel per worker, and await them so shutdown is clean.
+* *Unbounded queues.* `Queue()` without `maxsize` turns a slow worker pool into unbounded memory growth. Pick a
+  `maxsize`, and decide whether producers wait (`put`), time out (`+put(timeout=...)+`) or are rejected with `503`
+  (`put_nowait` plus `QueueFull`).
+* *Absolute versus relative timeouts.* `timeout=5` is a point in time, not five seconds. Use
+  `datetime.timedelta(seconds=5)`. This is the most common mistake when porting from `queue.Queue` or asyncio.
+* *Two timeout conventions.* `Condition.wait` returns `False`; every other waiting method raises
+  `tornado.util.TimeoutError`.
+* *Holding a `Lock` across slow I/O.* Serialises every coroutine behind it; lock the check and the store, not the fetch,
+  or use a per-key lock or a `Semaphore`.
+* *Re-entrant locking.* A `Lock` is not re-entrant; a coroutine that acquires it twice deadlocks itself. A timeout
+  on `acquire` is the safety net.
+* *Using `with` instead of `async with`.* Raises `RuntimeError` for `Lock` and `Semaphore`.
+* *Blocking the loop inside a worker.* A synchronous HTTP library or `time.sleep` inside a worker stalls every request
+  of the process. Use `AsyncHTTPClient`, or push the blocking call to a thread with `asyncio.to_thread` or an
+  executor.
+* *Using the primitives from threads.* They are not thread-safe; hop onto the loop with `IOLoop.add_callback`.
+* *Per-process state.* With several Tornado processes behind a proxy, each has its own queue and locks; a lock does
+  not exclude coroutines in another process. Use a database constraint, a Redis lock or a broker for cross-process
+  coordination.
+* *Fire-and-forget tasks.* Keep a reference to every task you create (the pool keeps its task list); the event loop only
+  holds weak references to tasks.
+
+[#changes]
+== Recent Changes and Version Notes
+
+[cols="1,3",options="header"]
+|===
+| Version | Change
+
+| Tornado 4.3
+| `Lock` and the other primitives gained `async with` support on Python 3.5 and later.
+
+| Tornado 5.0
+| Tornado runs on the `asyncio` event loop; `Condition` waiters are always notified on the next `IOLoop` iteration,
+  never synchronously from `notify()`.
+
+| Tornado 6.6 (alpha only)
+| Upcoming, not released: Python 3.11 becomes the minimum version, and Python 3.15 and free-threaded builds are
+  supported. Treat the queues and locks as single-event-loop primitives regardless of the Python build.
+|===
+
+Source: https://www.tornadoweb.org/en/stable/releases.html[Tornado: Release notes]
+
+[#next]
+== Related Reading
+
+* The Flask section's xref:backend/flask/async-gevent-and-quart.adoc[Async, Gevent & Quart] page compares how a
+  WSGI framework tries to wait on I/O, which is the problem these primitives solve natively.
+* The FastAPI section's xref:backend/fastapi/async-and-concurrency.adoc[Async & Concurrency] page covers the
+  `asyncio` side of the same ideas, including task groups and the thread pool.
+* The Python Reference's xref:programming-languages/python/index.adoc[Python] section covers `asyncio` itself.
+* xref:backend/tornado/applications-and-request-handlers.adoc[Applications & Request Handlers], xref:backend/tornado/async-http-client.adoc[Async HTTP Client], xref:backend/tornado/websockets.adoc[WebSockets] and
+  xref:backend/tornado/streaming-long-polling-and-sse.adoc[Streaming, Long Polling & SSE] build on the queue and event patterns above.
+
+[#references]
+== References
+
+* https://www.tornadoweb.org/en/stable/queues.html[Tornado: tornado.queues - Queues for coroutines]
+* https://www.tornadoweb.org/en/stable/locks.html[Tornado: tornado.locks - Synchronization primitives]
+* https://www.tornadoweb.org/en/stable/ioloop.html#tornado.ioloop.IOLoop.add_callback[Tornado: IOLoop.add_callback]
+* https://www.tornadoweb.org/en/stable/testing.html[Tornado: tornado.testing - Unit testing support for asynchronous code]
+* https://www.tornadoweb.org/en/stable/releases.html[Tornado: Release notes]
+* https://docs.python.org/3/library/asyncio-queue.html[Python: asyncio queues]
