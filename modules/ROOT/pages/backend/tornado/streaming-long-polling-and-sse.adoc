@@ -1,0 +1,746 @@
+= Streaming, Long Polling & SSE
+:description: How Tornado streams data in both directions and pushes updates to browsers: stream_request_body and data_received for large uploads, flush for streamed responses, long polling with locks.Condition, Server-Sent Events with Last-Event-ID and keep-alives, client disconnects with on_connection_close, proxies and testing.
+:keywords: Tornado, stream_request_body, data_received, set_max_body_size, max_body_size, max_buffer_size, body_timeout, flush, chunked transfer encoding, long polling, Condition, Server-Sent Events, SSE, EventSource, text/event-stream, Last-Event-ID, keep-alive, on_connection_close, StreamClosedError, AsyncHTTPTestCase
+
+include::partial$tornado-disclaimer.adoc[]
+
+This page is written against Tornado 6.5.10 on Python 3.13, checked on 2026-10-07. Tornado 6.6 is only available as an
+alpha (6.6a1) at the time of writing, so anything described as "6.6" is upcoming and may still change. Every example
+was executed with those versions against real servers bound to a loopback port. The running example is the
+_Bookshelf Live_ scenario: a book catalogue that accepts large CSV imports, exports itself as a stream, and tells
+browsers about new books without being polled every second.
+
+Tornado is a good fit for connections that stay open: one coroutine per request costs a few kilobytes, a handler can
+`await` for as long as it likes without blocking other requests, and `flush()` pushes bytes to the client at any
+moment. This page covers the four HTTP-level techniques that rely on that, and the cross-cutting problem they share,
+which is noticing that the client has gone away. For the same topics in other frameworks see
+xref:backend/flask/streaming-and-server-sent-events.adoc[Flask: Streaming & Server-Sent Events] (generator responses on
+a threaded or async worker) and xref:backend/fastapi/streaming-json-lines-and-sse.adoc[FastAPI: Streaming, JSON Lines & SSE].
+Bidirectional messaging with WebSockets, the coroutine model behind everything here and the HTTP client used to consume
+streams are covered in xref:backend/tornado/websockets.adoc[WebSockets], xref:backend/tornado/coroutines-and-asyncio.adoc[Coroutines & asyncio] and xref:backend/tornado/async-http-client.adoc[Async HTTP Client]; chat-room design beyond the framework wiring is out of scope (issue #264).
+
+== Choosing a Technique
+
+[mermaid]
+....
+sequenceDiagram
+    participant C as Browser
+    participant S as Tornado
+    Note over C,S: Long polling - one request per batch of events
+    C->>S: GET /poll?cursor=7
+    Note over S: handler awaits a Condition
+    S-->>C: 200 with events, or 204 on timeout
+    C->>S: GET /poll?cursor=9 (immediately again)
+    Note over C,S: SSE - one response that never ends
+    C->>S: GET /events (Last-Event-ID: 9)
+    S-->>C: id, event and data frames, flushed one by one
+    S-->>C: comment line as keep-alive
+    Note over C,S: WebSocket - one upgraded connection, both directions
+    C->>S: GET /ws with Upgrade
+    S-->>C: 101 Switching Protocols
+    C->>S: message
+    S-->>C: message
+....
+
+.Long polling repeats short requests, SSE keeps one response open, WebSockets switch protocol and talk both ways.
+
+[cols="2,2,2,2"]
+|===
+|Aspect |Long polling |Server-Sent Events |WebSocket
+
+|Direction
+|Server to client, one batch per request
+|Server to client only
+|Both directions
+
+|Browser API
+|`fetch` in a loop
+|`EventSource`, with automatic reconnect and `Last-Event-ID`
+|`WebSocket`, reconnect is up to you
+
+|Works through plain HTTP infrastructure
+|Yes
+|Yes, if proxies do not buffer
+|Only if the proxy supports the upgrade
+
+|Overhead
+|A request and its headers per batch
+|One request, a few bytes per event
+|One handshake, a few bytes per message
+
+|Authentication
+|Any header or cookie
+|Cookies only (`EventSource` cannot set headers)
+|Cookies or a token sent in the first message
+
+|Tornado piece
+|`tornado.locks.Condition` and a timeout
+|`flush()` and `text/event-stream`
+|`WebSocketHandler`
+|===
+
+Rule of thumb: use SSE for one-way notifications (new books, progress bars), long polling when a client or proxy
+cannot hold a response open, and a WebSocket when the browser also sends frequent messages.
+
+== Shared Helper
+
+Every example below runs against a real server on a free loopback port. The helper starts an `HTTPServer` on port 0
+and yields its URL and port; keyword arguments are passed to `HTTPServer`, which is where the body limits live.
+
+[source,python]
+----
+import asyncio
+import contextlib
+import datetime
+import hashlib
+import json
+
+from tornado import httpclient, httpserver, iostream, locks, netutil, web
+
+
+@contextlib.asynccontextmanager
+async def serve(app, **server_kwargs):
+    """Serve app on a free loopback port and yield (base_url, port)."""
+    server = httpserver.HTTPServer(app, **server_kwargs)
+    sockets = netutil.bind_sockets(0, "127.0.0.1")
+    server.add_sockets(sockets)
+    port = sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}", port
+    finally:
+        server.stop()
+        await server.close_all_connections()
+----
+
+Source: https://www.tornadoweb.org/en/stable/httpserver.html#tornado.httpserver.HTTPServer[Tornado: tornado.httpserver.HTTPServer]
+
+== Streaming Request Bodies
+
+By default Tornado reads the whole request body into memory before it calls your handler, parses form and JSON
+arguments, and then calls `get`, `post` and friends. That is convenient and dangerous for large uploads: a 2 GiB
+upload needs 2 GiB of RAM. Decorating the handler class with `@web.stream_request_body` changes the order of events:
+
+* `prepare()` is called as soon as the request _headers_ have been read, before any body byte.
+* `data_received(self, chunk)` is called zero or more times as data arrives (not at all for an empty body). Both
+  `prepare` and `data_received` may be coroutines; the next call waits for the previous one to finish, which gives
+  you back-pressure: while you `await` a slow disk or database, Tornado stops reading from the socket.
+* The usual HTTP method (`post`, `put`, ...) is called once the whole body has been received.
+* `self.request.body` is undefined and body arguments are not available through `get_argument`. Query-string
+  arguments still work. Multipart parsing does not happen either, so a `multipart/form-data` upload must be parsed
+  incrementally by you; most applications stream a raw body (`PUT` of a file, a CSV import) instead.
+
+The body-size limits are properties of the HTTP server and of the connection:
+
+[cols="2,3"]
+|===
+|Setting |Meaning
+
+|`+HTTPServer(max_body_size=...)+`
+|Maximum body of one request, in bytes. When it is not given, it defaults to `max_buffer_size`.
+
+|`+HTTPServer(max_buffer_size=...)+`
+|Size of the read buffer of each connection, 100 MiB by default. It is the fallback for `max_body_size`.
+
+|`+HTTPServer(body_timeout=...)+`
+|Seconds allowed to read the body of one request. Unset by default, which means a client may send one byte per minute
+for ever; set it for any public upload endpoint.
+
+|`+HTTPServer(chunk_size=...)+`
+|How much data is read at a time, 64 KiB by default; it bounds the size of the chunks passed to `data_received`.
+
+|`self.request.connection.set_max_body_size(n)`
+|Overrides `max_body_size` for the current request. Call it in `prepare`.
+
+|`self.request.connection.set_body_timeout(seconds)`
+|Overrides `body_timeout` for the current request. Call it in `prepare`.
+|===
+
+`+Application.listen(port, **kwargs)+` passes the keyword arguments to `HTTPServer`, so `+app.listen(8888, max_body_size=...)+` works too. The pattern that follows keeps a small global limit, so that every ordinary handler
+rejects oversized bodies cheaply, and raises it only for the import endpoint:
+
+[source,python]
+----
+IMPORT_LIMIT = 1024 * 1024        # 1 MiB for the demo; use a real quota in production
+
+
+@web.stream_request_body
+class CsvImportHandler(web.RequestHandler):
+    def prepare(self):
+        declared = self.request.headers.get("Content-Length")
+        if declared is not None and int(declared) > IMPORT_LIMIT:
+            raise web.HTTPError(413, "import of %s bytes is too large", declared)
+        self.request.connection.set_max_body_size(IMPORT_LIMIT)
+        self.request.connection.set_body_timeout(30.0)
+        self.digest = hashlib.sha256()
+        self.size = self.lines = 0
+
+    def data_received(self, chunk):
+        self.size += len(chunk)
+        self.lines += chunk.count(b"\n")
+        self.digest.update(chunk)
+
+    def post(self):
+        self.write({"bytes": self.size, "lines": self.lines, "digest_length": len(self.digest.hexdigest())})
+
+
+class PingHandler(web.RequestHandler):
+    def post(self):
+        self.write({"received": len(self.request.body)})
+
+
+import_app = web.Application([(r"/imports/books", CsvImportHandler), (r"/ping", PingHandler)])
+
+
+async def send(client, url, **kwargs):
+    """POST and describe the outcome, including connections closed by the server."""
+    try:
+        r = await client.fetch(url, method="POST", raise_error=False, **kwargs)
+        return r.code, r.reason
+    except Exception as error:
+        return type(error).__name__
+
+
+async def demo_upload():
+    csv = b"title,author\n" + b"Dune,Frank Herbert\n" * 20000      # about 380 KB
+
+    async def producer(write):                    # no Content-Length: sent chunked
+        for start in range(0, len(csv), 50_000):
+            await write(csv[start:start + 50_000])
+
+    async def endless(write):
+        for _ in range(40):
+            await write(b"x" * 65536)             # 2.5 MiB in total
+
+    async with serve(import_app, max_body_size=16 * 1024) as (base, _):
+        client = httpclient.AsyncHTTPClient()
+        url = base + "/imports/books"
+        r = await client.fetch(url, method="POST", body=csv)
+        print("streamed 380 KB:", r.code, r.body.decode())
+        r = await client.fetch(url, method="POST", body_producer=producer)
+        print("chunked upload :", r.code, r.body.decode())
+        print("declared 2 MiB :", await send(client, url, body=b"x" * (2 * 1024 * 1024)))
+        print("chunked 2.5 MiB:", await send(client, url, body_producer=endless))
+        print("/ping 100 KB   :", await send(client, base + "/ping", body=b"x" * 100_000))
+        print("/ping 1 KB     :", await send(client, base + "/ping", body=b"x" * 1000))
+
+
+asyncio.run(demo_upload())
+----
+
+Source: https://www.tornadoweb.org/en/stable/web.html#tornado.web.stream_request_body[Tornado: tornado.web.stream_request_body]
+
+Output (the log lines of the rejected request are omitted):
+
+[source,text]
+----
+streamed 380 KB: 200 {"bytes": 380013, "lines": 20001, "digest_length": 64}
+chunked upload : 200 {"bytes": 380013, "lines": 20001, "digest_length": 64}
+declared 2 MiB : (413, 'Content Too Large')
+chunked 2.5 MiB: HTTPStreamClosedError
+/ping 100 KB   : (400, 'Bad Request')
+/ping 1 KB     : (200, 'OK')
+----
+
+What the output shows:
+
+* The import handler accepted 380 KB although the server-wide limit is 16 KiB, because `set_max_body_size` in
+  `prepare` replaced it for that request.
+* A declared `Content-Length` over the limit can be refused with a proper 413 in `prepare`, before any body byte is
+  read. Raising in `prepare` is also the place for authentication and quota checks: the upload is refused before it
+  costs bandwidth. Clients that send `Expect: 100-continue` (curl does so for large bodies) are answered with the
+  interim `100 Continue` only after `prepare` returns, so a rejected upload never starts.
+* When the limit is exceeded in any other way (an undeclared chunked body over the limit, or a body over the
+  server-wide limit on a normal handler), Tornado does not produce a 413 page: it logs "Malformed HTTP message", sends a
+  bare `400 Bad Request` and closes the connection. A client that is still writing sees the connection closed (here
+  `HTTPStreamClosedError`, other clients a broken pipe), so uploaders must be ready to handle a failure that is not an
+  HTTP response.
+
+Further points for streaming handlers:
+
+* `check_xsrf_cookie` runs before `prepare`, when no body has been read yet, so with `xsrf_cookies=True` the token must
+  come in the `X-XSRFToken` (or `X-CSRFToken`) header, never in a form field.
+* `on_finish` and `on_connection_close` are still called; if the client disconnects mid-upload the `post` method is not
+  called, so clean temporary files in both.
+* `data_received` must not block. Writing to disk with plain `open().write()` blocks the loop for the duration of the
+  write; for large uploads hand the writes to `loop.run_in_executor` and `await` it, which also provides the
+  back-pressure described above. Never trust a client-supplied file name when choosing the path.
+* On the client side the counterparts are `body_producer` (used above) and `streaming_callback` of `HTTPRequest`; see
+  xref:backend/tornado/async-http-client.adoc[Async HTTP Client].
+
+For the buffered counterpart (small multipart uploads read through `self.request.files`) see
+xref:backend/flask/file-uploads.adoc[Flask: File Uploads]; xref:backend/tornado/applications-and-request-handlers.adoc[Applications & Request Handlers] covers
+`self.request.files`.
+
+== Streaming Responses with flush()
+
+`write()` only appends to a buffer; the buffer is sent when the handler finishes. To send data while the handler is
+still working, call `flush()`. It sends the headers on the first call, then the buffered bytes, and returns a
+future that resolves when the data has been handed to the socket. Two details matter:
+
+* Without a `Content-Length`, an HTTP/1.1 response is sent with `Transfer-Encoding: chunked`; Tornado does this for
+  you. HTTP/1.0 clients get the body delimited by connection close.
+* **`await self.flush()`**, do not just call it. The await is what applies back-pressure to a slow client: if you
+  flush in a loop without awaiting, the write buffer of that connection grows without bound.
+
+The example streams the catalogue as newline-delimited JSON, producing a row every 50 ms, and consumes it with the
+client's `streaming_callback` to show that the rows arrive one by one:
+
+[source,python]
+----
+import time
+
+BOOKS = [{"id": i, "title": f"Book {i}"} for i in range(1, 6)]
+
+
+class ExportHandler(web.RequestHandler):
+    async def get(self):
+        self.set_header("Content-Type", "application/x-ndjson")
+        try:
+            for book in BOOKS:
+                self.write(json.dumps(book) + "\n")
+                await self.flush()                  # headers on the first call, then each row
+                await asyncio.sleep(0.05)           # stands in for a slow database cursor
+        except iostream.StreamClosedError:
+            return                                  # the client went away: stop producing
+
+
+async def demo_export():
+    app = web.Application([(r"/export", ExportHandler)])
+    async with serve(app) as (base, _):
+        start = time.perf_counter()
+        arrivals, headers = [], []
+        response = await httpclient.AsyncHTTPClient().fetch(
+            base + "/export",
+            streaming_callback=lambda chunk: arrivals.append(time.perf_counter() - start),
+            header_callback=headers.append,
+        )
+    print("chunks received :", len(arrivals))
+    print("spread over     :", "more than 0.15 s" if arrivals[-1] - arrivals[0] > 0.15 else "no time")
+    print("framing header  :", [h.strip() for h in headers if h.lower().startswith("transfer-")])
+    print("body kept by client:", response.body)
+
+
+asyncio.run(demo_export())
+----
+
+Source: https://www.tornadoweb.org/en/stable/web.html#tornado.web.RequestHandler.flush[Tornado: RequestHandler.flush]
+
+Output:
+
+[source,text]
+----
+chunks received : 5
+spread over     : more than 0.15 s
+framing header  : ['Transfer-Encoding: chunked']
+body kept by client: b''
+----
+
+Pitfalls of streamed responses:
+
+* Once `flush()` has sent the status line and headers, the status cannot change. An exception later in the handler is
+  logged, and the client sees a truncated body (the terminating zero-length chunk is never sent, so a well-behaved
+  client reports an incomplete response). Validate everything that can fail with a proper status code _before_ the
+  first flush, and encode failures that happen later inside the stream (for example a final `+{"error": "..."}+` line).
+* Headers, cookies and the status must be set before the first flush, including `Content-Type`.
+* Do not call `self.finish()` yourself unless you want to; a coroutine handler finishes automatically when it returns.
+* `compress_response=True` compresses any `+text/*+` type (and a short list of JSON, XML and JavaScript types) as
+  chunks are flushed, and that includes `text/event-stream`. In a local check the first flushed chunk of an SSE
+  response arrived immediately even with gzip enabled, but compression still adds CPU and can interact badly with
+  intermediaries; most applications leave it off for event streams, or let the reverse proxy decide.
+* A streamed handler holds a connection open for its whole life. Count it against file-descriptor limits (`ulimit -n`)
+  and load-balancer connection caps.
+
+== Long Polling
+
+Long polling is the oldest technique and still the most compatible: the client asks "anything new since cursor N?",
+and the server holds the request open until there is something to report or a timeout expires. Tornado's official
+chat demo (https://github.com/tornadoweb/tornado/tree/stable/demos/chat[demos/chat]) implements it with one future per
+waiting client; `tornado.locks.Condition` gives the same behaviour with less code:
+
+* `await condition.wait(timeout)` suspends the coroutine; the timeout is a `datetime.timedelta` or an absolute
+  IOLoop time. The returned future resolves to `True` when notified and to `False` on timeout; it does not raise.
+* `condition.notify_all()` wakes every waiter; each waiter then re-checks its own condition. A waiter must always
+  re-check (a `while` loop), because a wake-up does not guarantee that there is data for _its_ cursor.
+* An `Event` fits one-shot signals ("the export is ready"): `set()` wakes all waiters and later waits return at once
+  until `clear()`. A feed that is published to repeatedly needs the `Condition`.
+
+The cursor is the important design decision. The client sends the id of the last event it saw, the server answers with
+everything newer, so events published between two polls are never lost. A timeout answers `204 No Content`, and the
+client simply asks again:
+
+[source,python]
+----
+class Feed:
+    """Ordered log of book events, with a Condition for long-polling waiters."""
+
+    def __init__(self):
+        self.events = []
+        self.changed = locks.Condition()
+        self.subscribers = set()            # asyncio queues of connected SSE clients (next section)
+
+    def publish(self, kind, **data):
+        event = {"id": len(self.events) + 1, "type": kind, "data": data}
+        self.events.append(event)
+        self.changed.notify_all()
+        for queue in list(self.subscribers):
+            queue.put_nowait(event)
+        return event
+
+    def since(self, last_id):
+        return self.events[last_id:]
+
+
+feed = Feed()
+
+
+class PollHandler(web.RequestHandler):
+    POLL_TIMEOUT = 0.5            # seconds for the demo; 20 to 30 is typical, below proxy idle timeouts
+
+    async def get(self):
+        cursor = int(self.get_query_argument("cursor", "0"))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.POLL_TIMEOUT
+        while not (events := feed.since(cursor)):
+            remaining = deadline - loop.time()
+            if remaining <= 0 or not await feed.changed.wait(datetime.timedelta(seconds=remaining)):
+                self.set_status(204)
+                return
+        self.write({"events": events, "cursor": events[-1]["id"]})
+
+
+async def demo_poll():
+    app = web.Application([(r"/poll", PollHandler)])
+    async with serve(app) as (base, _):
+        client = httpclient.AsyncHTTPClient()
+        r = await client.fetch(base + "/poll?cursor=0", raise_error=False)
+        print("nothing published:", r.code)
+
+        async def publish_later():
+            await asyncio.sleep(0.1)
+            feed.publish("book-added", title="Dune")
+
+        task = asyncio.create_task(publish_later())
+        r = await client.fetch(base + "/poll?cursor=0")
+        print("woken by publish :", r.code, r.body.decode())
+        await task
+        feed.publish("book-added", title="Emma")
+        r = await client.fetch(base + "/poll?cursor=1")
+        print("catch-up         :", r.code, json.loads(r.body)["cursor"])
+
+
+asyncio.run(demo_poll())
+----
+
+Source: https://www.tornadoweb.org/en/stable/locks.html#tornado.locks.Condition[Tornado: tornado.locks.Condition]
+
+Output:
+
+[source,text]
+----
+nothing published: 204
+woken by publish : 200 {"events": [{"id": 1, "type": "book-added", "data": {"title": "Dune"}}], "cursor": 1}
+catch-up         : 200 2
+----
+
+The browser side is a loop around `fetch` that sends the last cursor it received, treats 204 as "ask again at once",
+and backs off after network errors. A few long-polling pitfalls:
+
+* Keep the server timeout below every idle timeout in the path (browser, load balancer, reverse proxy), or clients see
+  spurious 502 or 504 responses.
+* A waiter whose client has disconnected stays suspended until its timeout, because Tornado does not cancel your
+  handler. A short timeout bounds the waste; the disconnect section below shows how to react earlier.
+* State such as `Feed` lives in one process. With several Tornado processes (or hosts) behind a load balancer a
+  publish in one process is invisible to waiters in another; publish through a shared broker (Redis pub/sub, a message
+  queue) and have each process feed its local `Condition` from it.
+* Do not wait on a `Condition` while holding a database transaction or any other scarce resource: a waiting request
+  costs almost nothing, but the resource it pins does.
+* Use a bounded event log (a ring buffer or a database table with a retention period), not an ever-growing list, and
+  answer "cursor too old" with a full refresh.
+
+== Server-Sent Events
+
+Server-Sent Events (SSE) are a standard (WHATWG HTML, `EventSource`) for a one-way stream of text events over a normal
+HTTP response. The browser reconnects by itself after failures, waits `retry` milliseconds first, and tells the server
+where it left off with the `Last-Event-ID` request header. That makes SSE the lowest-effort way to push new books to a
+page.
+
+The wire format is plain text, UTF-8, with a blank line ending each event:
+
+[source,text]
+----
+retry: 2000
+
+id: 3
+event: book-added
+data: {"title": "Emma"}
+
+: keep-alive
+
+----
+
+[cols="1,3"]
+|===
+|Field |Meaning
+
+|`data:`
+|The payload. Several `data:` lines are joined with newlines by the browser, so a payload must not contain a raw
+newline in one line; serialising to single-line JSON avoids the problem.
+
+|`event:`
+|Event name; `EventSource` dispatches it to `+addEventListener("book-added", ...)+`. Without it the event is a
+`message`.
+
+|`id:`
+|Sets the last-event id. After a reconnect the browser sends it back as `Last-Event-ID`.
+
+|`retry:`
+|Reconnection delay in milliseconds.
+
+|Lines starting with `:`
+|Comments, ignored by the browser. Used as keep-alives.
+|===
+
+A Tornado SSE handler is a streamed response with three extra rules: the right headers
+(`Content-Type: text/event-stream`, `Cache-Control: no-cache`; `X-Accel-Buffering: no` asks nginx not to buffer),
+replay of missed events from `Last-Event-ID`, and periodic keep-alive comments so that idle connections are not
+closed by proxies and dead peers are noticed when a write fails. The handler below subscribes _before_ replaying, so an
+event published during the replay cannot be lost, and skips queued events that the replay already sent. Each client
+gets its own `asyncio.Queue`, which is also how the handler is woken when the connection closes:
+
+[source,python]
+----
+class SseHandler(web.RequestHandler):
+    KEEPALIVE = 0.3              # seconds for the demo; 15 to 30 in production
+
+    def initialize(self):
+        self.queue = asyncio.Queue()
+
+    @staticmethod
+    def frame(event):
+        return f"id: {event['id']}\nevent: {event['type']}\ndata: {json.dumps(event['data'])}\n\n"
+
+    async def get(self):
+        self.set_header("Content-Type", "text/event-stream")
+        self.set_header("Cache-Control", "no-cache")
+        self.set_header("X-Accel-Buffering", "no")
+        feed.subscribers.add(self.queue)             # subscribe first, then replay
+        try:
+            last_sent = int(self.request.headers.get("Last-Event-ID") or 0)
+            self.write("retry: 2000\n\n")
+            for event in feed.since(last_sent):
+                self.write(self.frame(event))
+                last_sent = event["id"]
+            await self.flush()
+            while True:
+                try:
+                    event = await asyncio.wait_for(self.queue.get(), self.KEEPALIVE)
+                except asyncio.TimeoutError:
+                    self.write(": keep-alive\n\n")
+                else:
+                    if event is None:                # sentinel from on_connection_close
+                        return
+                    if event["id"] <= last_sent:     # already delivered by the replay
+                        continue
+                    self.write(self.frame(event))
+                    last_sent = event["id"]
+                await self.flush()
+        except iostream.StreamClosedError:
+            return                                   # a write failed: the client is gone
+        finally:
+            feed.subscribers.discard(self.queue)
+
+    def on_connection_close(self):
+        self.queue.put_nowait(None)                  # wake the loop so that it can exit
+
+
+async def read_sse(port, last_id=None, want=2):
+    """A tiny raw-socket SSE client: returns the status line and the first `want` chunks."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    extra = f"Last-Event-ID: {last_id}\r\n" if last_id else ""
+    writer.write(f"GET /events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n{extra}\r\n".encode())
+    head = await reader.readuntil(b"\r\n\r\n")
+    chunks = []
+    while len(chunks) < want:
+        size = int(await reader.readline(), 16)            # chunked transfer encoding framing
+        chunks.append((await reader.readexactly(size + 2))[:-2].decode())
+    writer.close()                                          # abrupt client disconnect
+    return head.decode().splitlines()[0], chunks
+
+
+async def demo_sse():
+    app = web.Application([(r"/events", SseHandler)])
+    async with serve(app) as (_, port):
+        status, chunks = await read_sse(port, want=2)
+        print(status)
+        print(repr(chunks[0]))
+        print("subscribers after disconnect:", end=" ")
+        await asyncio.sleep(0.2)
+        print(len(feed.subscribers))
+        status, chunks = await read_sse(port, last_id=1, want=1)
+        print("resumed after id 1 ->", repr(chunks[0]))
+        task = asyncio.create_task(read_sse(port, want=3))
+        await asyncio.sleep(0.1)
+        feed.publish("book-removed", id=1)
+        print("live event ->", repr((await task)[1][1]))
+
+
+asyncio.run(demo_sse())
+----
+
+Source: https://www.tornadoweb.org/en/stable/web.html#tornado.web.RequestHandler.flush[Tornado: RequestHandler.flush] and https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG HTML: Server-sent events]
+
+Output:
+
+[source,text]
+----
+HTTP/1.1 200 OK
+'retry: 2000\n\nid: 1\nevent: book-added\ndata: {"title": "Dune"}\n\nid: 2\nevent: book-added\ndata: {"title": "Emma"}\n\n'
+subscribers after disconnect: 0
+resumed after id 1 -> 'retry: 2000\n\nid: 2\nevent: book-added\ndata: {"title": "Emma"}\n\n'
+live event -> 'id: 3\nevent: book-removed\ndata: {"id": 1}\n\n'
+----
+
+The first chunk holds the `retry` line and the replay; the counter shows that the handler cleaned up after the abrupt
+disconnect. In the browser the matching client is only a few lines:
+
+[source,javascript]
+----
+const source = new EventSource("/events", { withCredentials: true });
+source.addEventListener("book-added", (e) => addRow(JSON.parse(e.data)));
+source.onerror = () => console.log("connection lost, the browser will retry");
+----
+
+Source: https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG HTML: Server-sent events]
+
+SSE-specific points:
+
+* **Authentication.** `EventSource` cannot set an `Authorization` header, so use the session cookie (signed cookies
+  work; `withCredentials: true` for cross-origin) or a short-lived, single-use ticket in the query string obtained from
+  an authenticated endpoint. Never put a long-lived token in the URL, because URLs end up in logs. Check the user in
+  `prepare`, before the first flush, so that failures return a real 401 or 403.
+* **Cross-origin.** A cross-origin `EventSource` needs CORS headers on the response (see xref:web/cors.adoc[CORS]);
+  Tornado adds none by itself.
+* **Connection limits.** Over HTTP/1.1 browsers allow about six connections per host, shared by all tabs. Many tabs
+  with an SSE stream each exhaust them; terminate HTTP/2 at the proxy (Tornado itself speaks HTTP/1.1) or share the
+  stream between tabs.
+* **Replay window.** `Last-Event-ID` only works if the server can replay: keep a bounded log and decide what to do
+  when the id is older than the log.
+* **Per-client queues need bounds.** An unbounded `asyncio.Queue` for a client that reads slowly eats memory;
+  create it with `maxsize` and drop or disconnect the client on `QueueFull`.
+* **Text only.** SSE carries UTF-8 text; binary payloads need Base64 or a WebSocket.
+* **Consuming SSE from Python.** `AsyncHTTPClient` with `streaming_callback` consumes a stream such as the one an
+  upstream LLM API produces; split the incoming bytes on blank lines yourself.
+
+== Client Disconnects
+
+A client can vanish at any time (tab closed, phone out of coverage), and a long-lived handler that does not notice
+leaks memory, queue entries and downstream work. Tornado offers two signals:
+
+* **`RequestHandler.on_connection_close()`** is called when the client closes the connection while the handler is
+  still running asynchronously. It is _not_ called after a normal finish (use `on_finish` for per-request cleanup).
+  It runs in a plain callback, so it must not block or `await`; use it to flip a flag or wake the handler, as
+  `SseHandler` does. A proxy may hold the connection to Tornado open after the browser disconnected, so the call may
+  come late or not at all.
+* **`StreamClosedError` from `flush()`.** A write to a closed connection raises `tornado.iostream.StreamClosedError`
+  from the `await self.flush()`. That is why SSE keep-alives matter: an idle stream that never writes would not notice
+  a dead peer until the proxy gives up.
+
+Tornado does **not** cancel the handler coroutine when the client leaves: it keeps running until it returns or hits
+one of the two signals. Treat cleanup as three rules: unregister in a `finally`, wake waiters from
+`on_connection_close`, and give every wait a timeout. In streaming-upload handlers `on_connection_close` also makes
+the pending `post` call be skipped, so release temporary files there.
+
+== Behind a Reverse Proxy
+
+Streaming works only if every hop streams. Checklist for nginx or a similar proxy in front of Tornado:
+
+* Disable response buffering for streaming locations (`proxy_buffering off`), or send `X-Accel-Buffering: no` from the
+  handler as above.
+* Raise the read timeout above your keep-alive interval (`proxy_read_timeout`), and keep keep-alives well below it.
+* Use HTTP/1.1 to the upstream with `Connection` cleared, so keep-alive and chunked encoding work.
+* For uploads, check the proxy's own body limit (`client_max_body_size` in nginx) and whether it buffers request
+  bodies to disk before forwarding; a proxy that buffers the whole upload defeats `+stream_request_body's+` early
+  rejection.
+* Load balancers often have a hard idle timeout (commonly 60 seconds): keep-alives and the long-poll timeout must be
+  shorter.
+* Restarts: a deploy closes every open stream. `EventSource` clients reconnect on their own; long pollers will see an
+  error and must retry, so make both idempotent with cursors and ids.
+
+== Testing Streaming Handlers
+
+`AsyncHTTPTestCase` runs a real server on a loopback port and `self.http_client.fetch` accepts `streaming_callback`, so
+streamed bodies can be asserted chunk by chunk. Keep long-lived endpoints testable by making their timeouts
+attributes (as `POLL_TIMEOUT` above), and write tests so that they finish: either a finite stream or a client that
+closes the connection after reading what it needs, as `read_sse` does.
+
+[source,python]
+----
+import unittest
+
+from tornado.testing import AsyncHTTPTestCase, gen_test
+
+
+class StreamingTests(AsyncHTTPTestCase):
+    def get_app(self):
+        return web.Application([(r"/export", ExportHandler), (r"/poll", PollHandler), (r"/imports/books", CsvImportHandler)])
+
+    @gen_test
+    async def test_export_is_streamed(self):
+        chunks = []
+        await self.http_client.fetch(self.get_url("/export"), streaming_callback=chunks.append)
+        self.assertEqual(len(chunks), 5)
+        self.assertEqual(json.loads(chunks[0])["id"], 1)
+
+    @gen_test
+    async def test_poll_times_out_with_204(self):
+        response = await self.http_client.fetch(self.get_url("/poll?cursor=999"), raise_error=False)
+        self.assertEqual(response.code, 204)
+
+    @gen_test
+    async def test_import_counts_lines(self):
+        body = b"title,author\nDune,Frank Herbert\n"
+        response = await self.http_client.fetch(self.get_url("/imports/books"), method="POST", body=body)
+        self.assertEqual(json.loads(response.body)["lines"], 2)
+
+
+result = unittest.TextTestRunner(verbosity=0).run(unittest.defaultTestLoader.loadTestsFromTestCase(StreamingTests))
+print("tests run:", result.testsRun, "failures:", len(result.failures) + len(result.errors))
+----
+
+Source: https://www.tornadoweb.org/en/stable/testing.html#tornado.testing.AsyncHTTPTestCase[Tornado: tornado.testing.AsyncHTTPTestCase]
+
+Output:
+
+[source,text]
+----
+tests run: 3 failures: 0
+----
+
+== Pitfalls and Recent Changes
+
+* A blocking call inside a streaming or long-poll handler stalls every other connection; wrap blocking drivers in
+  `run_in_executor`.
+* The decorator `@tornado.web.asynchronous` and callback-style `+flush(callback=...)+` were removed in Tornado 6.0;
+  `flush()` returns a future and handlers are plain coroutines.
+* In 6.5 `HTTPError.log_message` and `args` became deprecated in favour of `get_message()`, which matters for custom
+  `log_exception` implementations used with these handlers (see xref:backend/tornado/error-handling.adoc[Error Handling]).
+* Tornado 6.6 is still an alpha; its notable security-related change for this page is the `cross_origin_protection`
+  setting (see xref:backend/tornado/xsrf-and-cross-origin-protection.adoc[XSRF & Cross-Origin Protection]), which is meant to reject cross-site unsafe browser requests and so may also affect browser-driven streaming uploads
+  once it is released; check the release notes of 6.6 before upgrading.
+* Compared with other frameworks: Flask on a WSGI worker ties up a thread per stream (Flask's streaming page shows the
+  generator approach and its limits), FastAPI offers `StreamingResponse` and SSE helpers in an ASGI event loop; Tornado
+  has the same event-loop model as FastAPI but with explicit `flush()` and no response object.
+
+== References
+
+* https://www.tornadoweb.org/en/stable/web.html[Tornado: tornado.web, RequestHandler and Application]
+* https://www.tornadoweb.org/en/stable/httpserver.html[Tornado: tornado.httpserver]
+* https://www.tornadoweb.org/en/stable/locks.html[Tornado: tornado.locks]
+* https://www.tornadoweb.org/en/stable/iostream.html[Tornado: tornado.iostream]
+* https://www.tornadoweb.org/en/stable/httpclient.html[Tornado: tornado.httpclient]
+* https://www.tornadoweb.org/en/stable/testing.html[Tornado: tornado.testing]
+* https://www.tornadoweb.org/en/latest/[Tornado: development documentation (6.6)]
+* https://github.com/tornadoweb/tornado/tree/stable/demos/chat[Tornado demos: chat (long polling)]
+* https://github.com/tornadoweb/tornado/tree/stable/demos/file_upload[Tornado demos: file_upload (stream_request_body)]
+* https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG HTML: Server-sent events]
+* https://nginx.org/en/docs/http/ngx_http_proxy_module.html[nginx: ngx_http_proxy_module]
