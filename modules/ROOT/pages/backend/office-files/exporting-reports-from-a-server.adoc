@@ -1,0 +1,1783 @@
+= Exporting Reports from a Server
+:description: How to turn a database query into an Excel or Word download on a Java server with Apache POI: the report pipeline (query, mapping, workbook or document, stream), Spring MVC ResponseEntity<Resource> versus StreamingResponseBody, Content-Disposition with non-ASCII file names (RFC 6266), MIME types, Content-Length versus chunked transfer, Jakarta REST StreamingOutput and Quarkus REST, what happens when an export fails after the first byte, long-running exports as asynchronous jobs with a download link, a Word report endpoint, and paging large queries (JDBC fetch size, Spring Data streams) into SXSSF.
+:keywords: Apache POI, export, report, download, Spring MVC, ResponseEntity, Resource, StreamingResponseBody, spring.mvc.async.request-timeout, ContentDisposition, Content-Disposition, RFC 6266, RFC 8187, MIME type, Content-Length, chunked, Jakarta REST, JAX-RS, StreamingOutput, Quarkus REST, SXSSF, XSSF, XWPF, docx, xlsx, async job, 202 Accepted, Location, object storage, presigned URL, fetch size, Spring Data stream, JdbcTemplate, ProblemDetail, Bookshelf, Java
+
+include::partial$office-files-disclaimer.adoc[]
+
+Baseline date: 2026-10-09. This page was written against Apache POI 5.5.1 (the latest release on that date; 6.0 is
+announced but has not been released), Java 21 and later, Spring Boot 4.1.1 on Spring Framework 7 (Tomcat 11),
+Jakarta EE 11 (Jakarta REST 4.0) and Quarkus 3.40. Every class on this page was compiled against those versions in a
+throwaway project, and the application was started and called with `curl`; the outputs marked as observed come from those
+runs, on an in-memory H2 database with generated Bookshelf loans.
+
+Generating a workbook is the easy half of an export. The hard half is what surrounds it: a query that must not load a
+million rows into the heap, a response whose headers are fixed before the file is finished, a browser that must save
+`Informe de préstamos.xlsx` under that name, a proxy that cuts connections that stay silent for a minute, and an export
+that takes longer than any HTTP request should. This page is the server-side half of the Bookshelf export story. The
+earlier pages of the section build the files:
+xref:backend/office-files/spreadsheet-usermodel-basics.adoc[Spreadsheet Usermodel Basics] for the cells,
+xref:backend/office-files/streaming-writes-with-sxssf.adoc[Streaming Writes with SXSSF] for `loans-report.xlsx` and its
+sliding window, and xref:backend/office-files/word-xwpf-basics.adoc[Word (XWPF) Basics] for `monthly-report.docx`. This
+page puts them behind HTTP endpoints. The generic REST material (controllers, validation, `@ControllerAdvice`) is in
+xref:backend/springboot/rest-apis.adoc[REST APIs with Spring Boot] and xref:backend/quarkus/rest-services.adoc[Quarkus REST
+Services]; only the parts specific to file downloads are repeated here.
+
+== The shape of a report
+
+Every export in this section is the same four steps, whatever the framework:
+
+. *Query*: ask the database for the rows, in an order, as a stream and not as a list.
+. *Map*: turn each row into a small value object (`LoanRow`) so that the POI code knows nothing about SQL.
+. *Build*: put the values into a workbook or a document (`SXSSFWorkbook`, `XSSFWorkbook`, `XWPFDocument`).
+. *Stream*: write the finished file to an `OutputStream`, which is a response, a file or a byte array.
+
+The only thing that changes between a download, an e-mail attachment and a background job is the last step. So the
+examples keep the build step behind a one-method interface that takes the stream as an argument. `StreamingResponseBody`
+(Spring), `StreamingOutput` (Jakarta REST) and a plain file `OutputStream` all fit it:
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.io.OutputStream;
+
+/** A report that knows how to write itself to any stream: a response, a temp file or a byte array. */
+@FunctionalInterface
+public interface ReportWriter {
+    void writeTo(OutputStream out) throws IOException;
+}
+----
+
+Source: https://poi.apache.org/apidocs/dev/org/apache/poi/ss/usermodel/Workbook.html#write(java.io.OutputStream)[Workbook.write(OutputStream), POI Javadoc]
+
+Three questions decide how the rest of the pipeline is wired, and they are asked in this order:
+
+[cols="2,3,3",options="header"]
+|===
+|Question
+|If the answer is "small"
+|If the answer is "large"
+
+|How many rows or pages?
+|Build in memory with `XSSFWorkbook` or `XWPFDocument`, then send a byte array with a known length.
+|Use `SXSSFWorkbook` for Excel. XWPF has no streaming mode: cap the row count or choose another format.
+
+|How long does it take?
+|A few seconds: answer in the same request.
+|Longer than the shortest timeout between the user and the server (proxy, load balancer, async request timeout): run it as a job and hand out a link.
+
+|Who must wait?
+|The user, who clicks and expects the file.
+|Nobody: a job, a schedule or a queue produces the file and the user comes back for it.
+|===
+
+The sections below follow that table: first the synchronous endpoints, then what can go wrong in them, then the job.
+
+== The report pieces
+
+The data query is where memory is won or lost. `LoanSource` pushes rows to a callback one at a time and never builds a
+`List`; the fetch size is the number of rows the driver brings per round trip. `@Transactional(readOnly = true)` keeps one
+connection open for the whole export (the reason is in the section on paging).
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.time.LocalDate;
+
+/** One line of loans-report.xlsx: the mapping step between the data query and the workbook. */
+public record LoanRow(long id, String bookTitle, String borrower, LocalDate loanedOn, LocalDate dueOn,
+                      boolean returned) {
+}
+----
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.sql.Date;
+import java.time.LocalDate;
+import java.util.function.Consumer;
+import javax.sql.DataSource;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.core.RowCallbackHandler;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+/** The data query of the report: rows are pushed to the caller one by one and never collected into a list. */
+@Component
+public class LoanSource {
+
+    private final JdbcTemplate jdbc;
+
+    public LoanSource(DataSource dataSource) {
+        this.jdbc = new JdbcTemplate(dataSource);
+        this.jdbc.setFetchSize(1_000);   // rows per round trip; the driver decides whether it honours it
+    }
+
+    /** The transaction keeps one connection (and, on PostgreSQL, one server-side cursor) open for the whole export. */
+    @Transactional(readOnly = true)
+    public void forEachBetween(LocalDate from, LocalDate to, Consumer<LoanRow> consumer) {
+        jdbc.query("""
+                select id, book_title, borrower, loaned_on, due_on, returned
+                from loan_entity where loaned_on between ? and ? order by id""",
+                ps -> {
+                    ps.setDate(1, Date.valueOf(from));
+                    ps.setDate(2, Date.valueOf(to));
+                },
+                (RowCallbackHandler) rs -> consumer.accept(new LoanRow(
+                        rs.getLong("id"),
+                        rs.getString("book_title"),
+                        rs.getString("borrower"),
+                        rs.getDate("loaned_on").toLocalDate(),
+                        rs.getDate("due_on").toLocalDate(),
+                        rs.getBoolean("returned"))));
+    }
+
+    @Transactional(readOnly = true)
+    public long countSince(LocalDate from) {
+        Long count = jdbc.queryForObject("select count(*) from loan_entity where loaned_on >= ?", Long.class,
+                Date.valueOf(from));
+        return count == null ? 0 : count;
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/jdbc/core/JdbcTemplate.html[JdbcTemplate, Spring Framework Javadoc]
+
+`LoansWorkbookWriter` is the SXSSF code of the earlier page, with the query plugged in: the rows flow from the callback
+into a 200-row window, old rows are flushed to a compressed temporary file, and `write` assembles the .xlsx.
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.time.LocalDate;
+import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.CreationHelper;
+import org.apache.poi.ss.usermodel.Font;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.xssf.streaming.SXSSFSheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
+
+/** Writes loans-report.xlsx: query rows go through a 200-row SXSSF window into the output stream. */
+public class LoansWorkbookWriter implements ReportWriter {
+
+    private static final String[] HEADERS = {"Id", "Book", "Borrower", "Loaned on", "Due on", "Returned"};
+
+    private final LoanSource source;
+    private final LocalDate from;
+    private final LocalDate to;
+
+    public LoansWorkbookWriter(LoanSource source, LocalDate from, LocalDate to) {
+        this.source = source;
+        this.from = from;
+        this.to = to;
+    }
+
+    @Override
+    public void writeTo(OutputStream out) throws IOException {
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(200)) {
+            workbook.setCompressTempFiles(true);
+            CreationHelper helper = workbook.getCreationHelper();
+
+            Font bold = workbook.createFont();
+            bold.setBold(true);
+            CellStyle headerStyle = workbook.createCellStyle();
+            headerStyle.setFont(bold);
+            CellStyle dateStyle = workbook.createCellStyle();
+            dateStyle.setDataFormat(helper.createDataFormat().getFormat("yyyy-mm-dd"));
+
+            SXSSFSheet sheet = workbook.createSheet("Loans");
+            Row header = sheet.createRow(0);
+            for (int c = 0; c < HEADERS.length; c++) {
+                header.createCell(c).setCellValue(HEADERS[c]);
+                header.getCell(c).setCellStyle(headerStyle);
+            }
+            sheet.createFreezePane(0, 1);
+            sheet.setColumnWidth(1, 40 * 256);
+            sheet.setColumnWidth(2, 24 * 256);
+
+            int[] next = {1};
+            source.forEachBetween(from, to, loan -> {
+                Row row = sheet.createRow(next[0]++);
+                row.createCell(0).setCellValue(loan.id());
+                row.createCell(1).setCellValue(loan.bookTitle());
+                row.createCell(2).setCellValue(loan.borrower());
+                row.createCell(3).setCellValue(loan.loanedOn());
+                row.getCell(3).setCellStyle(dateStyle);
+                row.createCell(4).setCellValue(loan.dueOn());
+                row.getCell(4).setCellStyle(dateStyle);
+                row.createCell(5).setCellValue(loan.returned());
+            });
+
+            workbook.write(out);   // flushes the rest of the window and finishes the zip; does not close out
+        }
+    }
+}
+----
+
+Source: https://poi.apache.org/components/spreadsheet/how-to.html#sxssf[SXSSF (Streaming Usermodel API), POI Spreadsheet How-To]
+
+Two properties of this writer matter for everything that follows. First, `SXSSFWorkbook.write` copies the temporary row
+files into the zip only when it is called, so *nothing reaches the output stream until the query has finished*. SXSSF
+makes the memory of the export constant; it does not make the download progressive. Second, none of `XSSFWorkbook.write`,
+`SXSSFWorkbook.write` and `XWPFDocument.write` closes the stream it is given (checked with a stream that records
+`close()` in POI 5.5.1), so the code that owns the stream, the container or a try-with-resources, closes it.
+
+An .xlsx sheet holds at most 1,048,576 rows. A table that can exceed that needs a rule decided in advance (a second
+sheet, a narrower date range or a refusal with a clear message) because POI will not decide for you; the limits are
+listed in https://support.microsoft.com/en-us/office/excel-specifications-and-limits-1672b34d-7043-467e-8e27-269d656771c3[Excel specifications and limits].
+Any text that comes from users and goes into a cell (a borrower name, a book title) also needs the treatment described in
+xref:backend/office-files/security-and-untrusted-files.adoc#_formula_injection_in_exported_files[the formula injection section of the security page].
+
+== Spring MVC: ResponseEntity<Resource>
+
+The dependencies are the web starter (renamed `spring-boot-starter-webmvc` in Spring Boot 4), JDBC for the query and POI:
+
+[source,xml]
+----
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-webmvc</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-jdbc</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.apache.poi</groupId>
+    <artifactId>poi-ooxml</artifactId>
+    <version>5.5.1</version>
+  </dependency>
+</dependencies>
+----
+
+[source,kotlin]
+----
+dependencies {
+    implementation(platform("org.springframework.boot:spring-boot-dependencies:4.1.1"))
+    implementation("org.springframework.boot:spring-boot-starter-webmvc")
+    implementation("org.springframework.boot:spring-boot-starter-jdbc")
+    implementation("org.apache.poi:poi-ooxml:5.5.1")
+}
+----
+
+Source: https://docs.spring.io/spring-boot/reference/web/servlet.html[Servlet Web Applications, Spring Boot reference]
+
+The simplest download builds the file in memory and returns it as a `Resource`. The message converter reads the length
+from the resource and sets `Content-Length`; a `ByteArrayResource` also gets range support for free. This is the right
+shape for `books-inventory.xlsx`, a catalogue of a few hundred rows. The controller below contains all the Spring
+endpoints of this page (the streaming and Word ones are explained in later sections), together with the helper that
+builds the `Content-Disposition` value.
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.util.List;
+import java.util.UUID;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
+import org.springframework.http.ContentDisposition;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+
+@RestController
+public class ReportController {
+
+    private final LoanSource loans;
+    private final Path spoolDirectory;   // the reports directory, so the purge also removes a spool file never sent
+
+    public ReportController(LoanSource loans, @Value("${reports.directory}") Path spoolDirectory) {
+        this.loans = loans;
+        this.spoolDirectory = spoolDirectory;
+    }
+
+    /** Small report: build it in memory, so the length is known and the client gets Content-Length. */
+    @GetMapping("/reports/books-inventory.xlsx")
+    public ResponseEntity<Resource> booksInventory() {
+        byte[] bytes = ReportBytes.toByteArray(new BooksInventoryWriter(List.of(
+                new BooksInventoryWriter.Book("978-0-00-000001-0", "El camino", 3),
+                new BooksInventoryWriter.Book("978-0-00-000002-7", "Don Quijote", 5))));
+        return ResponseEntity.ok()
+                .contentType(ReportMediaTypes.XLSX)
+                .header(HttpHeaders.CONTENT_DISPOSITION, attachment("books-inventory.xlsx"))
+                .body(new ByteArrayResource(bytes));
+    }
+
+    /** Large report: the workbook is written straight to the response, so the length is unknown. */
+    @GetMapping("/reports/loans.xlsx")
+    public ResponseEntity<StreamingResponseBody> loansReport(
+            @RequestParam(defaultValue = "2020-01-01") LocalDate from) {
+        if (from.isAfter(LocalDate.now())) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "'from' is in the future");
+        }
+        ReportWriter writer = new LoansWorkbookWriter(loans, from, LocalDate.now());
+        StreamingResponseBody body = writer::writeTo;
+        return ResponseEntity.ok()
+                .contentType(ReportMediaTypes.XLSX)
+                .header(HttpHeaders.CONTENT_DISPOSITION, attachment("loans-report.xlsx"))
+                .body(body);
+    }
+
+    /** Same report, spooled to a file first: a failure still gives a 500, and the length is known. */
+    @GetMapping("/reports/loans-spooled.xlsx")
+    public ResponseEntity<StreamingResponseBody> loansSpooled(
+            @RequestParam(defaultValue = "2020-01-01") LocalDate from) throws IOException {
+        Path file = ReportBytes.toFile(new LoansWorkbookWriter(loans, from, LocalDate.now()),
+                spoolDirectory, "spool-" + UUID.randomUUID() + ".xlsx");
+        long length = Files.size(file);
+        StreamingResponseBody body = out -> {
+            try (InputStream in = Files.newInputStream(file)) {
+                in.transferTo(out);
+            } finally {
+                Files.deleteIfExists(file);
+            }
+        };
+        return ResponseEntity.ok()
+                .contentType(ReportMediaTypes.XLSX)
+                .contentLength(length)
+                .header(HttpHeaders.CONTENT_DISPOSITION, attachment("loans-report.xlsx"))
+                .body(body);
+    }
+
+    /** Word report: XWPF is not streaming, so build it in memory behind a row cap. */
+    @GetMapping("/reports/monthly-report.docx")
+    public ResponseEntity<Resource> monthlyReport(@RequestParam YearMonth month) {
+        List<LoanRow> rows = MonthlyReportWriter.collect(loans, month, 2_000);   // may throw before any byte is sent
+        byte[] bytes = ReportBytes.toByteArray(new MonthlyReportWriter(month, rows));
+        return ResponseEntity.ok()
+                .contentType(ReportMediaTypes.DOCX)
+                .header(HttpHeaders.CONTENT_DISPOSITION, attachment("monthly-report-" + month + ".docx"))
+                .body(new ByteArrayResource(bytes));
+    }
+
+    static String attachment(String filename) {
+        return ContentDisposition.attachment().filename(filename, StandardCharsets.UTF_8).build().toString();
+    }
+}
+----
+
+`BooksInventoryWriter` is an `XSSFWorkbook` with a header row, one row per book and an auto-filter, as built on the
+spreadsheet basics page; `ReportBytes` and `ReportMediaTypes` are the two helpers below.
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+
+/** Helpers that turn a ReportWriter into bytes or into a file, for the variants that need a length first. */
+public final class ReportBytes {
+
+    private ReportBytes() {
+    }
+
+    public static byte[] toByteArray(ReportWriter writer) {
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        try {
+            writer.writeTo(buffer);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+        return buffer.toByteArray();
+    }
+
+    /** Writes next to the final name and renames at the end, so a reader never sees a half-written file. */
+    public static Path toFile(ReportWriter writer, Path directory, String name) throws IOException {
+        Files.createDirectories(directory);
+        Path partial = Files.createTempFile(directory, name, ".part");
+        try {
+            try (var out = Files.newOutputStream(partial)) {
+                writer.writeTo(out);
+            }
+            Path target = directory.resolve(name);
+            return Files.move(partial, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } finally {
+            Files.deleteIfExists(partial);
+        }
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/core/io/ByteArrayResource.html[ByteArrayResource, Spring Framework Javadoc] and https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/nio/file/Files.html[Files.move, Java SE 21 API]
+
+[source,java]
+----
+package bookshelf.export;
+
+import org.springframework.http.MediaType;
+
+public final class ReportMediaTypes {
+
+    public static final MediaType XLSX =
+            MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    public static final MediaType DOCX =
+            MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+
+    private ReportMediaTypes() {
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-methods/responseentity.html[ResponseEntity, Spring Framework reference], https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/ResponseEntity.html[ResponseEntity Javadoc] and https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/MediaType.html[MediaType Javadoc]
+
+The observed response of `GET /reports/books-inventory.xlsx` (3,478 bytes):
+
+[source,bash]
+----
+curl -s -D - -o inventory.xlsx http://localhost:8080/reports/books-inventory.xlsx
+----
+
+----
+HTTP/1.1 200
+Content-Disposition: attachment; filename="books-inventory.xlsx"; filename*=UTF-8''books-inventory.xlsx
+Accept-Ranges: bytes
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+Content-Length: 3478
+----
+
+A request with `Range: bytes=0-99` to the same endpoint was answered with `206`, `Content-Range: bytes 0-99/3478` and
+`Content-Length: 100`, which is what download managers use to resume. The cost of this shape is the whole file in the
+heap while it is sent: a `byte[]` of the size of the file for every concurrent request. A `FileSystemResource` over a
+temporary file has the same headers without the heap cost, and is used by the spooled variant and by the job download
+below.
+
+== Spring MVC: StreamingResponseBody
+
+For a file too large to hold in memory, return a `StreamingResponseBody`. Spring starts asynchronous request handling,
+the servlet thread goes back to the pool, and the body runs on another thread with the response `OutputStream` as its
+argument. `loansReport` in the controller above is the whole endpoint: validate the parameters, build the writer, and
+return a lambda that calls `writer.writeTo(out)`. The observed response (100,000 loans, 3.4 MB):
+
+[source,bash]
+----
+curl -s -D - -o loans.xlsx 'http://localhost:8080/reports/loans.xlsx?from=2026-01-01'
+----
+
+----
+HTTP/1.1 200
+Content-Disposition: attachment; filename="loans-report.xlsx"; filename*=UTF-8''loans-report.xlsx
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+Transfer-Encoding: chunked
+----
+
+There is no `Content-Length`: the length of a zip file is unknown until it is finished, so the container sends the body
+with chunked transfer coding. With 300,000 rows the first byte arrived after 3.4 s of a 4.5 s request, the consequence of
+the SXSSF behaviour described above. Opening the downloaded files with `WorkbookFactory` showed 100,001 rows (header
+plus data) in `loans.xlsx`, as expected. The same endpoint ran with a 96 MB heap (`-Xmx96m`) over 100,000 rows without an
+`OutOfMemoryError`.
+
+The sequence of a synchronous streaming download is below. The validation step comes before the asynchronous hand-off,
+which is the only moment at which an error can still become a normal error response.
+
+[mermaid]
+....
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant C as Controller
+    participant X as Download thread
+    participant D as Database
+    U->>C: GET /reports/loans.xlsx?from=2026-01-01
+    C->>C: validate parameters and permissions
+    alt invalid request
+        C-->>U: 400 or 422 with a problem body
+    else valid request
+        C->>X: return StreamingResponseBody (async starts)
+        X->>D: open cursor, fetch size 1000
+        loop each batch of rows
+            D-->>X: rows
+            X->>X: SXSSF createRow, old rows flushed to a temp file
+        end
+        X-->>U: 200 and headers, then workbook.write(out) as chunks
+        X-->>U: last chunk, response complete
+    end
+    Note over X,U: a failure after the first chunk cuts the connection and the client keeps a truncated file
+....
+
+=== Which thread runs the body
+
+By default Spring Boot runs `StreamingResponseBody` on its `applicationTaskExecutor` (observed thread name `task-1`).
+That bean exists only while the application defines no other `Executor` bean. In the test application, adding the
+`reportExecutor` bean of the job section made the body run on `MvcAsync1`, the thread of Spring MVC's
+`SimpleAsyncTaskExecutor` fallback, which starts a new thread per request with no upper bound. The Spring Framework
+reference says that the executor used by default is not suitable for production under load. The fix is to give MVC an executor of its own,
+sized for the number of exports you accept in parallel:
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.util.concurrent.ThreadPoolExecutor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.web.servlet.config.annotation.AsyncSupportConfigurer;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
+
+@Configuration
+@EnableScheduling   // without it the @Scheduled purge of the job section never runs
+public class ReportExecutorConfig implements WebMvcConfigurer {
+
+    /** Two background exports at a time and at most twenty waiting: a burst is refused, not queued forever. */
+    @Bean
+    ThreadPoolTaskExecutor reportExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setThreadNamePrefix("report-");
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(2);
+        executor.setQueueCapacity(20);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.AbortPolicy());
+        return executor;
+    }
+
+    /** Streaming downloads run here. Without this, defining any Executor bean silently drops Boot's default. */
+    @Bean
+    ThreadPoolTaskExecutor streamingExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setThreadNamePrefix("download-");
+        executor.setCorePoolSize(8);
+        executor.setMaxPoolSize(8);
+        executor.setQueueCapacity(0);   // a ninth concurrent download is rejected; use an explicit queue to wait
+        return executor;
+    }
+
+    @Override
+    public void configureAsyncSupport(AsyncSupportConfigurer configurer) {
+        configurer.setTaskExecutor(streamingExecutor());
+    }
+}
+----
+
+With `configureAsyncSupport` in place the body ran on `download-1`.
+
+Source:
+https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/scheduling/concurrent/ThreadPoolTaskExecutor.html[ThreadPoolTaskExecutor Javadoc],
+https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html[Asynchronous Requests, Spring Framework reference],
+https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/web/servlet/config/annotation/AsyncSupportConfigurer.html[AsyncSupportConfigurer Javadoc] and
+https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html[Task Execution and Scheduling, Spring Boot reference]
+
+=== spring.mvc.async.request-timeout
+
+The asynchronous request has a timeout, set by `spring.mvc.async.request-timeout`. When the property is not set, the
+timeout of the container applies; with embedded Tomcat that was 30 seconds in the test (a 40-second slow download ended
+after 30.4 s with 31,744 bytes). When the timeout fires after the body has started, the response is already committed, so
+Spring can only log `Ignoring exception, response committed already` and the container ends the response. The
+*observed* behaviour is the dangerous one: `curl` exited with status 0 and the file was silently truncated, because the
+last chunk was written normally.
+
+[source,properties]
+----
+# a timeout longer than the slowest export you are willing to serve synchronously
+spring.mvc.async.request-timeout=5m
+----
+
+The property is a ceiling, not a fix. A timeout that cuts a healthy export produces a file that looks complete to the
+HTTP client, so choose a value comfortably above the worst measured export time, and move anything near it to a job.
+
+Source: https://docs.spring.io/spring-boot/appendix/application-properties/index.html[Common Application Properties, Spring Boot reference] and https://tomcat.apache.org/tomcat-11.0-doc/config/http.html[Tomcat HTTP connector, asyncTimeout]
+
+== Content-Length or chunked
+
+The two shapes of response differ in what the client can know and what the server can do:
+
+[cols="2,3,3",options="header"]
+|===
+|
+|Known length (`Content-Length`)
+|Unknown length (chunked, or HTTP/2 frames)
+
+|How it is produced
+|`ResponseEntity<Resource>` over a byte array or file, or an explicit `contentLength(n)`.
+|`StreamingResponseBody`, `StreamingOutput`, any body written while it is still being produced.
+
+|Progress bar in the browser
+|Yes.
+|No: the total is unknown.
+
+|Detecting a truncated file
+|The client sees fewer bytes than announced and reports an error.
+|Only an aborted connection is detected (`curl` exit 18 in the test). A clean but early end is not.
+
+|Resuming with `Range`
+|Supported by Spring for resources.
+|Not available.
+
+|Memory or disk
+|The whole file exists before the first byte: heap, or a temporary file.
+|Constant, apart from the SXSSF temporary files.
+|===
+
+A response in HTTP/1.1 either announces its length or uses chunked coding (https://www.rfc-editor.org/rfc/rfc9112[RFC 9112]);
+HTTP/2 has no chunked coding and ends a stream with a flag. The code in the controller shows a middle path,
+`loansSpooled`: write the workbook to a spool file first (still SXSSF, so the heap stays flat), then send it with the
+size known. Because the length is declared by the code and the body is a `StreamingResponseBody` that copies the file
+and deletes it afterwards, the observed headers were:
+
+----
+HTTP/1.1 200
+Content-Disposition: attachment; filename="loans-report.xlsx"; filename*=UTF-8''loans-report.xlsx
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+Content-Length: 3431428
+----
+
+The price is latency (nothing is sent until the file is complete; in the 300,000-row test the first byte arrived at 3.0 s,
+about the same as the 3.4 s of the direct stream, because SXSSF already waits for the end of the query) and temporary
+disk. The gain is that every failure while building the file still produces a normal `500` before the headers are sent,
+and the client gets a length it can check. The spool file goes into the reports directory of the job section, not into
+a fresh temporary directory, because the body that deletes it may never run: the download executor can reject it (its
+queue capacity is 0) or the asynchronous request can time out before it starts. The scheduled purge then removes the
+file with the expired reports; a failure inside `ReportBytes.toFile` leaves nothing, because it deletes its `.part` file. For files that must be complete, this or the job below is the better default.
+An .xlsx is a zip file, so response compression gains almost nothing and costs CPU.
+
+== Content-Disposition and file names
+
+`Content-Disposition: attachment` makes the browser save the file instead of showing it, and its `filename` parameter
+is the suggested name. The header is defined by https://www.rfc-editor.org/rfc/rfc6266[RFC 6266], which delegates the
+encoding of non-ASCII names to https://www.rfc-editor.org/rfc/rfc8187[RFC 8187]: a plain `+filename="..."+` is limited to
+ASCII, and `+filename*=UTF-8''...+` carries the name percent-encoded as UTF-8. Clients that understand both prefer
+`+filename*+`. In Spring, `ContentDisposition.attachment().filename(name, StandardCharsets.UTF_8)` writes both; the one-argument
+`filename(name)` writes only the raw name. All of the following are observed outputs of Spring Framework 7.0 (the first
+line of each pair uses the charset; the second is the same name without it):
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.nio.charset.StandardCharsets;
+import org.springframework.http.ContentDisposition;
+
+public class ContentDispositionDemo {
+
+    public static void main(String[] args) {
+        String[] names = {"loans-report.xlsx", "Informe de préstamos – septiembre.xlsx", "a\"b\\c;d.xlsx", "日本語.xlsx"};
+        for (String name : names) {
+            System.out.println(ContentDisposition.attachment().filename(name, StandardCharsets.UTF_8).build());
+            System.out.println(ContentDisposition.attachment().filename(name).build());
+        }
+    }
+}
+----
+Observed output:
+
+----
+attachment; filename="loans-report.xlsx"; filename*=UTF-8''loans-report.xlsx
+attachment; filename="loans-report.xlsx"
+attachment; filename="Informe de prestamos _ septiembre.xlsx"; filename*=UTF-8''Informe%20de%20pr%C3%A9stamos%20%E2%80%93%20septiembre.xlsx
+attachment; filename="Informe de préstamos – septiembre.xlsx"
+attachment; filename="a\"b\\c;d.xlsx"; filename*=UTF-8''a%22b%5Cc%3Bd.xlsx
+attachment; filename="a\"b\\c;d.xlsx"
+attachment; filename="___.xlsx"; filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.xlsx
+attachment; filename="日本語.xlsx"
+----
+
+The charset form is the one to use. Spring derives the ASCII fallback for old clients (`prestamos`, with the accented
+letter folded and the dash replaced by an underscore), escapes quotes and backslashes in the quoted form, and
+percent-encodes every other character in `+filename*+`. The one-argument form leaves the accents and the Japanese
+characters raw in the header, which each browser then interprets in its own way. The fallback of `日本語.xlsx` shows
+the limit of any fallback: three underscores.
+
+Source: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/ContentDisposition.html[ContentDisposition, Spring Framework Javadoc] and https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Disposition[Content-Disposition, MDN]
+
+Two rules for the name itself. Build it from values the server controls (`monthly-report-2026-03.docx`); a name that
+contains text typed by a user is an input like any other, so strip path separators, control characters and line breaks
+first. And keep the extension in line with the content type, because a browser that sees `.xlsx` with a different type
+may rename or refuse the file.
+
+== MIME types
+
+`Content-Type` tells the client what the bytes are, and `Content-Disposition` tells it what to do with them. The values
+for the formats of this section, registered in the https://www.iana.org/assignments/media-types/media-types.xhtml[IANA media types registry]:
+
+[cols="2,1,4",options="header"]
+|===
+|Format
+|Extension
+|Media type
+
+|Excel workbook
+|`.xlsx`
+|`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+
+|Excel workbook with macros
+|`.xlsm`
+|`application/vnd.ms-excel.sheet.macroEnabled.12`
+
+|Excel 97-2003 workbook
+|`.xls`
+|`application/vnd.ms-excel`
+
+|Word document
+|`.docx`
+|`application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+
+|Word 97-2003 document
+|`.doc`
+|`application/msword`
+
+|Comma-separated values
+|`.csv`
+|`text/csv`
+
+|Unknown or forced download
+|any
+|`application/octet-stream`
+|===
+
+Use the exact type, not `application/octet-stream`, so that the operating system picks the right application, and send
+`application/octet-stream` only when you do not know. A report with personal data should also not be cached by shared
+caches; `CacheControl.noStore()` on the `ResponseEntity` adds `Cache-Control: no-store`. Protect the endpoint like any
+other: authentication and the authorisation of the *rows* the user may see belong in the query, see
+xref:backend/springboot/spring-security.adoc[Spring Security].
+
+== Jakarta REST: StreamingOutput
+
+In Jakarta REST (formerly JAX-RS) the equivalent of `StreamingResponseBody` is `jakarta.ws.rs.core.StreamingOutput`, a
+one-method interface that receives the entity `OutputStream` when the runtime writes the response. It is part of the
+specification, so the same resource runs on Jakarta EE servers and on Quarkus. Jakarta REST has no helper for
+`Content-Disposition`, so the value is built by hand after the two RFCs; the class below was checked against the
+Spring output on the same names:
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.nio.charset.StandardCharsets;
+
+/** Builds Content-Disposition values after RFC 6266 and RFC 8187, for stacks that have no helper. */
+public final class ContentDispositions {
+
+    private static final String ATTR_CHARS = "!#$&+-.^_`|~";
+
+    private ContentDispositions() {
+    }
+
+    public static String attachment(String filename) {
+        return "attachment; filename=\"" + asciiFallback(filename) + "\"; filename*=UTF-8''" + encode(filename);
+    }
+
+    /** What an old client shows: ASCII only, no quote, no backslash, no control character. */
+    static String asciiFallback(String filename) {
+        StringBuilder sb = new StringBuilder();
+        for (char c : filename.toCharArray()) {
+            sb.append(c < 0x20 || c > 0x7e || c == '"' || c == '\\' ? '_' : c);
+        }
+        return sb.toString();
+    }
+
+    /** Percent-encodes the UTF-8 bytes of every character that is not an RFC 8187 attr-char. */
+    static String encode(String filename) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : filename.getBytes(StandardCharsets.UTF_8)) {
+            int c = b & 0xff;
+            if (Character.isLetterOrDigit(c) && c < 0x80 || ATTR_CHARS.indexOf(c) >= 0) {
+                sb.append((char) c);
+            } else {
+                sb.append('%').append(Character.toUpperCase(Character.forDigit(c >> 4, 16)))
+                        .append(Character.toUpperCase(Character.forDigit(c & 0xf, 16)));
+            }
+        }
+        return sb.toString();
+    }
+}
+----
+
+Source: https://www.rfc-editor.org/rfc/rfc8187[RFC 8187, Indicating Character Encoding and Language for HTTP Header Field Parameters] and https://www.rfc-editor.org/rfc/rfc6266[RFC 6266]
+
+Output for the same four names (the ASCII fallback turns the accented letter into an underscore, where Spring folds it
+to its base letter; the `+filename*+` values are identical):
+
+----
+attachment; filename="loans-report.xlsx"; filename*=UTF-8''loans-report.xlsx
+attachment; filename="Informe de pr_stamos _ septiembre.xlsx"; filename*=UTF-8''Informe%20de%20pr%C3%A9stamos%20%E2%80%93%20septiembre.xlsx
+attachment; filename="a_b_c;d.xlsx"; filename*=UTF-8''a%22b%5Cc%3Bd.xlsx
+attachment; filename="___.xlsx"; filename*=UTF-8''%E6%97%A5%E6%9C%AC%E8%AA%9E.xlsx
+----
+
+The resource validates before it returns, and returns the writer as a `StreamingOutput`:
+
+[source,java]
+----
+package bookshelf.export;
+
+import jakarta.inject.Inject;
+import jakarta.ws.rs.BadRequestException;
+import jakarta.ws.rs.DefaultValue;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
+import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.StreamingOutput;
+import java.time.LocalDate;
+import java.time.format.DateTimeParseException;
+
+@Path("/reports")
+public class ReportResource {
+
+    static final String XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    @Inject
+    LoanSource source;
+
+    @GET
+    @Path("/loans.xlsx")
+    @Produces(XLSX)
+    public Response loans(@QueryParam("from") @DefaultValue("2020-01-01") String from) {
+        LocalDate start;
+        try {
+            start = LocalDate.parse(from);               // validate before the first byte is written
+        } catch (DateTimeParseException e) {
+            throw new BadRequestException("'from' must be an ISO date such as 2026-01-31");
+        }
+        LocalDate end = LocalDate.now();
+        StreamingOutput body = out -> new LoansWorkbookWriter(source).writeTo(start, end, out);
+        return Response.ok(body, XLSX)
+                .header(HttpHeaders.CONTENT_DISPOSITION, ContentDispositions.attachment("loans-report.xlsx"))
+                .build();
+    }
+}
+----
+
+Source: https://jakarta.ee/specifications/restful-ws/4.0/apidocs/jakarta.ws.rs/jakarta/ws/rs/core/StreamingOutput.html[StreamingOutput, Jakarta RESTful Web Services 4.0 API] and https://jakarta.ee/specifications/restful-ws/4.0/[Jakarta RESTful Web Services 4.0]
+
+Notes on the resource:
+
+* `StreamingOutput.write` may throw `IOException` and `WebApplicationException`, which is why the SQL exception of the
+  loader is wrapped in an `IOException` by the writer. Once the first bytes are written, throwing a
+  `WebApplicationException` can no longer change the status.
+* The parameter is a `String` parsed by hand because Jakarta REST only converts types with a `String` constructor,
+  `valueOf` or `fromString`, and `LocalDate` has none of them. Throwing `BadRequestException` before the `Response` is
+  built gives a `400`.
+* In a Jakarta EE application server the datasource is injected with `@Resource` or CDI; the JDBC loop is the same.
+* The `Response` is built from the entity and the media type (`Response.ok(body, XLSX)`), and not with
+  `@Produces` alone; see the next section for why.
+
+The dependency, for a plain Jakarta EE server (the API is provided by the server):
+
+[source,xml]
+----
+<dependency>
+  <groupId>jakarta.platform</groupId>
+  <artifactId>jakarta.jakartaee-api</artifactId>
+  <version>11.0.0</version>
+  <scope>provided</scope>
+</dependency>
+----
+
+== Quarkus REST
+
+Quarkus REST (the `quarkus-rest` extension, formerly RESTEasy Reactive) implements the same resource model, so the
+resource above runs unchanged. The project of this page used `quarkus-rest`, `quarkus-agroal` with `quarkus-jdbc-h2`
+and POI. The query is the same loop in plain JDBC through the injected `AgroalDataSource`:
+
+[source,xml]
+----
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>io.quarkus.platform</groupId>
+      <artifactId>quarkus-bom</artifactId>
+      <version>3.40.1</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+<dependencies>
+  <dependency>
+    <groupId>io.quarkus</groupId>
+    <artifactId>quarkus-rest</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>io.quarkus</groupId>
+    <artifactId>quarkus-agroal</artifactId>
+  </dependency>
+  <dependency>
+    <groupId>org.apache.poi</groupId>
+    <artifactId>poi-ooxml</artifactId>
+    <version>5.5.1</version>
+  </dependency>
+</dependencies>
+----
+
+[source,java]
+----
+package bookshelf.export;
+
+import io.agroal.api.AgroalDataSource;
+import jakarta.enterprise.context.ApplicationScoped;
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.LocalDate;
+import java.util.function.Consumer;
+
+/** The data query: plain JDBC, one connection, a fetch size, and no list of rows. */
+@ApplicationScoped
+public class LoanSource {
+
+    private final AgroalDataSource dataSource;
+
+    public LoanSource(AgroalDataSource dataSource) {
+        this.dataSource = dataSource;
+    }
+
+    public void forEachBetween(LocalDate from, LocalDate to, Consumer<LoanRow> consumer) throws SQLException {
+        try (Connection connection = dataSource.getConnection()) {
+            connection.setAutoCommit(false);           // PostgreSQL only uses a cursor when autocommit is off
+            connection.setReadOnly(true);
+            try (PreparedStatement statement = connection.prepareStatement("""
+                    select id, book_title, borrower, loaned_on, due_on, returned
+                    from loan where loaned_on between ? and ? order by id""")) {
+                statement.setFetchSize(1_000);
+                statement.setDate(1, Date.valueOf(from));
+                statement.setDate(2, Date.valueOf(to));
+                try (ResultSet rs = statement.executeQuery()) {
+                    while (rs.next()) {
+                        consumer.accept(new LoanRow(rs.getLong("id"), rs.getString("book_title"),
+                                rs.getString("borrower"), rs.getDate("loaned_on").toLocalDate(),
+                                rs.getDate("due_on").toLocalDate(), rs.getBoolean("returned")));
+                    }
+                }
+            } finally {
+                connection.rollback();                 // read-only: nothing to commit, and the cursor is released
+            }
+        }
+    }
+}
+----
+
+Source: https://quarkus.io/guides/rest[Writing REST services with Quarkus REST] and https://quarkus.io/guides/rest#rest-streaming[Streaming, Quarkus REST guide]
+
+`LoansWorkbookWriter` in this project is the writer of the Spring section with the stream passed to `writeTo(from, to,
+out)` and a `SQLException` wrapped in an `IOException`. Observed in Quarkus 3.40.1:
+
+* A resource method that returns a `Response` or a `StreamingOutput` runs on a *worker thread*
+  (`executor-thread-1`), and so did the write of the stream. Blocking JDBC and POI calls are therefore safe without
+  annotations. A method declared `@NonBlocking`, or one that returns a `Uni` or `Multi`, would run on the event loop and
+  must not do this work; see xref:backend/quarkus/rest-services.adoc[Quarkus REST Services] for the dispatch rules and
+  xref:backend/quarkus/virtual-threads.adoc[Virtual Threads] for the alternative.
+* With only `@Produces(XLSX)` and `Response.ok(body)`, the response carried `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;charset=UTF-8`.
+  A charset on a binary type is wrong, though harmless in practice. Passing the media type to `Response.ok(body, XLSX)`
+  removed it.
+* The response was chunked (`transfer-encoding: chunked`) with `Content-Disposition` as written, and
+  `/reports/loans.xlsx?from=yesterday` returned `400` with an empty body. 100,000 loans were exported in a 96 MB heap.
+* The Quarkus HTTP layer has its own limits and timeouts (idle timeout, body size for uploads); they are in the
+  https://quarkus.io/guides/http-reference[HTTP reference]. Check them for the longest export you serve synchronously.
+
+== When it fails after the first byte
+
+An HTTP response has a status line and headers, then a body. Once the first bytes of the body have gone to the client the
+status can no longer change. Everything that can go wrong falls on one side of that line, and the design goal is to move
+as many failures as possible to the safe side.
+
+[cols="3,3,3",options="header"]
+|===
+|Failure
+|What the client sees (observed)
+|What to do
+
+|Bad parameter, no permission, unknown month
+|`400`, `403` or `404` with a problem body: `GET /reports/loans.xlsx?from=2030-01-01` returned `400`.
+|Validate everything that does not need the data before returning the body.
+
+|Report too large for the format
+|`422` with `pass:c[application/problem+json]`: `More than 2000 loans in 2026-06; use the Excel export instead`.
+|Count or cap first, and answer with a `ProblemDetail`.
+
+|Query or POI fails while building (before the first byte)
+|A normal `500` error response, because nothing was committed: a query that threw after 5,000 rows gave `500` with a JSON error body. With SXSSF this covers the whole query, since `write` runs last.
+|Log with a report id; return `500`.
+
+|Exception thrown after bytes were flushed
+|`200` with headers, then `curl: (18) transfer closed with outstanding read data remaining` after 65,536 bytes.
+|Log with a report id. The client can detect it; make the client check.
+
+|`spring.mvc.async.request-timeout` fires
+|`200`, a clean end of the chunked body, `curl` exit status 0, 4,096 of 10,240 bytes.
+|Raise the timeout above the worst export, or use a job. Undetectable on the client.
+
+|Client closes the connection
+|Nothing: the server gets an `IOException` (a "broken pipe") on the next write.
+|Let it propagate; stop the query and delete temporary files in `finally`.
+
+|Proxy closes an idle connection
+|A truncated file, or `502` / `504` from the proxy.
+|Nothing is sent while SXSSF reads the query, so a proxy with a 60 s read timeout cuts a slow export. Use a job.
+|===
+
+The `ProblemDetail` that produced the `422` is the standard Spring way of turning an exception into a response; it is
+valid only before the response is committed:
+
+[source,java]
+----
+package bookshelf.export;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+/** Turns failures that happen before the first byte into a normal error response. */
+@RestControllerAdvice
+public class ReportProblemAdvice {
+
+    @ExceptionHandler(ReportTooLargeException.class)
+    public ProblemDetail tooLarge(ReportTooLargeException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, e.getMessage());
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html[Asynchronous Requests, Spring Framework reference], https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/ProblemDetail.html[ProblemDetail Javadoc] and https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_read_timeout[proxy_read_timeout, nginx documentation]
+
+One more observation about how late "late" is. A streaming body that wrote 1 KiB, flushed and then threw still ended in a
+normal `500` error response in the test, because the servlet container had not committed the response yet (its buffer
+is larger than that). With 64 KiB the connection was cut instead. So the border between the two behaviours is the
+container's response buffer, not the first `write`, and a test with a tiny file proves nothing about it.
+
+Practical consequences:
+
+* Make the file verifiable: the spooled variant gives `Content-Length`, a job gives a stored file with a size and a
+  checksum you can show next to the link, and an upstream consumer can compare the number of rows with a count taken
+  before the export.
+* Log every failure with an identifier, because the user's only symptom is a corrupted download. Open the downloaded
+  file in a test with POI (`WorkbookFactory.create`): a truncated zip fails at the central directory, which sits at the
+  end of the file.
+* Never send a partially valid `.xlsx` and hope: the zip central directory is written last, so a truncated workbook
+  usually does not open at all, which is the lucky case.
+
+== Paging large queries into SXSSF
+
+SXSSF bounds the memory of the workbook; the query is the other half. By default a JDBC driver reads the whole result set
+into memory, so a million-row `select` defeats a flat SXSSF window before the first row is written. Three mechanisms
+bring the rows in small batches, and they differ by driver:
+
+[cols="2,4",options="header"]
+|===
+|Driver
+|What it takes (from the driver documentation)
+
+|PostgreSQL
+|`setFetchSize(n)` with the connection *not* in autocommit mode, a forward-only result set and a single statement. Otherwise the driver silently falls back to reading everything.
+
+|MySQL / MariaDB (Connector/J)
+|Either `setFetchSize(Integer.MIN_VALUE)` on a forward-only, read-only statement (row-by-row streaming, with the connection busy until the result set is closed), or `useCursorFetch=true` in the URL and a positive fetch size.
+
+|Other databases
+|Read the driver notes; a fetch size is a hint, not a guarantee, and the default may be to read everything.
+|===
+
+This is why `LoanSource` is `@Transactional(readOnly = true)`: the transaction switches off autocommit for the
+connection, which PostgreSQL needs for a cursor, and holds one connection for the whole export. In plain JDBC
+(the Quarkus `LoanSource`) the same is `setAutoCommit(false)` before the statement. Because the transaction runs on the
+thread that streams the body, the annotated method is called from the lambda, and not from the controller method that has
+already returned.
+
+Source: https://jdbc.postgresql.org/documentation/query/[Getting results based on a cursor, PostgreSQL JDBC] and https://dev.mysql.com/doc/connector-j/en/connector-j-reference-implementation-notes.html[ResultSet, MySQL Connector/J implementation notes]
+
+=== Spring Data streams
+
+With Spring Data JPA a repository method can return a `Stream`, which the repository documentation requires to be closed
+and used inside a transaction. The two traps are the fetch size, which is a Hibernate hint, and the persistence context,
+which keeps every managed entity alive until the transaction ends. Projecting straight to the record avoids the second:
+
+[source,java]
+----
+package bookshelf.export;
+
+import jakarta.persistence.QueryHint;
+import java.time.LocalDate;
+import java.util.stream.Stream;
+import org.hibernate.jpa.HibernateHints;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.jpa.repository.QueryHints;
+import org.springframework.data.repository.Repository;
+
+public interface LoanStreamRepository extends Repository<LoanEntity, Long> {
+
+    /** Projects straight to the record, so no managed entity piles up in the persistence context. */
+    @Query("""
+            select new bookshelf.export.LoanRow(l.id, l.bookTitle, l.borrower, l.loanedOn, l.dueOn, l.returned)
+            from LoanEntity l where l.loanedOn >= :from order by l.id""")
+    @QueryHints(@QueryHint(name = HibernateHints.HINT_FETCH_SIZE, value = "1000"))
+    Stream<LoanRow> streamSince(LocalDate from);
+}
+----
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.time.LocalDate;
+import java.util.function.Consumer;
+import java.util.stream.Stream;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+/** The same data query through Spring Data JPA: a Stream that must be closed, inside a transaction. */
+@Component
+public class JpaLoanSource {
+
+    private final LoanStreamRepository repository;
+
+    public JpaLoanSource(LoanStreamRepository repository) {
+        this.repository = repository;
+    }
+
+    @Transactional(readOnly = true)
+    public void forEachSince(LocalDate from, Consumer<LoanRow> consumer) {
+        try (Stream<LoanRow> rows = repository.streamSince(from)) {
+            rows.forEach(consumer);
+        }
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-data/jpa/reference/repositories/query-methods-details.html[Query methods, Spring Data JPA reference]
+
+This streamed all 100,000 loans in a 96 MB heap. If you return entities instead of the record, call
+`EntityManager.clear()` every few thousand rows, or the heap grows with the export. A `Stream` that is not closed holds
+the connection and the cursor, which is why `JpaLoanSource` uses try-with-resources.
+
+=== Keyset paging
+
+When a single long transaction is unacceptable (a replica that must not be held for ten minutes, a database that kills
+long transactions), read in pages by key instead of by cursor. Each page is a short query that continues after the last
+key seen:
+
+[source,sql]
+----
+select id, book_title, borrower, loaned_on, due_on, returned
+from loan
+where loaned_on >= :from and id > :lastId
+order by id
+fetch first 5000 rows only
+----
+
+The loop repeats with `lastId` set to the id of the last row until a page comes back empty. An offset (`offset 5000 rows`)
+looks simpler but makes each page slower than the one before. The price of keyset paging is that the pages are no longer
+one consistent snapshot: loans created or changed while the export runs may or may not be included, which is usually the
+right trade for a report and wrong for a financial statement.
+
+== A Word report endpoint
+
+`monthly-report.docx` is a different kind of file. XWPF keeps the whole document in memory as XML beans, with no
+streaming writer, so the strategy for a Word report is to bound it. `MonthlyReportWriter.collect` stops with a
+`ReportTooLargeException` as soon as the month has more rows than the cap, and the advice above turns that into the
+`422` of the failure table. Everything is checked before the first byte, and the document is built into a byte array so the
+download has a `Content-Length` (4,694 bytes for 186 loans in the test):
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.time.YearMonth;
+import java.util.ArrayList;
+import java.util.List;
+import org.apache.poi.xwpf.usermodel.ParagraphAlignment;
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
+import org.apache.poi.xwpf.usermodel.XWPFRun;
+import org.apache.poi.xwpf.usermodel.XWPFTable;
+import org.apache.poi.xwpf.usermodel.XWPFTableRow;
+
+/** Writes monthly-report.docx. XWPF keeps the whole document in memory, so the row count is capped by the caller. */
+public class MonthlyReportWriter implements ReportWriter {
+
+    private final YearMonth month;
+    private final List<LoanRow> loans;
+
+    public MonthlyReportWriter(YearMonth month, List<LoanRow> loans) {
+        this.month = month;
+        this.loans = loans;
+    }
+
+    /** Collects the month's rows; stops with an exception as soon as the cap is exceeded. */
+    public static List<LoanRow> collect(LoanSource source, YearMonth month, int maxRows) {
+        List<LoanRow> rows = new ArrayList<>();
+        source.forEachBetween(month.atDay(1), month.atEndOfMonth(), loan -> {
+            if (rows.size() >= maxRows) {
+                throw new ReportTooLargeException("More than " + maxRows + " loans in " + month
+                        + "; use the Excel export instead");
+            }
+            rows.add(loan);
+        });
+        return rows;
+    }
+
+    @Override
+    public void writeTo(OutputStream out) throws IOException {
+        try (XWPFDocument document = new XWPFDocument()) {
+            XWPFParagraph title = document.createParagraph();
+            title.setStyle("Title");
+            title.setAlignment(ParagraphAlignment.LEFT);
+            XWPFRun titleRun = title.createRun();
+            titleRun.setBold(true);
+            titleRun.setFontSize(20);
+            titleRun.setText("Monthly loans report: " + month);
+
+            XWPFParagraph summary = document.createParagraph();
+            summary.createRun().setText(loans.size() + " loans started in " + month + ".");
+
+            XWPFTable table = document.createTable(loans.size() + 1, 4);
+            String[] headers = {"Id", "Book", "Borrower", "Due on"};
+            XWPFTableRow headerRow = table.getRow(0);
+            for (int c = 0; c < headers.length; c++) {
+                XWPFRun run = headerRow.getCell(c).getParagraphArray(0).createRun();
+                run.setBold(true);
+                run.setText(headers[c]);
+            }
+            for (int r = 0; r < loans.size(); r++) {
+                LoanRow loan = loans.get(r);
+                XWPFTableRow row = table.getRow(r + 1);
+                row.getCell(0).setText(Long.toString(loan.id()));
+                row.getCell(1).setText(loan.bookTitle());
+                row.getCell(2).setText(loan.borrower());
+                row.getCell(3).setText(loan.dueOn().toString());
+            }
+            document.write(out);
+        }
+    }
+}
+----
+
+The endpoint is `monthlyReport` in the controller above. The observed response:
+
+[source,bash]
+----
+curl -s -D - -o monthly-report.docx 'http://localhost:8080/reports/monthly-report.docx?month=2026-03'
+----
+
+----
+HTTP/1.1 200
+Content-Disposition: attachment; filename="monthly-report-2026-03.docx"; filename*=UTF-8''monthly-report-2026-03.docx
+Accept-Ranges: bytes
+Content-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document
+Content-Length: 4694
+----
+
+Opening the file with `XWPFDocument` showed two paragraphs and one table of 187 rows (a header and 186 loans). The title
+and tables in this example are the plain XWPF API; styles, headers and footers, images and a template that is filled
+instead of built are in xref:backend/office-files/word-tables-lists-and-images.adoc[Word Tables, Lists & Images] and
+xref:backend/office-files/word-templates-and-placeholder-replacement.adoc[Word Templates & Placeholder Replacement].
+Two limits apply that no amount of streaming removes. A Word document of thousands of pages is slow to open in Word
+itself, so the cap is a feature. And POI does not convert .docx to PDF; when the user needs a PDF the options are
+discussed in xref:backend/pdf-generation/index.adoc[PDF Generation].
+
+Source: https://poi.apache.org/components/document/quick-guide-xwpf.html[XWPF Quick Guide, POI Word] and https://poi.apache.org/apidocs/dev/org/apache/poi/xwpf/usermodel/XWPFDocument.html[XWPFDocument, POI Javadoc]
+
+== Long-running exports as jobs
+
+When the export can take longer than the shortest timeout between the user and the server, the request stops being the
+place where it runs. The pattern is the same everywhere: the request creates a *job* and returns at once; a worker
+produces the file; the client asks about the job and downloads the file when it is ready.
+
+. `+POST /report-jobs?from=...+` validates the request, creates the job in state `QUEUED`, and answers `202 Accepted` with a
+  `Location` header that points to the job.
+. A bounded worker takes the job (`RUNNING`), runs the same `LoansWorkbookWriter` into a temporary file, stores the file
+  and marks the job `SUCCEEDED` (or `FAILED` with a message that is safe to show).
+. The client polls `+GET /report-jobs/{id}+` (or receives a notification) and, when the state is `SUCCEEDED`, follows to
+  the download.
+. The download is an ordinary `ResponseEntity<Resource>` over the stored file: a known `Content-Length`, ranges and
+  resume, and a link that can be used again until the file expires.
+
+[mermaid]
+....
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant A as API
+    participant Q as Bounded executor
+    participant W as Worker
+    participant D as Database
+    participant S as Report storage
+    U->>A: POST /report-jobs?from=2026-01-01
+    A->>Q: submit (QUEUED)
+    alt queue full
+        A-->>U: 429 Too Many Requests, Retry-After
+    else accepted
+        A-->>U: 202 Accepted, Location /report-jobs/{id}
+    end
+    Q->>W: run (RUNNING)
+    W->>D: cursor query, fetch size 1000
+    D-->>W: rows
+    W->>W: SXSSF into a temporary file
+    W->>S: put {id}.xlsx
+    W->>W: state SUCCEEDED (or FAILED)
+    loop until SUCCEEDED or FAILED
+        U->>A: GET /report-jobs/{id}
+        A-->>U: 200 with the state
+    end
+    U->>A: GET /report-jobs/{id}/file
+    A->>S: open {id}.xlsx
+    A-->>U: 200, Content-Length, Content-Disposition
+....
+
+=== The job code
+
+The record holds only what the client may see. The executor is the part that protects the server: two exports at a time,
+twenty waiting, and a rejection after that, so a burst of requests becomes `429` and not an `OutOfMemoryError`. The
+`reportExecutor` and `streamingExecutor` beans are in the configuration shown earlier, together with the
+`@EnableScheduling` that the `@Scheduled` purge below needs. A job refused by the executor is removed from the map
+before the exception reaches the controller, so it does not stay `QUEUED`.
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.time.Instant;
+
+public record ExportJob(String id, State state, Instant createdAt, String error) {
+
+    public enum State { QUEUED, RUNNING, SUCCEEDED, FAILED }
+
+    ExportJob with(State newState, String newError) {
+        return new ExportJob(id, newState, createdAt, newError);
+    }
+}
+----
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.TaskExecutor;
+import org.springframework.core.task.TaskRejectedException;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+@Service
+public class ExportJobService {
+
+    private static final Logger log = LoggerFactory.getLogger(ExportJobService.class);
+
+    private final Map<String, ExportJob> jobs = new ConcurrentHashMap<>();   // use a table when there are several instances
+    private final LoanSource loans;
+    private final ReportStorage storage;
+    private final TaskExecutor executor;
+
+    public ExportJobService(LoanSource loans, ReportStorage storage, @Qualifier("reportExecutor") TaskExecutor reportExecutor) {
+        this.loans = loans;
+        this.storage = storage;
+        this.executor = reportExecutor;
+    }
+
+    /** Throws TaskRejectedException when the queue is full; the controller maps that to 429. */
+    public ExportJob submit(LocalDate from) {
+        ExportJob job = new ExportJob(UUID.randomUUID().toString(), ExportJob.State.QUEUED, Instant.now(), null);
+        jobs.put(job.id(), job);
+        try {
+            executor.execute(() -> run(job.id(), from));
+        } catch (TaskRejectedException e) {
+            jobs.remove(job.id());   // a refused job must not stay QUEUED forever
+            throw e;
+        }
+        return job;
+    }
+
+    public Optional<ExportJob> find(String id) {
+        return Optional.ofNullable(jobs.get(id));
+    }
+
+    public Optional<org.springframework.core.io.Resource> result(String id) {
+        return find(id).filter(j -> j.state() == ExportJob.State.SUCCEEDED).map(j -> storage.get(j.id() + ".xlsx"));
+    }
+
+    private void run(String id, LocalDate from) {
+        jobs.computeIfPresent(id, (k, j) -> j.with(ExportJob.State.RUNNING, null));
+        Path temp = null;
+        try {
+            temp = Files.createTempFile("loans-" + id, ".xlsx");
+            try (var out = Files.newOutputStream(temp)) {
+                new LoansWorkbookWriter(loans, from, LocalDate.now()).writeTo(out);
+            }
+            storage.put(id + ".xlsx", temp);
+            jobs.computeIfPresent(id, (k, j) -> j.with(ExportJob.State.SUCCEEDED, null));
+        } catch (IOException | RuntimeException e) {
+            log.error("Export job {} failed", id, e);
+            jobs.computeIfPresent(id, (k, j) -> j.with(ExportJob.State.FAILED, "The export failed; try again"));
+        } finally {
+            if (temp != null) {
+                try {
+                    Files.deleteIfExists(temp);
+                } catch (IOException e) {
+                    log.warn("Could not delete {}", temp, e);
+                }
+            }
+        }
+    }
+
+    /** Expired files and job records go away together, so a stale link ends in 404, not in a leak. */
+    @Scheduled(fixedDelayString = "PT15M")
+    void purge() throws IOException {
+        Instant limit = Instant.now().minus(Duration.ofHours(24));
+        jobs.values().removeIf(j -> j.createdAt().isBefore(limit));
+        int deleted = storage.deleteOlderThan(Duration.ofHours(24));
+        log.info("Purged {} expired reports", deleted);
+    }
+}
+----
+
+The storage is an interface because it is the part that changes between a single instance and a cluster:
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.nio.file.Path;
+import java.time.Duration;
+import org.springframework.core.io.Resource;
+
+/**
+ * Where finished reports wait for the user. The local-disk implementation below is for one instance;
+ * with several instances, implement it over an object store and hand out a presigned URL instead.
+ */
+public interface ReportStorage {
+
+    void put(String key, Path file) throws IOException;
+
+    Resource get(String key);
+
+    /** Removes everything older than maxAge; returns how many objects were deleted. */
+    int deleteOlderThan(Duration maxAge) throws IOException;
+}
+----
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.stream.Stream;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.stereotype.Component;
+
+@Component
+public class LocalReportStorage implements ReportStorage {
+
+    private final Path directory;
+
+    public LocalReportStorage(@Value("${reports.directory}") Path directory) throws IOException {
+        this.directory = Files.createDirectories(directory);
+    }
+
+    @Override
+    public void put(String key, Path file) throws IOException {
+        Files.move(file, resolve(key), StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    @Override
+    public Resource get(String key) {
+        return new FileSystemResource(resolve(key));
+    }
+
+    @Override
+    public int deleteOlderThan(Duration maxAge) throws IOException {
+        Instant limit = Instant.now().minus(maxAge);
+        int deleted = 0;
+        try (Stream<Path> files = Files.list(directory)) {
+            for (Path file : (Iterable<Path>) files::iterator) {
+                if (Files.getLastModifiedTime(file).toInstant().isBefore(limit)) {
+                    Files.delete(file);
+                    deleted++;
+                }
+            }
+        }
+        return deleted;
+    }
+
+    /** The key is generated by the server (a UUID); never build a path from a name the client chose. */
+    private Path resolve(String key) {
+        Path file = directory.resolve(key).normalize();
+        if (!file.startsWith(directory)) {
+            throw new IllegalArgumentException("Invalid key");
+        }
+        return file;
+    }
+}
+----
+
+[source,java]
+----
+package bookshelf.export;
+
+import java.net.URI;
+import java.time.LocalDate;
+import org.springframework.core.io.Resource;
+import org.springframework.core.task.TaskRejectedException;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
+
+@RestController
+public class ExportJobController {
+
+    private final ExportJobService jobs;
+
+    public ExportJobController(ExportJobService jobs) {
+        this.jobs = jobs;
+    }
+
+    @PostMapping("/report-jobs")
+    public ResponseEntity<ExportJob> start(@RequestParam(defaultValue = "2020-01-01") LocalDate from) {
+        ExportJob job = jobs.submit(from);
+        return ResponseEntity.accepted()
+                .location(URI.create("/report-jobs/" + job.id()))
+                .body(job);
+    }
+
+    @GetMapping("/report-jobs/{id}")
+    public ExportJob status(@PathVariable String id) {
+        return jobs.find(id).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+    }
+
+    @GetMapping("/report-jobs/{id}/file")
+    public ResponseEntity<Resource> download(@PathVariable String id) {
+        Resource file = jobs.result(id).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        return ResponseEntity.ok()
+                .contentType(ReportMediaTypes.XLSX)
+                .header(HttpHeaders.CONTENT_DISPOSITION, ReportController.attachment("loans-report.xlsx"))
+                .body(file);
+    }
+
+    @ExceptionHandler(TaskRejectedException.class)
+    ResponseEntity<Void> busy() {
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header(HttpHeaders.RETRY_AFTER, "60").build();
+    }
+}
+----
+
+Source: https://docs.spring.io/spring-framework/reference/integration/scheduling.html[Task Execution and Scheduling, Spring Framework reference] and https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/core/io/FileSystemResource.html[FileSystemResource Javadoc]
+
+The observed run (1,500 loans, so that the file stays small; the job runs the same code at any size):
+
+[source,bash]
+----
+curl -s -D - -X POST 'http://localhost:8080/report-jobs?from=2026-01-01'
+----
+
+----
+HTTP/1.1 202
+Location: /report-jobs/6accb506-9502-43bf-8c01-8494ce835c77
+Content-Type: application/json
+
+{"id":"6accb506-9502-43bf-8c01-8494ce835c77","state":"QUEUED","createdAt":"2026-10-09T20:35:02.090963Z","error":null}
+----
+
+[source,bash]
+----
+curl -s http://localhost:8080/report-jobs/6accb506-9502-43bf-8c01-8494ce835c77
+curl -s -D - -o loans-report.xlsx http://localhost:8080/report-jobs/6accb506-9502-43bf-8c01-8494ce835c77/file
+----
+
+----
+{"id":"6accb506-9502-43bf-8c01-8494ce835c77","state":"SUCCEEDED","createdAt":"2026-10-09T20:35:02.090963Z","error":null}
+
+HTTP/1.1 200
+Content-Disposition: attachment; filename="loans-report.xlsx"; filename*=UTF-8''loans-report.xlsx
+Accept-Ranges: bytes
+Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+Content-Length: 55002
+----
+
+A request for an unknown id returned `404`. Thirty near-simultaneous `POST` requests against the application with 100,000
+loans answered eight times `429` and twenty-two times `202`: two running, twenty queued and the rest refused, which is
+the bounded queue doing its work.
+
+=== What a real deployment changes
+
+The sample keeps the job table in a `ConcurrentHashMap` and the files on the local disk. That is correct for one
+instance and wrong for two, because the instance that serves the status request may not be the one that ran the job.
+The decisions that make it a service:
+
+[cols="2,5",options="header"]
+|===
+|Concern
+|Choice
+
+|Job state
+|A table (id, owner, parameters, state, created, finished, error, storage key) in the application database. Updates are single-row writes, and a restart can mark `RUNNING` jobs as `FAILED`.
+
+|Who runs the job
+|An in-process bounded executor as above; a queue consumer when the load must be shared across instances (see xref:backend/messaging/spring-boot-messaging-overview.adoc[Spring Boot Messaging Overview]); or Spring Batch when the export needs restart and chunk-level monitoring (see xref:backend/springboot/spring-batch.adoc[Spring Batch with Spring Boot] and xref:backend/spring-batch/item-writers-files.adoc[file item writers]).
+
+|Reports on a schedule
+|Nightly or monthly reports have no requester waiting: run the same writer from a scheduled task, with a lock so only one instance fires (see xref:backend/springboot/scheduling-and-shedlock.adoc[Scheduling and ShedLock] and xref:backend/scheduling/getting-started-with-spring-boot.adoc[Quartz with Spring Boot]; for Quarkus xref:backend/quarkus/scheduling-and-mail.adoc[Scheduling and Mail]) and store or e-mail the result.
+
+|Where the file waits
+|Object storage (S3, Google Cloud Storage, Azure Blob), keyed by the job id, with a lifecycle rule that expires it. Local disk only for a single instance. See xref:backend/springboot/file-storage-and-object-stores.adoc[File Storage and Object Stores].
+
+|The download link
+|Either the application's own authenticated endpoint, which streams the object (simple, and every download is checked for the owner), or a short-lived presigned URL that sends the browser straight to the object store (the application does not carry the bytes; see xref:backend/springboot/file-storage-and-object-stores.adoc#_presigned_urls_and_sas_tokens[presigned URLs and SAS tokens]). The `Content-Disposition` name is then set when the URL is signed.
+
+|Telling the user
+|Polling is the simplest and works through every proxy. Server-sent events or a WebSocket give instant feedback; an e-mail with the link suits reports that take hours.
+
+|Cleanup
+|`purge` in the sample removes records and files older than 24 hours. With object storage use the store's expiry rule, and drop the job rows with a scheduled task.
+|===
+
+Security is part of the design, not an add-on. The job id in the sample is an unguessable UUID, which is not an access
+control: a real service stores the owner with the job and checks it on the status and the download endpoints, applies the
+same row-level rules to the query as to the interactive screens, and bounds the parameters (a date range, a maximum
+row count) because anyone who can create a job can ask for the most expensive one. The error message stored in the job is
+a fixed text; the exception detail goes to the log with the job id.
+
+== Pitfalls
+
+[cols="2,4",options="header"]
+|===
+|Pitfall
+|What happens and how to avoid it
+
+|Collecting the query into a `List` first
+|The heap holds every row and SXSSF no longer matters. Process rows in a callback or a `Stream`, and check the fetch size works for your driver.
+
+|Using `XSSFWorkbook` for the big report
+|The whole workbook is built in the heap before the first byte. Switch to SXSSF as soon as a report can pass tens of thousands of rows.
+
+|Expecting SXSSF to stream to the client progressively
+|The bytes are written at the end. For progressive output use CSV, and for a long export use a job.
+
+|Defining an `Executor` bean and losing Boot's default
+|Streaming bodies run on one new thread per request. Configure `AsyncSupportConfigurer` with a bounded executor.
+
+|Forgetting to close the Stream or the transaction
+|The connection is held for as long as the leaked stream lives. Use try-with-resources and keep the transaction on the thread that reads.
+
+|Setting `Content-Length` and then writing a different number of bytes
+|The client waits for bytes that never arrive or receives a corrupted file. Declare the length only for a file whose size is known.
+
+|Trusting the file name
+|Names that include user text can carry path separators or line breaks. Build names on the server, and let Spring or the helper encode them.
+
+|`application/octet-stream` for everything
+|The browser cannot choose the right application and some clients refuse the file. Use the exact media type.
+
+|Unbounded parallel exports
+|Ten concurrent SXSSF exports are ten sets of temporary files and ten connections held. Bound the executor and the connection pool, and reject the excess.
+
+|A timeout that truncates silently
+|The async timeout ends the chunked body cleanly. Set it above the worst case and verify the file on the client, or use a job.
+
+|Temporary files left behind
+|SXSSF deletes its row files on `close()`; your own spool files are yours. Delete them in `finally`, and give the application a temp directory it owns and can clean at startup.
+
+|===
+
+== Changes across versions
+
+* Spring Boot 4 (Spring Framework 7, Tomcat 11): the web starter is `spring-boot-starter-webmvc` (it was
+  `spring-boot-starter-web` in Boot 3). The classes used on this page (`StreamingResponseBody`, `ContentDisposition`,
+  `ResponseEntity`, `ProblemDetail`, `AsyncSupportConfigurer`) are the ones that Spring Framework 6 already had.
+* Jakarta EE 11 uses Jakarta REST 4.0; `StreamingOutput` is unchanged from the `javax.ws.rs` days apart from the package
+  name (`jakarta.ws.rs.core`).
+* POI: in 5.5.1 none of the `write` methods used here closes the stream, and since POI 5.3.0 `SXSSFWorkbook.close()`
+  deletes the temporary files (the explicit `dispose()` call is no longer needed). POI 6.0 has not been released; nothing
+  here depends on it.
+* Nothing on this page needs `+javax.*+` packages or POI 4.x APIs. Moving an older export from `HttpServletResponse` to a
+  streaming body is a mechanical change; see the xref:backend/office-files/whats-changed-and-migration.adoc[migration page] of this section for the older idioms.
+
+== Summary
+
+* Keep the build step behind one method that writes to an `OutputStream`; the endpoint is a thin wrapper that validates,
+  sets headers and hands the stream over.
+* Small file: build in memory and return a `Resource` (`Content-Length`, ranges). Large file: SXSSF plus a streaming body, or
+  spool to a file first when the length and early failure matter. Very long: a job, a stored file and a download link.
+* Use `ContentDisposition.attachment().filename(name, UTF_8)` in Spring, or an RFC 8187 helper elsewhere, and the exact
+  media type.
+* Everything that can be checked before the first byte must be: after it, a failure is a truncated file, and a timeout can
+  be a truncated file that looks complete.
+* Query in batches (fetch size and a transaction, or keyset pages), cap Word reports, bound the executors.
+
+== References
+
+* Apache POI, SXSSF (Streaming Usermodel API): https://poi.apache.org/components/spreadsheet/how-to.html#sxssf
+* Apache POI, XWPF Quick Guide: https://poi.apache.org/components/document/quick-guide-xwpf.html
+* Apache POI Javadoc, `Workbook.write`: https://poi.apache.org/apidocs/dev/org/apache/poi/ss/usermodel/Workbook.html
+* Apache POI Javadoc, `XWPFDocument`: https://poi.apache.org/apidocs/dev/org/apache/poi/xwpf/usermodel/XWPFDocument.html
+* Spring Framework, `ResponseEntity`: https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-controller/ann-methods/responseentity.html
+* Spring Framework, asynchronous requests: https://docs.spring.io/spring-framework/reference/web/webmvc/mvc-ann-async.html
+* Spring Framework Javadoc, `StreamingResponseBody`: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/web/servlet/mvc/method/annotation/StreamingResponseBody.html
+* Spring Framework Javadoc, `ContentDisposition`: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/http/ContentDisposition.html
+* Spring Framework Javadoc, `AsyncSupportConfigurer`: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/web/servlet/config/annotation/AsyncSupportConfigurer.html
+* Spring Framework Javadoc, `JdbcTemplate`: https://docs.spring.io/spring-framework/docs/current/javadoc-api/org/springframework/jdbc/core/JdbcTemplate.html
+* Spring Framework, task execution and scheduling: https://docs.spring.io/spring-framework/reference/integration/scheduling.html
+* Spring Boot, task execution and scheduling: https://docs.spring.io/spring-boot/reference/features/task-execution-and-scheduling.html
+* Spring Boot, common application properties: https://docs.spring.io/spring-boot/appendix/application-properties/index.html
+* Spring Data JPA, query methods and streaming: https://docs.spring.io/spring-data/jpa/reference/repositories/query-methods-details.html
+* Jakarta RESTful Web Services 4.0: https://jakarta.ee/specifications/restful-ws/4.0/
+* Jakarta REST 4.0 API, `StreamingOutput`: https://jakarta.ee/specifications/restful-ws/4.0/apidocs/jakarta.ws.rs/jakarta/ws/rs/core/StreamingOutput.html
+* Quarkus REST: https://quarkus.io/guides/rest
+* Quarkus HTTP reference: https://quarkus.io/guides/http-reference
+* RFC 6266, Content-Disposition: https://www.rfc-editor.org/rfc/rfc6266
+* RFC 8187, encoding of header parameters: https://www.rfc-editor.org/rfc/rfc8187
+* RFC 9112, HTTP/1.1 message syntax (chunked transfer coding): https://www.rfc-editor.org/rfc/rfc9112
+* IANA media types: https://www.iana.org/assignments/media-types/media-types.xhtml
+* Microsoft, Excel specifications and limits: https://support.microsoft.com/en-us/office/excel-specifications-and-limits-1672b34d-7043-467e-8e27-269d656771c3
+* Apache Tomcat HTTP connector: https://tomcat.apache.org/tomcat-11.0-doc/config/http.html
+* PostgreSQL JDBC, getting results based on a cursor: https://jdbc.postgresql.org/documentation/query/
+* MySQL Connector/J implementation notes: https://dev.mysql.com/doc/connector-j/en/connector-j-reference-implementation-notes.html
+* nginx `ngx_http_proxy_module`: https://nginx.org/en/docs/http/ngx_http_proxy_module.html
+* MDN, Content-Disposition: https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Disposition
