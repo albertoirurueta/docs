@@ -1,0 +1,1207 @@
+= Performance & Scaling
+:description: Performance and scaling of Apache Tika 4.1.x: the deployment shapes (in-process AutoDetectParser, PipesForkParser, tika-server per-client and shared-server, Tika Pipes batch, tika-grpc) and their trade-offs, a "which deployment shape?" decision table and flow, numClients versus cores, heap per fork, temp-file volume and spooling (the 4.1.0 batch-throughput fix), parser reuse, write limits, Markdown versus XHTML cost, horizontal scaling behind a load balancer using 429 as the signal, and the metrics to watch.
+:keywords: Apache Tika, performance, scaling, throughput, latency, deployment shape, in-process, AutoDetectParser, PipesForkParser, tika-server, Tika Pipes, shared server mode, useSharedServer, numClients, ActiveProcessorCount, MaxRAMPercentage, forkedJvmArgs, heap per fork, cacheMemoryBudgetBytes, CacheMemoryBudget, spooling, temp files, java.io.tmpdir, tmpfs, maxInlineBytes, maxFilesProcessedPerProcess, maxWaitForClientMillis, 429 Too Many Requests, Retry-After, backpressure, horizontal scaling, load balancer, HorizontalPodAutoscaler, KEDA, Prometheus, Micrometer, tika_pipes_workers, tika_server_rejected_total, tika_pipes_worker_restarts_total, writeLimit, Markdown, XHTML, emitStrategy, JFR, TIKA-4835, TIKA-4828, Bookshelf
+
+include::partial$apache-tika-disclaimer.adoc[]
+
+Baseline date: 2026-10-13. This page was written against Apache Tika 4.1.0 (the latest release on Maven Central on that
+date) with the 3.3.x differences noted, Java 21 and later for the examples (Tika 4.x needs Java 17, 3.x needs Java 11),
+Spring Boot 4.x on Spring Framework 7 for the integration pointers and the Docker image `apache/tika:4.1.0` (pin
+`apache/tika:4.1.0-1`). Tika's speed is rarely limited by one parser. It is limited by the *shape* of the deployment:
+how many JVMs parse, how much CPU and heap each one sees, how much the documents spill to disk, and how the callers react
+when the parsers are busy. Tika 4.x moved almost every surface onto forked JVMs (Tika Pipes), which bought crash
+isolation and a real backpressure signal, and made sizing your job.
+
+This page covers the deployment shapes and how to choose one, `numClients` versus cores, memory per fork, temp files and
+spooling (including the batch-throughput fix in 4.1.0), parser reuse, write limits and the cost of each output format,
+horizontal scaling with `429` as the signal, and the metrics to watch. It pulls together material that the other pages
+describe in depth:
+xref:backend/apache-tika/tika-pipes.adoc[Tika Pipes] (the forked-JVM model and the `pipes` configuration),
+xref:backend/apache-tika/tika-server-rest-api.adoc[Tika Server (REST API)] (endpoints, `429` and `503`, the fork pool),
+xref:backend/apache-tika/robustness-limits-and-timeouts.adoc[Robustness, Limits & Timeouts] (limits, timeouts and the
+fork sizing rules), xref:backend/apache-tika/docker-and-kubernetes-deployment.adoc[Docker & Kubernetes Deployment]
+(container limits, probes, autoscaling manifests) and
+xref:backend/apache-tika/parser-api-and-autodetectparser.adoc[Parser API & AutoDetectParser] (spooling and thread
+safety).
+
+How this page was checked. The CHANGES entries were read in the Apache Tika `CHANGES.txt` on GitHub (section
+"Release 4.1.0 - 9/26/2026"). The sizing formulas, the shared-server trade-offs, the temp-file analysis and the benchmark
+figures attributed to the Tika project come from the 4.1.x documentation pages listed in <<references>>; this page does
+not reproduce that benchmark. The Java examples were compiled and run against Tika 4.1.0 on Java 25 (8 cores, 24 GB of
+RAM, macOS), and the tika-server runs used the `tika-server-standard-4.1.0.zip` distribution bound to `127.0.0.1`. The
+small measurements in <<indicative-measurements>> are *indicative only*: they were taken on a busy developer laptop, on a
+tiny synthetic corpus, with run-to-run spreads of up to 2x. Use them to see the direction of an effect, never as a
+capacity figure. The section <<what-is-verified,What was verified and what was not>> lists the limits of the checks.
+
+== Where the time and memory go
+
+A parse spends time and memory in a handful of places, and each deployment shape moves some of them around:
+
+[cols="2,4,3",options="header"]
+|===
+|Cost |What happens |Who pays it
+
+|Start-up |Building an `AutoDetectParser` discovers every parser, detector and encoding detector on the class path and loads their resources (about 4 s per instance on the test laptop, measured below). A forked JVM pays it again when it starts. |Once per JVM if you reuse the parser; per document if you do not
+|Detection |Magic bytes, the file name and, for containers, a look inside (ZIP central directory, OLE2 directory). 4.1.0 made magic detection about 35% faster on unmatched input (part of the combined TIKA-4868 PERFORMANCE entry). |Every document
+|Parsing |The concrete parser: PDFBox, POI, jsoup and so on. PDF and Office files with many embedded objects dominate, and OCR or a VLM call dwarfs everything else. |Every document
+|Random access and spooling |ZIP-family, OLE2 and PDF parsers want random access. A plain `InputStream` may be cached in memory or spilled to a temp file. |Documents that arrive as streams, and embedded documents
+|Content handler |Turning SAX events into text, Markdown, HTML or XHTML, and holding the result as a string. |Every document; grows with output size
+|IPC |In 4.x, the request and the result cross a socket between the caller and a forked worker, and the result is serialized. |Forked shapes only
+|Garbage collection |Large intermediate objects (images, fonts, XFA, huge strings) and many concurrent parses. |All shapes, worst with many small heaps
+|===
+
+Two consequences follow. First, for small and medium documents the fixed costs (start-up, IPC, one more JVM) matter as
+much as parser speed, so reuse everything that can be reused. Second, for a large corpus the dominant cost is often not
+CPU at all but *disk*: temp files, the corpus reads and the output writes competing for the same storage. That is what
+the 4.1.0 fix in <<the-410-batch-throughput-fix>> was about.
+
+== The deployment shapes
+
+[cols="2,3,2,2,2,2",options="header"]
+|===
+|Shape |How it parses |Isolation and blast radius |Memory |Throughput |Backpressure
+
+|In-process `AutoDetectParser` (or the `Tika` facade)
+|In your own JVM, on your own threads
+|None. An OOM, a native crash or an endless loop hits your application.
+|One heap, shared with your application
+|Highest: no IPC, one JIT, one GC
+|None built in; you get slower
+
+|`PipesForkParser` in your application
+|`numClients` forked JVMs, one document each at a time; your JVM sends the file or the bytes
+|One document. Only that fork restarts.
+|Your heap plus `numClients` fork heaps
+|Close to in-process for large documents; the IPC and extra JVMs cost a fixed share
+|A caller blocks waiting for a free fork; `CLIENT_UNAVAILABLE_WITHIN_MS` after `maxWaitForClientMillis`
+
+|tika-server, per-client (4.x default)
+|An HTTP front end routes to `numClients` forks
+|One request. The HTTP front end stays up.
+|Front-end heap plus `numClients` fork heaps
+|As above, plus HTTP
+|`429` with `Retry-After`, metrics
+
+|tika-server, shared server (`useSharedServer: true`)
+|One forked JVM with `numClients` worker threads
+|Every in-flight request. The front end stays up and respawns the worker.
+|Front-end heap plus one large fork heap
+|Higher than per-client at the same concurrency
+|`429`, metrics (busy and idle count client slots, not JVMs)
+
+|Tika Pipes batch (`tika-app -i/-o`, `tika-async-cli`, `/async`)
+|A pipes iterator feeds tuples to `numClients` forks; fetchers and emitters move the bytes
+|One document per fork, recorded by the reporter
+|Driver heap plus fork heaps
+|Highest of the isolated shapes for file-system batch work; storage-bound
+|An internal queue (`queueSize`); the `/async` endpoint answers `429` when it is full
+
+|tika-grpc
+|gRPC front end over the same pipes machinery; fetchers name the input
+|As per-client tika-server
+|As per-client tika-server
+|Not measured here; same forks as tika-server
+|In-band `CLIENT_UNAVAILABLE_WITHIN_MS` in the reply status instead of `429`
+|===
+
+The 3.x shapes are useful context when you migrate. tika-server 3.x ran a watchdog parent and *one* forked child that
+did all the parsing, so one bad document dropped every in-flight request and briefly took the port down while the child
+restarted; `--noFork` (or `-noFork`) parsed in the server process itself with no recovery at all. In 4.x the per-client
+default narrows the blast radius to one request, and both pipes modes keep the HTTP front end serving while a worker
+restarts. The official performance page frames the 4.x choice as "between per-client (strongest isolation) and
+shared-server (highest throughput)".
+
+Source: https://tika.apache.org/docs/4.1.x/pipes/performance.html[Performance and Isolation Trade-offs, Apache Tika
+4.1.x] and https://tika.apache.org/docs/4.1.x/pipes/shared-server-mode.html[Shared Server Mode, Apache Tika 4.1.x].
+
+=== Per-client versus shared server
+
+The two 4.x modes differ only in how many JVMs parse:
+
+[cols="2,4,4",options="header"]
+|===
+|Aspect |Per-client (default) |Shared server (experimental)
+
+|JVMs parsing |`numClients` |1, with `numClients` connection handlers
+|Failure takes down |The one request on that fork |Every in-flight request on the shared worker
+|Emit status after a crash |Unambiguous: the request that crashed is the one that failed |Ambiguous with `EMIT_ALL` or `DYNAMIC`: another worker's document may already have been emitted; `PASSBACK_ALL` avoids this at the cost of carrying every extract over IPC
+|Heap sizing |Each fork for the worst single document |One heap for the worst _concurrent_ load (4 clients at 500 MB each needs at least 2 GB)
+|CPU auto-cap |`-XX:ActiveProcessorCount` injected per fork |Not applied: one JVM, no thread blow-up
+|Thread-safety bugs in parsers |Hidden: one thread per JVM |Exposed: parses run concurrently in one JVM
+|Throughput |Lower: several JITs and GCs competing for cores and cache |Higher: one warm JIT and GC; the project measured it within about 5-15% of a single in-JVM parser on mixed and large documents, per-client about 20-35% slower in that benchmark
+|===
+
+Enable it only when the documents are well behaved, memory is tight, and the application already retries lost requests:
+
+[source,json]
+----
+{
+  "pipes": {
+    "numClients": 4,
+    "useSharedServer": true,
+    "forkedJvmArgs": ["-Xmx4g"],
+    "emitStrategy": { "type": "PASSBACK_ALL" }
+  },
+  "parse-context": {
+    "timeout-limits": { "progressTimeoutMillis": 60000 }
+  }
+}
+----
+
+Source: https://tika.apache.org/docs/4.1.x/pipes/shared-server-mode.html[Shared Server Mode, Apache Tika 4.1.x] and
+https://tika.apache.org/docs/4.1.x/pipes/configuration.html[Pipes Configuration, Apache Tika 4.1.x] (Emit Strategy).
+
+From Java, `PipesForkParserConfig` has no setter of its own for this flag, but it exposes the underlying `PipesConfig`,
+which has `setUseSharedServer(boolean)` (checked against the 4.1.0 jar):
+
+[source,java]
+----
+PipesForkParserConfig config = new PipesForkParserConfig()
+        .setHandlerType(BasicContentHandlerFactory.HANDLER_TYPE.MARKDOWN)
+        .setNumClients(3)
+        .addJvmArg("-Xmx2g");
+config.getPipesConfig().setUseSharedServer(true);   // one fork, three worker threads
+----
+
+Source: https://tika.apache.org/4.1.0/api/org/apache/tika/pipes/core/PipesConfig.html[`PipesConfig`, Javadoc 4.1.0] and
+https://tika.apache.org/4.1.0/api/org/apache/tika/pipes/fork/PipesForkParserConfig.html[`PipesForkParserConfig`,
+Javadoc 4.1.0].
+
+[[which-deployment-shape]]
+== Which deployment shape?
+
+Start from two questions: _can a bad document be allowed to hurt the caller?_ and _who calls Tika?_ Untrusted input
+(uploads, mail attachments, crawled files) rules out in-process parsing on the request path, whatever the throughput
+gain. The flow below is the decision this section uses for the _Bookshelf_ intake service.
+
+[mermaid]
+....
+flowchart TD
+    A[Documents to extract] --> B{Is the input trusted<br/>and well behaved?}
+    B -- "yes: your own generated files" --> C{Is it a JVM application<br/>that parses a few files?}
+    C -- yes --> D[In-process AutoDetectParser<br/>one shared instance]
+    C -- no --> F
+    B -- "no: uploads, mail, crawls" --> E{Who calls Tika?}
+    E -- "one JVM application" --> G[PipesForkParser<br/>per-client forks]
+    E -- "many services, other languages" --> F{Interactive requests<br/>or a corpus?}
+    F -- "interactive, per request" --> H[tika-server per-client<br/>behind a load balancer]
+    F -- "a corpus: files, S3, Kafka" --> I[Tika Pipes batch<br/>tika-app -i/-o or tika-async-cli]
+    H --> J{Memory-bound, inputs<br/>tested and well behaved?}
+    I --> J
+    G --> J
+    J -- yes --> K[Consider useSharedServer<br/>and retry lost requests]
+    J -- no --> L[Keep per-client mode]
+....
+
+The same decision as a table, with the reason each row wins:
+
+[cols="3,2,4",options="header"]
+|===
+|Situation |Shape |Why
+
+|A build tool or test suite extracting text from files you generated |In-process `AutoDetectParser` |No hostile input; the fastest path; no extra JVM
+|A Spring Boot service accepting uploads, one team, Java only |`PipesForkParser` bean, or tika-server as a sidecar |A poison file kills a fork, not the service. See xref:backend/apache-tika/spring-boot-integration.adoc[Spring Boot Integration]
+|Several services (Java, Python, Node) need extraction |tika-server per-client, several replicas behind a load balancer |One shared, language-neutral service; `429` drives retries and autoscaling
+|Nightly re-index of millions of files to Solr or Elasticsearch |Tika Pipes batch with a file-system or S3 fetcher and a search emitter |Isolation per document, a reporter that records every failure, no HTTP hop. See xref:backend/apache-tika/search-indexing-with-lucene-solr-and-elasticsearch.adoc[Search Indexing with Lucene, Solr & Elasticsearch]
+|RAG ingestion from a document store |Tika Pipes batch, or tika-server with Markdown output |Markdown is the default and what chunkers want. See xref:backend/apache-tika/rag-and-llm-ingestion.adoc[RAG & LLM Ingestion]
+|A memory-tight pod with a vetted, homogeneous corpus |Shared server |One heap instead of `numClients`, higher throughput; accept shared fate
+|Scanned documents that need OCR |Any isolated shape with the `-full` image or Tesseract installed; fewer, fatter forks |OCR is CPU-heavy and `tesseract` is an external process; set `OMP_THREAD_LIMIT=1` (the 4.1.0 `-full` images do)
+|===
+
+What the table does not say: do not mix shapes inside one JVM without thinking about cores. Two `PipesForkParser`
+instances, or tika-server with `/async` enabled beside the sync endpoints, each size their forks as if they owned the
+whole host (see <<numclients-versus-cores>>).
+
+[[numclients-versus-cores]]
+== `numClients` versus cores
+
+`numClients` is the number of forks in a pool, so it is both the concurrency limit and the divisor for each fork's CPU
+and heap. Each fork is a full JVM that sizes its GC, JIT and common `ForkJoinPool` from the CPU count it sees: without
+help, four forks on a 16-core host would each start about 16 GC threads. Tika Pipes therefore injects a fair CPU slice
+into every fork in per-client mode, unless you set `-XX:ActiveProcessorCount` yourself:
+
+[source,text]
+----
+slice = (hostCores - 2) / numClients      2 cores are reserved for the parent JVM
+slice < 2 is clamped to 2                 1 core for the parser thread, 1 for GC, JIT, heartbeat and socket I/O
+----
+
+Before 4.1.0 a share below 2 switched the cap _off_ instead of clamping it, so an over-provisioned pool (8 forks on 16
+logical cores) let every fork size itself for the whole host. The 4.1.0 CHANGES entry reads "The forked-worker CPU cap
+(-XX:ActiveProcessorCount) is clamped at its floor of 2 (TIKA-4905)", and the project's performance page names this as
+one of the reasons its 4.0.0 regression run was slow.
+
+The rule to size by hand is *the largest `numClients` for which `pass:c[numClients × 2 + 2 ≤ hostCores]`*. Beyond that, more
+forks make throughput worse, and the parent logs a WARN.
+
+[cols="1,1,1,4",options="header"]
+|===
+|Host cores |`numClients` |Slice |Notes (from the 4.1.x sizing page, plus the 8-core line observed here)
+
+|2 |1 |1, clamped to 2 |Tight; acceptable for low throughput
+|4 |1 |2 |Comfortable single-fork deployment
+|4 |2 |1, clamped to 2 |Over-provisioned; use 1
+|8 |3 |2 |Sweet spot for medium pods (observed: `autoCap=slice=2`)
+|16 |4 |3 |The project's measured winner on 16-core hosts
+|16 |6 |2 |Higher concurrency, tighter breathing room
+|16 |8 |1, clamped to 2 |Does not fit; keep 4 or 6
+|32 |8 |3 |Same shape as 16 and 4
+|===
+
+When you leave `numClients` unset, the 4.1.0 default is `max(1, min(4, (cores - 2) / 2))` for tika-server and the
+pipes configuration; the batch CLIs use 2 and `PipesForkParser` uses 1 (as read from the 4.1.0 sources by the
+xref:backend/apache-tika/tika-pipes.adoc[Tika Pipes] page). Every pipes start-up logs its decision once; grep for
+`pipes-cpu-sizing`. From the tika-server runs for this page on the 8-core laptop:
+
+[source,text]
+----
+INFO  [main] 23:02:01,156 org.apache.tika.pipes.core.PerClientServerManager pipes-cpu-sizing: hostCores=8, numClients=1, parentReserved=2, autoCap=slice=6, heap=user-set in forkedJvmArgs
+INFO  [main] 23:02:58,486 org.apache.tika.pipes.core.PerClientServerManager pipes-cpu-sizing: hostCores=8, numClients=3, parentReserved=2, autoCap=slice=2, heap=user-set in forkedJvmArgs
+----
+
+The `autoCap` field reads `slice=N` (the cap fired), `slice=2 (clamped; fair share would be N)` (over-provisioned:
+lower `numClients`) or `user-set in forkedJvmArgs`.
+
+Further rules:
+
+* *`numClients` is a ceiling, not a resident count.* Forks start lazily on the first request that needs one, the pool
+  hands out the most recently used fork first (LIFO), and a fork idle for `socketTimeoutMillis` (60 s) exits and is
+  restarted on next use. Over-sizing costs little at idle, but the CPU and heap slices are still computed from
+  `numClients`, so a lone warm fork does not get its idle siblings' share.
+* *Several pools in one JVM do not see each other.* tika-server's sync endpoints and `/async` are two independent
+  groups; two `PipesForkParser` instances are two groups. Each computes its slice as if it were alone. Scope
+  `server.endpoints` to what you use, or set `-XX:ActiveProcessorCount` in `forkedJvmArgs` with the combined total in
+  mind.
+* *Containers*: on JDK 17 and later `Runtime.availableProcessors()` honours cgroup CPU limits. A pod without
+  `resources.limits.cpu` sees the whole node, so the formula sizes for cores the pod cannot have. Always set CPU limits
+  on pods that run forks.
+* *OCR*: Tesseract is a separate native process per page, and OpenMP threads inside it multiply the load. The 4.1.0
+  `-full` Docker images set `OMP_THREAD_LIMIT=1` "to avoid oversubscribing the CPU under forked parse workers"
+  (TIKA-4910, TIKA-4866, TIKA-4863). Set it yourself when you install Tesseract outside those images.
+
+Overriding the cap, for a host you know better than the formula (here a pod running both sync and `/async` pools of 2 on
+12 cores, so 4 forks in all):
+
+[source,json]
+----
+{
+  "pipes": {
+    "numClients": 2,
+    "forkedJvmArgs": ["-Xmx2g", "-XX:ActiveProcessorCount=2"]
+  }
+}
+----
+
+Source: https://tika.apache.org/docs/4.1.x/pipes/cpu-sizing.html[Forked-JVM CPU and Heap Sizing, Apache Tika 4.1.x],
+https://tika.apache.org/docs/4.1.x/using-tika/server/index.html[Tika Server, Apache Tika 4.1.x] (Endpoints and
+Forked-Process Groups) and https://github.com/apache/tika/blob/main/CHANGES.txt[`CHANGES.txt`] (Release 4.1.0).
+
+== Memory per fork
+
+CPU decides `numClients`; memory is then divided among however many forks that produced. Check both constraints:
+
+[source,text]
+----
+CPU:     numClients × 2 + 2                          ≤ hostCores
+Memory:  numClients × per-fork -Xmx + parent heap    ≤ 75% of host or container memory
+----
+
+What Tika does when you do not set a heap:
+
+* It injects `-XX:MaxRAMPercentage=75/numClients` into each fork (60 for a single fork) when `forkedJvmArgs` has no
+  `-Xmx`, `-XX:MaxRAMPercentage` or `-XX:MaxRAMFraction`. The parent keeps the JVM default (about 25% of the container)
+  on top, and metaspace, thread stacks, direct buffers and the page cache come out of what is left.
+* Each fork checks its own heap at start-up and logs a WARN below 256 MB, "the point below which ordinary documents,
+  not just pathological ones, begin to fail".
+* With an explicit `-Xmx`, the parent warns when `numClients × -Xmx` exceeds 75% of memory. It warns rather than fails.
+
+A reasonable starting point is *about 2 GB per fork* (`-Xmx2g`). Three constraints drive it: a few pathological PDFs in
+any large corpus allocate hundreds of megabytes each; embedded-heavy Office files multiply per-document allocation by the
+embedding count; and G1 behaves poorly above about 85% occupancy. To right-size for your corpus, log GC with
+`+-Xlog:gc*+` in `forkedJvmArgs` (the forks do not inherit the parent's flags), read the post-GC working set under real
+concurrency, and set `-Xmx` to about 1.5 times the peak.
+
+=== The cache memory budget is a quarter of the fork heap
+
+Since 4.1.0, each fork keeps a process-wide `CacheMemoryBudget` for rewind buffers and in-memory random-access views, so
+small embedded objects stay in RAM instead of spilling at the per-object 1 MB threshold. The default is a quarter of the
+fork's maximum heap; the fork logs it at start-up. From the `PipesForkParser` benchmark runs (`-Xmx512m`):
+
+[source,text]
+----
+INFO  [main] 10:07:53,245 [fork] pipesClientId=0 org.apache.tika.pipes.core.server.PipesServer Cache memory budget: 134217728 bytes (default, a quarter of max heap)
+----
+
+Size `-Xmx` so that three quarters of it covers the parsing working set; the remaining quarter is what the budget may
+hold. It is a ceiling on live cached bytes, not a preallocation. A value set with `-Dtika.pipes.cacheMemoryBudgetBytes`
+(plain bytes, in `forkedJvmArgs`) is clamped to the same quarter-heap ceiling, and a value of 0 or less disables the
+budget and restores the per-object threshold. The project's regression box ran `-Xmx4g` per fork (a 1 GB budget each)
+and found that "archive-heavy corpora do better with -Xmx6g (1.5 GB budget)".
+
+[source,json]
+----
+{
+  "pipes": {
+    "numClients": 4,
+    "forkedJvmArgs": ["-Xmx6g", "-Dtika.pipes.cacheMemoryBudgetBytes=1610612736"]
+  }
+}
+----
+
+=== Other memory you are paying for
+
+[cols="2,5",options="header"]
+|===
+|Item |Cost
+
+|Inline bodies (`maxInlineBytes`, 10 MB) |A body at or below this size travels inside the IPC request and touches no disk. The parent holds the payload and a frame containing a copy, and the fork holds it again: budget about `2 × maxInlineBytes × concurrent requests` in the parent. Lower it on a memory-tight front end; raise it only with heap to spare.
+|Results (`maxIpcPayloadBytes`) |The fork sends the whole extract back unless it emits it itself. A huge `/rmeta` result is held in both JVMs; above the cap the request fails with `413` (`PAYLOAD_LIMIT_EXCEEDED`). Use a `writeLimit`.
+|The result string |`toString()` on a content handler materializes the whole extract. A 99 MB text file produced a 99 million-character Markdown string in the runs below: about 200 MB of UTF-16 in a `String`, plus the builder it came from.
+|Shared server |One heap for the worst concurrent load, not the worst single document; no per-document limit contains a hungry document.
+|Page cache |Not heap, but on a cold-cache corpus it matters more: the project's 62 GB box left about 30 GB for the page cache with 7 forks at 4 GB each.
+|===
+
+A worked budget for a 16-core, 16 GB pod: `numClients` 4 (`pass:c[4 × 2 + 2 = 10 ≤ 16]`), `-Xmx2g` per fork, about 1 GB for
+the parent: `pass:c[4 × 2 GB + 1 GB ≈ 9 GB]`, under the 75% line (12 GB), leaving room for the kernel, I/O buffers and native
+memory. Set the container memory limit to the full 16 GB and the parent heap explicitly (see
+xref:backend/apache-tika/docker-and-kubernetes-deployment.adoc[Docker & Kubernetes Deployment] for the
+`JAVA_TOOL_OPTIONS` trap, which also reaches the forks).
+
+Source: https://tika.apache.org/docs/4.1.x/pipes/cpu-sizing.html[Forked-JVM CPU and Heap Sizing, Apache Tika 4.1.x]
+(Heap per fork) and https://tika.apache.org/docs/4.1.x/pipes/configuration.html[Pipes Configuration, Apache Tika 4.1.x]
+(Embedded-object cache memory budget, IPC and Inline Payload Limits).
+
+[[the-410-batch-throughput-fix]]
+== Temp files and spooling: the 4.1.0 batch-throughput fix
+
+Spooling means writing a stream to a temporary file so that a parser can read it with random access. In 4.x, nothing
+spools until something asks: a `TikaInputStream` wrapping a plain `InputStream` starts in pass-through mode, and only
+`getFile()`/`getPath()` or `enableRewind()` make it cache (in memory, spilling to a file past 1 MB). That design is
+explained on xref:backend/apache-tika/parser-api-and-autodetectparser.adoc[Parser API & AutoDetectParser]. What matters
+for throughput is how many bytes end up on disk, and in 4.0.0 that number was far too high.
+
+=== What happened in 4.0.0
+
+The Tika project's own regression run, tika-app in batch mode over a 1.2-million-file corpus from file system to file
+system on spinning disks, took about 4 hours on 3.x and about 7.5 hours on 4.0.0. The diagnosis, as published on the
+4.1.x performance page:
+
+* *4.0.0 wrote 8 to 30 times more temp bytes than 3.x* for the same documents.
+* Digesting an embedded document (MD5 or SHA-256 per embedded object) buffered a rewindable copy that spilled to a temp
+  file past 1 MB: one temp file per embedded object.
+* Several parsers and detectors asked for a `java.io.File` even when the bytes were already in memory: the JPEG, TIFF
+  and WebP metadata extractors, the OLE2 container detector, OpenDocument inline pictures, the PDF incremental-update
+  scan, and the PDF parser's main load and renderer.
+* With temp files, the corpus and the outputs on the same spindles, wall-clock time tracked temp volume almost linearly.
+
+The page also lists what it was _not_, measured and ruled out: pipes IPC and result passback (about 1% of worker time),
+the driver's emit path, the second read of each container for the digest, the parsers themselves, and 4.x extracting
+about 3% more embedded objects.
+
+=== What 4.1.0 changed
+
+The CHANGES entries for Release 4.1.0, under PERFORMANCE:
+
+[cols="1,5",options="header"]
+|===
+|Issue |CHANGES entry (4.1.0)
+
+|TIKA-4835 |"Improve spooling/decrease number of spills to disk. The pipes cache memory budget defaults to a quarter of the fork heap (-Dtika.pipes.cacheMemoryBudgetBytes overrides)."
+|TIKA-4828 |"Digesting embedded documents no longer spools each to a temp file; a process-wide CacheMemoryBudget keeps them in memory. Zip-family parsing uses seekable channels, so hasFile() may be false afterward."
+|TIKA-4878 |"Embedded documents in Office files, PDFs, PST and the zip-family containers are re-opened from their container on rewind instead of cached."
+|TIKA-4898 |"PDF incremental-update scanning reads in blocks; ~4x less CPU."
+|TIKA-4905 |The forked-worker CPU cap is clamped at its floor of 2 (listed under fixes).
+|TIKA-4877 |"Temp files follow -Djava.io.tmpdir on the parent JVM (Tika, its libraries and forks); pipes.tempDirectory is deprecated." (breaking changes)
+|===
+
+The project then measured the result as a controlled study: 100,000 documents sampled from the corpus, cold page cache,
+plain-text extraction with SHA-256 digests, seven workers at 4 GB each, on 4.1.0-SNAPSHOT in August 2026. Its medians:
+
+[cols="3,2,2",options="header"]
+|===
+|Version and shape (the project's figures) |Wall time (median) |Temp written
+
+|Tika 3.x |25.2 min |3.3 GB
+|4.1.0, shared server |27.2 min |1.4 GB
+|4.1.0, per-client (default) |29.0 min |8.2 GB
+|4.0.0, shared server |41.1 min |57 GB
+|4.0.0, per-client |42.0 min |57 GB
+|===
+
+So 4.0.0 to 4.1.0 per-client is about 1.45 times faster, with temp writes falling from 57 GB to 8 GB, and 4.1.0
+per-client lands within about 15% of 3.x. The page splits that 15% into about 7% for crossing the process boundary
+(present in both shapes, inherent to isolation) and up to about 8% more for running several worker JVMs on one box
+(separate GCs and JIT caches, contention for cores, memory bandwidth and cache). The page's own caveats: one 100k subset
+on one host, a snapshot build, remote emitters not measured, and "read these as a snapshot, not a final
+characterization". This page did not reproduce the study.
+
+Source: https://tika.apache.org/docs/4.1.x/pipes/performance.html#_restoring_batch_throughput_in_4_1_0[Restoring batch
+throughput in 4.1.0, Apache Tika 4.1.x] and https://github.com/apache/tika/blob/main/CHANGES.txt[`CHANGES.txt`]
+(Release 4.1.0).
+
+=== What to do about temp files
+
+* *Upgrade to 4.1.x* if you run 4.0.0 batch jobs; nothing else recovers the lost throughput as cheaply.
+* *Hand Tika a `Path` or a `byte[]`, not an opaque stream.* `TikaInputStream.get(path)` is file-backed and never spools;
+  `TikaInputStream.get(bytes)` is memory-backed; `TikaInputStream.get(new FileInputStream(file))` may spool a copy of a
+  file you already had.
+* *Point `java.io.tmpdir` at fast, disk-backed storage on the parent JVM.* It has to be a launch flag: POI, PDFBox and
+  the JDK read it once at start-up. Each fork gets a private `+pipes-server-*+` subdirectory under it, which the parent
+  deletes. `pipes.tempDirectory` is deprecated since 4.1 and planned for removal in 5.0.
+* *Never use tmpfs (`/dev/shm`, any RAM-backed file system) for it.* A RAM disk does recover the 4.0.0 loss, and it is a
+  good _diagnostic_ (if moving temp to tmpfs makes a run fast, temp volume is your bottleneck), but spool size is bounded
+  only by the input: one large archive can exhaust memory for every process, or push a pod over its memory limit.
+* *Separate the spindles* when you can: temp, corpus and output on the same disks turn every temp byte into a seek
+  stolen from a read or a write. On cloud volumes, check the IOPS budget of the temp volume.
+* *Give archive-heavy corpora more heap*, which also raises the cache budget.
+
+To find which code path writes temp files, record `jdk.FileWrite` with JFR *in the fork* (flags go in `forkedJvmArgs`;
+a recording on the parent shows near-zero bytes) and lower the event threshold, because temp spills finish well under
+the default 20 ms:
+
+[source,json]
+----
+{
+  "pipes": {
+    "forkedJvmArgs": [
+      "-Xmx4g",
+      "-XX:FlightRecorderOptions=maxchunksize=1m",
+      "-XX:StartFlightRecording=settings=profile,jdk.FileWrite#threshold=0ms,maxsize=500M,filename=/var/tmp/spill.jfr,dumponexit=true"
+    ]
+  }
+}
+----
+
+Then group the events by path and by the top `org.apache.tika` frame with `jfr print --events jdk.FileWrite`
+(`jfr print --json` on a large recording expands to tens of gigabytes). Forks are force-killed on teardown, so the last
+chunk can be lost; `maxchunksize` bounds the loss. This recipe was not run for this page.
+
+Source: https://tika.apache.org/docs/4.1.x/pipes/performance.html#_diagnosing_temp_file_volume_in_your_own_run[Diagnosing
+temp-file volume in your own run, Apache Tika 4.1.x],
+https://tika.apache.org/docs/4.1.x/advanced/spooling.html[TikaInputStream and Spooling, Apache Tika 4.1.x] and
+https://tika.apache.org/docs/4.1.x/pipes/configuration.html[Pipes Configuration, Apache Tika 4.1.x] (Where temporary
+files go).
+
+== Parser reuse
+
+The single biggest avoidable cost is building parsers per document. On the test laptop, constructing an
+`AutoDetectParser` took about four seconds each time (the class path holds the full standard parser package, CharSoup and
+the junk detector models):
+
+[source,java]
+----
+import org.apache.tika.parser.AutoDetectParser;
+
+public class Ctor {
+    public static void main(String[] args) {
+        for (int i = 0; i < 5; i++) {
+            long t = System.nanoTime();
+            new AutoDetectParser();
+            System.out.printf("new AutoDetectParser() #%d: %d ms%n", i + 1, (System.nanoTime() - t) / 1_000_000);
+        }
+    }
+}
+----
+
+[source,text]
+----
+new AutoDetectParser() #1: 6192 ms
+new AutoDetectParser() #2: 4806 ms
+new AutoDetectParser() #3: 4265 ms
+new AutoDetectParser() #4: 4056 ms
+new AutoDetectParser() #5: 4325 ms
+----
+
+Indicative, on a laptop under load from other processes; a dedicated server will be faster, but the order of magnitude
+(seconds, not milliseconds) is the point. In the benchmark below, a fresh parser per document turned about 70 documents
+per second into 0.1 to 0.2.
+
+Source: https://tika.apache.org/docs/4.1.x/using-tika/java-api/getting-started.html[Getting Started with the Java API,
+Apache Tika 4.1.x]; the timing was measured against Tika 4.1.0 for this page.
+
+The reuse rules for each shape:
+
+[cols="2,4",options="header"]
+|===
+|Object |Rule
+
+|`AutoDetectParser`, `DefaultDetector`, a loaded `TikaLoader` |One per application, shared by all threads. Do not call its setters once shared. See xref:backend/apache-tika/parser-api-and-autodetectparser.adoc#_thread_safety_and_parser_reuse[Thread safety and parser reuse].
+|`Tika` facade |One instance; it wraps one parser and one detector.
+|`TikaInputStream`, `ContentHandler`, `Metadata`, `ParseContext` |New per document, closed with try-with-resources.
+|`PipesForkParser` |One per application (it is documented as thread-safe), closed on shutdown. Creating one per request pays a fork start-up (seconds) every time.
+|Forks |Reused automatically; recycled after `maxFilesProcessedPerProcess` documents (10,000 in 4.1.0) to contain slow leaks. 4.2.0, unreleased, raises the default to 100,000 so that forks "restart a tenth as often" (TIKA-4950).
+|tika-server client |One `HttpClient` or `RestClient` per application, keeping connections alive.
+|===
+
+A fork's first parse includes its JVM start and parser loading: lazy start means the first request after start-up, after
+a crash and after an idle shutdown is slow. In the server runs below, three cold forks took most of the first 14 seconds.
+For latency-sensitive services, send a small warm-up document to each fork after start-up (concurrency equal to
+`numClients`), and consider raising `socketTimeoutMillis` so that forks do not idle out between bursts. 4.2.0 (unreleased)
+adds `PipesParser.start()` and `PipesForkParser.start()` to bring forks up before the first parse (TIKA-4953).
+
+== Write limits and the cost of the output format
+
+=== Write limits
+
+Every extracted character is held at least once as a string, crosses IPC in the forked shapes, and is written to an
+index. Most applications need far less than the whole document: a search snippet, a classifier input, the first pages
+for RAG. Bound it:
+
+[source,json]
+----
+{
+  "parse-context": {
+    "output-limits": {
+      "writeLimit": 2000000,
+      "throwOnWriteLimit": false
+    },
+    "embedded-limits": {
+      "maxCount": 1000
+    }
+  }
+}
+----
+
+With `throwOnWriteLimit` false (the default), extraction stops at the limit and the metadata carries
+`tk:exception:write-limit-reached=true`, so the index can mark the document as truncated. The default `writeLimit` is
+`-1` (unlimited). A write limit caps output, not parse time: a parser may keep working past the limit, so pair it with
+`timeout-limits`. The full set of limits is on xref:backend/apache-tika/robustness-limits-and-timeouts.adoc[Robustness,
+Limits & Timeouts].
+
+Source: https://tika.apache.org/docs/4.1.x/advanced/setting-limits.html[Setting Limits, Apache Tika 4.1.x].
+
+=== Markdown versus XHTML versus text
+
+Markdown is the 4.x default everywhere (tika-app, tika-server, the pipes CLI). Its cost relative to the other handlers
+depends on the release:
+
+* *4.1.0 made Markdown output "~30x faster"* (CHANGES, PERFORMANCE: one combined TIKA-4868 entry that also covers
+  faster detection and a stricter `Content-Type` override). If you measured Markdown as expensive on
+  4.0.0, measure again.
+* *XHTML and HTML carry more characters*: every element, attribute and namespace is serialized. On the synthetic corpus
+  below, XML output was about 14% larger than Markdown and about 26% larger than plain text, and HTML was the slowest
+  handler in the single-thread runs.
+* *Plain text is the cheapest* to produce and store, and loses headings, lists and links.
+* *`IGNORE`* (or `/rmeta/ignore`) skips content entirely when you need only metadata, and the parse still runs.
+
+Choose by what consumes the output, not by handler speed: the handler is a small share of a parse. Use Markdown for RAG
+and chunking (`tk:chunks` and the chunkers split on headings), text for a plain full-text index, XHTML only when you post-
+process the structure. The handler choices are on
+xref:backend/apache-tika/content-handlers-and-output-formats.adoc[Content Handlers & Output Formats].
+
+=== Parse mode and emit strategy in batch work
+
+* `RMETA` (one metadata object per document, embedded ones included) costs more than `CONCATENATE` (one object, all
+  text concatenated) because every embedded document gets its own metadata and content; use `CONCATENATE` for a plain
+  full-text index and `RMETA` when embedded documents become their own search hits or chunks.
+* `emitStrategy` `DYNAMIC` (default, threshold 100,000 bytes) lets forks write large extracts themselves; the project
+  found that more emitter threads (`numEmitters`) and `EMIT_ALL` did not move file-system batch numbers. Change it only
+  for a measured memory or throughput problem.
+* For search emitters, batch the emits (`emitMaxEstimatedBytes`, `emitWithinMillis`) rather than one request per
+  document; see xref:backend/apache-tika/tika-pipes.adoc[Tika Pipes].
+
+[[indicative-measurements]]
+== Indicative local measurements
+
+To see the direction of the effects above, a small Java probe parsed a synthetic _Bookshelf_ corpus of 11 files 20 times
+(220 parses per run) after one warm-up pass: the small sample files (`manuscript.docx`, `catalogue.pdf`,
+`publisher-email.eml`, `samples.zip`, `novel.epub`, `reviews-es.html`, `legacy-catalogue.txt`, `renamed-invoice.png`)
+plus three larger generated ones (a 60-page `catalogue-large.pdf`, a 1,650-paragraph `manuscript-large.docx` and a 660 KB
+`reviews-large.html`). `scanned-loan-form.pdf` was left out because Tesseract was not installed.
+
+[WARNING]
+====
+These numbers are indicative only. They come from one 8-core laptop that was running other heavy workloads at the same
+time (load averages from about 9 to several hundred during the runs), a tiny corpus that fits in the page cache, and
+two or three repetitions per cell, with spreads of up to 2x between repetitions. They are not capacity figures and they
+do not compare with the project's benchmark above. Measure your own corpus on your own hardware.
+====
+
+[cols="4,2,2",options="header"]
+|===
+|Configuration (Tika 4.1.0, Java 25) |Documents per second (runs) |Characters out
+
+|In-process, shared `AutoDetectParser`, 1 thread, `TEXT` |70.5, 68.4, 78.7 |27.5 million
+|In-process, shared parser, 1 thread, `MARKDOWN` |69.9, 69.8, 67.3 |30.3 million
+|In-process, shared parser, 1 thread, `XML` (XHTML) |67.0, 63.9, 44.3 |34.6 million
+|In-process, shared parser, 1 thread, `HTML` |52.1, 53.6, 57.2 |34.6 million
+|In-process, *new parser per document*, 1 thread, `MARKDOWN` (11 docs) |0.1, 0.2 |1.5 million
+|In-process, shared parser, 4 threads, `MARKDOWN` |101.2, 59.0, 48.4 |30.3 million
+|In-process, shared parser, 4 threads, `XML` |80.1, 84.8 |34.6 million
+|`PipesForkParser`, per-client, `numClients` 1, 1 thread, `MARKDOWN` |33.5, 13.9 |30.3 million
+|`PipesForkParser`, per-client, `numClients` 3, 3 threads, `MARKDOWN` |72.9, 60.4 |30.3 million
+|`PipesForkParser`, shared server, `numClients` 3, 3 threads, `MARKDOWN` |60.9, 69.4 |30.3 million
+|===
+
+What can be read from it, and no more:
+
+* A new `AutoDetectParser` per document is catastrophic (two to three orders of magnitude).
+* On these small documents, a single fork is about half the in-process speed: the per-request boundary (IPC,
+  serialization) is a large share when each parse takes milliseconds. The project's figure of about 7% for that boundary
+  is for a real corpus of larger documents.
+* Three forks recover in-process single-thread throughput; per-client and shared server were within noise of each
+  other at three workers here.
+* The output format changed the volume more than the speed, except that `HTML` was consistently slowest single-threaded.
+
+The probe (compiled and run for this page; the fork runs use `CONCATENATE` so that one string comes back per document):
+
+[source,java]
+----
+package demo;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
+
+import org.apache.tika.io.TikaInputStream;
+import org.apache.tika.metadata.Metadata;
+import org.apache.tika.parser.AutoDetectParser;
+import org.apache.tika.parser.ParseContext;
+import org.apache.tika.parser.Parser;
+import org.apache.tika.pipes.api.ParseMode;
+import org.apache.tika.pipes.fork.PipesForkParser;
+import org.apache.tika.pipes.fork.PipesForkParserConfig;
+import org.apache.tika.pipes.fork.PipesForkResult;
+import org.apache.tika.sax.BasicContentHandlerFactory;
+import org.apache.tika.sax.BasicContentHandlerFactory.HANDLER_TYPE;
+import org.xml.sax.ContentHandler;
+
+/**
+ * Indicative throughput probe for the Bookshelf corpus.
+ * Bench <corpusDir> <rounds> inproc <TEXT|MARKDOWN|XML|HTML> <threads> <reuse|new>
+ * Bench <corpusDir> <rounds> fork <TEXT|MARKDOWN|XML> <threads> <numClients> <perclient|shared>
+ */
+public class Bench {
+
+    public static void main(String[] args) throws Exception {
+        Path corpus = Path.of(args[0]);
+        int rounds = Integer.parseInt(args[1]);
+        String mode = args[2];
+        HANDLER_TYPE type = HANDLER_TYPE.valueOf(args[3]);
+        int threads = Integer.parseInt(args[4]);
+        List<Path> files;
+        try (Stream<Path> s = Files.list(corpus)) {
+            files = s.filter(Files::isRegularFile).sorted().toList();
+        }
+        List<Path> work = new ArrayList<>();
+        for (int r = 0; r < rounds; r++) {
+            work.addAll(files);
+        }
+        if (mode.equals("inproc")) {
+            boolean reuse = args[5].equals("reuse");
+            Parser shared = new AutoDetectParser();
+            Task task = file -> {
+                Parser parser = reuse ? shared : new AutoDetectParser();
+                ContentHandler handler = new BasicContentHandlerFactory(type, -1).createHandler();
+                try (TikaInputStream tis = TikaInputStream.get(file)) {
+                    parser.parse(tis, handler, new Metadata(), new ParseContext());
+                }
+                return handler.toString().length();
+            };
+            run(task, files, 1);                      // warm-up: one pass over the corpus
+            report(args, run(task, work, threads), work.size());
+        } else {
+            int numClients = Integer.parseInt(args[5]);
+            PipesForkParserConfig config = new PipesForkParserConfig()
+                    .setHandlerType(type)
+                    .setParseMode(ParseMode.CONCATENATE)
+                    .addJvmArg("-Xmx512m")
+                    .setNumClients(numClients);
+            config.getPipesConfig().setUseSharedServer(args[6].equals("shared"));
+            try (PipesForkParser parser = new PipesForkParser(config)) {
+                Task task = file -> {
+                    PipesForkResult result = parser.parse(file);
+                    if (!result.isSuccess()) {
+                        throw new IllegalStateException(file + " " + result.getStatus());
+                    }
+                    String content = result.getContent();
+                    return content == null ? 0 : content.length();
+                };
+                // warm-up: start every fork before timing
+                run(task, work.subList(0, Math.min(work.size(), files.size() * numClients)), threads);
+                report(args, run(task, work, threads), work.size());
+            }
+        }
+    }
+
+    interface Task {
+        long apply(Path file) throws Exception;
+    }
+
+    static long[] run(Task task, List<Path> work, int threads) throws Exception {
+        AtomicLong chars = new AtomicLong();
+        long start = System.nanoTime();
+        try (ExecutorService pool = Executors.newFixedThreadPool(threads)) {
+            List<Future<?>> futures = new ArrayList<>();
+            for (Path file : work) {
+                futures.add(pool.submit(() -> {
+                    chars.addAndGet(task.apply(file));
+                    return null;
+                }));
+            }
+            for (Future<?> f : futures) {
+                f.get();
+            }
+        }
+        return new long[] {System.nanoTime() - start, chars.get()};
+    }
+
+    static void report(String[] args, long[] r, int docs) {
+        double secs = r[0] / 1e9;
+        System.out.printf("%-48s docs=%d wall=%.2fs docs/s=%.1f chars=%d%n",
+                String.join(" ", List.of(args).subList(2, args.length)), docs, secs, docs / secs, r[1]);
+    }
+}
+----
+
+Run it with the dependencies of the xref:backend/apache-tika/tika-pipes.adoc[Tika Pipes] page
+(`tika-pipes-fork-parser`, `tika-pipes-core`, `tika-parsers-standard-package` as a `pom` dependency, an SLF4J binding).
+Sample output lines:
+
+[source,text]
+----
+inproc MARKDOWN 1 reuse                          docs=220 wall=3.15s docs/s=69.9 chars=30321440
+inproc MARKDOWN 1 new                            docs=11 wall=59.26s docs/s=0.2 chars=1516072
+fork MARKDOWN 3 3 perclient                      docs=220 wall=3.02s docs/s=72.9 chars=30321440
+fork MARKDOWN 3 3 shared                         docs=220 wall=3.17s docs/s=69.4 chars=30321440
+----
+
+Source: https://tika.apache.org/docs/4.1.x/using-tika/java-api/pipes.html[Tika Pipes from Java, Apache Tika 4.1.x] and
+https://github.com/apache/tika/blob/main/tika-example/src/main/java/org/apache/tika/example/PipesForkParserExample.java[tika-example,
+PipesForkParserExample.java].
+
+For your own benchmark, follow the project's advice: fix concurrency equal to the worker count when comparing, exclude
+a warm-up phase, hold the output format constant, benchmark cold when the corpus is larger than RAM (evict the page
+cache, write outputs to the real destination), and watch peak RSS across the whole process tree, not one JVM.
+
+[[horizontal-scaling]]
+== Horizontal scaling with 429 as the signal
+
+A 4.x tika-server knows when it is full. When every fork in a pool is busy and none frees up within
+`pipes.maxWaitForClientMillis` (default 60 s), the request fails fast with `429 Too Many Requests`, a `Retry-After`
+header and `+{"status":"CLIENT_UNAVAILABLE_WITHIN_MS"}+`. That is deliberately different from `503`, which means a fork
+crashed, ran out of memory or timed out _on this document_. The official server page says the distinction "is worth
+building on": clients back off on `429`, load balancers shed load, queue consumers slow their fetch rate, autoscalers get
+a signal. In its words, "a 429 spike means raise numClients or add capacity, a 503 spike means something is actually
+crashing".
+
+[mermaid]
+....
+flowchart LR
+    Q[Intake queue<br/>or upload API] --> C[Bookshelf extract client<br/>retry with Retry-After]
+    C --> LB[Load balancer<br/>least outstanding requests]
+    LB --> S1[tika-server pod 1<br/>numClients forks]
+    LB --> S2[tika-server pod 2<br/>numClients forks]
+    LB --> S3[tika-server pod N]
+    S1 -- "429 busy" --> C
+    S1 -- "503 fork died" --> DLQ[Quarantine<br/>dead-letter]
+    P[Prometheus] -. scrapes metricsPort .-> S1
+    P -. scrapes .-> S2
+    P --> HPA[HPA or KEDA<br/>busy ratio, 429 rate]
+    HPA -. adds or removes pods .-> S3
+....
+
+=== The client side
+
+The client must treat `429` as "try again later, maybe elsewhere", honour `Retry-After`, add jitter so that many clients
+do not retry in lockstep, and cap the retries. `503` gets one retry at most, then quarantine. Everything else is final.
+A JDK `HttpClient` version for the _Bookshelf_ intake:
+
+[source,java]
+----
+package demo;
+
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
+
+/** Sends Bookshelf files to tika-server and treats 429 as backpressure, 503 as a poison document. */
+public class BackpressureClient {
+
+    sealed interface Outcome permits Extracted, Quarantined, GaveUp { }
+    record Extracted(String markdown) implements Outcome { }
+    record Quarantined(int status, String body) implements Outcome { }
+    record GaveUp(int attempts) implements Outcome { }
+
+    private static final int MAX_BUSY_RETRIES = 6;
+
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(5))
+            .build();
+    private final URI endpoint;
+
+    BackpressureClient(URI endpoint) {
+        this.endpoint = endpoint;
+    }
+
+    Outcome extract(Path file) throws IOException, InterruptedException {
+        boolean retriedCrash = false;
+        for (int attempt = 1; attempt <= MAX_BUSY_RETRIES; attempt++) {
+            HttpRequest request = HttpRequest.newBuilder(endpoint)
+                    .timeout(Duration.ofMinutes(5))
+                    .PUT(HttpRequest.BodyPublishers.ofFile(file))
+                    .build();
+            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            switch (response.statusCode()) {
+                case 200 -> {
+                    return new Extracted(response.body());
+                }
+                case 429 -> {
+                    // Busy, nothing failed: wait at least Retry-After, plus jitter so clients spread out.
+                    System.out.println(file + ": 429, attempt " + attempt);
+                    long seconds = response.headers().firstValueAsLong("Retry-After").orElse(2L);
+                    long jitter = ThreadLocalRandom.current().nextLong(0, 1000L * attempt);
+                    Thread.sleep(seconds * 1000L + jitter);
+                }
+                case 503 -> {
+                    // A fork died on this document. One retry, then quarantine it.
+                    if (retriedCrash) {
+                        return new Quarantined(503, response.body());
+                    }
+                    retriedCrash = true;
+                    long seconds = response.headers().firstValueAsLong("Retry-After").orElse(5L);
+                    Thread.sleep(seconds * 1000L);
+                }
+                default -> {
+                    return new Quarantined(response.statusCode(), response.body());
+                }
+            }
+        }
+        return new GaveUp(MAX_BUSY_RETRIES);
+    }
+
+    public static void main(String[] args) throws Exception {
+        BackpressureClient client = new BackpressureClient(URI.create(
+                args.length > 0 ? args[0] : "http://localhost:9998/tika/md"));
+        List<Path> files = args.length > 1
+                ? java.util.Arrays.stream(args, 1, args.length).map(Path::of).toList()
+                : List.of(Path.of("manuscript.docx"), Path.of("catalogue.pdf"));
+        for (Path file : files) {
+            Outcome outcome = client.extract(file);
+            switch (outcome) {
+                case Extracted e -> System.out.println(file + ": " + e.markdown().length() + " chars");
+                case Quarantined q -> System.out.println(file + ": quarantined, HTTP " + q.status());
+                case GaveUp g -> System.out.println(file + ": still busy after " + g.attempts() + " attempts");
+            }
+        }
+    }
+}
+----
+
+Do not send an `Accept: text/markdown` header to `/tika/md`: the path already chooses the format, and the first version of
+this client got `406 Not Acceptable` for doing both.
+
+To see the backpressure work, tika-server 4.1.0 was started with `numClients` 1 and `maxWaitForClientMillis` 2000, and
+four copies of the client were started 0.3 s apart, each sending a 99 MB text file (`huge-catalogue.txt`) that keeps a
+fork busy for a few seconds:
+
+[source,json]
+----
+{
+  "server": { "host": "127.0.0.1", "port": 9998, "metricsPort": 9404, "endpoints": ["tika", "rmeta", "version"] },
+  "pipes": { "numClients": 1, "maxWaitForClientMillis": 2000, "forkedJvmArgs": ["-Xmx1g"] }
+}
+----
+
+[source,text]
+----
+huge-catalogue.txt: 98993203 chars
+huge-catalogue.txt: 429, attempt 1
+huge-catalogue.txt: 429, attempt 2
+huge-catalogue.txt: 98993203 chars
+huge-catalogue.txt: 429, attempt 1
+huge-catalogue.txt: 429, attempt 2
+huge-catalogue.txt: 98993203 chars
+huge-catalogue.txt: 429, attempt 1
+huge-catalogue.txt: 429, attempt 2
+huge-catalogue.txt: 98993203 chars
+----
+
+Every document was extracted; the metrics port then showed `+tika_server_rejected_total{reason="busy_429"} 6.0+` and
+four `2xx` requests. Restarted with `numClients` 3 (the log showed `autoCap=slice=2`), the same four clients got only two
+`429` answers: one client waited for one of the three forks. The total wall time was about 14 s in both runs, because
+the three forks of the second run started cold on the first requests (lazy start) and one large text file is mostly
+I/O. A cold pool is slower than a warm one; warm it up before you measure.
+
+Source: https://tika.apache.org/docs/4.1.x/using-tika/server/index.html#_backpressure_the_server_can_tell_you_it_is_busy[Backpressure,
+Tika Server, Apache Tika 4.1.x] and https://tika.apache.org/docs/4.1.x/using-tika/server/monitoring.html[Monitoring with
+Prometheus, Apache Tika 4.1.x]. In Spring, the same mapping (`429` to retry, `503` to dead-letter) is on
+xref:backend/apache-tika/spring-boot-integration.adoc[Spring Boot Integration]; for retry and circuit-breaker libraries
+see the site's xref:backend/resilience/index.adoc[Resilience] section.
+
+=== Tuning `maxWaitForClientMillis`
+
+The wait is how long a request may sit in the server, holding a request thread and a connection, before it gets `429`.
+It is also the `Retry-After` value the server sends.
+
+* *Short (1 to 5 s)*: backpressure reaches the client quickly, so the client or the load balancer can try another pod.
+  Use it with several replicas and a retrying client.
+* *Long (the default, 60 s)*: the server absorbs bursts by queueing. Use it with one server and clients that cannot
+  retry, and set the client's own request timeout above `maxWaitForClientMillis` plus the parse timeout, or the client
+  gives up before the server answers.
+
+=== The load balancer
+
+* *Prefer least-outstanding-requests (or least-connections) balancing* over round robin: parse times vary by orders of
+  magnitude, and round robin keeps sending work to a pod whose forks are all stuck on PDFs.
+* *Do not let the load balancer retry non-idempotent uploads blindly*, but a retry of a `429` on another pod is safe:
+  nothing was parsed. Many proxies (Envoy, NGINX `proxy_next_upstream`, cloud load balancers) can retry on `429` only.
+* *Set the proxy's read timeout above the longest parse* (`totalTaskTimeoutMillis`, one hour by default in 4.x; set it
+  lower), or the proxy turns slow parses into `504` answers while the fork keeps working.
+* *Size request bodies at the edge* as well as with `server.maxRequestSizeBytes`.
+* *Health checks* go to `GET /version` on the parse port, never to `/metrics`; a full pool must not fail a liveness
+  probe, or Kubernetes kills the pods that are doing the most work.
+
+=== The autoscaler
+
+Scale on saturation, not CPU. A pod whose forks are busy with OCR shows high CPU, but a pod whose forks wait on a slow
+fetcher or a remote VLM is saturated at low CPU, and the parent JVM's CPU tells you nothing because it does not parse.
+The signals the monitoring page recommends:
+
+* *Sync endpoints*: the busy ratio `+tika_pipes_workers{state="busy"}+` over all workers, and the rate of
+  `+tika_server_rejected_total{reason="busy_429"}+`. Both "move before latency does, which CPU does not".
+* *`/async`*: `tika_pipes_queue_depth`; there is no busy or idle gauge for that pool.
+
+With Kubernetes, expose the busy ratio as a per-pod custom metric (prometheus-adapter) or use KEDA's Prometheus scaler,
+target an average busy ratio around 0.7, and give scale-down a long stabilization window so that pods with in-flight
+parses are not removed after every burst. A pod that is removed mid-parse drops its requests; a `preStop` delay and a
+termination grace period longer than a typical parse help. The manifests are on
+xref:backend/apache-tika/docker-and-kubernetes-deployment.adoc[Docker & Kubernetes Deployment]; this autoscaling setup
+was not tested for this page. For the Kubernetes mechanics see xref:backend/kubernetes/autoscaling.adoc[Autoscaling].
+
+Batch work scales differently: Tika Pipes has no `429` between the iterator and the forks, only its internal queue. Scale a
+batch out by partitioning the input (by prefix, by date, by Kafka partition) across several pipes processes, each with
+its own `numClients`, not by putting one batch behind a load balancer.
+
+== Metrics to watch
+
+Metrics are off by default. Set `server.metricsPort` (or `--metricsPort`) to a port different from the parse port, and
+keep it reachable by the scraper only. The scrape listener serves only `/metrics`, has its own small thread pool and
+caps open connections at 64, so a scrape never waits behind a slow parse.
+
+[cols="3,1,4",options="header"]
+|===
+|Meter |Type |Watch it for
+
+|`+tika_pipes_workers{pool,state}+` |gauge |Saturation: `pass:c[busy / (busy + idle)]` near 1 means the pool is full. Only `+pool="sync"+` has it. Under `useSharedServer` it counts client slots, not JVMs.
+|`+tika_server_rejected_total{reason}+` |counter |`busy_429`: capacity. `crash_503`: documents breaking forks. `payload_413`: bodies or results over the limits.
+|`+tika_pipes_worker_restarts_total{pool,reason}+` |counter |Alert on `oom`, `timeout`, `crash`. `max_files` (recycling), `idle` (idle shutdown), `connection_abandoned` and `shutdown` are expected.
+|`+tika_pipes_queue_depth{pool="async"}+` |gauge |Saturation for `/async`.
+|`+tika_server_requests_seconds{endpoint,method,status}+` |timer |Latency per endpoint; twelve fixed buckets from 10 ms to 120 s, so `histogram_quantile` works.
+|`tika_server_tasks_active` |gauge |Sync parse and detect tasks in flight (`/unpack`, `/pipes` and `/async` excluded).
+|`+tika_server_request_size_bytes{endpoint}+` |summary |Input sizes as declared by `Content-Length`; chunked uploads are not recorded.
+|`+jvm_*+`, `+process_*+` |various |The *parent* JVM only. It routes requests and holds results; a near-idle heap here is not headroom.
+|===
+
+There is deliberately no GC or CPU binder, because both would describe a process that does not parse. For the forks'
+CPU and memory, use container metrics (cAdvisor, node-exporter), and look at the *whole process tree* for memory.
+
+[source,promql]
+----
+# Saturation per pod: share of busy forks (scale on this)
+sum by (pod) (tika_pipes_workers{state="busy"}) / sum by (pod) (tika_pipes_workers)
+
+# Backpressure: requests turned away because no fork was free in time
+sum(rate(tika_server_rejected_total{reason="busy_429"}[5m]))
+
+# Failures: forks killed by documents (alert on these)
+sum by (reason) (rate(tika_pipes_worker_restarts_total{reason=~"oom|timeout|crash"}[5m]))
+sum(rate(tika_server_rejected_total{reason="crash_503"}[5m]))
+
+# Latency: p95 per endpoint
+histogram_quantile(0.95, sum by (le, endpoint) (rate(tika_server_requests_seconds_bucket[5m])))
+----
+
+What to do when a signal moves:
+
+[cols="3,5",options="header"]
+|===
+|Symptom |Likely cause and action
+
+|Busy ratio near 1, `429` rate rising, CPU high |Real capacity limit: add pods. Raise `numClients` only while `pass:c[numClients × 2 + 2 ≤ cores]`.
+|Busy ratio near 1, CPU low |Forks wait on I/O (fetchers, temp disk, remote OCR/VLM). Add pods or fix the slow dependency; more forks per pod may help here, since the CPU rule assumes CPU-bound parsing.
+|`429` with a low busy ratio |Several pools in one server (sync and `/async`), or bursts shorter than the scrape interval. Check `pool` labels and `maxWaitForClientMillis`.
+|`oom` restarts rising |A few documents need more heap: raise `-Xmx`, set `embedded-limits` and `output-limits`, or quarantine the documents. If it appears only with `useSharedServer`, go back to per-client.
+|`timeout` restarts rising |Pathological documents or OCR on large scans. Lower `timeout-limits` and quarantine, or route OCR to its own pool.
+|p95 latency rising with stable busy ratio |Larger documents, cold forks after restarts, or temp-disk contention. Check `max_files` and `idle` restarts and the temp volume.
+|Parent `jvm_memory` high |Large results held in the parent (`/rmeta` with many embedded documents, high `maxInlineBytes`). Add a `writeLimit`.
+|===
+
+For a batch run, the equivalents are the reporter's records (`file-system-jsonl-reporter` records a batch run's
+crashes, new in 4.1.0), the `pipes-cpu-sizing` line, the fork start-up lines (heap and cache budget) and the temp
+directory's size over time.
+
+Source: https://tika.apache.org/docs/4.1.x/using-tika/server/monitoring.html[Monitoring with Prometheus, Apache Tika
+4.1.x]. See also xref:backend/kubernetes/observability-logging-and-metrics.adoc[Observability: Logging, Metrics and
+Tracing] and xref:database/prometheus/recording-and-alerting-rules.adoc[Recording & Alerting Rules].
+
+== A worked sizing for the Bookshelf intake service
+
+The _Bookshelf_ intake receives uploads (manuscripts, catalogues, publisher e-mail with attachments, scanned loan
+forms) from three services and re-indexes the archive every night. Applying the page:
+
+* *Interactive path*: tika-server per-client, three replicas of 8 cores and 12 GB each. `numClients` 3
+  (`pass:c[3 × 2 + 2 = 8]`), `-Xmx2g` per fork (6 GB of forks plus a 1 GB parent, under the 9 GB line), `maxWaitForClientMillis`
+  3000 so that a busy pod answers `429` quickly and the client retries on another, `writeLimit` 2,000,000 characters,
+  Markdown output for the RAG pipeline.
+* *Scanned documents*: routed by the client to a separate tika-server deployment on the `-full` image with
+  `numClients` 2 and a longer `totalTaskTimeoutMillis`, so OCR cannot starve ordinary uploads.
+* *Nightly re-index*: `tika-app` in pipes mode on a batch node, file-system fetcher and Solr emitter, `numClients`
+  sized by the CPU rule, `java.io.tmpdir` on a local SSD separate from the archive volume, Tika 4.1.x.
+* *Autoscaling*: on the busy ratio (target 0.7) with a 10-minute scale-down window; alerts on `oom`, `timeout` and
+  `crash` restarts.
+
+[source,json]
+----
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 9998,
+    "metricsPort": 9404,
+    "endpoints": ["tika", "rmeta", "meta", "detect", "version"]
+  },
+  "pipes": {
+    "numClients": 3,
+    "maxWaitForClientMillis": 3000,
+    "forkedJvmArgs": ["-Xmx2g"]
+  },
+  "parse-context": {
+    "output-limits": { "writeLimit": 2000000 },
+    "embedded-limits": { "maxCount": 1000 },
+    "timeout-limits": { "totalTaskTimeoutMillis": 300000, "progressTimeoutMillis": 60000 }
+  }
+}
+----
+
+The configuration keys were checked against the 4.1.x documentation and the configuration shown on
+xref:backend/apache-tika/tika-server-rest-api.adoc[Tika Server (REST API)]; this combined file was not started as is.
+
+Source: https://tika.apache.org/docs/4.1.x/using-tika/server/index.html[Tika Server, Apache Tika 4.1.x],
+https://tika.apache.org/docs/4.1.x/pipes/timeouts.html[Timeouts, Apache Tika 4.1.x] and
+https://tika.apache.org/docs/4.1.x/advanced/setting-limits.html[Setting Limits, Apache Tika 4.1.x].
+
+== From 1.x to 4.x: what changed for performance
+
+[cols="1,4",options="header"]
+|===
+|Release |Performance-relevant change
+
+|1.x (_Tika in Action_) |In-process parsing as the norm; `ForkParser` as an optional child process; tika-server parsed in its own JVM, with an opt-in `-spawnChild` watchdog in later 1.x releases. Throughput tuning meant reusing the parser and adding threads.
+|2.x |tika-server gained the watchdog and forked child by default (`-noFork` to opt out); tika-batch for file-system batches; Tika Pipes introduced (`tika-app -a` async). Java 8.
+|3.x |Java 11. Pipes matured; the server's single child still meant shared fate for in-flight requests. The project's 1.2M-file regression run took about 4 hours.
+|4.0.0 |Every tika-server parsing endpoint, `tika-app` batch and tika-grpc run on Tika Pipes per-client forks; `ForkParser` and tika-batch removed (`PipesForkParser`, pipes CLI instead); Markdown default; `429` backpressure. Temp-file volume regression: the same run took about 7.5 hours.
+|4.1.0 |Spooling fixes (TIKA-4828, TIKA-4835, TIKA-4878) and the CPU-cap clamp (TIKA-4905) bring batch throughput to within about 15% of 3.x; Markdown about 30 times faster; faster detection and PDF incremental-update scanning; Micrometer metrics; `java.io.tmpdir` governs all temp files.
+|4.2.0 (unreleased) |`maxFilesProcessedPerProcess` default 10,000 to 100,000 (TIKA-4950); faster parser loading and fork start-up; `start()` to bring forks up before the first parse (TIKA-4953); quieter per-parse logging.
+|===
+
+_Tika in Action_ (chapter 9) treats robustness and `ForkParser` as an option; in 4.x process isolation is the default and
+throughput tuning is mostly about forks, heap and disk. The release notes are summarized on
+xref:backend/apache-tika/whats-changed-and-migration.adoc[What's Changed & Migration].
+
+Source: https://github.com/apache/tika/blob/main/CHANGES.txt[Apache Tika `CHANGES.txt`] and
+https://tika.apache.org/docs/4.1.x/migration-to-4x/migrating-to-4x.html[Migrating to Tika 4.x, Apache Tika 4.1.x].
+
+== Pitfalls
+
+* *A new `AutoDetectParser` or `PipesForkParser` per request.* Seconds each. Build once, share, close on shutdown.
+* *Copying `numClients` from an example.* The official server page warns that the value in example configurations "is
+  not safe boilerplate". Size it with the CPU rule, then check memory.
+* *No CPU limit on the pod.* The forks size themselves for the whole node.
+* *JVM flags on the parent that were meant for the forks.* `-Xmx`, `-Xlog:gc`, JFR and `-Dtika.pipes.cacheMemoryBudgetBytes`
+  belong in `forkedJvmArgs`. `JAVA_TOOL_OPTIONS`, on the other hand, reaches every JVM, forks included.
+* *tmpfs for `java.io.tmpdir`.* Fast until one archive takes the host down.
+* *Benchmarking warm.* A corpus in the page cache with outputs on tmpfs hid the 4.0.0 regression from the project
+  "for weeks". Benchmark cold when the corpus is larger than RAM.
+* *Benchmarking a cold pool.* Lazy start puts JVM start-up into the first requests; warm the forks first.
+* *Scaling on CPU.* Saturation and `429` move first; the parent's CPU means nothing.
+* *Retrying `429` without honouring `Retry-After` or without jitter.* The clients synchronize and hammer the pool.
+* *Treating `503` like `429`.* A document that killed a fork will kill the next one too. Retry once, then quarantine.
+* *Unlimited output.* `writeLimit` `-1` plus `/rmeta` on a mailbox puts the whole mailbox's text in two JVMs at once.
+* *Shared server for throughput on untrusted input.* One poison file drops every in-flight request, and with fork-side
+  emitting you cannot tell which were emitted.
+* *Two pools on one host without a combined CPU cap.* Each pool believes it owns the machine.
+
+== Checklist
+
+* [ ] The deployment shape matches the trust level of the input and the callers (<<which-deployment-shape>>).
+* [ ] One `AutoDetectParser`, `PipesForkParser` and HTTP client per application, all reused.
+* [ ] `pass:c[numClients × 2 + 2 ≤ cores]` and `pass:c[numClients × -Xmx + parent heap ≤ 75%]` of memory; the `pipes-cpu-sizing` line
+  shows no clamp.
+* [ ] Pods have CPU and memory limits; `OMP_THREAD_LIMIT=1` where Tesseract runs.
+* [ ] `java.io.tmpdir` on disk-backed, fast storage, not tmpfs; running 4.1.x or later for batch work.
+* [ ] `writeLimit`, `embedded-limits` and `timeout-limits` set for the use case.
+* [ ] Output format chosen by the consumer (Markdown for RAG, text for a plain index).
+* [ ] Clients retry `429` with `Retry-After` and jitter, quarantine after one `503`.
+* [ ] Load balancer uses least outstanding requests, has a read timeout above the parse timeout, and probes `/version`.
+* [ ] Metrics enabled on a private port; autoscaling on the busy ratio or the `429` rate; alerts on `oom`, `timeout`,
+  `crash` restarts.
+* [ ] Benchmarks run cold, with fixed concurrency, warm forks and the real output destination.
+
+[[what-is-verified]]
+== What was verified and what was not
+
+Verified for this page:
+
+* The 4.1.0 CHANGES entries quoted above (TIKA-4828, TIKA-4835, TIKA-4868, TIKA-4877, TIKA-4878, TIKA-4898, TIKA-4905,
+  TIKA-4910) and the 4.2.0 entries (TIKA-4950, TIKA-4953), read in `CHANGES.txt` on the Tika `main` branch, where 4.2.0
+  is marked unreleased.
+* `PipesConfig.setUseSharedServer`, `getMaxWaitForClientMillis` and `defaultNumClients` exist in the 4.1.0
+  `tika-pipes-core` jar; `PipesForkParserConfig.getPipesConfig()` and the `BasicContentHandlerFactory.HANDLER_TYPE` values
+  `BODY`, `IGNORE`, `TEXT`, `HTML`, `XML` and `MARKDOWN` exist in 4.1.0.
+* The `Bench`, `Ctor` and `BackpressureClient` programs compiled and ran against Tika 4.1.0 on Java 25. The output
+  shown is real; the fork log lines and the cache budget line come from those runs.
+* tika-server 4.1.0 (zip distribution): the `pipes-cpu-sizing` lines for `numClients` 1 and 3 on 8 cores, the `429`
+  retries, and the `busy_429` counter values shown.
+
+Not verified:
+
+* The project's benchmark figures (the 3.x, 4.0.0 and 4.1.0 table, the 15% and 7% splits, the shared-server 5-15%
+  figure) and the regression-box configuration: quoted from the 4.1.x documentation, not reproduced.
+* The local measurements were taken on a heavily loaded laptop and are indicative only (see the warning in
+  <<indicative-measurements>>). No measurement on Linux, in a container or on a cold cache was made.
+* The JFR recipe, the shared-server JSON with `PASSBACK_ALL`, the `-XX:ActiveProcessorCount` override, the cache-budget
+  override and the worked Bookshelf configuration were not run as shown.
+* The load balancer, HorizontalPodAutoscaler and KEDA guidance is general practice applied to Tika's documented
+  signals; none of it was deployed for this page.
+* Memory figures for strings (about 200 MB for a 99-million-character result) are estimates from UTF-16 sizing, not a
+  heap measurement.
+* tika-grpc throughput was not measured; its row in the shapes table follows the
+  xref:backend/apache-tika/tika-grpc.adoc[Tika gRPC] page (same pipes machinery, in-band `CLIENT_UNAVAILABLE_WITHIN_MS`).
+
+[[references]]
+== References
+
+* https://tika.apache.org/docs/4.1.x/pipes/performance.html[Apache Tika 4.1.x, Performance and Isolation Trade-offs]
+* https://tika.apache.org/docs/4.1.x/pipes/cpu-sizing.html[Apache Tika 4.1.x, Forked-JVM CPU and Heap Sizing]
+* https://tika.apache.org/docs/4.1.x/pipes/shared-server-mode.html[Apache Tika 4.1.x, Shared Server Mode]
+* https://tika.apache.org/docs/4.1.x/pipes/configuration.html[Apache Tika 4.1.x, Pipes Configuration]
+* https://tika.apache.org/docs/4.1.x/pipes/timeouts.html[Apache Tika 4.1.x, Timeouts]
+* https://tika.apache.org/docs/4.1.x/advanced/spooling.html[Apache Tika 4.1.x, TikaInputStream and Spooling]
+* https://tika.apache.org/docs/4.1.x/advanced/setting-limits.html[Apache Tika 4.1.x, Setting Limits]
+* https://tika.apache.org/docs/4.1.x/using-tika/server/index.html[Apache Tika 4.1.x, Tika Server]
+* https://tika.apache.org/docs/4.1.x/using-tika/server/monitoring.html[Apache Tika 4.1.x, Monitoring with Prometheus]
+* https://tika.apache.org/docs/4.1.x/using-tika/java-api/getting-started.html[Apache Tika 4.1.x, Getting Started with the
+  Java API] and https://tika.apache.org/docs/4.1.x/using-tika/java-api/pipes.html[Tika Pipes from Java]
+* https://tika.apache.org/docs/4.1.x/using-tika/docker.html[Apache Tika 4.1.x, Running Tika in Docker]
+* https://tika.apache.org/docs/4.1.x/migration-to-4x/migrating-to-4x.html[Apache Tika 4.1.x, Migrating to Tika 4.x]
+* https://tika.apache.org/4.1.0/api/[Apache Tika 4.1.0 Javadoc] (`org.apache.tika.pipes.core.PipesConfig`,
+  `org.apache.tika.pipes.fork`, `org.apache.tika.sax.BasicContentHandlerFactory`)
+* https://github.com/apache/tika/blob/main/CHANGES.txt[Apache Tika CHANGES.txt]
+* https://github.com/apache/tika/blob/main/tika-example/src/main/java/org/apache/tika/example/PipesForkParserExample.java[tika-example,
+  PipesForkParserExample.java]
+* https://cwiki.apache.org/confluence/display/TIKA/The+Robustness+of+Apache+Tika[Apache Tika wiki, The Robustness of
+  Apache Tika] (3.x era)
+* Chris A. Mattmann and Jukka L. Zitting, https://www.manning.com/books/tika-in-action[_Tika in Action_], Manning, 2011,
+  chapter 9 (robustness and `ForkParser`, superseded by Tika Pipes in 4.x)
