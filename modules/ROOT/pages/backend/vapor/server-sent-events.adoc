@@ -1,0 +1,666 @@
+= Server-Sent Events
+:description: One-way push from Vapor 4.122 on Swift 6 with Server-Sent Events - the text/event-stream wire format (id, event, data, retry, comment keep-alives), a streaming Response.Body built with managedAsyncStream, a Sendable actor that fans loan-due notifications out to every open stream, reconnection and replay with Last-Event-ID, detecting disconnected clients, graceful shutdown, proxy buffering (nginx X-Accel-Buffering) and compression pitfalls, authentication limits of EventSource, and a comparison with WebSockets and long polling.
+:keywords: Vapor, Server-Sent Events, SSE, EventSource, text/event-stream, Last-Event-ID, retry, keep-alive, heartbeat, Response.Body, managedAsyncStream, AsyncBodyStreamWriter, BodyStreamResult, actor, AsyncStream, fan-out, replay buffer, LifecycleHandler, shutdownAsync, shutdownTimeout, X-Accel-Buffering, proxy_buffering, responseCompression, WebSockets, long polling, Sendable, Swift 6
+
+include::partial$vapor-disclaimer.adoc[]
+
+This page is written against Vapor 4.122.2 on Swift 6.4 (the package builds in the Swift 6 language mode with tools
+version 6.3, as the official template does), with swift-nio 2.104.0, checked on 2026-10-17. Every Swift listing on this
+page was compiled in that setup with zero warnings, and the server was run against an in-memory SQLite database and
+exercised with `curl`; the output shown is captured from those runs. The JavaScript and nginx snippets were not run.
+Vapor 5 is at 5.0.0-beta.4 and is not released yet; where its streaming body differs, that is noted. The page extends
+the *Bookshelf* service of the earlier pages of this section (see
+xref:backend/vapor/introduction-and-architecture.adoc[Introduction & Architecture]): when a loan is about to fall due,
+every open browser tab of the library should be told at once, without polling. Swift itself is covered by the
+xref:programming-languages/swift/index.adoc[Swift Reference], and `async` functions, `Sendable` and actors by
+xref:programming-languages/swift/async-await-and-tasks.adoc[Async/Await and Tasks] and
+xref:programming-languages/swift/actors-isolation-and-sendable.adoc[Actors, Isolation and Sendable]. The same topic in
+Rust is in xref:backend/axum/server-sent-events-and-streaming.adoc[Server-Sent Events and Streaming].
+
+== What Server-Sent Events are
+
+Server-Sent Events (SSE) is a one-way push channel over plain HTTP. The client sends one ordinary `GET`; the server
+answers `200` with `Content-Type: text/event-stream` and then keeps the response open, writing a small text frame
+whenever it has something to say. The browser side is the `EventSource` API, specified in the WHATWG HTML standard: it
+parses the frames, dispatches them as DOM events, and *reconnects on its own* when the connection drops, telling the
+server where it stopped through a `Last-Event-ID` request header.
+
+That small contract is what makes SSE attractive for Bookshelf's notifications: no protocol upgrade, nothing to install
+on the server beyond a streaming response, and automatic reconnection and resume come from the browser rather than from
+code you write. The price is that it is strictly server-to-client and text-only, which the comparison near the end of
+the page weighs against WebSockets and long polling.
+
+Vapor 4.122 has no SSE type. What it has is the streaming response body it uses for every large or unbounded response,
+and an SSE endpoint is that body plus a few headers plus about forty lines to format frames. The rest of the page is
+about doing those lines correctly, and about the operational details (heartbeats, disconnects, shutdown, proxies) that
+decide whether the endpoint survives production.
+
+== The wire format
+
+The stream is UTF-8 text made of events separated by a blank line. Within an event, each line is `field: value`:
+
+[cols="1,5",options="header"]
+|===
+|Field |Meaning
+|`data` |The payload. Several `data` lines in one event are joined with a line feed by the client. An event with no `data` lines is not dispatched.
+|`event` |The event name. The client dispatches it as an event of that type (`+addEventListener("loan-due", ...)+`); without it the event type is `message`.
+|`id` |Sets the client's "last event ID". It is sent back as the `Last-Event-ID` header on reconnect. An `id` with no value resets it.
+|`retry` |The reconnection delay in milliseconds, as an integer. The client uses it the next time the connection drops.
+|a line starting with a colon |A comment. Ignored by the client; used as a keep-alive that never reaches the application.
+|===
+
+Lines end with LF, CR or CRLF. Two consequences matter when you build frames from application data. A payload that
+contains a line break must be split into one `data:` line per line, or the break would end the event. And `id` and
+`event` are single-line fields, so if they ever come from user input, line breaks must be removed, otherwise the input
+could inject a new field or a new event. The type below does both.
+
+Source: https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG HTML Standard: Server-sent events]
+
+== Where it sits in a Vapor request
+
+An SSE route is an ordinary route. The request passes through the same xref:backend/vapor/middleware.adoc[middleware] as
+any other (CORS, error handling, request ids, authentication); the handler returns a `Response` whose body is a stream;
+Vapor writes the status line and headers, and then runs the stream's closure for as long as it takes. Middleware that
+runs *before* the handler sees the request normally, but middleware that wants to inspect or buffer the response body
+sees a stream it cannot read without consuming it, so keep body-transforming middleware (compression, response logging
+of bodies) away from stream routes.
+
+The stream closure runs in its own task, outside the handler's `async` call: the handler has already returned the
+`Response`. That has three consequences used below. The request object must not be captured by the closure (copy out
+what you need first); errors thrown inside the closure can no longer become an error response, because the `200` has
+been sent, so they end the stream; and the closure is where a disconnect shows up.
+
+== A small SSE type
+
+The first listing is the whole protocol layer. `ServerSentEvent` is a `Sendable` value that knows its wire format;
+`Response.eventStream` wraps a producer closure in a streaming body and sets the three headers an SSE response needs.
+
+[source,swift]
+----
+import Vapor
+
+/// One Server-Sent Event, serialised exactly as the WHATWG "event stream" format describes.
+struct ServerSentEvent: Sendable {
+    var id: String?
+    var event: String?
+    var data: String
+    var retry: Int?          // milliseconds the browser should wait before reconnecting
+    var comment: String?     // a line starting with ":" is ignored by EventSource: a keep-alive
+
+    /// A comment-only frame used as a heartbeat.
+    static func keepAlive(_ text: String = "keep-alive") -> ServerSentEvent {
+        ServerSentEvent(data: "", comment: text)
+    }
+
+    /// The bytes written to the socket. A blank line ends the event.
+    var wireFormat: String {
+        var out = ""
+        if let comment {
+            for line in Self.lines(comment) { out += ": \(line)\n" }
+        }
+        if let id { out += "id: \(Self.singleLine(id))\n" }
+        if let event { out += "event: \(Self.singleLine(event))\n" }
+        if let retry { out += "retry: \(retry)\n" }
+        // each line of the payload needs its own "data:" prefix; a frame without data dispatches nothing
+        if !data.isEmpty {
+            for line in Self.lines(data) { out += "data: \(line)\n" }
+        }
+        return out + "\n"
+    }
+
+    /// Splits on LF, CR and CRLF, the three line endings the format allows. Swift treats "\r\n" as ONE Character,
+    /// so the split works on unicode scalars.
+    private static func lines(_ text: String) -> [String] {
+        var result: [String] = []
+        var current = String.UnicodeScalarView()
+        var previousWasCR = false
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\r":
+                result.append(String(current)); current = String.UnicodeScalarView(); previousWasCR = true
+            case "\n":
+                if previousWasCR { previousWasCR = false } else { result.append(String(current)); current = String.UnicodeScalarView() }
+            default:
+                previousWasCR = false; current.append(scalar)
+            }
+        }
+        result.append(String(current))
+        return result
+    }
+
+    /// `id` and `event` are single-line fields: drop any line break rather than let it inject a field.
+    private static func singleLine(_ value: String) -> String {
+        String(String.UnicodeScalarView(value.unicodeScalars.filter { $0 != "\n" && $0 != "\r" }))
+    }
+}
+
+extension Response {
+    /// Builds a `text/event-stream` response around a producer closure.
+    static func eventStream(
+        _ produce: @escaping @Sendable (_ send: @Sendable (ServerSentEvent) async throws -> Void) async throws -> Void
+    ) -> Response {
+        var headers = HTTPHeaders()
+        headers.replaceOrAdd(name: .contentType, value: "text/event-stream; charset=utf-8")
+        headers.replaceOrAdd(name: .cacheControl, value: "no-cache, no-transform")
+        headers.replaceOrAdd(name: "X-Accel-Buffering", value: "no")   // nginx: do not buffer this response
+        let body = Response.Body(managedAsyncStream: { writer in
+            let send: @Sendable (ServerSentEvent) async throws -> Void = { event in
+                try await writer.writeBuffer(ByteBuffer(string: event.wireFormat))
+            }
+            try await produce(send)
+        })
+        return Response(status: .ok, headers: headers, body: body)
+    }
+}
+----
+
+Source: https://docs.vapor.codes/basics/response/[Vapor docs: Response] (streaming bodies) and
+https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Response/Response%2BBody.swift[vapor/vapor 4.122.2:
+Response+Body.swift]
+
+Points worth reading closely:
+
+* `Response.Body(managedAsyncStream:)` takes a closure that receives an `AsyncBodyStreamWriter`. "Managed" means Vapor
+  writes the final `.end` when the closure returns and an `.error` when it throws, so you must *not* write them
+  yourself. The unmanaged `asyncStream:` initializer leaves that to you: forgetting `.end` there leaves the connection
+  open forever.
+* There is no `Content-Length`: with `count` left at its default of `-1` the response is sent with `Transfer-Encoding:
+  chunked` on HTTP/1.1 (visible in the captured response below).
+* `Cache-Control: no-cache, no-transform` stops intermediaries from caching the stream and `no-transform` asks them not
+  to re-encode it. `X-Accel-Buffering: no` is read by nginx (see <<_proxies_and_buffering>>) and ignored by everything
+  else.
+* The `send` closure is typed `@Sendable`, so the producer can pass it to child tasks. The writer is `Sendable`, which
+  is what makes that legal under Swift 6.
+
+== A hub that fans notifications out to every stream
+
+A notification originates somewhere else in the application (a handler, a scheduled job, a Fluent hook) and has to reach
+every open stream. The shared state is the set of open streams, so it lives in an `actor`; each stream owns an
+`AsyncStream` that the actor yields into. The hub also keeps a bounded buffer of recent notices with sequence numbers,
+which is what makes `Last-Event-ID` resume possible.
+
+[source,swift]
+----
+import Vapor
+
+struct LoanDueNotice: Content, Sendable {
+    let loanID: UUID
+    let bookTitle: String
+    let dueAt: Date
+}
+
+/// What a subscriber receives: a numbered notice, or a tick from the heartbeat task.
+enum HubItem: Sendable {
+    case notice(id: Int, LoanDueNotice)
+    case heartbeat
+}
+
+/// Fan-out of notices to every open stream, with a bounded replay buffer for Last-Event-ID.
+actor NotificationHub {
+    private var nextID = 1
+    private var buffer: [(id: Int, notice: LoanDueNotice)] = []
+    private let capacity: Int
+    private var subscribers: [UUID: AsyncStream<HubItem>.Continuation] = [:]
+
+    init(capacity: Int = 100) { self.capacity = capacity }
+
+    var subscriberCount: Int { subscribers.count }
+
+    func publish(_ notice: LoanDueNotice) {
+        let id = nextID
+        nextID += 1
+        buffer.append((id, notice))
+        if buffer.count > capacity { buffer.removeFirst(buffer.count - capacity) }
+        for continuation in subscribers.values { continuation.yield(.notice(id: id, notice)) }
+    }
+
+    /// Returns the missed notices (ids greater than `lastID`) and a live stream. Both are produced inside one actor
+    /// turn, so no notice can fall between the replay and the live part.
+    func subscribe(after lastID: Int?) -> (replay: [HubItem], live: AsyncStream<HubItem>, token: UUID) {
+        let token = UUID()
+        let replay = buffer.filter { $0.id > (lastID ?? Int.max) }.map { HubItem.notice(id: $0.id, $0.notice) }
+        let (live, continuation) = AsyncStream.makeStream(of: HubItem.self, bufferingPolicy: .bufferingNewest(256))
+        subscribers[token] = continuation
+        return (replay, live, token)
+    }
+
+    func heartbeat(_ token: UUID) {
+        subscribers[token]?.yield(.heartbeat)
+    }
+
+    /// Ends every live stream so the producers return and the connections close.
+    func finishAll() {
+        for continuation in subscribers.values { continuation.finish() }
+        subscribers.removeAll()
+    }
+
+    func unsubscribe(_ token: UUID) {
+        subscribers.removeValue(forKey: token)?.finish()
+    }
+}
+
+struct HubKey: StorageKey { typealias Value = NotificationHub }
+
+extension Application {
+    var hub: NotificationHub {
+        get { storage[HubKey.self]! }
+        set { storage[HubKey.self] = newValue }
+    }
+}
+----
+
+Source: https://developer.apple.com/documentation/swift/asyncstream[Swift: AsyncStream];
+https://docs.vapor.codes/advanced/services/[Vapor docs: Services] (application storage)
+
+Why it is shaped this way:
+
+* *One actor turn per subscription.* `subscribe(after:)` computes the replay list and registers the live continuation
+  inside the same actor turn, so a notice published concurrently is either in the replay or delivered live, never lost
+  between the two and never both.
+* *`bufferingNewest(256)`.* A slow client must not make the server buffer without limit. When a subscriber's buffer is
+  full, the oldest items are dropped; the client's `Last-Event-ID` then lets it recover anything still in the replay
+  buffer on its next reconnect. The right policy depends on the data: for "balance changed" style events dropping is
+  fine, for events that must all arrive use the `id` replay plus a database-backed history instead of a memory ring.
+* *The buffer is in memory and per process.* After a restart, or on a second instance behind a load balancer, ids start
+  from 1 again and the replay is empty. A multi-instance deployment needs a shared source for both sequence and history
+  (a database table, or Redis streams, see xref:backend/vapor/redis-and-caching.adoc[Redis & Caching]) and a pub/sub
+  channel to wake the instances; the hub then becomes a local fan-out fed by that channel.
+* *Application storage.* The hub is stored with `app.storage` (see
+  xref:backend/vapor/services-storage-and-dependency-injection.adoc[Services, Storage and Dependency Injection]) and
+  read in the handler with `req.application.hub`. It is created once in `configure`.
+
+== The routes
+
+The stream route reads `Last-Event-ID`, subscribes, and returns the event stream. A second route scans the database for
+loans due within a day and publishes a notice for each; in a real deployment that scan would run from a scheduled job,
+and it is a route here so the example can be driven with `curl`.
+
+[source,swift]
+----
+import Fluent
+import Vapor
+
+func routes(_ app: Application) throws {
+    let notifications = app.grouped("notifications")
+
+    // GET /notifications/stream
+    notifications.get("stream") { req async throws -> Response in
+        let lastID = req.headers.first(name: "Last-Event-ID").flatMap(Int.init)
+        let hub = req.application.hub
+        let logger = req.logger
+        let interval = Environment.get("SSE_HEARTBEAT").flatMap(Int.init) ?? 15
+        let (replay, live, token) = await hub.subscribe(after: lastID)
+
+        return Response.eventStream { send in
+            defer { Task { await hub.unsubscribe(token); logger.info("subscriber removed") } }
+            let heartbeat = Task {
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(interval))
+                    await hub.heartbeat(token)
+                }
+            }
+            defer { heartbeat.cancel() }
+
+            try await send(ServerSentEvent(data: "", retry: 3000, comment: "stream open"))
+            for item in replay { try await send(item.frame) }
+            for await item in live {
+                try await send(item.frame)
+            }
+            logger.info("stream finished")
+        }
+    }
+
+    notifications.get("subscribers") { req async -> [String: Int] in
+        ["open": await req.application.hub.subscriberCount]
+    }
+
+    // POST /notifications/scan : publish a notice for every loan due within a day
+    notifications.post("scan") { req async throws -> [String: Int] in
+        let horizon = Date().addingTimeInterval(24 * 3600)
+        let loans = try await Loan.query(on: req.db)
+            .filter(\.$returnedAt == nil)
+            .filter(\.$dueAt <= horizon)
+            .with(\.$book)
+            .all()
+        for loan in loans {
+            await req.application.hub.publish(
+                LoanDueNotice(loanID: try loan.requireID(), bookTitle: loan.book.title, dueAt: loan.dueAt))
+        }
+        return ["published": loans.count]
+    }
+}
+
+extension HubItem {
+    var frame: ServerSentEvent {
+        switch self {
+        case .notice(let id, let notice):
+            let json = (try? String(data: JSONEncoder.custom(dates: .iso8601).encode(notice), encoding: .utf8)) ?? "{}"
+            return ServerSentEvent(id: String(id), event: "loan-due", data: json)
+        case .heartbeat:
+            return .keepAlive()
+        }
+    }
+}
+----
+
+Source: https://docs.vapor.codes/basics/routing/[Vapor docs: Routing];
+https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header[WHATWG HTML Standard: The
+Last-Event-ID header]
+
+How the stream route behaves:
+
+* The header is read *before* the stream starts. `Last-Event-ID` arrives as a string; a value that is not an integer is
+  ignored and the client simply gets the live stream.
+* The first frame is a comment plus `retry: 3000`. A frame with a comment and no `data` is never dispatched by the
+  client, but it makes the server write immediately, so the browser fires `open` without waiting for the first
+  notification, and it sets the reconnect delay to three seconds.
+* Replayed events are written first, then the live loop runs until the hub finishes the stream (shutdown) or a write
+  fails (client gone).
+* A heartbeat task wakes the stream every `interval` seconds by yielding `.heartbeat` into the same `AsyncStream`, which
+  becomes a comment frame. The interval is read from the `SSE_HEARTBEAT` environment variable so that tests and demos
+  can use two seconds; production uses the default of fifteen.
+* Both `defer` blocks run when the closure exits for any reason, so the heartbeat task is cancelled and the subscriber
+  removed. `defer` cannot `await`, hence the small `Task` for the unsubscribe call.
+
+=== Running it
+
+The captured session below used a seed with two loans, one due in two hours and one due in a week. A client opens the
+stream; a second terminal triggers the scan twice; the client sees both notices, the heartbeat comments between them,
+and the response headers:
+
+[source,text]
+----
+$ curl -sN -i localhost:18431/notifications/stream
+HTTP/1.1 200 OK
+content-type: text/event-stream; charset=utf-8
+cache-control: no-cache, no-transform
+X-Accel-Buffering: no
+connection: keep-alive
+transfer-encoding: chunked
+
+: stream open
+retry: 3000
+
+id: 1
+event: loan-due
+data: {"bookTitle":"Book 1","dueAt":"2026-10-17T18:01:07Z","loanID":"699B72B9-3FF7-4590-A443-6BBBE5BD1AEC"}
+
+: keep-alive
+
+id: 2
+event: loan-due
+data: {"bookTitle":"Book 1","dueAt":"2026-10-17T18:01:07Z","loanID":"699B72B9-3FF7-4590-A443-6BBBE5BD1AEC"}
+
+: keep-alive
+----
+
+Only the loan due within a day was published (`{"published":1}` from each scan call); the one due in a week was not. The
+`dueAt` format comes from `JSONEncoder.custom(dates: .iso8601)`, Vapor's helper for a JSON encoder with a chosen date
+strategy.
+
+=== Reconnecting with Last-Event-ID
+
+Reconnecting after the second notice, a client that last saw id 1 sends that id and receives what it missed, followed by
+the live stream:
+
+[source,text]
+----
+$ curl -sN -H 'Last-Event-ID: 1' localhost:18431/notifications/stream
+: stream open
+retry: 3000
+
+id: 2
+event: loan-due
+data: {"bookTitle":"Book 1","dueAt":"2026-10-17T18:01:07Z","loanID":"699B72B9-3FF7-4590-A443-6BBBE5BD1AEC"}
+----
+
+[mermaid]
+----
+sequenceDiagram
+    participant B as Browser EventSource
+    participant S as Vapor stream route
+    participant H as NotificationHub
+    B->>S: GET /notifications/stream
+    S->>H: subscribe(after: nil)
+    S-->>B: retry: 3000, then keep-alive and id 1, id 2
+    Note over B,S: connection drops (network, deploy, proxy timeout)
+    B->>B: wait retry milliseconds
+    B->>S: GET with Last-Event-ID 2
+    S->>H: subscribe(after: 2)
+    H-->>S: replay of ids greater than 2, plus live stream
+    S-->>B: missed events first, then live events
+----
+
+The `id` values are what make this work, and they must be monotonic per stream: the client stores whatever the last
+`id:` line said and sends it back verbatim. The replay is exact only as far as the buffer reaches. If the client's id is
+older than the oldest buffered notice, the gap is silent; applications that cannot tolerate that send a dedicated event
+(`event: reset`) telling the page to re-fetch state from a normal endpoint, or compare ids on the server and do the
+same.
+
+== Detecting disconnects
+
+The streaming closure is not told when the client goes away. What happens is that a *write* fails, and the failure
+propagates as an error out of `send`, which ends the closure and runs the `defer` cleanup. That has an operational
+consequence the captured run shows: a connection that nobody writes to is never noticed.
+
+In the run, the client disconnected at three seconds with a two-second heartbeat. The subscriber count read `{"open":1}`
+two seconds later and `{"open":0}` after the following heartbeat, with the log line `subscriber removed` between. A
+stream with no heartbeat and no traffic would leak its subscriber until the next notice happened to be written. So the
+keep-alive does two jobs: it keeps idle proxies from closing the connection (they commonly cut off silent connections
+after 60 seconds), and it is the server's only disconnect detector. Choose an interval shorter than the shortest idle
+timeout on the path, and remember that the dead subscriber lives on for up to one interval.
+
+The server does not set an idle timeout of its own by default (`app.http.server.configuration.idleTimeout` is `nil`), so
+a stream is closed by the client, by a proxy, or by a failed write, not by Vapor.
+
+== Graceful shutdown
+
+An open stream blocks shutdown. Vapor stops the HTTP server by closing the listener and waiting for open connections to
+finish, up to `app.http.server.configuration.shutdownTimeout` (10 seconds by default; see
+xref:backend/vapor/application-lifecycle-and-entrypoint.adoc[Application Lifecycle and the Entrypoint]). A stream never
+finishes by itself. With no extra handling the captured run, sent SIGINT while a client was connected, printed an error
+after the timeout and then exited:
+
+[source,text]
+----
+[ ERROR ] Could not stop HTTP server: Abort.500: Server stop took too long.
+----
+
+The fix is to end the streams first. A `LifecycleHandler` registered *after* the server's own handler runs *before* it
+on shutdown (shutdown handlers run in reverse registration order), so the hub's `finishAll()` makes every `for await`
+loop return, the closures exit, Vapor writes the final chunk, and the connections close in time:
+
+[source,swift]
+----
+/// Without this, an open stream keeps the server from stopping until the shutdown timeout expires.
+struct FinishStreamsOnShutdown: LifecycleHandler {
+    let hub: NotificationHub
+    func shutdownAsync(_ application: Application) async {
+        await hub.finishAll()
+    }
+}
+----
+
+[source,swift]
+----
+import Fluent
+import FluentSQLiteDriver
+import Vapor
+
+func configure(_ app: Application) async throws {
+    app.databases.use(.sqlite(.memory), as: .sqlite)
+    app.migrations.add(CreateBookshelf())
+    try await app.autoMigrate()
+    app.hub = NotificationHub()
+    // registered after the HTTP server's own handler, so it runs first on shutdown
+    app.lifecycle.use(FinishStreamsOnShutdown(hub: app.hub))
+    try routes(app)
+}
+----
+
+Source: https://docs.vapor.codes/advanced/services/#lifecycle[Vapor docs: Services, lifecycle];
+https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Utilities/LifecycleHandler.swift[vapor/vapor 4.122.2:
+LifecycleHandler.swift]
+
+The same run with this handler registered, sent SIGINT while a client was connected, logged `stream finished` and
+`subscriber removed` for the open stream and exited well inside the timeout. Browsers reconnect after a clean close too,
+so during a rolling deploy clients move to the next instance by themselves after the `retry` delay.
+
+== Proxies and buffering
+
+Most SSE failures in production are not in the application; a proxy holds the bytes back. The usual layers:
+
+* *nginx buffers proxied responses by default.* The stream then arrives in large bursts, or only when the connection
+  closes. Send `X-Accel-Buffering: no` from the application, as the code above does, or turn buffering off for the
+  location. Also keep the upstream connection HTTP/1.1 with the `Connection` header cleared, and give it a read timeout
+  longer than the heartbeat interval:
++
+[source,nginx]
+----
+location /notifications/stream {
+    proxy_pass http://vapor_upstream;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 1h;
+}
+----
+* *Compression buffers.* A gzip layer collects bytes until it has a block to emit, which delays small frames. Vapor's
+  own `responseCompression` is `.disabled` by default; if you enable it globally, make sure stream routes are excluded,
+  and exclude `text/event-stream` in any proxy that compresses.
+* *Load balancers and CDNs* may enforce a maximum response time or idle time (the keep-alive interval has to be shorter)
+  and some cannot stream at all. Test through the real path, not against `localhost`.
+* *HTTP version.* Over HTTP/1.1 browsers allow about six connections per host, and every open `EventSource` takes one
+  for as long as it is open, so a user with several tabs can starve ordinary requests. HTTP/2 multiplexes streams over
+  one connection and removes the limit; terminate TLS with HTTP/2 at the proxy or in Vapor (see
+  xref:backend/vapor/server-configuration.adoc[Server Configuration]).
+
+A quick way to see buffering is `curl -N` through the proxy: if the keep-alive comments appear at the heartbeat
+interval, the path streams; if they arrive in a burst, something is buffering.
+
+== The browser side
+
+The client is a few lines of `EventSource`. Named events use `addEventListener`; `onmessage` only receives events
+without an `event:` field:
+
+[source,javascript]
+----
+const source = new EventSource("/notifications/stream");
+
+source.addEventListener("loan-due", (e) => {
+  const notice = JSON.parse(e.data);
+  showToast(`"${notice.bookTitle}" is due ${new Date(notice.dueAt).toLocaleString()}`);
+});
+
+source.onerror = () => {
+  // EventSource reconnects by itself while readyState is CONNECTING;
+  // CLOSED means the server answered with a non-200 or the wrong content type
+  if (source.readyState === EventSource.CLOSED) console.warn("stream closed for good");
+};
+----
+
+Things `EventSource` cannot do, which shape the server design:
+
+* *No custom request headers*, so no `+Authorization: Bearer ...+`. Options: authenticate with a session cookie
+  (same-origin, or cross-origin with `new EventSource(url, { withCredentials: true })` and matching CORS headers with
+  credentials allowed); or use `fetch` with a streaming reader, which allows headers and `POST` but means you parse the
+  format and handle reconnection yourself; or issue a short-lived one-time ticket from an authenticated endpoint and
+  pass it in the query string, accepting that URLs end up in logs. Put the authentication middleware on the stream route
+  as on any other, and decide what happens to a stream whose token expires while it is open (close it from the producer
+  when the check fails).
+* *No `POST` and no request body.*
+* *A non-200 status or a content type other than `text/event-stream` ends the connection for good* (`readyState` becomes
+  `CLOSED`). A `401` therefore stops the reconnection loop, which is what you want for an expired login and not what you
+  want for a transient `503`.
+* *Text only.* Binary data has to be encoded (base64 inflates it by a third); for binary streaming use WebSockets or a
+  download.
+
+The same data can be consumed outside a browser: a Swift client uses `URLSession.bytes(for:)` and iterates `lines`, and
+a service uses AsyncHTTPClient; both have to implement the dispatch and reconnection rules themselves.
+
+== SSE, WebSockets and long polling
+
+[cols="2,3,3,3",options="header"]
+|===
+| |Server-Sent Events |WebSockets |Long polling
+|Direction |Server to client only |Both directions |Client request, server response, repeat
+|Transport |Plain HTTP, a normal route |HTTP upgrade to a separate protocol |Plain HTTP
+|Reconnect and resume |Built into `EventSource`, with `Last-Event-ID` |Written by the application |The next request is the reconnect
+|Data |UTF-8 text |Text and binary frames |Anything an HTTP body can hold
+|Browser limits |About six connections per host on HTTP/1.1 |Not counted against that limit in practice |Same as ordinary requests
+|Proxies and infrastructure |Needs buffering off; otherwise ordinary HTTP |Needs upgrade support end to end |Works everywhere
+|Vapor support |Streaming `Response.Body`, no dedicated type |`app.webSocket` in the framework |Ordinary handlers with `Task.sleep` or a wait on the hub
+|Fits |Notifications, progress, live dashboards, feeds |Chat, collaboration, games, anything the client also sends in real time |Environments that block streaming; low event rates
+|===
+
+Bookshelf's loan notices are one-way, small and infrequent, so SSE is the proportionate choice. The
+xref:backend/vapor/websockets.adoc[WebSockets] page covers the bidirectional case, and the choice between them as a
+security and operations question (connection limits, authentication on upgrade, cross-origin behaviour) is the topic of
+the site's real-time security material (issue #264, not yet published). Long polling is the fallback when something
+between the client and the server cannot stream; it needs no special server code, but each event costs a full request
+and the client must re-issue it, so it scales worse and has no standard resume mechanism.
+
+== Common mistakes
+
+* *Forgetting the blank line.* An event is only dispatched after the empty line; a frame written as `data: x\n` alone
+  sits in the client's buffer until the next frame.
+* *A newline in the payload.* Embedding a raw JSON string with a line feed breaks the frame. Compact JSON has none; for
+  arbitrary text use the per-line `data:` prefix as the type above does.
+* *Writing `.end` inside a managed stream, or not writing it in an unmanaged one.* Use `managedAsyncStream` unless you
+  have a reason not to.
+* *Capturing `req` in the stream closure.* The closure is `@Sendable` and outlives the handler; copy out the
+  application, the logger and plain values first, as the route does.
+* *No heartbeat.* The proxy cuts the connection after its idle timeout and dead subscribers pile up (see
+  <<_detecting_disconnects>>).
+* *Unbounded per-client buffers.* An `AsyncStream` without a buffering policy grows without limit when a client reads
+  slowly.
+* *Using `id` without a replay path.* Sending `id:` and then ignoring `Last-Event-ID` means the client believes it
+  resumes and silently misses events.
+* *Running it on a single event loop assumption.* Handlers and stream closures can run on different threads; share state
+  only through an actor or other `Sendable` types, as the hub does.
+* *Testing only with `localhost`.* Buffering, compression and idle timeouts appear only behind the real proxy.
+
+== Vapor 5 and versions
+
+* *Vapor 4.122* (this page): `Response.Body(asyncStream:)` and `Response.Body(managedAsyncStream:)` with an
+  `AsyncBodyStreamWriter`; the older callback-style `Response.Body(stream:)` with a `BodyStreamWriter` is the legacy
+  futures-based form.
+* *Vapor 5* (5.0.0-beta.4, not generally available; see xref:backend/vapor/whats-new-upgrading-and-vapor-5.adoc[What's
+  New, Upgrading and Vapor 5]): per its sources, `Response.Body` is built with `init(stream:)` taking an `async throws`
+  closure that receives a non-escapable `HTTPBodyWriter`, and the same body type is used for client requests. The frame
+  formatting in `ServerSentEvent` carries over unchanged; only the lines that write bytes change. No dedicated SSE type
+  turned up in a search of the beta.4 file names; that is not a full read of the sources.
+* *Swift 6.* The closure is `@Sendable`, the hub is an actor, the notice is a `Sendable` struct. With
+  `InternalImportsByDefault` and `MemberImportVisibility` enabled, as in the official template, each file imports
+  `Vapor` (and `Fluent` where it uses queries) itself, as above.
+
+== Where the books are outdated
+
+* The three books consulted (Condon et al. for Kodeco, Yeung and Patel for Packt) predate Vapor 4's `async` streaming
+  bodies and were written for Vapor 2 or 3; their real-time material is about WebSockets, polling and future-based
+  callbacks, and none of it is relied on here for SSE, which is taken from the WHATWG specification and the Vapor 4.122
+  sources. The concepts carry over; the stream is now an `async` closure and the shared state an actor instead of a
+  locked dictionary or an event-loop-confined array.
+* Anything in those books that keeps client connections in a plain array mutated from several event loops must be redone
+  as an actor (or another `Sendable` design) to compile in the Swift 6 language mode.
+
+== References
+
+* https://html.spec.whatwg.org/multipage/server-sent-events.html[WHATWG HTML Standard: Server-sent events] and
+  https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events[MDN: Using server-sent
+  events]
+* https://docs.vapor.codes/basics/response/[Vapor docs: Response], https://docs.vapor.codes/basics/routing/[Routing] and
+  https://docs.vapor.codes/advanced/server/[Server]
+* https://api.vapor.codes[Vapor API documentation]
+* https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Response/Response%2BBody.swift[vapor/vapor 4.122.2:
+  Response+Body.swift],
+  https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/HTTP/BodyStream.swift[BodyStream.swift] and
+  https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Utilities/LifecycleHandler.swift[LifecycleHandler.swift]
+* https://github.com/vapor/vapor/blob/5.0.0-beta.4/Sources/Vapor/Response/Response%2BBody.swift[vapor/vapor
+  5.0.0-beta.4: Response+Body.swift]
+* https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_buffering[nginx: proxy_buffering] and
+  https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_read_timeout[proxy_read_timeout]
+* https://developer.apple.com/documentation/swift/asyncstream[Apple: AsyncStream]
+* https://www.kodeco.com/books/server-side-swift-with-vapor[Kodeco: Server-Side Swift with Vapor] (Condon et al.)
+* xref:backend/vapor/index.adoc#_bibliography[Bibliography of this section]

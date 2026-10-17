@@ -1,0 +1,991 @@
+= Swift Concurrency in Vapor
+:description: How Vapor 4.122 combines SwiftNIO event loops, the Swift concurrency cooperative pool and the NIO blocking thread pool -- async/await handlers, Swift 6 strict concurrency (Sendable services, actors, locks, Fluent models as unchecked Sendable), the legacy EventLoopFuture API and its bridges, blocking and CPU-bound work, cancellation, task-locals and structured concurrency inside handlers.
+:keywords: Vapor, Swift concurrency, async await, Sendable, Sendable closure, unchecked Sendable, actor, NIOLockedValueBox, Mutex, EventLoopFuture, EventLoopPromise, flatMap, flatMapThrowing, hop, makeFutureWithTask, completeWithTask, wait, NIOThreadPool, threadPool, Task.detached, TaskLocal, task group, async let, cancellation, strict concurrency, Swift 6
+
+include::partial$vapor-disclaimer.adoc[]
+
+This page is written against Vapor 4.122.2 (the latest 4.x release on 2026-10-17) on Swift 6.4 in the Swift 6 language
+mode (`swift-tools-version:6.3`, the version of the current `vapor/template`; Vapor itself needs tools 6.0), with
+SwiftNIO 2.104.0 and Fluent 4.13.0 (the Fluent part of Vapor is covered in
+xref:backend/vapor/fluent-overview-and-drivers.adoc[Fluent Overview and Database Drivers] and
+xref:backend/vapor/fluent-models.adoc[Fluent Models]). Vapor 5 is at 5.0.0-beta.4 and is not generally available; where
+it changes the picture the page says so. All examples were compiled in a scratch package with those versions pinned and
+no warnings, and the HTTP examples were run with `curl`.
+
+The page answers four questions that every Vapor developer meets sooner or later:
+
+. Which threads run my code, and what happens if I block one?
+. What does Swift 6 strict concurrency require of my routes, services and models?
+. How do I read and bridge the older `EventLoopFuture` API that is still all over Vapor and the third-party packages?
+. How do I do CPU-bound or blocking work, cancellation, request-scoped context and parallel work in a handler?
+
+The language itself (`async`, `await`, `Task`, actors, `Sendable`) is covered in the Swift Reference:
+xref:programming-languages/swift/async-await-and-tasks.adoc[Async/await and tasks],
+xref:programming-languages/swift/actors-isolation-and-sendable.adoc[Actors, isolation and Sendable] and
+xref:programming-languages/swift/dispatch-and-legacy-concurrency.adoc[Dispatch and legacy concurrency]. This page does
+not re-explain them; it shows how Vapor uses them. For the app side of the same language features see
+xref:apps/apple/concurrency-in-apps.adoc[Concurrency in Apple apps].
+
+== Three kinds of threads
+
+A Vapor process runs your code on three different families of threads. Almost every concurrency bug in a Vapor service
+is a confusion between them.
+
+[cols="1,2,2,2",options="header"]
+|===
+|Family |Who owns it |What runs there |What you must not do there
+|*Event loops* |SwiftNIO `MultiThreadedEventLoopGroup`; by default `System.coreCount` threads, each a `SelectableEventLoop` |socket reads and writes, HTTP parsing, TLS, `EventLoopFuture` callbacks, database driver I/O (each connection is pinned to one loop) |block (sleep, synchronous file or network I/O, semaphores, `wait()`), or run long CPU loops: every connection pinned to that loop stalls
+|*Swift cooperative pool* |the Swift runtime; a fixed pool of roughly one thread per CPU core |every `async` function that is not isolated to an actor with its own executor: your route handlers, `AsyncMiddleware`, `AsyncMigration`, `AsyncJob` |block: a blocked pool thread cannot run any other task, and the pool does not grow to compensate
+|*NIO blocking pool* |`NIOThreadPool`; Vapor exposes it as `app.threadPool` (the NIO singleton `NIOSingletons.posixBlockingThreadPool`, one thread per core by default) |blocking work on purpose: file I/O through `NonBlockingFileIO`, password hashing (Bcrypt), your own blocking calls |nothing special; it is the right place for blocking work, but it is finite too
+|===
+
+Source: https://docs.vapor.codes/basics/async/[Vapor docs: Async] and
+https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Core/Core.swift[vapor/vapor 4.122.2: Core.swift (threadPool)]
+
+The Vapor template's `Application.make` creates the event loop group for you (the default is
+`.singleton`, which is NIO's shared `MultiThreadedEventLoopGroup.singleton`). The diagram shows how the three families
+relate and where each kind of work belongs. The lines marked "hop" are the points where execution moves between
+families and where the cost of a context switch is paid.
+
+[mermaid]
+....
+flowchart LR
+    C([Client connection]) --> EL
+    subgraph NIO["SwiftNIO event loops (one thread each, never block)"]
+        EL["Channel pipeline: TLS, HTTP/1.1 or HTTP/2 parsing, Vapor server"]
+        FUT["EventLoopFuture callbacks, promises, database driver I/O"]
+    end
+    subgraph SWIFT["Swift cooperative pool (about one thread per core, never block)"]
+        H["Async route handler, AsyncMiddleware, structured child tasks"]
+    end
+    subgraph BLOCK["NIOThreadPool: app.threadPool (blocking is allowed here)"]
+        B["Blocking file or C library calls, Bcrypt hashing, CPU-bound jobs"]
+    end
+    EL -- "request arrives: promise.completeWithTask starts a Task" --> H
+    H -- "await future.get()" --> FUT
+    FUT -- "result resumes the task (hop)" --> H
+    H -- "await threadPool.runIfActive" --> B
+    B -- "result resumes the task (hop)" --> H
+    H -- "response is written: promise succeeds" --> EL
+    EL --> R([Response bytes to the client])
+....
+
+Each arrow into `H` is a context switch from a NIO thread to a pool thread and each arrow out is another one. That cost
+is small, but it is why the Vapor documentation still says that applications needing explicit control over event loops,
+or very high performance, may keep using `EventLoopFuture`, while "everyone else" should use async/await for
+readability. The `NIOSingletons` executor takeover described later removes part of those switches.
+
+== Where it runs in the request
+
+In the request lifecycle (server accepts the connection on an event loop, the HTTP decoder builds a `Request`, the
+`Responder` chain runs: middleware in registration order, then the router, then your handler; the `Response` is encoded
+and written back) concurrency touches every step:
+
+. The *event loop* that owns the connection builds the `Request` and calls the responder chain. `req.eventLoop` is that
+  loop.
+. Each `AsyncMiddleware` and each `async` handler is wrapped by Vapor: it makes an `EventLoopPromise<Response>` and
+  calls `+promise.completeWithTask { ... }+`, which starts a new unstructured `Task` on the cooperative pool and
+  completes the promise from it (see `Responder+Concurrency.swift` and `AsyncMiddleware.swift` in the Source links
+  below). The task is not stored or cancelled by Vapor, a point that matters in the cancellation section.
+. When the handler awaits a database query, an HTTP `Client` call or `future.get()`, the task suspends and the event
+  loop does the I/O; the continuation resumes on the cooperative pool.
+. When the handler returns, `encodeResponse(for:)` runs in the same task, the promise succeeds, and the event loop
+  writes the bytes.
+
+Source: https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Concurrency/Responder%2BConcurrency.swift[vapor/vapor
+4.122.2: Responder+Concurrency.swift],
+https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Concurrency/AsyncMiddleware.swift[AsyncMiddleware.swift] and
+https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Concurrency/RoutesBuilder%2BConcurrency.swift[RoutesBuilder+Concurrency.swift]
+
+== async/await handlers are the default
+
+Every routing method (`get`, `post`, `put`, `patch`, `delete`, `on`) has an overload whose closure is
+`+@Sendable (Request) async throws -> Response+`, where `Response` conforms to `AsyncResponseEncodable` (every
+`ResponseEncodable`, `Content` type, `String`, `HTTPStatus` and so on already does). An `async` handler can `await`
+Fluent queries, `Client` calls, `req.fileio`, `req.password.async` and anything else; errors are thrown, and a thrown
+`Abort` becomes the matching HTTP status through `ErrorMiddleware`.
+
+The official documentation recommends one programming model per handler (do not mix `async` with futures) and recommends
+async/await for everyone except applications that need explicit event-loop control. Nothing in Vapor 4.122 is deprecated
+on the future side, but the blog post _The future of Vapor_ states the direction: Vapor 5 will have no API that returns
+`EventLoopFuture`.
+
+[source,swift]
+----
+import Vapor
+
+struct BookDTO: Content, Sendable {
+    var id: Int
+    var title: String
+}
+----
+
+The `BookDTO` is a plain `Content` struct; because it is a struct of `Sendable` values it is `Sendable` and can be
+returned from the handler without any annotation. Writing `Sendable` on it, as above, documents the intent and makes the
+compiler check it.
+
+Source: https://docs.vapor.codes/basics/content/[Vapor docs: Content]
+
+[source,swift]
+----
+func routes(_ app: Application) throws {
+    app.get("books", ":id") { req async throws -> BookDTO in
+        guard let id = req.parameters.get("id", as: Int.self) else { throw Abort(.badRequest) }
+        try await Task.sleep(for: .milliseconds(10))
+        return BookDTO(id: id, title: "Book #\(id)")
+    }
+}
+----
+
+Source: https://docs.vapor.codes/basics/async/[Vapor docs: Async] and https://docs.vapor.codes/basics/routing/[Vapor
+docs: Routing]
+
+== Swift 6 strict concurrency in a Vapor app
+
+A package whose tools version is 6.0 or later compiles in the Swift 6 language mode by default: data-race safety is
+checked at compile time and violations are errors, not warnings. The Vapor template already builds this way (tools
+version 6.3). The Vapor team states that Vapor 4 builds with zero warnings under strict concurrency; the price is that
+Vapor's own types are `Sendable` and that *your* types must be too wherever they cross an isolation boundary. Vapor's
+blog announced this work in 2023 (_Upcoming Sendable changes_); the rules below are the practical outcome in 4.122.
+
+=== What Vapor already makes Sendable
+
+* `Application` and `Request` are `+final class ... : Sendable+` (their mutable state is behind locks), so a handler can
+  capture `req` in a child task, a task group or a `@Sendable` closure.
+* Route closures are `@Sendable`: `+@Sendable (Request) async throws -> Response+`. A handler may only capture
+  `Sendable` values, and may not mutate captured `var`s.
+* The response type of a handler conforms to `AsyncResponseEncodable`, declared as refining `SendableMetatype` on Swift
+  6.2 and later (an alias that is just `Any` on older compilers).
+* `Application.storage` and `Request.storage` hold values keyed by a `StorageKey`; `StorageKey.Value` must be
+  `Sendable`. This is where long-lived services belong.
+* `app.threadPool`, `app.fileio` and the other services are lock-protected, so reading them from any task is fine.
+
+Source: https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Application.swift[vapor/vapor 4.122.2:
+Application.swift], https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Request/Request.swift[Request.swift],
+https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Utilities/Storage.swift[Storage.swift] and
+https://blog.vapor.codes/posts/upcoming-sendable-changes/[Vapor blog: Upcoming Sendable changes]
+
+=== Sendable DTOs
+
+A `Content` struct whose stored properties are all `Sendable` (strings, numbers, `UUID`, `Date`, arrays and optionals of
+those, other such structs) is implicitly `Sendable` as long as it is not `public`/`open`; a public struct needs the
+explicit conformance. Declare it anyway (`struct BookDTO: Content, Sendable`) so that adding a reference-type property
+later turns into a compile error at the declaration, not at some distant capture. Put DTOs in value types; keep Fluent
+models out of handler results where you can (the _Models and DTOs_ guidance in the Fluent pages).
+
+=== Shared mutable state: actors, locks, Mutex
+
+The classic mistake, from tutorials written before Swift 6 (and from books that keep a controller-level array), is
+mutable state shared by every request:
+
+[source,swift]
+----
+// Does NOT compile in the Swift 6 language mode.
+var cache: [Int: String] = [:]
+
+func routes(_ app: Application) {
+    app.get("titles", ":id") { req async -> String in
+        let id = req.parameters.get("id", as: Int.self) ?? 0
+        cache[id] = "cached"
+        return cache[id] ?? "none"
+    }
+}
+----
+
+The compiler says:
+
+[source,text]
+----
+error: var 'cache' is not concurrency-safe because it is nonisolated global shared mutable state
+----
+
+Source: https://www.swift.org/migration/documentation/swift-6-concurrency-migration-guide/commonproblems/[Swift 6
+concurrency migration guide: Common compiler errors]
+
+Two requests on two cooperative-pool threads would race on that dictionary. Swift 6 refuses to compile it. There are
+three correct replacements, from most to least recommended:
+
+. *An actor* that owns the state, stored in `Application.storage` (below; see
+  xref:backend/vapor/services-storage-and-dependency-injection.adoc[Services, Storage and Dependency Injection]).
+  Callers `await` its methods; no lock is visible. Use it when the operations are short, asynchronous callers are fine,
+  and you want the compiler to enforce isolation.
+. *A `final class` with a lock* when you need synchronous access (for example inside a non-async callback):
+  `NIOLockedValueBox` from `NIOConcurrencyHelpers` (available on every platform Vapor supports) or the standard
+  library's `Mutex` from the `Synchronization` module (Swift 6.0, requires macOS 15, iOS 18 and later at runtime; the
+  Vapor template targets macOS 13, so on Apple platforms guard it with `@available`). Never `await` while holding a lock
+  (the lock APIs take synchronous closures, so the compiler stops you).
+. *Do not share*: derive the state from the database or Redis (see xref:backend/vapor/redis-and-caching.adoc[Redis &
+  Caching] and xref:backend/vapor/queues-and-background-jobs.adoc[Queues & Background Jobs]) so that several server
+  processes agree.
+
+[source,swift]
+----
+import Vapor
+import NIOConcurrencyHelpers
+
+actor LoanLedger {
+    private var loans: [Int: String] = [:]
+
+    func lend(bookID: Int, to member: String) throws {
+        guard loans[bookID] == nil else {
+            throw Abort(.conflict, reason: "Book \(bookID) is already on loan")
+        }
+        loans[bookID] = member
+    }
+
+    func giveBack(bookID: Int) -> String? {
+        loans.removeValue(forKey: bookID)
+    }
+
+    var count: Int { loans.count }
+}
+
+struct LoanLedgerKey: StorageKey {
+    typealias Value = LoanLedger
+}
+
+extension Application {
+    var loanLedger: LoanLedger {
+        get {
+            guard let ledger = storage[LoanLedgerKey.self] else {
+                fatalError("LoanLedger not configured; set app.loanLedger in configure(_:)")
+            }
+            return ledger
+        }
+        set { storage[LoanLedgerKey.self] = newValue }
+    }
+}
+
+final class VisitCounter: Sendable {
+    private let value = NIOLockedValueBox(0)
+
+    func increment() -> Int {
+        value.withLockedValue { count in
+            count += 1
+            return count
+        }
+    }
+}
+----
+
+[source,swift]
+----
+import Synchronization
+
+@available(macOS 15, *)
+final class RecentTitles: Sendable {
+    private let titles = Mutex<[String]>([])
+
+    func record(_ title: String) {
+        titles.withLock { list in
+            list.append(title)
+            if list.count > 10 { list.removeFirst() }
+        }
+    }
+
+    func snapshot() -> [String] {
+        titles.withLock { $0 }
+    }
+}
+----
+
+Registering and using the actor (`LoanLedger`), and the lock-based counter, in `configure`/`routes`:
+
+[source,swift]
+----
+func configure(_ app: Application) async throws {
+    app.loanLedger = LoanLedger()
+    try routes(app)
+}
+----
+
+[source,swift]
+----
+app.post("loans", ":bookID", ":member") { req async throws -> HTTPStatus in
+    let bookID = try req.parameters.require("bookID", as: Int.self)
+    let member = try req.parameters.require("member")
+    try await req.application.loanLedger.lend(bookID: bookID, to: member)
+    return .created
+}
+app.get("loans", "count") { req async -> String in
+    "\(await req.application.loanLedger.count)"
+}
+
+let visits = VisitCounter()
+app.get("visit") { _ async -> String in "visit \(visits.increment())" }
+----
+
+Source: https://docs.vapor.codes/advanced/services/[Vapor docs: Services],
+https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/nioconcurrencyhelpers[swift-nio 2.104.0:
+NIOConcurrencyHelpers] and https://developer.apple.com/documentation/synchronization/mutex[Apple: Mutex]
+
+[source,bash]
+----
+$ curl -s -XPOST -w " %{http_code}\n" localhost:8080/loans/1/ana
+ 201
+$ curl -s -XPOST -w " %{http_code}\n" localhost:8080/loans/1/bob
+{"error":true,"reason":"Book 1 is already on loan"} 409
+$ curl -s localhost:8080/loans/count
+1
+$ curl -s localhost:8080/visit; curl -s localhost:8080/visit
+visit 1
+visit 2
+----
+
+Actors serialise their callers on the cooperative pool, which is exactly what you want here. Two cautions: an actor's
+method that `await`s lets other callers in between (re-entrancy, covered in the Swift Reference), so keep
+check-then-act sequences in one synchronous method as `lend` does; and never make a Fluent query inside a lock.
+
+=== Fluent models are final class ... @unchecked Sendable
+
+Fluent models (see xref:backend/vapor/fluent-models.adoc[Fluent Models]) are classes whose stored properties are
+property wrappers (`@ID`, `@Field`, `@Parent`, `@Children`). The template's `Todo` model documents the pragmatic answer:
+property wrappers interact poorly with `Sendable` checking, so write the model with sendability checking on and then
+suppress the diagnostic with `@unchecked Sendable`.
+
+Fluent's `Model` inherits from `Fields`, which is `Sendable`, so a model class must either prove it is safe (it cannot:
+the property wrappers are mutable `var`s) or vouch for itself:
+
+[source,swift]
+----
+// Does NOT compile: the stored property wrappers are mutable.
+final class Draft: Model {
+    static let schema = "drafts"
+    @ID(key: .id) var id: UUID?
+    @Field(key: "title") var title: String
+    init() {}
+}
+----
+
+[source,text]
+----
+error: stored property '_id' of 'Sendable'-conforming class 'Draft' is mutable
+----
+
+Source: https://docs.vapor.codes/fluent/model/[Vapor docs: Fluent model]
+
+The fix is the model the Vapor template ships:
+
+[source,swift]
+----
+import Foundation
+import Fluent
+
+final class Book: Model, @unchecked Sendable {
+    static let schema = "books"
+
+    @ID(key: .id)
+    var id: UUID?
+
+    @Field(key: "title")
+    var title: String
+
+    init() {}
+
+    init(id: UUID? = nil, title: String) {
+        self.id = id
+        self.title = title
+    }
+}
+----
+
+The `@unchecked` is a promise, not a proof. A model instance is safe to pass between tasks as long as one task at a time
+mutates it. The practical rules that keep the promise:
+
+* Load, mutate and save a model inside one handler (one task). Do not share one instance between concurrent child tasks.
+* Return DTOs (value types) from handlers and send DTOs across actors; convert in a `toDTO()` method as the template
+  does.
+* Never stash a model in a global, an actor property or `app.storage` for reuse across requests. Models carry state
+  (`$id.exists`, original values) belonging to a single save cycle.
+
+Source: https://github.com/vapor/template/blob/main/Sources/App/Models/Todo.swift[vapor/template: Todo.swift] and
+https://docs.vapor.codes/fluent/model/[Vapor docs: Fluent model]
+
+=== Common compiler diagnostics
+
+[cols="3,3",options="header"]
+|===
+|Diagnostic (Swift 6.4, language mode 6) |Usual cause and fix
+|`+error: var 'cache' is not concurrency-safe because it is nonisolated global shared mutable state+` |Shared mutable global. Use an actor or a lock-protected `Sendable` class in `Application.storage`.
+|`+warning: capture of 'x' with non-Sendable type 'T' in a '@Sendable' closure+` |A route closure captured a non-`Sendable` reference. Make `T` `Sendable` (see the table of common errors below).
+|`+error: stored property '_id' of 'Sendable'-conforming class 'Draft' is mutable+` |A Fluent model without `@unchecked Sendable`.
+|`+warning: instance method 'wait' is unavailable from asynchronous contexts+` |`wait()` in an `async` function; use `get()`.
+|===
+
+=== Isolation of handlers
+
+Route handlers are not isolated to the main actor. A `@MainActor` view-model style type has no place in a server: every
+call would hop to the main thread. If you enable the `defaultIsolation(MainActor.self)` setting that Swift 6.2 added for
+app targets, keep it out of a Vapor target. Services shared by handlers are either actors, `Sendable` classes with
+locks, or value types.
+
+The template also turns on the upcoming-feature flags `ExistentialAny`, `InternalImportsByDefault`,
+`MemberImportVisibility`, `InferIsolatedConformances` and `ImmutableWeakCaptures`; they appear in the snippets as
+`any AsyncResponder` and so on. They are language hygiene, not concurrency requirements.
+
+== Legacy: EventLoopFuture and EventLoopPromise
+
+Before Swift 5.5 all asynchronous Vapor code was written with SwiftNIO's `EventLoopFuture`. The type is still
+everywhere: in Vapor APIs that have not got an `async` twin, in Fluent's older query builders, in third-party packages
+and in every tutorial written for Vapor 3 and early Vapor 4. *This section is a legacy reference.* New code uses
+async/await; you need futures when you maintain an older codebase, call a library that only offers futures, or need to
+understand a stack trace. The Vapor 5 line removes all future-returning APIs.
+
+A `EventLoopFuture<Value>` is a read-only reference to a value (or an error) that will exist later; it is bound to one
+`EventLoop` and its callbacks run on that loop. An `EventLoopPromise<Value>` is the write side: whoever holds it calls
+`+succeed(_:)+`, `+fail(_:)+` or `+completeWith(_:)+` exactly once, and `promise.futureResult` is the future. `Void`
+futures are "signals" that only report completion.
+
+[cols="2,2,3",options="header"]
+|===
+|Operator |Shape |Use
+|`map` |`+(T) -> U+` |transform the value synchronously, cannot throw
+|`flatMapThrowing` |`+(T) throws -> U+` |transform synchronously and allow a thrown error to fail the chain
+|`flatMap` |`+(T) -> EventLoopFuture<U>+` |chain another asynchronous step; avoids a nested future
+|`transform(to:)` |`U` |ignore the value, produce a constant (typical after a `Void` future such as `save`)
+|`and` / `and(value:)` |`EventLoopFuture<U>` or `U` |wait for two futures and get a tuple
+|`flatten(on:)` (AsyncKit, on arrays of futures) |`[EventLoopFuture<T>]` |wait for all and get `[T]`, or `Void` for an array of `Void` futures
+|`flatMapError` / `recover` |`+(Error) -> EventLoopFuture<T>+` or `+(Error) -> T+` |turn a failure into a value or another future
+|`whenComplete` / `whenSuccess` / `whenFailure` |`+(Result<T, Error>) -> Void+` |side-effect callback; returns nothing, cannot be awaited
+|`hop(to:)` |`EventLoop` |get a future whose callbacks run on another event loop
+|===
+
+Source: https://docs.vapor.codes/basics/async/#eventloopfutures[Vapor docs: Async, EventLoopFutures] and
+https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/niocore/eventloopfuture[swift-nio 2.104.0:
+EventLoopFuture]
+
+Every operator above in one function, written for Swift 6 (the closures are `@Sendable`, and `Request` is `Sendable`, so
+capturing `req` or its event loop is fine):
+
+[source,swift]
+----
+import Vapor
+import NIOCore
+
+// Legacy EventLoopFuture chain: each operator in one place.
+func legacyChain(_ req: Request, text: String) -> EventLoopFuture<String> {
+    let loop = req.eventLoop
+
+    let parsed: EventLoopFuture<Int> = loop
+        .makeSucceededFuture(text)
+        .flatMapThrowing { value -> Int in             // sync, may throw
+            guard let number = Int(value) else {
+                throw Abort(.badRequest, reason: "not a number")
+            }
+            return number
+        }
+
+    let doubled = parsed.map { $0 * 2 }                // sync, cannot throw
+
+    let described = doubled.flatMap { number in        // returns another future
+        loop.makeSucceededFuture("n=\(number)")
+    }
+
+    let saved: EventLoopFuture<Void> = loop.makeSucceededVoidFuture()
+    let marker = saved.transform(to: "saved")          // ignore the value
+
+    let both = described.and(marker)                   // EventLoopFuture<(String, String)>
+
+    let list: [EventLoopFuture<Int>] = (1...3).map { loop.makeSucceededFuture($0) }
+    let flat: EventLoopFuture<[Int]> = list.flatten(on: loop)
+
+    return both.and(flat)
+        .map { pair, numbers in "\(pair.0) \(pair.1) \(numbers)" }
+        .flatMapError { error in                       // recover from failure
+            loop.makeSucceededFuture("recovered: \(error)")
+        }
+}
+
+func observe(_ future: EventLoopFuture<String>, logger: Logger) {
+    future.whenComplete { result in                    // callback, no new future
+        switch result {
+        case .success(let value): logger.info("done: \(value)")
+        case .failure(let error): logger.error("failed: \(error)")
+        }
+    }
+}
+
+func onRequestLoop(_ req: Request, _ foreign: EventLoopFuture<String>) -> EventLoopFuture<String> {
+    foreign.hop(to: req.eventLoop)
+}
+
+// Bridging
+func legacyToAsync(_ req: Request) async throws -> String {
+    try await legacyChain(req, text: "21").get()
+}
+
+func asyncToLegacy(_ req: Request) -> EventLoopFuture<String> {
+    req.eventLoop.makeFutureWithTask {
+        try await Task.sleep(for: .milliseconds(5))
+        return "from async"
+    }
+}
+
+func asyncToLegacyWithPromise(_ req: Request) -> EventLoopFuture<String> {
+    let promise = req.eventLoop.makePromise(of: String.self)
+    promise.completeWithTask {
+        try await Task.sleep(for: .milliseconds(5))
+        return "from async via promise"
+    }
+    return promise.futureResult
+}
+
+func manualPromise(_ req: Request, work: @escaping @Sendable (@escaping @Sendable (String) -> Void) -> Void) -> EventLoopFuture<String> {
+    let promise = req.eventLoop.makePromise(of: String.self)
+    work { promise.succeed($0) }
+    return promise.futureResult
+}
+----
+
+Source: https://docs.vapor.codes/basics/async/#eventloopfutures[Vapor docs: Async, EventLoopFutures] and
+https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/niocore/eventloopfuture[swift-nio 2.104.0:
+EventLoopFuture]
+
+A legacy route returns the future directly: Vapor accepts a handler `+(Request) throws -> EventLoopFuture<String>+`
+because `EventLoopFuture<Value>` is `ResponseEncodable` when `Value` is:
+
+[source,swift]
+----
+app.get("legacy", ":text") { req -> EventLoopFuture<String> in
+    legacyChain(req, text: req.parameters.get("text") ?? "")
+}
+----
+
+Source: https://docs.vapor.codes/basics/async/[Vapor docs: Async] and
+https://github.com/apple/swift-nio/blob/2.104.0/Sources/NIOCore/EventLoopFuture.swift[swift-nio 2.104.0:
+EventLoopFuture.swift]
+
+[source,bash]
+----
+$ curl -s localhost:8080/legacy/21
+n=42 saved [1, 2, 3]
+$ curl -s localhost:8080/legacy/abc
+recovered: Abort.400: not a number
+----
+
+=== Bridging futures and async/await
+
+* `try await future.get()` turns any future into an `async` call. It requires `Value: Sendable`. Cancelling the awaiting
+  task does not cancel the underlying work; in swift-nio 2.104 there is also `getAbandoningOnCancel()`, which throws
+  `CancellationError` when the task is cancelled while the future keeps running.
+* `+eventLoop.makeFutureWithTask { ... }+` runs an `async` closure and returns its result as a future (the closure is
+  `@Sendable`, `Return` must be `Sendable`). The equivalent promise form is `+promise.completeWithTask { ... }+`, which
+  is what Vapor itself uses to wrap every async handler and middleware; it returns the `Task` (discardable).
+* To hand work to a callback-style API, make a promise with `eventLoop.makePromise(of:)` and complete it from the
+  callback (the last function in the legacy example).
+
+In Vapor 4.122 the official Async page documents `.get()` and `promise.completeWithTask`; `makeFutureWithTask` is the
+shorter form of the same thing, present in swift-nio 2.104 and used inside Vapor's own sources (`FileIO.swift`,
+`MemoryCache.swift`).
+
+=== Never wait() on an event loop
+
+`future.wait()` blocks the calling thread until the future completes. It is only safe on a thread that is not an event
+loop, for example in a command-line `main` before the server starts or in a test. Three layers guard against misuse:
+
+* inside an `async` function the compiler rejects it: `wait()` is marked `+@available(*, noasync, ...)+` and the
+  diagnostic suggests `get()`;
+* on an event loop thread, swift-nio calls `preconditionNotInEventLoop` and the process crashes with a "BUG DETECTED"
+  message;
+* from a cooperative-pool thread in a synchronous helper called by an async handler it compiles and blocks that pool
+  thread, the worst case: no crash, just a service that stops answering under load.
+
+A call that the compiler flags (in 4.122.2 as a warning, because `wait` is `@preconcurrency`):
+
+[source,swift]
+----
+func bad(_ req: Request) async throws {
+    let future = req.eventLoop.makeSucceededFuture(1)
+    _ = try future.wait() // do not do this
+}
+----
+
+[source,text]
+----
+warning: instance method 'wait' is unavailable from asynchronous contexts; wait() can block indefinitely, prefer get()
+----
+
+Source: https://github.com/apple/swift-nio/blob/2.104.0/Sources/NIOCore/EventLoopFuture.swift[swift-nio 2.104.0:
+EventLoopFuture.swift]
+
+The fix is always `try await future.get()` (or, in genuinely synchronous startup code, running the work before the
+server starts). Vapor's own `Application.execute()` calls `wait()` only in the legacy `app.run()` path, never in a
+request.
+
+=== hop(to:) and event-loop affinity
+
+A future's callbacks run on the loop it was created on. Vapor's `req.eventLoop` documentation notes that "if this is
+difficult or awkward to guarantee, use `EventLoopFuture.hop(to:)` to jump to this event loop". The case that needs it is
+a future obtained from a resource bound to another loop (a client connection pool, a database connection created
+elsewhere, a stored global future). Return `foreign.hop(to: req.eventLoop)` so the rest of the chain runs where the
+request lives. With async/await you do not hop: `.get()` returns the value to the cooperative pool regardless of the
+loop.
+
+== Blocking and CPU-bound work
+
+Two kinds of work do not belong on an event loop or on a cooperative-pool thread:
+
+* *blocking work*: synchronous file or network I/O, a C library call that waits, `sleep`, a semaphore or
+  `DispatchGroup.wait`, `future.wait()`;
+* *long CPU-bound work*: image resizing, large JSON or PDF generation, hashing, compression, big sorts.
+
+The cooperative pool has about one thread per CPU core and, by design, never creates more. If every thread is blocked,
+no other task makes progress anywhere in the process: not other requests, not the code that would unblock the first
+ones. The event loops fare no better, since each stalls all the connections pinned to it.
+
+The compiler helps a little: `Thread.sleep`, `DispatchSemaphore.wait` and a few other well-known calls are rejected
+inside `async` functions (_class method 'sleep' is unavailable from asynchronous contexts_). It cannot see through your
+own synchronous helper, or through a library that blocks internally. The following measurement was taken on a 10-core
+Mac with the example package: a route that calls a synchronous helper sleeping for one second, hit by 30 concurrent
+requests, took the response time of an unrelated, instant route from about 14 ms to about 2.7 seconds; the same 30
+requests through the thread pool left that route at 14 ms.
+
+[source,bash]
+----
+$ curl -s -o /dev/null -w "%{time_total}s\n" localhost:8080/books/1
+0.014120s
+$ for i in $(seq 1 30); do curl -s -o /dev/null localhost:8080/block-bad & done; sleep 0.3
+$ curl -s -o /dev/null -w "%{time_total}s\n" localhost:8080/books/1
+2.681546s
+----
+
+=== The thread pool: app.threadPool
+
+Vapor exposes a `NIOThreadPool` as `app.threadPool`; by default this is NIO's shared
+`NIOSingletons.posixBlockingThreadPool`, one thread per core. `NonBlockingFileIO` (`req.fileio`) and Bcrypt hashing
+(`req.password.async`) run on it. For your own blocking code use the `async` overload of `runIfActive`, which
+runs the closure on a pool thread and resumes the caller afterwards. The closure is `@Sendable` and its result must be
+`Sendable`; if the surrounding task is cancelled before the work starts, the call throws `CancellationError`
+(the future-returning overload fails with `NIOThreadPoolError.ThreadPoolInactive` when the pool is inactive).
+
+[source,swift]
+----
+import Vapor
+import NIOPosix
+import Foundation
+
+func checksum(of path: String) throws -> Int {
+    // Stand-in for a blocking, synchronous C or file API.
+    Thread.sleep(forTimeInterval: 0.05)
+    return path.utf8.reduce(0) { ($0 &* 31) &+ Int($1) }
+}
+
+func buildReport(on req: Request) async throws -> String {
+    let value = try await req.application.threadPool.runIfActive {
+        try checksum(of: "/var/data/report.csv")
+    }
+    return "checksum=\(value)"
+}
+
+func configureThreadPool(_ app: Application) {
+    // Optional: a larger pool dedicated to blocking work (set before the app boots).
+    app.threadPool = NIOThreadPool(numberOfThreads: 16)
+}
+
+func hashPassword(_ req: Request, _ plain: String) async throws -> String {
+    try await req.password.async.hash(plain)
+}
+
+func computeOffPool(_ input: Int) async -> Int {
+    await Task.detached(priority: .utility) {
+        (1...1_000).reduce(input, &+)
+    }.value
+}
+
+/// A synchronous helper from a blocking library. The compiler cannot see that it blocks.
+func legacySynchronousCall() -> String {
+    Thread.sleep(forTimeInterval: 1)
+    return "done"
+}
+----
+
+You can replace the pool with a larger one by assigning `app.threadPool` in `configure`, before the application boots
+(Vapor takes ownership, starts it and shuts it down; assigning after boot is a fatal error). Size it for the number of
+simultaneous blocking operations you accept, not for the number of requests. Past that point, requests queue up in the
+pool, which is better than starving the cooperative pool but still hurts latency; the better fix is a queue (see
+xref:backend/vapor/queues-and-background-jobs.adoc[Queues & Background Jobs]) or a separate worker process;
+xref:backend/vapor/production-and-performance.adoc[Production and Performance] measures the effect.
+
+Source: https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Core/Core.swift[vapor/vapor 4.122.2: Core.swift,
+threadPool], https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/nioposix/niothreadpool[swift-nio
+2.104.0: NIOThreadPool] and https://docs.vapor.codes/security/passwords/[Vapor docs: Passwords]
+
+=== Task.detached caveats
+
+`Task.detached` is *not* a way to get off the cooperative pool: a detached task runs on the same pool, it merely drops
+the parent's actor isolation, priority and task-locals. Detaching a blocking call therefore still occupies one of the
+few pool threads. It is appropriate for fire-and-forget CPU work that must not inherit a context (and for starting work
+from a synchronous function), with these caveats:
+
+* it is unstructured: nobody awaits it unless you keep the `Task` handle, errors are lost if you do not read
+  `task.value`, and cancelling the handler does not cancel it;
+* it does not inherit task-locals (the request ID in the next section disappears);
+* it can outlive the application: on shutdown, Vapor does not wait for stray tasks. Keep the handle somewhere that your
+  `LifecycleHandler` can await, or use a queue for work that must complete;
+* its closure is `@Sendable`, so what it captures must be `Sendable`.
+
+For heavy CPU work the options are: chunk it with `await Task.yield()` between chunks so the pool stays shared; run it
+through `app.threadPool.runIfActive` (the pool is separate from the cooperative one, and a blocked thread there harms
+nothing else); or hand it to a worker process through Vapor Queues
+(xref:backend/vapor/queues-and-background-jobs.adoc[Queues & Background Jobs]).
+
+=== The executor takeover: fewer thread hops
+
+Every `await` of a future moves a task between a NIO thread and a pool thread. SwiftNIO has an experimental switch that
+installs the NIO singleton event loop group as Swift's global concurrency executor, so that async code runs on the event
+loops and the switches disappear. The Vapor template carries this as commented-out code in `entrypoint.swift`:
+
+[source,swift]
+----
+import NIOCore
+import NIOPosix
+
+func tryExecutorTakeover() -> Bool {
+    // Call once, from the main thread, before any async work (see the template's entrypoint.swift).
+    NIOSingletons.unsafeTryInstallSingletonPosixEventLoopGroupAsConcurrencyGlobalExecutor()
+}
+----
+
+The template's comment is the best summary: you "can enable it" to reduce context switching, but it "has caused issues
+with some libraries that use `.wait()` and cleanly shutting down", and if enabled you should be careful about calling
+async functions before it runs. SwiftNIO documents more constraints: call it once, from the main thread, not on Windows,
+and the method is named `+unsafe...+` for a reason. In swift-nio 2.104.0 the hook is only installed when compiling with
+a compiler older than Swift 6.6 and the function returns `false` otherwise, so check the result and do not depend on it.
+With takeover enabled, blocking an executor thread blocks an event loop; the advice of this section applies more
+strongly, not less. Leave it off unless a profile shows thread-hop cost and you have tested shutdown.
+
+Source: https://github.com/vapor/template/blob/main/Sources/App/entrypoint.swift[vapor/template: entrypoint.swift] and
+https://github.com/apple/swift-nio/blob/2.104.0/Sources/NIOPosix/PosixSingletons%2BConcurrencyTakeOver.swift[swift-nio
+2.104.0: PosixSingletons+ConcurrencyTakeOver.swift]
+
+== Cancellation, task-locals and structured concurrency in handlers
+
+=== Cancellation
+
+Swift cancellation is cooperative: cancelling a task only sets a flag that your code (or the library you call) must
+check with `Task.isCancelled`, `try Task.checkCancellation()` or by awaiting something that throws `CancellationError`
+(`Task.sleep` does).
+
+An important Vapor 4.122.2 detail, established by reading `Responder+Concurrency.swift` and by running the
+example: *Vapor does not cancel a handler when the client disconnects.* The handler runs in a `Task` started with
+`promise.completeWithTask`, and nothing keeps a reference to cancel it. Requesting the `/slow` route of the example (50
+steps of 100 ms) with `curl --max-time 1` aborted the client after one second, and the server log still showed all 50
+steps and the final response being produced. So a handler that does expensive work for an absent client keeps spending
+resources; add your own limits (time-outs with `withThrowingTaskGroup`, request size limits, rate limits) rather than
+relying on disconnect-driven cancellation. Long-lived connections have their own handling of disconnects; see
+xref:backend/vapor/server-sent-events.adoc[Server-Sent Events] and xref:backend/vapor/websockets.adoc[WebSockets].
+
+Cancellation still matters inside a handler: child tasks of `async let` and task groups are cancelled when the group is
+left by a thrown error, and `withTaskCancellationHandler` lets you release a resource when that happens.
+
+=== Structured concurrency: async let and task groups
+
+Inside a handler you can fan out with child tasks. They run on the cooperative pool, inherit task-locals and priority,
+and are awaited before the scope ends. The `req` object is `Sendable`, so children may use it. Databases scale with
+connection pool size, so use fan-out for I/O that is truly independent, and bound the number of simultaneous operations.
+
+[source,swift]
+----
+import Vapor
+
+struct Dashboard: Content, Sendable {
+    var books: Int
+    var members: Int
+    var loans: Int
+}
+
+func countBooks() async throws -> Int { try await Task.sleep(for: .milliseconds(50)); return 120 }
+func countMembers() async throws -> Int { try await Task.sleep(for: .milliseconds(50)); return 18 }
+func countLoans() async throws -> Int { try await Task.sleep(for: .milliseconds(50)); return 7 }
+
+func loadDashboard(_ req: Request) async throws -> Dashboard {
+    async let books = countBooks()
+    async let members = countMembers()
+    async let loans = countLoans()
+    return try await Dashboard(books: books, members: members, loans: loans)
+}
+
+func lookup(isbn: String) async throws -> String {
+    try await Task.sleep(for: .milliseconds(100))
+    return "Title for \(isbn)"
+}
+
+/// Looks up many ISBNs with at most `limit` lookups in flight.
+func lookupAll(_ isbns: [String], limit: Int) async throws -> [String: String] {
+    try await withThrowingTaskGroup(of: (String, String).self) { group in
+        var iterator = isbns.makeIterator()
+        var results: [String: String] = [:]
+        for _ in 0..<limit {
+            guard let isbn = iterator.next() else { break }
+            group.addTask { (isbn, try await lookup(isbn: isbn)) }
+        }
+        while let (isbn, title) = try await group.next() {
+            results[isbn] = title
+            if let next = iterator.next() {
+                group.addTask { (next, try await lookup(isbn: next)) }
+            }
+        }
+        return results
+    }
+}
+
+enum RequestContext {
+    @TaskLocal static var requestID: String?
+}
+
+struct RequestIDMiddleware: AsyncMiddleware {
+    func respond(to request: Request, chainingTo next: any AsyncResponder) async throws -> Response {
+        let id = request.headers.first(name: "X-Request-ID") ?? UUID().uuidString
+        return try await RequestContext.$requestID.withValue(id) {
+            try await next.respond(to: request)
+        }
+    }
+}
+----
+
+Source: https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/[The Swift
+Programming Language: Concurrency] and https://docs.vapor.codes/advanced/middleware/[Vapor docs: Middleware]
+
+The `dashboard` route awaits three independent counts concurrently (about 50 ms total instead of 150 ms) and `/isbns`
+looks up five ISBNs with at most two in flight (about 300 ms: three waves of 100 ms):
+
+[source,swift]
+----
+app.get("dashboard") { req async throws -> Dashboard in
+    try await loadDashboard(req)
+}
+app.get("isbns") { req async throws -> [String: String] in
+    try await lookupAll(["978-0", "978-1", "978-2", "978-3", "978-4"], limit: 2)
+}
+----
+
+[source,bash]
+----
+$ curl -s localhost:8080/dashboard
+{"members":18,"loans":7,"books":120}
+$ time curl -s localhost:8080/isbns
+{"978-1":"Title for 978-1","978-0":"Title for 978-0", ...}   # 0.33 s total
+----
+
+Source: https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/[The Swift
+Programming Language: Concurrency] and https://docs.vapor.codes/basics/async/[Vapor docs: Async]
+
+Rules for fan-out inside a handler:
+
+* Never share one Fluent model between child tasks. Give each child its own query and produce a DTO.
+* One `Database` connection executes one statement at a time; parallel queries on `req.db` use several pooled
+  connections and are each subject to pool limits. Do not run hundreds in parallel.
+* Do not fan out inside `+req.db.transaction { ... }+`: a transaction is one connection, so the work is serialised
+  anyway.
+* Task groups return results in completion order; sort or key them if order matters, as the `/isbns` example keys by
+  ISBN.
+
+=== Task-locals for request-scoped context
+
+A `@TaskLocal` value is visible in the task that binds it and in all of its child tasks, and is gone when the scope
+exits. That makes it a fit for request-scoped context (request ID, tenant, authenticated user ID) without threading a
+parameter through every function. Bind it in an `AsyncMiddleware` around the call to the next responder (the
+`RequestIDMiddleware` at the end of the example above is registered with `app.middleware.use(RequestIDMiddleware())`),
+and read it anywhere below:
+
+[source,swift]
+----
+app.get("request-id") { _ async -> String in
+    RequestContext.requestID ?? "none"
+}
+----
+
+[source,bash]
+----
+$ curl -s -H 'X-Request-ID: req-42' localhost:8080/request-id
+req-42
+----
+
+Source: https://docs.vapor.codes/advanced/middleware/[Vapor docs: Middleware] and
+https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/[The Swift Programming
+Language: Concurrency]
+
+This works in 4.122.2 (the example above was run with `curl`): the task-local is set while `next.respond` runs, and the
+`Task` that Vapor creates with `completeWithTask` for the handler is created inside that scope, so it inherits the
+value. Do not count on the value in code that runs outside the task:
+
+* `Task.detached` (by design it drops task-locals);
+* callbacks that NIO runs on an event loop (`whenComplete`, scheduled tasks), since they do not run inside the task.
+
+Vapor's own request-scoped logging does not need task-locals: `req.logger` already carries a `request-id` metadata
+field, visible in the log lines above. Prefer `req.logger` for logging and keep `@TaskLocal` for application data.
+
+== Common errors and pitfalls
+
+[cols="2,3",options="header"]
+|===
+|Symptom |Cause and fix
+|`+error: var 'cache' is not concurrency-safe because it is nonisolated global shared mutable state+` |A top-level or `static var` shared by handlers. Move the state into an actor or a lock-protected `Sendable` class and keep it in `Application.storage`.
+|`+warning: capture of 'c' with non-Sendable type 'PlainClass' in a '@Sendable' closure+` |A route closure captured a non-`Sendable` reference. Vapor's route-registration overloads are `@preconcurrency`, so in 4.122.2 this is only a *warning* even in the Swift 6 mode, but it is still a real data race; treat it as an error and fix it.
+|`+error: stored property '_id' of 'Sendable'-conforming class 'Draft' is mutable+` |A Fluent `Model` declared without `@unchecked Sendable`. Declare it `final class Draft: Model, @unchecked Sendable`.
+|`+error: passing closure as a 'sending' parameter risks causing data races between code in the current isolation context and concurrent execution of the closure+` |A non-`Sendable` value (for instance a plain class instance) used inside `group.addTask` or `+Task { }+`. Make it `Sendable`, pass a copy or a DTO, or restructure.
+|`+warning: instance method 'wait' is unavailable from asynchronous contexts; wait() can block indefinitely, prefer get()+` |`future.wait()` in an `async` function. Replace with `try await future.get()`. It is a warning in 4.122/2.104 because `wait` is declared `@preconcurrency`, but it can freeze the service.
+|`+error: class method 'sleep' is unavailable from asynchronous contexts; Use Task.sleep(until:clock:) instead+` |`Thread.sleep` inside an async handler. Use `try await Task.sleep(for:)`.
+|"BUG DETECTED" crash from `wait()` on an event loop |A synchronous callback on an event loop called `wait()`. Chain with `flatMap` or hop to an async context with `makeFutureWithTask`.
+|The whole service freezes under load, CPU idle |Blocking calls on cooperative-pool or event-loop threads. Move them to `app.threadPool.runIfActive` (see above).
+|`+Cannot find 'NIOSingletons' in scope+` |Missing `import NIOCore` (the type) in addition to `import NIOPosix` (the takeover extension). Remember `InternalImportsByDefault`/`MemberImportVisibility` in the template: add the NIO products to the target's dependencies.
+|Handler keeps running after the client left |Vapor 4.122 does not cancel handler tasks on disconnect; add your own limits.
+|Fatal error "Cannot replace thread pool after application has booted" |`+app.threadPool = ...+` assigned after boot. Do it in `configure`.
+|Task-local value is `nil` in a helper |The code runs in a `Task.detached`, a NIO callback or another unstructured context that does not inherit task-locals.
+|===
+
+== Version notes
+
+[cols="1,3",options="header"]
+|===
+|Version |What changed for concurrency
+|Vapor 3 and early Vapor 4 |All asynchronous APIs return futures (Vapor 3 had its own `Future<T>` type and `Worker`/`Container` instead of `Request.eventLoop`; Vapor 4 uses SwiftNIO's `EventLoopFuture` directly); handlers chain `map`/`flatMap`.
+|Vapor 4 with Swift 5.5 (2021) |async/await support arrives: `async` route closures, `AsyncMiddleware`, async Fluent calls, `AsyncMigration`. The official docs recommend one programming model per handler.
+|Vapor 4 in 2023 |Large `Sendable` annotation effort across Vapor, Fluent and the NIO-based packages (blog: _Upcoming Sendable changes_, 2023-05-24); `@Sendable` route closures; `Application`/`Request` made `Sendable` through locks.
+|Vapor 4 (2024-2026) |Builds warning-free in the Swift 6 language mode; async twins for nearly every future-based API; the template (4.121.4 baseline) uses `@main enum Entrypoint` with `Application.make` and `asyncShutdown`.
+|Vapor 4.122.2 (2026-09-17) |Latest 4.x; `AsyncResponseEncodable` refines `SendableMetatype` on Swift 6.2+; this page's examples were compiled against it.
+|Vapor 5 (beta, 5.0.0-beta.4 on 2026-10-13) |No `EventLoopFuture`-returning API, structured concurrency throughout, Swift Service Lifecycle for startup/shutdown, HTTP Types, Swift Argument Parser. `Request`/`Response` are planned to become value types, a new service architecture is planned. 4.x enters maintenance (fixes for at least six months after 5.0). Not generally available; do not rely on APIs shown in betas.
+|===
+
+Source: https://blog.vapor.codes/posts/the-future-of-vapor/[Vapor blog: The future of Vapor] and
+https://blog.vapor.codes/posts/upcoming-sendable-changes/[Upcoming Sendable changes]
+
+== Where the books are outdated
+
+* Condon et al. (_Server-Side Swift with Vapor_, Kodeco) teach `EventLoopFuture` throughout (chapter 4 introduces
+  futures and promises, `map`/`flatMap`/`flatMapThrowing`/`transform`/`and`/`flatten`, error recovery, and warns against
+  `wait()`). The concepts and the operators in the legacy section above are still accurate, but new code is written with
+  async/await, and `wait()` is flagged inside async code.
+* Books and tutorials from the Swift 5 era use global mutable state, controllers holding `var` arrays and classes
+  without `Sendable`. Under Swift 6 they are compile errors, as shown in the diagnostics above.
+* Fluent models in older books are plain `final class Book: Model, Content`; today they are `final class Book: Model,
+  @unchecked Sendable`, and returning the model as `Content` is replaced by DTOs.
+* The official 4.0 documentation is silent about Swift 6 and `Sendable` guidance; the template and the Vapor blog are
+  the sources, and this page fills the gap.
+
+== References
+
+* https://docs.vapor.codes/basics/async/[Vapor docs: Async] (async/await, `.get()`, `completeWithTask`,
+  `EventLoopFuture` operators)
+* https://docs.vapor.codes/basics/routing/[Vapor docs: Routing],
+  https://docs.vapor.codes/advanced/middleware/[Middleware], https://docs.vapor.codes/advanced/services/[Services] and
+  https://docs.vapor.codes/security/passwords/[Passwords]
+* https://docs.vapor.codes/fluent/model/[Vapor docs: Fluent model] and
+  https://github.com/vapor/template/blob/main/Sources/App/Models/Todo.swift[vapor/template: Todo.swift]
+  (`@unchecked Sendable`)
+* https://github.com/vapor/template/blob/main/Sources/App/entrypoint.swift[vapor/template: entrypoint.swift] (entry
+  point and executor takeover)
+* https://blog.vapor.codes/posts/upcoming-sendable-changes/[Vapor blog: Upcoming Sendable changes] and
+  https://blog.vapor.codes/posts/the-future-of-vapor/[The future of Vapor]
+* https://github.com/vapor/vapor/tree/4.122.2/Sources/Vapor/Concurrency[vapor/vapor 4.122.2: Sources/Vapor/Concurrency]
+  and https://github.com/vapor/vapor/blob/4.122.2/Sources/Vapor/Core/Core.swift[Core.swift]
+* https://api.vapor.codes[Vapor API documentation]
+* https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/niocore/eventloopfuture[swift-nio 2.104.0:
+  EventLoopFuture],
+  https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/nioposix/niothreadpool[NIOThreadPool] and
+  https://swiftpackageindex.com/apple/swift-nio/2.104.0/documentation/nioconcurrencyhelpers[NIOConcurrencyHelpers]
+* https://github.com/apple/swift-nio/blob/2.104.0/Sources/NIOPosix/PosixSingletons%2BConcurrencyTakeOver.swift[swift-nio
+  2.104.0: concurrency takeover]
+* https://docs.swift.org/swift-book/documentation/the-swift-programming-language/concurrency/[The Swift Programming
+  Language: Concurrency] and https://developer.apple.com/documentation/synchronization/mutex[Apple: Mutex]
+* https://www.kodeco.com/books/server-side-swift-with-vapor[Kodeco: Server-Side Swift with Vapor] (Condon et al.)
