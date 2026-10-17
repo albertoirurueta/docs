@@ -1,6 +1,6 @@
 ---
 name: iru-setup-antora
-description: Set up an Antora documentation site in a repository that doesn't have one yet — installs Node.js/Antora prerequisites, scaffolds `docs/antora.yml` and `docs/antora-playbook.yml`, and builds a minimal ROOT module with `index.adoc`, `installation.adoc`, and `reference.adoc` pages wired into `nav.adoc`. Invoke as `/iru-setup-antora`. Idempotent: safe to re-run on a repository that already has some or all of this in place — it fills gaps without overwriting existing pages, config, or nav entries. Use whenever a repository needs Antora documentation bootstrapped from scratch, instead of hand-wiring `antora.yml`/`antora-playbook.yml`/the module skeleton one file at a time.
+description: Set up an Antora documentation site in a repository that doesn't have one yet — installs Node.js/Antora prerequisites, scaffolds `docs/antora.yml` and `docs/antora-playbook.yml`, and builds a minimal ROOT module with `index.adoc`, `installation.adoc`, and `reference.adoc` pages wired into `nav.adoc`. Invoke as `/iru-setup-antora`, optionally with an `args` line setting `on-existing` to `ask`/`keep`/`update`/`replace` (scripted runs; default `ask`). Announces whether it is creating the site from scratch or updating an existing one; when `docs/antora.yml`/the playbook/the ROOT module already exist it warns and asks whether to Update (fill gaps only, never overwriting existing pages, config, or nav entries — safe to re-run), Keep the site as is, or Replace `antora.yml` + the playbook from its template (existing pages kept unless the user explicitly confirms otherwise). For a repository with a user interface it also adds the **User interface** skeleton (`ui/index.adoc`, `ui/navigation.adoc`, an `images/ui/` directory and their nav entries, per `reference/ui-docs.md`) that `iru-update-docs` later fills with one page per screen and component illustrated by the UI tests' screenshots. Use whenever a repository needs Antora documentation bootstrapped from scratch, instead of hand-wiring `antora.yml`/`antora-playbook.yml`/the module skeleton one file at a time.
 model: haiku
 ---
 
@@ -10,9 +10,18 @@ Bootstrap a minimal, working Antora documentation site for a repository: verify/
 install Antora plus its supported extensions under `docs/`, write `antora.yml` and `antora-playbook.yml`, create
 the `ROOT` module with three starter pages, and confirm the site actually builds. This skill makes no assumptions
 about the repository's language or build system — discover the project name, version, and install instructions
-fresh each run. It is additive: if some or all of this already exists (as it does in this very repository), skip
-what's already in place and only fill genuine gaps, without overwriting existing pages or reordering existing nav
-entries.
+fresh each run. Its default update path is additive: if some or all of this already exists (as it does in this very
+repository), it announces that, asks how to treat the existing site (Step 2), and on **Update** skips what's
+already in place and only fills genuine gaps, without overwriting existing pages or reordering existing nav entries.
+
+## Step 0 — Resolve inputs
+
+This skill takes one optional `args` line, `on-existing: <ask|keep|update|replace>` — passed by an orchestrator
+only when its own `args` received it (scripted runs). Default `ask`. Any other `key: value` line (e.g. `sonar`,
+`mode`, `visibility`) is ignored — this skill only owns the docs site. When `on-existing` is `keep`/`update`/
+`replace`, Step 2 still prints its warning about the existing site but applies that value without asking. `mode:
+existing` alone (if an orchestrator happens to pass it) does **not** mean "update silently" — Step 2 still asks
+unless `on-existing` says otherwise.
 
 ## Step 1 — Verify Node.js is installed
 
@@ -52,9 +61,32 @@ Don't assume a clean slate. Before creating anything, check:
 - Is `docs/package.json` already tracking `antora` and the three extensions from Step 3 as dependencies?
 
 Build a concrete gap list from this survey (e.g. "antora.yml missing", "playbook exists but has no mermaid
-extension", "ROOT module exists with 5 pages already, no page covers installation"). Every later step acts only
-on genuine gaps — a fully-set-up repository (this one, `hermes`, already has all of this) should result in Step
-13 reporting "already set up," not in duplicated or overwritten files.
+extension", "ROOT module exists with 5 pages already, no page covers installation").
+
+Then tell the user which of the two this run is doing:
+
+- **None of `docs/antora.yml`, the playbook, or `docs/modules/ROOT/` exists** → "Creating the Antora site **from
+  scratch**." Continue to Step 3 with every gap in scope.
+- **Any of them exists** → "**Updating an existing Antora site** — found: <paths>." Warn that a prior docs setup is
+  present and — unless Step 0's `on-existing` already decided (`keep`/`update`/`replace`, applied without asking) —
+  ask with `AskUserQuestion` (header e.g. "Antora docs"), explaining each option's consequence in its description:
+  - **Update (Recommended)** — "Fill gaps only: add the missing config, extensions, starter pages and nav entries
+    using this skill's template as reference; never overwrite an existing page, existing nav entry, or a correct
+    config section. Your customizations survive; only genuinely wrong/missing fields in `antora.yml`/the playbook
+    are corrected (shown to you first)." — today's additive behaviour, exactly as Steps 3–12 describe.
+  - **Keep as is** — "Leave the docs site untouched (no config, page, or nav change; Step 11's `.gitignore` check
+    and Step 12's build still run as a verification). It may stay out of date — e.g. missing an extension or the
+    local `ui-bundle.zip` — and the report will list each gap left unfilled." Skip Steps 3–10.
+  - **Replace** — "Rewrite `docs/antora.yml` and `docs/antora-playbook.yml` from this skill's template (and
+    re-copy `ui-bundle.zip`). Matches this house pattern exactly, but every customization in those two files is lost
+    (recoverable only from git history). Existing pages and `nav.adoc` are kept." Only if the user, in a separate
+    explicit confirmation, also asks to regenerate the existing starter pages may Steps 7–9 overwrite them — never
+    by default, and never pages outside the three starter roles.
+  - **Stop** — "End this skill now without changing anything."
+
+Every later step acts only on genuine gaps (or, under **Replace**, on the two config files plus gaps) — a
+fully-set-up repository answered with **Update** should result in Step 13 reporting "already set up," not in
+duplicated or overwritten files.
 
 ## Step 3 — Install Antora and its extensions
 
@@ -62,12 +94,17 @@ If `docs/` doesn't exist yet, create it (`mkdir docs`). From inside `docs/`:
 
 ```bash
 cd docs
+[ -f package.json ] || npm init -y >/dev/null   # npm otherwise walks up and installs into the ROOT package.json
 npm i -D -E antora
 npm i @antora/lunr-extension
 npm i @sntke/antora-mermaid-extension
 npm i @djencks/asciidoctor-mathjax
 ```
 
+- **`docs/package.json` must exist before the first `npm i`** (verified against a pipeline-generated repository): with no manifest in
+  `docs/`, npm resolves the nearest ancestor `package.json` — the library/app's own root manifest — and installs
+  Antora and the three extensions there, polluting the project's real dependencies. The `npm init -y` guard above
+  creates a minimal manifest first (set `"private": true` in it afterwards so it can never be published).
 - `npm i -D -E antora` pins an exact Antora version as a dev dependency (`-E` = exact, no `^`/`~` range) —
   matching how this repo pins it in `docs/package.json`.
 - The three extensions add: full-text search (`@antora/lunr-extension`), Mermaid diagram rendering
@@ -80,17 +117,28 @@ npm i @djencks/asciidoctor-mathjax
 Determine three values first:
 
 - **`name`**: a short slug for the project — the Antora *component* name, used in `start_page` references like
-  `<name>::index.adoc`. Derive it from the project identifier (Maven `artifactId`, npm package `name`, Go module
-  base name, etc.), lowercased with no spaces.
+  `<name>::index.adoc`. Derive it from the project identifier (Maven `artifactId`, npm package `name`, `pyproject.toml`
+  `[project].name`, the root `Cargo.toml` `[package] name`, the last element of the `go.mod` `module` path (skipping a
+  `/vN` major-version suffix — `github.com/acme/hello-cli/v2` → `hello-cli`), a Swift package's executable product
+  name in `Package.swift`, a .NET solution's `*.slnx`/`*.sln` file name, an XcodeGen `project.yml`'s `name:`, etc.),
+  lowercased with no spaces.
 - **`title`**: the human-readable project name (e.g. from a README's top heading, `pom.xml`'s `<name>`, or
   `package.json`'s `name` capitalized).
 - **`version`**: the current release version, preferring, in order: (1) the latest GitHub release
   (`gh release view --json tagName -q .tagName` or `gh api repos/{owner}/{repo}/releases/latest`), (2) the latest
   git tag (`git tag --sort=-v:refname | head -1`), (3) the project manifest's version with any pre-release suffix
-  like `-SNAPSHOT` stripped. If none of these resolve, ask the user for a starting version rather than guessing.
+  like `-SNAPSHOT` (or Python's PEP 440 `.dev0`, or the `-dev` suffix .NET's `Directory.Build.props` `<Version>` and
+  PHP use) stripped — for an Apple app, `MARKETING_VERSION` in `project.yml`/`Project.swift`/`*.xcconfig`. The
+  manifest version of a command-line tool lives in: Rust — `[package] version` in the root `Cargo.toml` (never the
+  `xtask` member's `0.0.0`); Go — `var Version = "…"` in `internal/version/version.go` (`go.mod` has no version; a
+  module without that file relies on tags only); Swift — `public let toolVersion = "…"` in
+  `Sources/<Bin>Kit/Version.swift`; .NET — `<Version>` in `Directory.Build.props`. Each carries a `-dev` suffix on
+  the integration branch (e.g. `0.1.0-dev` → `0.1.0`). If none of these resolve, ask the user for a starting version
+  rather than guessing.
 
-Write (or, if `antora.yml` already exists, only correct genuinely wrong fields rather than rewriting the whole
-file):
+Write (or, if `antora.yml` already exists and Step 2's answer was **Update**, only correct genuinely wrong fields
+rather than rewriting the whole file; under **Replace**, rewrite it from this template, carrying over the existing
+`name` unless it's wrong so existing `xref:`s and `start_page` keep resolving):
 
 ```yaml
 name: <project-slug>
@@ -114,8 +162,9 @@ nav:
 
 The `site`/`content` sections are project-specific; the `ui`/`antora.extensions`/`asciidoc` sections are fixed
 boilerplate this skill applies as-is (they wire up the three extensions installed in Step 3) — don't improvise
-alternatives for them. If the file already exists, only add missing pieces (e.g. an extension block) rather than
-rewriting sections that already match this shape.
+alternatives for them. If the file already exists and Step 2's answer was **Update**, only add missing pieces (e.g.
+an extension block) rather than rewriting sections that already match this shape; under **Replace**, rewrite the
+whole file from the template below.
 
 - `site.title`: same human-readable title as Step 4.
 - `site.start_page`: `<component-name>::index.adoc`, using the `name` chosen in Step 4.
@@ -221,7 +270,8 @@ repository's `getting-started.adoc` does for its Maven coordinates.
 ## Step 9 — Write `reference.adoc` (links of interest)
 
 Discover what generated reports and external dashboards this repository actually has before listing them — don't
-list a report that isn't actually produced anywhere. Check for: a Javadoc/API-doc generation step, a coverage
+list a report that isn't actually produced anywhere. Check for: a Javadoc/API-doc generation step (Sphinx for Python, built from `docs/api/` and published
+under the site's `api/`), a coverage
 tool (JaCoCo, Istanbul/nyc, coverage.py) and where its report is published, a test-report plugin (Surefire, JUnit
 HTML reporter), a SonarCloud/SonarQube project, and the repository's own GitHub URL. Link only what's confirmed to
 exist (check CI config, `pom.xml`/`package.json` plugins, or existing GitHub Pages settings), in a table like this
@@ -246,9 +296,27 @@ These reports are generated during the build.
 |===
 ```
 
+## Step 9b — User interface skeleton (repositories with a UI only)
+
+Read `reference/ui-docs.md` (next to this file). If §1 says the repository has no user interface, skip this step.
+Otherwise create, when missing, the skeleton its §2 describes — and nothing more:
+
+- `pages/ui/index.adoc`: the disclaimer from Step 7, one paragraph on the app's UI, and the screens/components
+  tables from §3 filled from a quick inventory (the `Explore` agent: screens/pages/activities/windows and reusable
+  components, with the purpose their doc comments state). Link no per-screen page yet.
+- `pages/ui/navigation.adoc`: the disclaimer and the navigation graph from the app's navigation definition
+  (Mermaid `flowchart` — the playbook from Step 5 always wires Mermaid), without screenshots.
+- `images/ui/.gitkeep`, so the committed screenshot tree exists.
+
+Per-screen and per-component pages and every screenshot are `iru-update-docs`' job (its UI step builds the whole
+section on its first run on a UI repository) — tell the user to run `/iru-update-docs` after the UI tests have
+produced `.ui-screenshots/`. On **Update**, existing `ui/` pages are kept as is like every other page.
+
 ## Step 10 — Update `nav.adoc`
 
-Add an `xref:` entry for each page created in Steps 7–9 that doesn't already have one. Preserve the order and
+Add an `xref:` entry for each page created in Steps 7–9b that doesn't already have one (Step 9b's pages go in
+the **User interface** section shape from `reference/ui-docs.md` §2: `* xref:ui/index.adoc[User interface]` with
+`** xref:ui/navigation.adoc[Navigation flows]` under it). Preserve the order and
 content of any existing entries — append new entries in a sensible position (overview first, then the rest)
 rather than reordering what's already there:
 
@@ -258,11 +326,18 @@ rather than reordering what's already there:
 * xref:reference.adoc[]
 ```
 
+A command-line tool repository later gains a generated `cli-reference.adoc` page (written from the command tree by
+the CLI scaffold's docs generator) and its `* xref:cli-reference.adoc[Command-line reference]` nav entry —
+`iru-setup-cli-repository` adds both after this skill runs. Don't create that page or entry here; on **Update**,
+an existing one is like any other existing page and nav entry — kept as is.
+
 ## Step 11 — Ignore the build output
 
-Check the repository's `.gitignore` for an entry covering `docs/build/`. If missing, add one (this repository's
-own `.gitignore` has `/docs/build/`). Do **not** gitignore `docs/node_modules/`, `docs/package.json`, or
-`docs/package-lock.json` — those are committed, matching how this repository tracks them.
+Check the repository's `.gitignore` for entries covering `docs/build/` **and** `docs/node_modules/`. If either
+is missing, add it — every `iru-setup-<stack>-gitignore` skill in this catalog writes both, and CI reinstalls the
+toolchain with `cd docs && npm ci` from the committed lockfile. Do **not** gitignore `docs/package.json` or
+`docs/package-lock.json` — those must stay committed for `npm ci` to work. (This catalog's own repository
+historically committed `docs/node_modules/`; that is a legacy quirk, not the convention to reproduce.)
 
 ## Step 12 — Build the site
 
@@ -280,16 +355,22 @@ npx antora antora-playbook.yml
 
 ## Step 13 — Report
 
-Summarize, grouped by what Step 2 found already present vs. what this run created or filled in:
+Start by restating the mode from Step 2 — "created from scratch" or "updated an existing site" — and, for an
+existing site, the option applied (**updated** / **kept as is** / **replaced**, and whether it came from the user
+or from `on-existing`; or that the user chose **Stop**, in which case report only that). Then summarize, grouped by
+what Step 2 found already present vs. what this run created or filled in:
 
 - Node.js/Antora/extensions: already present vs. newly installed.
 - `antora.yml` / `antora-playbook.yml`: already present and correct, corrected, or newly written.
 - `ui-bundle.zip`: already present at `docs/` vs. newly copied in from this skill's directory.
 - Each of the three starter pages: newly created, or already covered by an existing page under a different name
   (name it).
+- The **User interface** skeleton from Step 9b: created, already present, or not applicable (no UI).
 - `nav.adoc` and `.gitignore`: entries added, if any.
 - Build result from Step 12, with the path to the built `index.html`.
+- Under **Keep as is**: every gap from Step 2's list that was left unfilled (missing extension, missing starter
+  page role, missing `ui-bundle.zip`, …), so the user can re-run with **Update** later.
 
 Remind the user to review the generated `index.adoc`/`installation.adoc`/`reference.adoc` content themselves
-before trusting it, and that `docs/build/` should stay untracked while `docs/node_modules/`, `docs/package.json`,
+before trusting it, and that `docs/build/` and `docs/node_modules/` should stay untracked while `docs/package.json`,
 and `docs/package-lock.json` should be committed.
