@@ -1,0 +1,1632 @@
+= Cleanups, Weak Pointers and Interning
+:description: Observing and reacting to object death in Go: runtime.SetFinalizer and its pitfalls, runtime.AddCleanup (Go 1.24) and why it replaces finalizers, Cleanup.Stop, the weak package and weak.Pointer for caches, the unique package and unique.Handle for interning, runtime.KeepAlive, runtime.Pinner for cgo, GODEBUG=checkfinalizers, testing object death, and when not to use any of it.
+:keywords: Go, golang, runtime.SetFinalizer, runtime.AddCleanup, runtime.Cleanup, Cleanup.Stop, weak, weak.Pointer, weak.Make, unique, unique.Handle, unique.Make, interning, canonicalization, runtime.KeepAlive, runtime.Pinner, finalizer, cleanup, weak pointer, garbage collector, resurrection, checkfinalizers, cache, Go 1.24, Go 1.23, Go 1.27
+
+include::partial$go-disclaimer.adoc[]
+
+This page is written against Go 1.27 (go1.27.2), checked on 2026-10-18; every `go.mod` shown has the line `go 1.27`.
+A garbage-collected language hides the death of objects: memory is never freed explicitly, so a program normally cannot
+tell when a value became unreachable. Go's runtime library offers four deliberate exceptions, and one related tool for
+the opposite problem. `runtime.SetFinalizer` (the original) and `runtime.AddCleanup` (Go 1.24) run a function some time
+after an object became unreachable. The `weak` package (Go 1.24) refers to an object without keeping it alive. The
+`unique` package (Go 1.23) canonicalizes ("interns") comparable values and is built on top of weak pointers and cleanups.
+`runtime.KeepAlive` and `runtime.Pinner` go the other way: they stop the runtime from collecting or moving something
+too early. These are low-level tools with sharp edges, and the official advice is to hide them inside a package and use
+them rarely. This page explains each one, shows what actually happens when they are used correctly and incorrectly, and
+ends with a guide to choosing between them and to testing code that depends on them.
+
+It builds on xref:programming-languages/go/memory-management-and-garbage-collection.adoc[Memory Management and Garbage Collection]
+(reachability, the GC cycle and `GOGC`), xref:programming-languages/go/pointers-and-value-semantics.adoc[Pointers and Value Semantics]
+and xref:programming-languages/go/goroutines-and-the-scheduler.adoc[Goroutines and the Scheduler] (cleanups and finalizers run
+on their own goroutines). Related pages are
+xref:programming-languages/go/unsafe-and-low-level-programming.adoc[unsafe and Low-Level Programming],
+xref:programming-languages/go/cgo-and-c-interop.adoc[cgo and C Interoperability] (the pointer-passing rules that `Pinner`
+serves), xref:programming-languages/go/sync-and-atomics.adoc[Sync and Atomics],
+xref:programming-languages/go/memory-model-and-data-races.adoc[Memory Model and Data Races],
+xref:programming-languages/go/testing.adoc[Testing], xref:programming-languages/go/generics.adoc[Generics] (all three
+packages are generic) and xref:programming-languages/go/io-files-and-the-filesystem.adoc[I/O, Files and the Filesystem]
+(`os.File` is the standard example of an explicit `Close` backed by a safety net). Other languages offer similar tools
+under other names: see `WeakReference<T>` and finalizers in
+xref:programming-languages/csharp/memory-management-and-disposal.adoc[C# Memory Management and Disposal], `Weak<T>` in
+xref:programming-languages/rust/smart-pointers.adoc[Rust Smart Pointers], `weak` references in
+xref:programming-languages/swift/automatic-reference-counting.adoc[Swift Automatic Reference Counting] and `weak_ptr` in
+xref:programming-languages/cpp/memory-management-and-smart-pointers.adoc[C++ Memory Management and Smart Pointers].
+
+Every example was compiled, vetted with `go vet` and run with Go 1.27.2; the output shown is the real output. Examples
+that call the garbage collector print only facts that do not vary between runs (whether something was collected, not
+when); sizes and timings that do vary by machine are labelled. Panic and `fatal error` traces are shortened to the
+lines that matter: file paths are replaced by `+.../main.go+`, `$GOROOT` stands for the toolchain directory, and
+the addresses in the traces change on every run. The example module has this `go.mod`:
+
+[source,text]
+----
+module example.com/shelf
+
+go 1.27
+----
+
+== Observing object death
+
+The Go specification does not say when memory is reclaimed, and the death of an object is not an observable event at
+the language level. The https://go.dev/doc/gc-guide[GC guide] describes the three features that break the illusion:
+
+* *cleanups* (`runtime.AddCleanup`): run `cleanup(arg)` on a runtime goroutine some time after the object became unreachable;
+* *weak pointers* (`weak.Pointer[T]`): a pointer the collector does not count when it decides whether the object is reachable;
+* *finalizers* (`runtime.SetFinalizer`): run `finalizer(obj)` some time after the object became unreachable, which makes the object reachable again for the duration of the call.
+
+Everything in this page follows from one property: *the runtime decides when*. A cleanup, a finalizer or a cleared weak
+pointer can appear at any garbage collection after the object's last use, and the object's last use is not the end of
+the enclosing block but the last point where the compiler's liveness analysis sees it mentioned. A function argument or
+receiver may become unreachable at the last point where the function mentions it. Nothing is guaranteed to run before
+the program exits, and nothing is guaranteed to run at all.
+
+[cols="2,3,3,3", options="header"]
+|===
+| | `runtime.SetFinalizer` | `runtime.AddCleanup` | `weak.Pointer[T]`
+| Since | Go 1.0 | Go 1.24 | Go 1.24
+| Receives | the object itself (resurrected) | an argument that must not reach the object | nothing: you call `Value()`
+| Per object | one finalizer, first byte only | any number, interior pointers allowed | any number
+| Cycles | a cycle through the object is never freed | cycles are collected | cycles are collected
+| Delays freeing | yes, at least one more GC cycle | no | no
+| Order | dependency order | unspecified, may run concurrently | not applicable
+| Official advice | avoid in new code | prefer to finalizers | caches, canonicalization maps, weak-keyed maps
+|===
+
+== Finalizers: runtime.SetFinalizer
+
+`SetFinalizer(obj, finalizer)` associates a function with the object `obj` points to. When the collector finds the
+object unreachable it clears the association, makes the object reachable again, and calls `finalizer(obj)` on the
+single goroutine that runs every finalizer in the program. If nothing resurrects the object further, the next cycle that
+finds it unreachable frees it. `SetFinalizer(obj, nil)` removes the finalizer.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+// Scanner wraps a barcode-scanner device identified by a descriptor.
+type Scanner struct {
+	fd int
+}
+
+func closeDevice(fd int) { fmt.Println("device closed:", fd) }
+
+func openScanner(fd int, done chan<- struct{}) *Scanner {
+	s := &Scanner{fd: fd}
+	// The finalizer receives the object itself, so the object is
+	// resurrected for the duration of the call.
+	runtime.SetFinalizer(s, func(s *Scanner) {
+		closeDevice(s.fd)
+		close(done)
+	})
+	return s
+}
+
+func main() {
+	done := make(chan struct{})
+	s := openScanner(3, done)
+	fmt.Println("scanner open:", s.fd)
+	s = nil // the last reference is dropped
+
+	for range 5 {
+		runtime.GC()
+		select {
+		case <-done:
+			fmt.Println("finalizer ran")
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	fmt.Println("finalizer did not run")
+}
+----
+
+[source,text]
+----
+scanner open: 3
+device closed: 3
+finalizer ran
+----
+
+Source: https://pkg.go.dev/runtime#SetFinalizer[runtime.SetFinalizer]
+
+The argument must be a pointer to an object allocated by `new`, by taking the address of a composite literal or by taking
+the address of a local variable, and the finalizer must be a function taking one parameter that ``obj``'s type is
+assignable to. Because both parameters are `any`, the compiler cannot check this; a violation is a run-time `fatal error`,
+not a panic you can recover from:
+
+[source,go]
+----
+package main
+
+import "runtime"
+
+type Scanner struct{ fd int }
+
+func main() {
+	s := Scanner{fd: 3}
+	// A value, not a pointer: the runtime refuses.
+	runtime.SetFinalizer(s, func(*Scanner) {})
+}
+----
+
+[source,text]
+----
+fatal error: runtime.SetFinalizer: first argument is main.Scanner, not pointer
+
+goroutine 1 gp=0x74535da7c1e0 m=0 mp=0x1023dfd40 [running]:
+runtime.throw({0x74535dc16000?, 0x10233de1d?})
+	$GOROOT/src/runtime/panic.go:1243 +0x38 ...
+runtime.SetFinalizer({0x1023cc1c0, 0x102340538}, {0x1023c67e8, 0x1023d3f08})
+	$GOROOT/src/runtime/mfinal.go:439 +0x584 ...
+main.main()
+	.../main.go:10 +0x40 ...
+----
+
+Source: https://pkg.go.dev/runtime#SetFinalizer[runtime.SetFinalizer]
+
+=== Why finalizers are error-prone
+
+The GC guide lists the problems, and each one is a consequence of resurrection:
+
+* *One per object, at the first byte.* An object can have a single finalizer, and it must be attached to the first byte of the allocation. A second `SetFinalizer` call on an object that already has one is a `fatal error` ("finalizer already set"), and packages that cannot add their own bookkeeping to an object they were handed cannot clean it up.
+* *Cycles are never freed.* Finalizers run in dependency order: if A points at B and both have finalizers, only A's finalizer runs, and B's runs after A is freed. If a cyclic structure includes an object with a finalizer, there is no order that respects the dependencies, so the cycle is not guaranteed to be collected and the finalizer is not guaranteed to run.
+* *Chains take one cycle per link.* A linked list in which every node has a finalizer needs at least as many GC cycles as there are nodes.
+* *One goroutine runs them all, sequentially.* A finalizer that blocks delays every other finalizer; one that must run long should start a goroutine.
+* *The object lives at least one more cycle.* Its memory cannot be reused until the cycle after the finalizer ran.
+* *Not at exit, not for zero-size objects, not guaranteed for package-level initializers.* The documentation says so explicitly for each case.
+* *Visibility.* `SetFinalizer` happens before the finalizer call, but nothing orders the program's other writes to the object before the finalizer reads them; a finalizer that touches mutable state needs a mutex or atomics, just like any other goroutine.
+
+The first two are easy to see. The next program builds a pair of objects that point at each other, as a device and its
+owning session often do, and attaches a finalizer to one pair and a cleanup (next section) to another:
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync/atomic"
+	"time"
+)
+
+// Scanner and Session point at each other, as a device and its owner often do.
+type Scanner struct {
+	fd      int
+	session *Session
+}
+
+type Session struct {
+	scanner *Scanner
+}
+
+var finalized, cleaned atomic.Int32
+
+func newPair(fd int) *Scanner {
+	s := &Scanner{fd: fd}
+	s.session = &Session{scanner: s}
+	return s
+}
+
+func makeWithFinalizer() {
+	s := newPair(1)
+	runtime.SetFinalizer(s, func(*Scanner) { finalized.Add(1) })
+}
+
+func makeWithCleanup() {
+	s := newPair(2)
+	runtime.AddCleanup(s, func(int) { cleaned.Add(1) }, s.fd)
+}
+
+func main() {
+	makeWithFinalizer()
+	makeWithCleanup()
+
+	for range 10 {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	fmt.Println("finalizers run for the cyclic pair:", finalized.Load())
+	fmt.Println("cleanups run for the cyclic pair:  ", cleaned.Load())
+}
+----
+
+[source,text]
+----
+finalizers run for the cyclic pair: 0
+cleanups run for the cyclic pair:   1
+----
+
+Source: https://go.dev/doc/gc-guide#Common_finalizer_issues[GC guide: Common finalizer issues]
+
+The finalizer never ran: the cyclic pair contains an object with a finalizer, there is no order that respects the
+dependencies, and the pair leaks until the program ends. The cleanup ran. The chain problem is just as visible; each
+GC cycle releases exactly one node of a five-node chain, because a node can only be finalized after the node pointing to
+it has been freed:
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync/atomic"
+	"time"
+)
+
+type node struct{ next *node }
+
+var finalized atomic.Int32
+
+func build(n int) {
+	var head *node
+	for range n {
+		head = &node{next: head}
+		runtime.SetFinalizer(head, func(*node) { finalized.Add(1) })
+	}
+}
+
+func main() {
+	build(5)
+	for cycle := 1; cycle <= 8; cycle++ {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+		fmt.Printf("after GC %d: %d of 5 finalizers have run\n", cycle, finalized.Load())
+	}
+}
+----
+
+[source,text]
+----
+after GC 1: 1 of 5 finalizers have run
+after GC 2: 2 of 5 finalizers have run
+after GC 3: 3 of 5 finalizers have run
+after GC 4: 4 of 5 finalizers have run
+after GC 5: 5 of 5 finalizers have run
+after GC 6: 5 of 5 finalizers have run
+after GC 7: 5 of 5 finalizers have run
+after GC 8: 5 of 5 finalizers have run
+----
+
+Source: https://go.dev/doc/gc-guide#Common_finalizer_issues[GC guide: Common finalizer issues]
+
+Finalizers still have one advantage: their execution order is defined, which can matter for structures with complex
+destruction order. The GC guide calls them potentially useful but rarely so; for all other uses in Go 1.24 and later it
+recommends cleanups.
+
+== Cleanups: runtime.AddCleanup
+
+`AddCleanup(ptr, cleanup, arg)` arranges for `cleanup(arg)` to run on a runtime goroutine some time after `ptr` is no
+longer reachable. It is generic, `+func AddCleanup[T, S any](ptr *T, cleanup func(S), arg S) Cleanup+`, so the compiler
+checks the cleanup against its argument. The typical use is the one in the documentation: `ptr` is an object that wraps
+an underlying resource, `arg` is the resource itself (a descriptor, a handle, a C pointer) and `cleanup` releases it.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+// Scanner wraps a barcode-scanner device identified by a descriptor.
+type Scanner struct {
+	fd int
+}
+
+func closeDevice(fd int) { fmt.Println("device closed:", fd) }
+
+func openScanner(fd int, done chan<- struct{}) *Scanner {
+	s := &Scanner{fd: fd}
+	// The cleanup receives only the argument (fd), never the object, so the
+	// object is not resurrected and can be freed immediately.
+	runtime.AddCleanup(s, func(fd int) {
+		closeDevice(fd)
+		close(done)
+	}, fd)
+	return s
+}
+
+func main() {
+	done := make(chan struct{})
+	s := openScanner(3, done)
+	fmt.Println("scanner open:", s.fd)
+	s = nil // the last reference is dropped
+
+	for range 5 {
+		runtime.GC()
+		select {
+		case <-done:
+			fmt.Println("cleanup ran")
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	fmt.Println("cleanup did not run")
+}
+----
+
+[source,text]
+----
+scanner open: 3
+device closed: 3
+cleanup ran
+----
+
+Source: https://pkg.go.dev/runtime#AddCleanup[runtime.AddCleanup]
+
+The difference from the finalizer version is the one that matters: the cleanup receives `fd`, never the scanner. The
+object is not resurrected, so it is freed in the same cycle that finds it unreachable, and the cleanup runs afterwards
+with whatever it needs to release the resource. The release notes for Go 1.24 give the practical advantages:
+
+* multiple cleanups may be attached to a single object;
+* cleanups may be attached to interior pointers (a field of a struct, an element of an array);
+* cleanups do not generally cause leaks when objects form a cycle;
+* cleanups do not delay the freeing of an object or of the objects it points to.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+)
+
+type Scanner struct {
+	fd   int
+	name string
+}
+
+func main() {
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	func() {
+		s := &Scanner{fd: 7, name: "desk"}
+		// Several independent cleanups on one object are allowed,
+		// and one may even target an interior pointer (a field).
+		runtime.AddCleanup(s, func(fd int) {
+			fmt.Println("release descriptor", fd)
+			wg.Done()
+		}, s.fd)
+		runtime.AddCleanup(&s.name, func(label string) {
+			fmt.Println("forget label", label)
+			wg.Done()
+		}, "desk")
+	}()
+
+	for range 3 {
+		runtime.GC()
+	}
+	wg.Wait()
+	fmt.Println("both cleanups ran (their order is unspecified)")
+}
+----
+
+[source,text]
+----
+release descriptor 7
+forget label desk
+both cleanups ran (their order is unspecified)
+----
+
+Source: https://pkg.go.dev/runtime#AddCleanup[runtime.AddCleanup]
+
+Because the compiler checks types, mistakes in the argument are ordinary compile errors:
+
+[source,go]
+----
+package main
+
+import "runtime"
+
+type Scanner struct{ fd int }
+
+func main() {
+	s := &Scanner{fd: 3}
+	runtime.AddCleanup(s, func(fd int) {}, "3")
+}
+----
+
+[source,text]
+----
+./main.go:9:41: cannot use "3" (untyped string constant) as int value in argument to runtime.AddCleanup
+----
+
+Source: https://pkg.go.dev/runtime#AddCleanup[runtime.AddCleanup]
+
+=== The one rule: the cleanup must not reach the object
+
+If `ptr` is reachable from the cleanup function or from `arg`, it is reachable from the runtime's own record of the
+cleanup, so it never becomes unreachable and the cleanup never runs. `AddCleanup` panics for the two simple cases it can
+detect, passing the pointer itself as the argument and a function literal that captures the pointer:
+
+[source,go]
+----
+package main
+
+import "runtime"
+
+type Scanner struct{ fd int }
+
+func main() {
+	s := &Scanner{fd: 3}
+	// The argument equals the pointer: the cleanup could never run.
+	runtime.AddCleanup(s, func(*Scanner) {}, s)
+}
+----
+
+[source,text]
+----
+panic: runtime.AddCleanup: ptr is equal to arg, cleanup will never run
+
+goroutine 1 [running]:
+main.main()
+	.../main.go:10 +0x50
+----
+
+Source: https://go.dev/doc/gc-guide#Common_cleanup_issues[GC guide: Common cleanup issues]
+
+[source,go]
+----
+package main
+
+import "runtime"
+
+type Scanner struct{ fd int }
+
+func main() {
+	s := &Scanner{fd: 3}
+	// The closure refers to s directly: the runtime detects this simple case.
+	runtime.AddCleanup(s, func(int) { println("closing", s.fd) }, s.fd)
+}
+----
+
+[source,text]
+----
+panic: runtime.AddCleanup: cleanup function closes over ptr, cleanup will never run
+
+goroutine 1 [running]:
+main.main()
+	.../main.go:10 +0x90
+----
+
+Source: https://go.dev/doc/gc-guide#Common_cleanup_issues[GC guide: Common cleanup issues]
+
+The runtime cannot see indirect paths. In the next program the argument is a `+*job+` that holds the scanner, so the
+scanner stays reachable through the runtime's own cleanup record. There is no panic, no error and no log line; the
+cleanup silently never runs, which is the worst failure mode in this page, because the leak looks like a working program:
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"time"
+)
+
+type Scanner struct{ fd int }
+
+func (s *Scanner) release() { fmt.Println("closing", s.fd) }
+
+// job refers back to the scanner, e.g. a queue entry that records its owner.
+type job struct{ owner *Scanner }
+
+func openScanner(ran *bool) {
+	s := &Scanner{fd: 3}
+	// Wrong: the argument reaches s, so s stays reachable from the
+	// runtime's own cleanup record. The runtime cannot spot this
+	// indirect path, so there is no panic: the cleanup silently never runs.
+	runtime.AddCleanup(s, func(j *job) {
+		*ran = true
+		j.owner.release()
+	}, &job{owner: s})
+}
+
+func main() {
+	ran := false
+	openScanner(&ran)
+
+	for range 5 {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
+	fmt.Println("cleanup ran:", ran)
+}
+----
+
+[source,text]
+----
+cleanup ran: false
+----
+
+Source: https://go.dev/doc/gc-guide#Common_cleanup_issues[GC guide: Common cleanup issues]
+
+Since Go 1.25 the runtime can find this mistake for you. Running the same program with `GODEBUG=checkfinalizers=1`
+makes the collector run extra diagnostic passes and terminate the program with a description of every cleanup or
+finalizer whose object is reachable from the cleanup or its argument, including where the cleanup was created (the first
+lines of the real report are shown, without its first line, a banner announcing likely cleanup and finalizer issues; the
+address changes on every run):
+
+[source,text]
+----
+Value of type main.Scanner at 0x41c49bb96020
+  is reachable from cleanup or cleanup argument
+
+Has cleanup at 0x10db27f88
+  main.openScanner.func1()
+      .../main.go:21 +0x0
+created at: 
+  main.openScanner()
+      .../main.go:25 +0xd0
+
+fatal error: detected possible issues with cleanups and/or finalizers
+----
+
+Source: https://go.dev/doc/go1.25[Go 1.25 release notes: runtime]
+
+The analysis is conservative: it flags any path back to the original object, even one that might be cut later. In this mode
+the runtime also prints one line to standard error per GC cycle with the finalizer and cleanup queue lengths, which helps
+find finalizers or cleanups that run too long. Use it in tests and staging, not in production.
+
+=== Stopping a cleanup: the safety-net pattern
+
+`AddCleanup` returns a `runtime.Cleanup`. Its `Stop` method cancels the cleanup, which is what an explicit `Close`
+should do. This is the pattern the GC guide recommends for non-memory resources such as file descriptors: release them
+deterministically with `Close`, and keep the cleanup only as a best-effort handler for programmers who forget (`os.File`
+does exactly this). File descriptors and similar resources have system limits the runtime knows nothing about, and the
+collector's timing is outside the package author's control (`GOGC` is set by operators), so a cleanup alone is a bad
+way to release them.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"time"
+)
+
+// Scanner has an explicit Close and a cleanup as a safety net for callers
+// that forget to call it.
+type Scanner struct {
+	fd      int
+	cleanup runtime.Cleanup
+	once    sync.Once
+}
+
+func openScanner(fd int) *Scanner {
+	s := &Scanner{fd: fd}
+	s.cleanup = runtime.AddCleanup(s, func(fd int) {
+		fmt.Println("cleanup: forgotten Close, closing device", fd)
+	}, fd)
+	return s
+}
+
+// Close releases the device deterministically and cancels the cleanup.
+func (s *Scanner) Close() {
+	s.once.Do(func() {
+		s.cleanup.Stop()
+		fmt.Println("Close: closing device", s.fd)
+	})
+}
+
+func main() {
+	openScanner(1).Close() // explicit Close: the cleanup is stopped
+	openScanner(2)         // forgotten: the cleanup is the safety net
+
+	for range 5 {
+		runtime.GC()
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+----
+
+[source,text]
+----
+Close: closing device 1
+cleanup: forgotten Close, closing device 2
+----
+
+Source: https://pkg.go.dev/runtime#Cleanup[runtime.Cleanup]
+
+=== Cleanup rules
+
+* `cleanup(arg)` runs on a separate goroutine. Since Go 1.25 cleanups run concurrently and in parallel with one another, which makes them viable for heavy use (the `unique` package relies on that); before that they shared a single goroutine. A cleanup that must run for a long time should start a new goroutine so it does not block the cleanup queue.
+* There is no specified order, even for objects that point at each other. Do not rely on one cleanup running before another.
+* `runtime.GC` waits until the cleanups for unreachable objects are *queued*, not until they have run.
+* If an object has both a cleanup and a finalizer, the cleanup runs only after the object has been finalized and becomes unreachable again.
+* Cleanups are not guaranteed to run before the program exits, for objects of zero size, for objects allocated in package-level variable initializers (the linker may allocate those statically), or for tiny pointer-free objects that share an allocation slot with live neighbours (see <<tiny>>).
+* A cleanup may run as soon as the object is unreachable, so the object must stay reachable until it is safe to release the resource: see <<keepalive>>.
+* Cleanups touch shared state from another goroutine. Protect it with a mutex or atomics and run your tests with `-race`.
+
+== Weak pointers: the weak package
+
+A `weak.Pointer[T]` refers to a value without making it reachable. `weak.Make(ptr)` creates one; `Value()` returns the
+original pointer, or `nil` if the collector reclaimed the object. The zero value behaves as if created from `nil`.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"weak"
+)
+
+// Cover is a large cover image that we are happy to reload when needed.
+type Cover struct {
+	ISBN string
+	PNG  []byte
+}
+
+func main() {
+	c := &Cover{ISBN: "9780134190440", PNG: make([]byte, 1<<20)}
+	w := weak.Make(c)
+
+	fmt.Println("before GC, strong ref alive:", w.Value() != nil)
+
+	runtime.GC()
+	// The strong reference c is used again below, so it stayed reachable.
+	fmt.Println("after GC, strong ref alive: ", w.Value() != nil)
+	fmt.Println("isbn:", c.ISBN)
+
+	// c is not used after this point: the object may now be reclaimed.
+	runtime.GC()
+	fmt.Println("after GC, no strong ref:    ", w.Value() != nil)
+
+	// Weak pointers are comparable and keep their identity.
+	var zero weak.Pointer[Cover]
+	fmt.Println("zero value equals Make(nil):", zero == weak.Make[Cover](nil))
+	fmt.Println("same object, same weak ptr: ", w == w)
+}
+----
+
+[source,text]
+----
+before GC, strong ref alive: true
+after GC, strong ref alive:  true
+isbn: 9780134190440
+after GC, no strong ref:     false
+zero value equals Make(nil): true
+same object, same weak ptr:  true
+----
+
+Source: https://pkg.go.dev/weak[weak]
+
+The first `Value()` calls returned non-nil because the strong pointer `c` was used again below them. The last call came
+after the last use of `c`, so the object was unreachable and the collector cleared the weak pointer. The documentation puts
+it precisely: `Value` may return `nil` as soon as the object becomes unreachable, and a function argument or receiver may
+become unreachable at the last point where the function mentions it.
+
+=== Properties worth knowing
+
+* *Comparable.* Two `weak.Pointer` values are equal if and only if the pointers they were made from are equal, and that stays true after the object was reclaimed. So a weak pointer works as a map key that identifies an object without keeping it alive.
+* *Objects and offsets.* Weak pointers map to an object and an offset, not to a bare address. Weak pointers made from pointers to different fields of the same struct are not equal. A weak pointer may point into the middle of an object, such as a field or an array element.
+* *Never guaranteed to become nil.* `Value` is not guaranteed to *eventually* return `nil`, either. Objects reachable from global variables stay reachable, and tiny pointer-free objects may share an allocation slot with live neighbours (see <<tiny>>).
+* *Weak keys do not protect values.* A map keyed by weak pointers does not affect reachability of the map values. If a value contains a strong pointer back to the object its key points to, the object stays reachable. This is the classic way to turn a "weak" map into a strong one by accident.
+* *Finalizers.* If the object has a finalizer, `Value` returns `nil` as soon as the finalizer is *queued*, even though the object is resurrected for the finalizer call. A weak pointer made from an object that a finalizer resurrected does not compare equal to weak pointers made after the resurrection.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"weak"
+)
+
+type Scanner struct {
+	fd   int
+	name string
+}
+
+func main() {
+	var w weak.Pointer[Scanner]
+	resurrected := make(chan *Scanner, 1)
+
+	func() {
+		s := &Scanner{fd: 3, name: "desk"}
+		w = weak.Make(s)
+		// The finalizer resurrects the object by handing it to another goroutine.
+		runtime.SetFinalizer(s, func(s *Scanner) { resurrected <- s })
+	}()
+
+	runtime.GC()
+	// The weak pointer is already cleared although the object still exists:
+	// it is waiting in the finalizer queue and then in the channel.
+	fmt.Println("weak pointer cleared:", w.Value() == nil)
+	s := <-resurrected
+	fmt.Println("object still usable, fd:", s.fd)
+}
+----
+
+[source,text]
+----
+weak pointer cleared: true
+object still usable, fd: 3
+----
+
+Source: https://pkg.go.dev/weak#Pointer[weak.Pointer]
+
+(When this demonstration was first written with a struct holding only an integer, the weak pointer was not cleared by the
+single `runtime.GC` call: a tiny pointer-free object may be batched with other objects in one allocation slot, which is
+exactly the caveat in the documentation. The `name` field makes the struct contain a pointer and so avoids tiny batching.)
+
+[#cache]
+=== A cache that does not leak
+
+The documentation names caches as the primary use. A cache that holds values only weakly keeps an entry for exactly as long
+as some caller still uses the value, with no size limit and no eviction policy to tune. The map itself still needs
+cleaning: the entry (a `weak.Pointer` and its key) stays in the map after the value has gone, so a cleanup removes it.
+The cleanup receives only the key; it captures the cache and the weak pointer, neither of which keeps the value alive.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"time"
+	"weak"
+)
+
+// Cache memoizes values by key. It holds them only weakly: a value stays in
+// the cache for as long as some caller still uses it, and no longer.
+type Cache[K comparable, V any] struct {
+	mu    sync.Mutex
+	items map[K]weak.Pointer[V]
+	load  func(K) *V
+}
+
+// NewCache returns a cache that calls load on a miss.
+func NewCache[K comparable, V any](load func(K) *V) *Cache[K, V] {
+	return &Cache[K, V]{items: make(map[K]weak.Pointer[V]), load: load}
+}
+
+// Get returns the cached value for key, loading it if needed.
+func (c *Cache[K, V]) Get(key K) *V {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if wp, ok := c.items[key]; ok {
+		if v := wp.Value(); v != nil {
+			return v
+		}
+	}
+	v := c.load(key)
+	wp := weak.Make(v)
+	c.items[key] = wp
+	// The cleanup receives only the key. It captures c and wp, neither of
+	// which keeps v reachable (wp is weak).
+	runtime.AddCleanup(v, func(key K) {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		// Delete only our own entry: a newer value may have replaced it.
+		if c.items[key] == wp {
+			delete(c.items, key)
+		}
+	}, key)
+	return v
+}
+
+// Len reports how many entries (live or not yet cleaned up) the map holds.
+func (c *Cache[K, V]) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.items)
+}
+
+// Cover is a large cover image that can be reloaded on demand.
+type Cover struct {
+	ISBN string
+	PNG  []byte
+}
+
+func heapMiB() uint64 {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc >> 20
+}
+
+func main() {
+	loads := 0
+	covers := NewCache(func(isbn string) *Cover {
+		loads++
+		return &Cover{ISBN: isbn, PNG: make([]byte, 4<<20)}
+	})
+
+	keep := covers.Get("9780134190440") // a caller that keeps using it
+	covers.Get("9781492077213")         // used once and dropped
+	covers.Get("9781784395438")         // used once and dropped
+	fmt.Printf("loaded %d covers, entries: %d, heap: %d MiB\n", loads, covers.Len(), heapMiB())
+
+	// Cleanups run asynchronously: collect and poll until they have run.
+	for range 50 {
+		runtime.GC()
+		if covers.Len() == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	fmt.Printf("after GC, entries: %d, heap: %d MiB\n", covers.Len(), heapMiB())
+
+	again := covers.Get("9780134190440") // still cached: same pointer
+	fmt.Println("same cover returned:", again == keep, "loads:", loads)
+	covers.Get("9781492077213") // was reclaimed, so it is loaded again
+	fmt.Println("loads after re-requesting a dropped cover:", loads)
+	runtime.KeepAlive(keep)
+}
+----
+
+[source,text]
+----
+loaded 3 covers, entries: 3, heap: 12 MiB
+after GC, entries: 1, heap: 4 MiB
+same cover returned: true loads: 3
+loads after re-requesting a dropped cover: 4
+----
+
+Source: https://go.dev/blog/cleanups-and-weak[The Go Blog: From unique to cleanups and weak]
+
+The heap figures are machine-specific (three 4 MiB covers before collection, one after); the entry counts and the
+`loads` values are what the program guarantees. Three details of the design deserve attention:
+
+* the lookup in `Get` treats a `nil` result of `Value()` like a miss, because a weak pointer can be cleared before its cleanup has removed the map entry;
+* the cleanup compares `c.items[key] == wp` before deleting, because a newer value may already have replaced the entry for that key (weak pointers are comparable, which is what makes this check possible);
+* the final `runtime.KeepAlive(keep)` keeps the strongly held cover alive up to that line, otherwise the compiler may consider it dead after its last use.
+
+The same program also shows the contract callers must follow: a `+*Cover+` returned from the cache must be treated as
+read-only, because it is shared by everybody who asked for the same key.
+
+[#unique]
+== Interning: the unique package
+
+Interning stores one canonical copy of each distinct value and lets everything else refer to it. `unique.Make(v)` returns a
+`unique.Handle[T]` for any comparable `T`. Two handles are equal exactly when the values they were made from are equal, so
+comparing handles is a single pointer comparison instead of a comparison of the contents. `Handle.Value()` returns a
+shallow copy of the value and is safe for concurrent use; so is `Make`.
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"unique"
+	"unsafe"
+)
+
+// Edition identifies a printing by publisher and year. Any comparable type
+// can be interned.
+type Edition struct {
+	Publisher string
+	Year      int
+}
+
+func main() {
+	// Two strings with equal contents but separate backing arrays.
+	a := string([]byte("O'Reilly Media"))
+	b := string([]byte("O'Reilly Media"))
+	fmt.Println("same backing data:", unsafe.StringData(a) == unsafe.StringData(b))
+
+	ha := unique.Make(a)
+	hb := unique.Make(b)
+	hc := unique.Make("Packt Publishing")
+
+	// Handles are equal exactly when the values are equal, and comparing
+	// them is a single pointer comparison.
+	fmt.Println("ha == hb:", ha == hb)
+	fmt.Println("ha == hc:", ha == hc)
+	fmt.Println("value:", ha.Value())
+	fmt.Println("handle size:", unsafe.Sizeof(ha), "bytes; string header:", unsafe.Sizeof(a), "bytes")
+
+	// The canonical copy is shared: both handles give back the same data.
+	fmt.Println("shared canonical data:", unsafe.StringData(ha.Value()) == unsafe.StringData(hb.Value()))
+
+	e1 := unique.Make(Edition{"O'Reilly Media", 2021})
+	e2 := unique.Make(Edition{string([]byte("O'Reilly Media")), 2021})
+	e3 := unique.Make(Edition{"O'Reilly Media", 2024})
+	fmt.Println("e1 == e2:", e1 == e2)
+	fmt.Println("e1 == e3:", e1 == e3)
+	fmt.Printf("%+v\n", e1.Value())
+}
+----
+
+[source,text]
+----
+same backing data: false
+ha == hb: true
+ha == hc: false
+value: O'Reilly Media
+handle size: 8 bytes; string header: 16 bytes
+shared canonical data: true
+e1 == e2: true
+e1 == e3: false
+{Publisher:O'Reilly Media Year:2021}
+----
+
+Source: https://pkg.go.dev/unique[unique]
+
+The strings `a` and `b` have equal contents but separate backing arrays, and the handles still compare equal. A handle is
+one pointer (8 bytes on a 64-bit platform) where a string header is 16, and any comparable type, including structs of
+comparable fields such as `Edition`, can be interned. The constraint is part of the signature, so the compiler enforces it:
+
+[source,go]
+----
+package main
+
+import "unique"
+
+func main() {
+	_ = unique.Make([]string{"a"})
+}
+----
+
+[source,text]
+----
+./main.go:6:17: []string does not satisfy comparable
+----
+
+Source: https://pkg.go.dev/unique#Make[unique.Make]
+
+=== Why use it
+
+Two benefits, one for memory and one for speed. The memory benefit appears when a program holds many copies of a few
+distinct values, for example the publisher name in every record parsed from a feed:
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"strconv"
+	"unique"
+)
+
+// Book keeps the publisher either as a plain string or as a handle.
+type Book struct {
+	Title     string
+	Publisher string
+}
+
+type InternedBook struct {
+	Title     string
+	Publisher unique.Handle[string]
+}
+
+var publishers = []string{
+	"O'Reilly Media", "Packt Publishing", "Addison-Wesley",
+	"Manning Publications", "No Starch Press",
+}
+
+func heapKiB() uint64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc >> 10
+}
+
+func main() {
+	const n = 200_000
+	base := heapKiB()
+
+	// Each record parsed from a feed owns a fresh copy of the publisher name.
+	plain := make([]Book, n)
+	for i := range plain {
+		plain[i] = Book{
+			Title:     "Book " + strconv.Itoa(i),
+			Publisher: string([]byte(publishers[i%len(publishers)])),
+		}
+	}
+	withPlain := heapKiB()
+	runtime.KeepAlive(plain)
+	plain = nil
+
+	interned := make([]InternedBook, n)
+	for i := range interned {
+		interned[i] = InternedBook{
+			Title:     "Book " + strconv.Itoa(i),
+			Publisher: unique.Make(string([]byte(publishers[i%len(publishers)]))),
+		}
+	}
+	withInterned := heapKiB()
+	runtime.KeepAlive(interned)
+
+	fmt.Printf("plain strings:    %d KiB\n", withPlain-base)
+	fmt.Printf("unique handles:   %d KiB\n", withInterned-base)
+	fmt.Println("same publisher:", interned[0].Publisher == interned[5].Publisher)
+}
+----
+
+[source,text]
+----
+plain strings:    12839 KiB
+unique handles:   7835 KiB
+same publisher: true
+----
+
+Source: https://go.dev/blog/unique[The Go Blog: New unique package]
+
+The figures include 200,000 titles in both variants, so only the difference is meaningful, and exact sizes depend on the
+platform and the Go version. The speed benefit is that equality of two handles is one pointer comparison, however long the
+value is. A benchmark that compares two equal 1,120-byte strings against two handles for the same value (nanoseconds per
+operation are machine-specific):
+
+[source,go]
+----
+package uqbench
+
+import (
+	"strings"
+	"testing"
+	"unique"
+)
+
+var (
+	// Two equal strings long enough that comparing them takes real work.
+	nameA = strings.Repeat("Addison-Wesley Professional ", 40)
+	nameB = strings.Repeat("Addison-Wesley Professional ", 40)
+	sink  bool
+)
+
+func BenchmarkCompareStrings(b *testing.B) {
+	a, c := string([]byte(nameA)), string([]byte(nameB))
+	for b.Loop() {
+		sink = a == c
+	}
+}
+
+func BenchmarkCompareHandles(b *testing.B) {
+	a, c := unique.Make(nameA), unique.Make(nameB)
+	for b.Loop() {
+		sink = a == c
+	}
+}
+
+func BenchmarkMakeExisting(b *testing.B) {
+	h := unique.Make(nameA) // the value is interned and stays alive
+	for b.Loop() {
+		sink = unique.Make(nameB) == h
+	}
+}
+----
+
+[source,text]
+----
+goos: darwin
+goarch: arm64
+pkg: example.com/shelf/uqbench
+cpu: Apple M5
+BenchmarkCompareStrings-10    	48637474	        28.70 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCompareHandles-10    	341559217	         3.608 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMakeExisting-10      	15053124	        76.52 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	example.com/shelf/uqbench	3.842s
+----
+
+Source: https://pkg.go.dev/testing#B.Loop[testing.B.Loop]
+
+`Make` itself is not free: it hashes the value and looks it up in a global concurrent map, so interning pays off when
+values are made once and compared or stored many times (the standard `net/netip` package interns the zone and address-family details of its `Addr` values with `unique.Handle`). Interning a value you will compare once costs more than comparing the strings.
+
+=== The canonical copy is reclaimed
+
+A naive interner never forgets its entries. `unique` is built on weak pointers and cleanups, so a canonical copy that no
+handle refers to any more becomes garbage and its map entry is removed:
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"strconv"
+	"time"
+	"unique"
+)
+
+func heapKiB() uint64 {
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc >> 10
+}
+
+func main() {
+	base := heapKiB()
+
+	handles := make([]unique.Handle[string], 0, 300_000)
+	for i := range 300_000 {
+		handles = append(handles, unique.Make("member-"+strconv.Itoa(i)))
+	}
+	fmt.Println("interned, heap grew by KiB:", heapKiB()-base)
+	runtime.KeepAlive(handles)
+
+	// Drop every handle: the canonical copies become unreachable and the
+	// package reclaims them (and its internal map entries) on later cycles.
+	handles = nil
+	for range 20 {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+	fmt.Println("handles dropped, heap grew by KiB:", heapKiB()-base)
+}
+----
+
+[source,text]
+----
+interned, heap grew by KiB: 65513
+handles dropped, heap grew by KiB: 22
+----
+
+Source: https://go.dev/blog/unique[The Go Blog: New unique package]
+
+After the handles were dropped and a few collections ran, the heap returned to roughly its starting size (the residue
+here is a few KiB; figures are machine-specific). The GC guide uses this package as its example of encapsulation: it
+uses weak pointers under the hood but completely hides the objects pointed to. Callers can only copy them out through
+`Value`, so the weak machinery cannot be misused from outside.
+
+=== What unique does not do
+
+* It does not make values immutable beyond what their types already are; `Value` returns a shallow copy, so a pointer inside the value still points to shared data.
+* It does not order or hash for you: a handle is an identity, so it is a good map key but has no meaningful ordering (compare the values for that).
+* It does not guarantee when memory is reclaimed. It follows the same rules as every other weak mechanism.
+* It is global: all callers of `unique.Make` share one map per type, which is the point, and also the reason for concurrency-friendly internals. Interning very large numbers of short-lived values can still cost time.
+
+Interning that is local to a data structure (a custom `map[string]string` used while parsing, discarded afterwards) is
+still a fine technique; reach for `unique` when the canonical set is long-lived or process-wide.
+
+[#keepalive]
+== Staying alive: runtime.KeepAlive
+
+The inverse problem of finalization is premature finalization. Reachability is decided by liveness analysis, not by scope:
+an object is dead after its last mention. If the object's cleanup (or finalizer, or weak pointer) releases a resource
+that the program is still using through a raw copy, the resource can be released while it is in use.
+
+`runtime.KeepAlive(x)` marks its argument as reachable at that point, so the object cannot be collected, and its cleanup
+or finalizer cannot run, before the call. In the next program the "device" is represented by a flag that the cleanup sets.
+`slowRead` stands for a system call that takes the raw descriptor while the garbage collector runs in another goroutine:
+
+[source,go]
+----
+package main
+
+import (
+	"fmt"
+	"runtime"
+	"sync/atomic"
+)
+
+// Scanner owns a device descriptor. Its cleanup "closes" the device by
+// setting a flag that lives outside the Scanner.
+type Scanner struct {
+	fd     int
+	closed *atomic.Bool
+}
+
+func open(fd int) *Scanner {
+	s := &Scanner{fd: fd, closed: new(atomic.Bool)}
+	runtime.AddCleanup(s, func(c *atomic.Bool) { c.Store(true) }, s.closed)
+	return s
+}
+
+// slowRead stands for a system call that takes the raw descriptor. While it
+// runs, the garbage collector may run, too. It reports whether the device was
+// closed underneath it.
+func slowRead(fd int, closed *atomic.Bool) bool {
+	for range 3 {
+		runtime.GC()
+		runtime.Gosched()
+	}
+	return closed.Load()
+}
+
+// readUnsafe never mentions s after loading its fields, so s may be collected
+// (and its cleanup may run) while slowRead is still executing.
+func (s *Scanner) readUnsafe() bool {
+	return slowRead(s.fd, s.closed)
+}
+
+// readSafe keeps s reachable until the call has returned.
+func (s *Scanner) readSafe() bool {
+	defer runtime.KeepAlive(s)
+	return slowRead(s.fd, s.closed)
+}
+
+func main() {
+	for range 3 {
+		fmt.Println("unsafe: device closed during read:", open(3).readUnsafe())
+	}
+	for range 3 {
+		fmt.Println("safe:   device closed during read:", open(3).readSafe())
+	}
+}
+----
+
+[source,text]
+----
+unsafe: device closed during read: true
+unsafe: device closed during read: true
+unsafe: device closed during read: true
+safe:   device closed during read: false
+safe:   device closed during read: false
+safe:   device closed during read: false
+----
+
+Source: https://pkg.go.dev/runtime#KeepAlive[runtime.KeepAlive]
+
+`readUnsafe` loads `s.fd` and `s.closed` and never mentions `s` again, so `s` is dead while `slowRead` runs and its cleanup
+fires underneath the read. `readSafe` defers `runtime.KeepAlive(s)`, which keeps `s` reachable until the function returns.
+The effect depends on the garbage collector's timing in general; this loop makes it deterministic enough to show, and it
+is exactly the bug that appears in production as a rare "file already closed" under load.
+
+Guidelines for `KeepAlive`:
+
+* call it (usually with `defer`) *after the last point* where the object must remain reachable, in every method that passes a resource extracted from the object to something that outlives the method's mention of the object, such as a system call, a cgo call or a goroutine;
+* it only prevents early cleanups and finalizers; it is not a substitute for the `unsafe.Pointer` rules (see xref:programming-languages/go/unsafe-and-low-level-programming.adoc[unsafe and Low-Level Programming]);
+* values stored in global variables, or reachable from one, are always reachable, so a global resource needs no `KeepAlive`;
+* it is also the right tool in tests that check a weak pointer is still non-nil after a collection (see <<testing-death>>).
+
+[#tiny]
+== Tiny objects and other cases where nothing happens
+
+Cleanups, finalizers and weak pointers all carry the same warnings, and the documentation repeats them for good reason.
+The runtime may batch tiny, pointer-free objects (on the order of 16 bytes or less) into one allocation slot to save space.
+If an unreferenced object always shares a slot with a referenced one, its cleanup may never run and its weak pointer may
+never become `nil`. The practical rules are:
+
+* attach cleanups and weak pointers to substantial objects, typically the wrapper struct for a resource (a struct with a pointer field is not tiny);
+* never attach one to a zero-size value (`+struct{}+`, `[0]int`): it may share an address with other zero-size values;
+* do not rely on a cleanup for an object allocated in a package-level variable initializer: the linker may place it in static memory;
+* `GODEBUG=checkfinalizers=1` also tracks tiny blocks, so it reports a cleanup attached to one.
+
+== Pinning memory for C: runtime.Pinner
+
+Goroutine stacks do move, and the language does not promise that heap objects stay where they are. cgo therefore forbids
+C code from keeping Go pointers around unless the rules allow it. `runtime.Pinner` (Go 1.21) is the sanctioned exception:
+a set of Go objects each pinned to a fixed location. `Pin` pins one object (any pointer, or `unsafe.Pointer`; pinning a
+non-Go pointer does nothing), and `Unpin` unpins all of them. A pointer to a pinned object may be stored in C memory or
+contained in Go memory passed to C functions, and C memory may retain a pinned pointer after the call returns, as long as
+the object stays pinned. The `Pinner` itself must stay alive across the cgo call (it unpins automatically some time after
+it becomes unreachable), and it is cheap to reuse. If the pinned object itself holds pointers to other Go objects that C
+code will access, those must be pinned separately.
+
+The next program passes a C struct that lives in Go memory and holds a pointer to a Go array. Without pinning, the cgo
+pointer check rejects the call at run time:
+
+[source,go]
+----
+package main
+
+/*
+typedef struct {
+	int *counts; // points to an array of per-shelf book counts
+	int n;
+} batch;
+
+static int total(batch *b) {
+	int sum = 0;
+	for (int i = 0; i < b->n; i++) {
+		sum += b->counts[i];
+	}
+	return sum;
+}
+*/
+import "C"
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+func main() {
+	counts := []C.int{12, 7, 30}
+	// b lives in Go memory and holds a Go pointer to counts.
+	b := C.batch{counts: (*C.int)(unsafe.Pointer(&counts[0])), n: C.int(len(counts))}
+	fmt.Println("total:", C.total(&b))
+}
+----
+
+[source,text]
+----
+panic: runtime error: argument of cgo function has Go pointer to unpinned Go pointer
+
+goroutine 1 [running]:
+main.main.func1(...)
+	.../main.go:28
+main.main()
+	.../main.go:28 +0xb0
+----
+
+Source: https://pkg.go.dev/cmd/cgo#hdr-Passing_pointers[cgo: Passing pointers]
+
+Pinning the array fixes it:
+
+[source,go]
+----
+package main
+
+/*
+typedef struct {
+	int *counts; // points to an array of per-shelf book counts
+	int n;
+} batch;
+
+static int total(batch *b) {
+	int sum = 0;
+	for (int i = 0; i < b->n; i++) {
+		sum += b->counts[i];
+	}
+	return sum;
+}
+*/
+import "C"
+
+import (
+	"fmt"
+	"runtime"
+	"unsafe"
+)
+
+func main() {
+	counts := []C.int{12, 7, 30}
+
+	// Pin the pointed-to array: the pointer stored inside b is then allowed
+	// in a cgo call even though b itself lives in Go memory.
+	var p runtime.Pinner
+	defer p.Unpin()
+	p.Pin(&counts[0])
+
+	b := C.batch{counts: (*C.int)(unsafe.Pointer(&counts[0])), n: C.int(len(counts))}
+	fmt.Println("total:", C.total(&b))
+}
+----
+
+[source,text]
+----
+total: 49
+----
+
+Source: https://pkg.go.dev/runtime#Pinner[runtime.Pinner]
+
+These two programs use cgo and were built with the platform C compiler (Xcode's `cc` on the machine used here); see
+xref:programming-languages/go/cgo-and-c-interop.adoc[cgo and C Interoperability] for the complete pointer-passing rules,
+`runtime/cgo.Handle` (the alternative when C needs only an opaque token for a Go value), `CGO_ENABLED` and the
+`GOEXPERIMENT=cgocheck2` mode, and xref:programming-languages/c/pointers.adoc[Pointers] and
+xref:programming-languages/c/dynamic-memory-allocation.adoc[Dynamic Memory Allocation] for the C side of the boundary.
+On the Rust side, xref:programming-languages/rust/ffi-and-c-interop.adoc[FFI & C Interop] makes the same distinction
+between owned and borrowed pointers. A cleanup attached to the Go wrapper of C-allocated memory (calling `free` on the
+C pointer) is the standard way to tie the C allocation's lifetime to the Go object, and it is what the GC guide uses as its
+example of a good fit: memory allocated outside Go, such as from C or a memory mapping.
+
+[#testing-death]
+== Testing object death
+
+The GC guide's advice is to write tests precisely because these features are subtle, and to make them deterministic:
+
+* do not run these tests in parallel with other tests;
+* call `runtime.GC` to establish a baseline, to force weak pointers to `nil` and to queue cleanups and finalizers;
+* remember that `runtime.GC` does *not* wait for cleanups or finalizers to run, only until they are queued: inject a channel the cleanup writes to, or spin on the post-cleanup state with a deadline;
+* for a chain of objects with finalizers, call `runtime.GC` at least as many times as the longest chain;
+* run the tests with `-race` to find races between cleanups and the rest of the code.
+
+The package below is a small slice of the shelf module: a `Scanner` whose descriptor is released by a cleanup, injected
+so that a test can observe it.
+
+[source,go]
+----
+// Package scanner wraps a barcode-scanner device.
+package scanner
+
+import "runtime"
+
+// Scanner owns a device descriptor.
+type Scanner struct {
+	fd int
+}
+
+// Open returns a scanner for fd. onRelease is called with the descriptor
+// when the scanner is collected without having been closed.
+func Open(fd int, onRelease func(fd int)) *Scanner {
+	s := &Scanner{fd: fd}
+	runtime.AddCleanup(s, onRelease, fd)
+	return s
+}
+
+// FD returns the device descriptor.
+func (s *Scanner) FD() int { return s.fd }
+----
+
+The tests use a helper that runs the collector until a condition holds, with a deadline, instead of sleeping for a fixed
+time:
+
+[source,go]
+----
+package scanner
+
+import (
+	"runtime"
+	"testing"
+	"time"
+	"weak"
+)
+
+// waitFor runs the garbage collector until cond reports true, so the test
+// neither sleeps for a fixed time nor fails because a cycle came late.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		runtime.GC()
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCleanupRunsWhenUnreachable(t *testing.T) {
+	released := make(chan int, 1)
+	func() {
+		s := Open(5, func(fd int) { released <- fd })
+		_ = s.FD()
+	}() // s is unreachable once the function returns
+
+	waitFor(t, "cleanup", func() bool { return len(released) == 1 })
+	if fd := <-released; fd != 5 {
+		t.Fatalf("cleanup got descriptor %d, want 5", fd)
+	}
+}
+
+func TestWeakPointerClearedWhenUnreachable(t *testing.T) {
+	w := func() weak.Pointer[Scanner] {
+		return weak.Make(Open(6, func(int) {}))
+	}()
+	waitFor(t, "weak pointer to clear", func() bool { return w.Value() == nil })
+}
+
+func TestStrongReferenceKeepsObject(t *testing.T) {
+	s := Open(7, func(int) {})
+	w := weak.Make(s)
+	for range 3 {
+		runtime.GC()
+	}
+	if w.Value() == nil {
+		t.Fatal("object collected while still referenced")
+	}
+	runtime.KeepAlive(s) // s is live until here
+}
+----
+
+[source,text]
+----
+=== RUN   TestCleanupRunsWhenUnreachable
+--- PASS: TestCleanupRunsWhenUnreachable (0.00s)
+=== RUN   TestWeakPointerClearedWhenUnreachable
+--- PASS: TestWeakPointerClearedWhenUnreachable (0.00s)
+=== RUN   TestStrongReferenceKeepsObject
+--- PASS: TestStrongReferenceKeepsObject (0.00s)
+PASS
+ok  	example.com/shelf/scanner	1.119s
+----
+
+Source: https://go.dev/doc/gc-guide#Testing_object_death[GC guide: Testing object death]
+
+(`go test -race -v` output; the elapsed time is machine-specific.) The last test keeps a strong reference alive with
+`runtime.KeepAlive` and checks the weak pointer is not cleared, which guards against the opposite bug. In Go 1.25 and later
+`testing/synctest` can make timing-dependent tests deterministic for goroutines inside a bubble, but the collector itself is not
+virtualized, so object-death tests still use `runtime.GC` and polling; see
+xref:programming-languages/go/benchmarks-fuzzing-and-synctest.adoc[Benchmarks, Fuzzing and synctest] and
+xref:programming-languages/go/testing.adoc[Testing].
+
+== Choosing a mechanism
+
+The flowchart is a summary of the decisions in this page; the table that follows lists typical shelf scenarios.
+
+[mermaid]
+----
+flowchart TD
+    A["A resource must be released when its Go wrapper becomes unreachable"] --> B{"Can callers be asked to call Close?"}
+    B -- yes --> C["Provide Close, and a cleanup as a best-effort safety net"]
+    B -- no --> D["AddCleanup with an argument that does not reach the object"]
+    E["Cache or index of objects owned elsewhere"] --> F{"Entry may disappear when no user remains?"}
+    F -- yes --> G["weak.Pointer plus AddCleanup to remove the map entry"]
+    F -- no --> H["Normal map, explicit eviction"]
+    I["Many equal values, frequent comparison"] --> J["unique.Handle"]
+    K["Go pointer stored in C memory"] --> L["runtime.Pinner"]
+    M["Raw copy of a resource used after the last mention of its owner"] --> N["runtime.KeepAlive"]
+----
+
+[cols="3,3,4", options="header"]
+|===
+| Situation in the shelf module | Mechanism | Why
+| `Scanner` wraps a device descriptor | `Close` plus `AddCleanup` | deterministic release; the cleanup reports or repairs forgotten `Close` calls
+| A decoded cover image cache keyed by ISBN | `weak.Pointer` plus `AddCleanup` | entries live exactly as long as callers use the image
+| 200,000 `Book` values sharing five publisher names | `unique.Handle[string]` | smaller records and pointer-sized equality
+| A C library stores a Go buffer pointer between calls | `runtime.Pinner` | the buffer must not move or be freed
+| `Scanner` method hands `s.fd` to a system call | `runtime.KeepAlive(s)` | prevents the cleanup from firing during the call
+| An in-memory `Store` guarded by a mutex | none of these | nothing outside the process needs releasing
+|===
+
+== Other languages
+
+Every garbage-collected platform offers some of these tools, and the differences explain Go's cautious documentation.
+
+[cols="2,3,3", options="header"]
+|===
+| Language | Weak reference | Death notification
+| Go | `weak.Pointer[T]`, `Value()` returns `nil` after reclamation | `runtime.AddCleanup` (no resurrection), `SetFinalizer` (resurrects)
+| C# | `WeakReference<T>.TryGetTarget` | finalizers and `SafeHandle`; deterministic `IDisposable`
+| Rust | `Weak<T>::upgrade` (reference counting, not tracing) | `Drop`, deterministic at scope end
+| Swift | `weak` and `unowned` references (ARC) | `deinit`, deterministic when the count reaches zero
+| C++ | `std::weak_ptr` | destructors, deterministic
+|===
+
+Reference-counting languages observe death deterministically, so their `Drop`, `deinit` and destructors can release
+resources at a known point. A tracing collector cannot, which is why Go (like C# and Java) steers authors toward an
+explicit `Close` method and treats cleanups as a safety net.
+
+== Pitfalls
+
+* *Relying on a cleanup to release a scarce resource.* File descriptors, database connections and locks must be released with `Close`; the collector knows nothing about their limits.
+* *Referencing the object from the cleanup.* Through a closure, through the argument, or through a structure the argument holds. Direct cases panic; indirect ones silently leak. Run `GODEBUG=checkfinalizers=1` in tests.
+* *Expecting a cleanup before exit.* Short-lived programs and `os.Exit` skip them. Flush and sync explicitly: a buffered writer must not depend on a cleanup.
+* *Using a finalizer in new code.* The only reason is a destruction order requirement; otherwise it resurrects the object, blocks freeing it for a cycle and breaks on cycles.
+* *Long cleanups.* A blocking cleanup stalls the cleanup queue; start a goroutine for slow work.
+* *Treating `Value()` as stable.* It may return `nil` between any two calls (it returns the pointer only while something else keeps the object alive). Always check for `nil` and have a fallback, such as reloading.
+* *A weak map that is actually strong.* A value in the map that points back at the key's object keeps it reachable.
+* *Weak pointers to interior fields.* Pointers to different fields of one struct are different weak pointers.
+* *Exposing the mechanism in the public API.* The GC guide recommends encapsulating cleanups, weak pointers and finalizers inside a package, as `unique` does, and not letting users set their own finalizers on objects you return.
+* *Not testing.* These features can seem to work through many consecutive runs and still be wrong.
+
+== Version notes
+
+* Go 1.0: `runtime.SetFinalizer` and `runtime.KeepAlive` (KeepAlive since Go 1.7).
+* Go 1.21: `runtime.Pinner`.
+* Go 1.23: the `unique` package.
+* Go 1.24: `runtime.AddCleanup`, `runtime.Cleanup` and the `weak` package; the `SetFinalizer` documentation now points new code to `AddCleanup`.
+* Go 1.25: cleanups run concurrently and in parallel; `GODEBUG=checkfinalizers=1` is added.
+* Go 1.26: the release notes list no changes to these APIs. The Green Tea collector became the default; it changes how the heap is scanned, not the semantics described here.
+* Go 1.27: no changes to `runtime.AddCleanup`, `weak` or `unique`. Examples were checked with `go 1.27` in `go.mod`.
+
+The Go books that predate Go 1.23 do not mention `unique`, `weak` or `runtime.AddCleanup`; they know only
+`runtime.SetFinalizer`, if at all. Code and advice written against them should use `AddCleanup` for new cleanup code and
+`weak.Pointer` for caches that must not retain their values. The old technique of keeping a map from key to value plus a
+finalizer to delete the entry is replaced by the weak-pointer cache above.
+
+== References
+
+* https://pkg.go.dev/runtime#AddCleanup[runtime.AddCleanup], https://pkg.go.dev/runtime#Cleanup[runtime.Cleanup], https://pkg.go.dev/runtime#SetFinalizer[runtime.SetFinalizer], https://pkg.go.dev/runtime#KeepAlive[runtime.KeepAlive] and https://pkg.go.dev/runtime#Pinner[runtime.Pinner]
+* https://pkg.go.dev/weak[weak package documentation]
+* https://pkg.go.dev/unique[unique package documentation]
+* https://go.dev/doc/gc-guide#Finalizers_cleanups_and_weak_pointers[A Guide to the Go Garbage Collector: Finalizers, cleanups, and weak pointers]
+* https://go.dev/blog/cleanups-and-weak[The Go Blog: From unique to cleanups and weak: new low-level tools for efficiency]
+* https://go.dev/blog/unique[The Go Blog: New unique package]
+* https://pkg.go.dev/cmd/cgo#hdr-Passing_pointers[cgo: Passing pointers]
+* https://go.dev/ref/mem[The Go Memory Model] (finalizer synchronization)
+* https://go.dev/doc/go1.21[Go 1.21], https://go.dev/doc/go1.23[1.23], https://go.dev/doc/go1.24[1.24] and https://go.dev/doc/go1.25[1.25] release notes
+* https://www.oreilly.com/library/view/learning-go/9781492077206/[Jon Bodner, Learning Go (O'Reilly, 1st edition)]
+* https://www.packtpub.com/en-us/product/learning-go-programming-9781784395438[Vladimir Vivien, Learning Go Programming (Packt, 2016)]
