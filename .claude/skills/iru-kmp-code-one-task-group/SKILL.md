@@ -1,34 +1,6 @@
 ---
 name: iru-kmp-code-one-task-group
-description: >-
-  Implement one bucket of Kotlin Multiplatform (Android + iOS app) tasks from a plan's task group end-to-end — detects
-  the project shape once (the `iru-setup-kmp-app` `shared/` + `androidApp/` + `iosApp/` layout or the wizard's single
-  `composeApp/` module, the shared module's Android plugin, `ui: compose|native`, XcodeGen, macOS/Xcode availability),
-  captures a single pre-change quality baseline for the whole bucket, runs `iru-kmp-code-one-task` once per task (in
-  parallel agents when the group is marked parallelizable) to implement each one with its tests and per-target
-  compile-check, then validates the entire bucket once, cheapest first, every check delegated to an `iru-gate-runner`
-  agent so no raw report lands in this context — license headers via `iru-check-license`, KDoc via `iru-kmp-dokka`,
-  scoped JVM/Android tests via `iru-kmp-test` (`target: android`), an 80% line-coverage gate via `iru-kmp-coverage`
-  measured from the JVM/Android host runs only (Kotlin/Native iOS code is reported "not measurable" and never fails
-  the gate), the full Android/JVM suite, a quality regression check via `iru-kmp-code-quality` (detekt, ktlint,
-  Android Lint, SwiftLint) against that one baseline — and, last, the iOS stage (Kotlin/Native simulator tests plus
-  the `iosApp` XCTest bundle via `iru-kmp-test` `target: ios`), macOS only, serialized repository-wide behind the
-  shared atomic-`mkdir` `.integration-test.lock` (owner file, stale after 60 minutes, bounded ~45-minute wait,
-  released on every exit path) and passed to the gate as `lock: held`; an unavailable iOS stage (not macOS, no full
-  Xcode, no simulator runtime, lock wait timeout) is reported "unverified", never silently skipped or reported as
-  passed. When the bucket touched UI (composables, `androidApp` UI, SwiftUI views) it adds a UI stage per the
-  catalog's UI contract: the UI tests through `iru-kmp-test`'s `ui` selector (Android host/Robolectric captures
-  without the lock, the iOS simulator and `iosApp` captures inside the locked iOS stage), a check that every
-  added/changed screen and component has a capture per visual state × `.ui-quality.yml` direction × theme × platform
-  (`--android`/`--ios`) in `.ui-screenshots/`, and the accessibility results applied at the configured
-  `enforce`/`report`/`off` level — device/simulator unavailable makes that part unverified, never passed. Scopes each gate by the module(s) the bucket touched (`shared`/`composeApp`, `androidApp`, `iosApp`) and by
-  source set — a `commonMain` change runs every target's tests, `androidMain` only the Android host tests, `iosMain`
-  only the iOS tests, `iosApp` Swift only the XCTest bundle. `iru-kmp-code-one-task` checks off each task's box itself
-  with a "group validation pending" note; this skill backfills any that didn't land and replaces each note with the
-  final outcome. Invoke as `/iru-kmp-code-one-task-group <bucket text>`, passing every task/sub-task in the bucket
-  with its own text, the group's `Parallelizable` verdict, and any relevant "Current code state" context. The Kotlin
-  Multiplatform counterpart to `iru-android-code-one-task-group`/`iru-swift-code-one-task-group`; used by
-  `iru-code-one-task-group`, which invokes it once per plan group for its `kmp`-tagged tasks.
+description: "Invoked as /iru-kmp-code-one-task-group <bucket text> (the group's tasks, Parallelizable verdict, code-state context) via Skill. Implements one Kotlin Multiplatform task bucket: one quality baseline, iru-kmp-code-one-task per task (parallel when allowed), then validates the bucket once (license, KDoc, JVM/Android tests, 80% coverage, quality, locked macOS iOS stage, UI) and finalizes checkboxes."
 model: sonnet
 allowed-tools: Read Edit Write Bash(./gradlew *) Bash(gradle *) Bash(xcodebuild *) Bash(xcrun *) Bash(xcodegen *) Bash(xcode-select *) Bash(uname *) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(git rev-parse *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(mkdir .integration-test.lock*) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Skill Agent
 ---
@@ -55,6 +27,8 @@ Three things shape the validation order:
    gate; the cheaper JVM gates run first so a bucket that's red on Android never holds the lock.
 
 It uses a medium model on purpose: the plan carries the hard reasoning; this skill drives execution of it.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Read this before running anything on a simulator
 
@@ -98,7 +72,7 @@ Record this once as the bucket's **validation scope** and reuse it, rather than 
   decomposition: the **UI inventory** (every added/changed screen and component `<Id>`, its kind, its visual states,
   and the platforms it renders on — both for shared Compose UI and for a screen built natively on both sides, one for
   a platform-only view) that Step 3.8 checks captures against. Read `.ui-quality.yml` at the repository root
-  (`accessibility`, `directions`, `themes`; missing file or key → `enforce`, `[ltr, rtl]`, `[light, dark]`).
+  (`accessibility`, `directions`, `themes`; missing (new UI project) file or key → `enforce`, `[ltr, rtl]`, `[light, dark]`).
 
 Then collect the files every task is expected to touch and capture a single pre-change baseline via
 `iru-gate-runner`:
@@ -116,6 +90,10 @@ Agent({
 
 Record it as the bucket's baseline — empty if every file is new. Step 3.6 diffs against it. Skip if
 `iru-kmp-code-quality` isn't installed, and say so in Step 5.
+
+**Accessibility opt-out (`accessibility: none`).** When `.ui-quality.yml` says `none`, the user opted out of accessibility support entirely (see `reference/ui-contract.md` §8, "Opting out and existing code"): do not apply the accessibility rules, do not run or require the accessibility checks (axe, ATF/semantics audit, `performAccessibilityAudit()`, Axe.Windows, a11y lint rules, TUI asserted checks), and report them as "accessibility: opted out" in the group report - never "unverified", and never a failure. `off` differs: the rules still apply when writing code, only the automated checks are not run.
+
+**Missing `.ui-quality.yml` in a repository that already has UI code.** The level was never chosen, so don't assume the `enforce` default — that default is only for a new UI project with no UI code yet. Before the first UI task of the bucket, resolve it once per `reference/ui-contract.md` §8 ("Opting out and existing code"): reuse the `Accessibility:` line of an `iru-explore` report in the plan's "Current code state" or this conversation (otherwise apply the detection rules of `iru-explore`'s `reference/accessibility-detection.md`), ask the user via `AskUserQuestion` with the setup's pre-selection (`present` → Enforce, `partial` → Report only with the mixed-compliance warning, `absent` → None with the half-compliance warning), and write `.ui-quality.yml` with the chosen level and the default `directions`/`themes`, so the per-task skills and the test gates read the same value. This is a decision only the user can make, so it is an allowed pause.
 
 ## Step 2 — Implement each task via `iru-kmp-code-one-task`
 

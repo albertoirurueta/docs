@@ -1,34 +1,6 @@
 ---
 name: iru-php-code-one-task-group
-description: >-
-  Implement one bucket of PHP tasks from a plan's task group end-to-end — Laravel application, WordPress plugin or
-  theme, PrestaShop module, or plain Composer library, detected once with the same markers as `iru-explore` and
-  `iru-php-code-quality`. Captures a single pre-change quality baseline for the whole bucket, runs
-  `iru-php-code-one-task` once per task (in parallel agents when the group is marked parallelizable) to implement
-  each one and its tests, then validates the entire bucket once, cheapest first, every check delegated to an
-  `iru-gate-runner` agent so no raw report lands in this context — license headers via `iru-check-license`, PHPDoc
-  via `iru-php-phpdoc`, `composer validate` and `composer audit` (informational), scoped fast tests via
-  `iru-php-test`, an 80% line-coverage gate via `iru-php-coverage` measured from **fast tests only**, the full fast
-  suite, PHPStan/Psalm/Pint/PHP-CS-Fixer/PHPCS via `iru-php-code-quality` diffed against that one baseline (Rector
-  findings reported as informational, never as regressions), and last the integration stage — only for suites
-  that genuinely need Docker or a database (`WP_UnitTestCase` suites under wp-env or the WordPress test library,
-  Laravel tests wired to MySQL/PostgreSQL/Redis through Sail, PrestaShop shop-backed tests). Laravel feature tests
-  on SQLite `:memory:` and Brain Monkey/WP_Mock WordPress tests are fast tests, not integration tests. The
-  integration stage is serialized repository-wide behind the same atomic `mkdir`-based `.integration-test.lock` as
-  the other `*-code-one-task-group` skills (owner file, stale after 60 minutes, bounded ~45-minute wait, released
-  on every exit path); if Docker is unavailable, the environment isn't running, or the wait times out, the stage
-  is reported **unverified**, never silently skipped, and the coverage verdict never depends on it. Buckets that
-  touched UI (Blade/Livewire views and components, blocks, patterns, template parts, `.tpl`/`.twig` templates,
-  their CSS/JS assets) also get a browser UI stage — `iru-php-test` with the `ui` selector (Playwright +
-  `@axe-core/playwright`, or `wp-scripts test-playwright` for WordPress) behind the same lock — followed by a check
-  that `.ui-screenshots/` holds every added/changed screen and component's states × `.ui-quality.yml` directions ×
-  themes, with the accessibility level applied (`enforce` fails the bucket on violations, `report` lists them); no
-  browser, Docker, wp-env or shop makes it **unverified**, never skipped.
-  `iru-php-code-one-task` checks off each task's box itself with a "group validation pending" note; this skill
-  backfills any that didn't land and replaces each note with the final outcome. Invoke as
-  `/iru-php-code-one-task-group <bucket text>`, passing every task/sub-task in the bucket with its own text, the
-  group's `Parallelizable` verdict, and any relevant "Current code state" context. Used by
-  `iru-code-one-task-group`, which invokes it once per plan group for its `php`-tagged tasks.
+description: "Invoked as /iru-php-code-one-task-group <bucket text> (group tasks, Parallelizable verdict, code state) via Skill. Implements one PHP task bucket: one baseline, iru-php-code-one-task per task (parallel when allowed), then validates once (license, PHPDoc, fast tests, 80% coverage, static analysis, locked integration/UI); finalizes checkboxes."
 model: sonnet
 allowed-tools: Read Edit Write Bash(php *) Bash(vendor/bin/*) Bash(./vendor/bin/*) Bash(composer *) Bash(npx wp-env *) Bash(ddev *) Bash(docker *) Bash(command -v *) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(mkdir .integration-test.lock*) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Skill Agent
 ---
@@ -59,6 +31,8 @@ Three things shape the validation order:
    may be in flight repository-wide (Step 3.8a).
 
 It uses a medium model on purpose: the plan carries the hard reasoning; this skill drives execution of it.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Read this before running anything container-backed
 
@@ -101,7 +75,7 @@ Detect once — and reuse in every gate prompt below rather than letting each ga
   `@wordpress/scripts` + `@wordpress/e2e-test-utils-playwright` in `package.json`), or Dusk (`laravel/dusk`) / the
   Pest browser plugin (`pestphp/pest-plugin-browser`) where the project already uses them; the server it targets
   (`webServer` running `php artisan serve`, the wp-env tests instance, or `PS_BASE_URL` for a shop); and
-  `.ui-quality.yml` at the repository root (missing → `accessibility: enforce`, `[ltr, rtl]`, `[light, dark]`).
+  `.ui-quality.yml` at the repository root (missing (new UI project) → `accessibility: enforce`, `[ltr, rtl]`, `[light, dark]`).
   No browser-test setup → Step 3.9 reports "no UI test setup" for a UI-touching bucket rather than scaffolding one.
 - **Whether the integration stage exists at all and can run**: `docker info` (record availability now), and for
   wp-env whether `.wp-env.json`/`@wordpress/env` is present. No integration suite → Step 3.8 is skipped, and
@@ -127,6 +101,10 @@ issues this bucket introduces are flagged, not the repository's backlog (or what
 
 Don't touch the integration lock here — a lock held through Step 2's implementation would block every other group
 for the whole bucket. It's acquired in Step 3.8a, immediately before the run that needs it.
+
+**Accessibility opt-out (`accessibility: none`).** When `.ui-quality.yml` says `none`, the user opted out of accessibility support entirely (see `reference/ui-contract.md` §8, "Opting out and existing code"): do not apply the accessibility rules, do not run or require the accessibility checks (axe, ATF/semantics audit, `performAccessibilityAudit()`, Axe.Windows, a11y lint rules, TUI asserted checks), and report them as "accessibility: opted out" in the group report - never "unverified", and never a failure. `off` differs: the rules still apply when writing code, only the automated checks are not run.
+
+**Missing `.ui-quality.yml` in a repository that already has UI code.** The level was never chosen, so don't assume the `enforce` default — that default is only for a new UI project with no UI code yet. Before the first UI task of the bucket, resolve it once per `reference/ui-contract.md` §8 ("Opting out and existing code"): reuse the `Accessibility:` line of an `iru-explore` report in the plan's "Current code state" or this conversation (otherwise apply the detection rules of `iru-explore`'s `reference/accessibility-detection.md`), ask the user via `AskUserQuestion` with the setup's pre-selection (`present` → Enforce, `partial` → Report only with the mixed-compliance warning, `absent` → None with the half-compliance warning), and write `.ui-quality.yml` with the chosen level and the default `directions`/`themes`, so the per-task skills and the test gates read the same value. This is a decision only the user can make, so it is an allowed pause.
 
 ## Step 2 — Implement each task via `iru-php-code-one-task`
 

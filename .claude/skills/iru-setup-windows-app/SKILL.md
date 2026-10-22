@@ -1,43 +1,6 @@
 ---
 name: iru-setup-windows-app
-description: >-
-  Scaffold a new Windows desktop app on .NET 10 / C# 14 at the repository root — `global.json` (SDK pinned,
-  `rollForward: latestFeature`), `Directory.Build.props` (the app `<Version>` `x.y.z[-dev]`, nullable, implicit usings,
-  warnings as errors, `AnalysisLevel latest-recommended`, code style enforced in the build, XML docs,
-  `EnableWindowsTargeting` so WPF/WinForms build on Linux/macOS, one SARIF analyzer log per project), central package
-  management in `Directory.Packages.props` (StyleCop.Analyzers as a `GlobalPackageReference`), `.editorconfig`,
-  `stylecop.json`, an `<AppName>.slnx` solution, a UI-framework-free `src/<AppName>.Core` (`net10.0`: `Services/`,
-  plus `ViewModels/` with CommunityToolkit.Mvvm 8.4 partial-property `[ObservableProperty]`/`[RelayCommand]` for
-  `architecture: mvvm`, or `Models/` + `Controllers/` + a passive-view `Views/IMainView.cs` for `architecture: mvc`),
-  the `src/<AppName>` UI project per `ui` — `wpf` (`{Binding}` + `DataContext`, Fluent `ThemeMode`), `winui` (WinUI 3 /
-  Windows App SDK 2.x, `x:Bind`, Mica, single-project MSIX `Package.appxmanifest`, publish profiles) or `winforms`
-  (designer-compatible `MainForm.Designer.cs`, PerMonitorV2, system color mode; `mvc` passive view or `mvvm`
-  `BindingSource` + `Button.Command`) — all composed with the Generic Host, an `app.manifest` (`asInvoker`, Windows
-  10/11, PerMonitorV2 for WPF/WinUI), an MSTest 4 + coverlet `tests/<AppName>.Core.Tests` project at 100% Core line
-  coverage, `tests/coverlet.runsettings` (cobertura + opencover, UI assembly excluded = "not measured"), an optional
-  FlaUI `tests/<AppName>.UITests` project (`[TestCategory("UI")]`, Windows only) that — per the catalog's UI
-  contract — renders the main screen in every left-to-right/right-to-left × light/dark combination (launch arguments
-  `--ui-direction`/`--ui-theme` applied by the app's `UiTestOptions`), captures it into `.ui-screenshots/` through the
-  shared `UiScreenshots` helper and runs an Axe.Windows accessibility scan at the level of a root `.ui-quality.yml`
-  (written for every `ui`), a DocFX `docfx.json` for the Core
-  API, generated placeholder icon/tile PNGs, and for WPF/WinForms with `msix: yes` a `packaging/` folder
-  (`AppxManifest.xml` with an `x.y.z.0` identity version + `build-msix.ps1`: publish per RID → makeappx → signtool).
-  Invoke as `/iru-setup-windows-app`. Accepts pre-resolved inputs via `args` (`key: value` lines) — `ui`
-  (`wpf`/`winui`/`winforms`), `architecture` (`mvvm`/`mvc`; WPF and WinUI are `mvvm` only), `app-name` (PascalCase,
-  also solution/project/assembly name), `display-name`, `root-namespace`, `publisher` (`CN=…`), `publisher-display-name`,
-  `package-name`, `version`, `rids` (default `win-x64;win-arm64`), `msix` (`yes`/`no`), `ui-tests` (`flaui`/`none`),
-  `branching` (`gitflow`/`main-only`), `accessibility` (`enforce`/`report`/`off`, default `enforce`), `license`,
-  `developer-name`, `developer-email`, `organization-url`, `open-source`, `visibility`, `ci`, `sonar` (+
-  `sonar-organization`/`sonar-project-key`/`sonar-host-url`),
-  `distribution` (`none`/`internal`/`store`), `mode` (`new`/`existing`) and `on-existing` (`ask`/`keep`/`update`/
-  `replace`) — so `iru-setup-windows-repository` can supply them without re-prompting. Announces whether it is
-  scaffolding from scratch or updating; for every file group it owns that already exists it warns and asks Update /
-  Keep as is / Replace / Stop (unless `on-existing` decides), never overwrites hand-written source, and treats a
-  foreign layout (a single-project `dotnet new wpf` app, a `.sln` with other projects, a `.wapproj` packaging
-  project) as foreign — add alongside or stop, never convert. Every version is looked up at run time (NuGet
-  flat-container API, .NET release metadata) with a verified 2026-10-16 fallback table. Use whenever a new WPF, WinUI 3
-  or Windows Forms app repository needs its solution, quality tooling, tests, docs and packaging bootstrapped from this
-  house template.
+description: "/iru-setup-windows-app [args] scaffolds a Windows desktop app on .NET 10 / C# 14 at the repository root: slnx solution, UI-free Core project, WPF, WinUI 3 or Windows Forms UI (MVVM or MVC), MSTest, optional FlaUI tests, analyzers, DocFX, optional MSIX. key: value args (ui, architecture...) let iru-setup-windows-repository drive it; asks Update/Keep/Replace/Stop on existing files."
 model: sonnet
 allowed-tools: Read Write Edit AskUserQuestion Bash(dotnet *) Bash(pwsh *) Bash(docfx *) Bash(curl *) Bash(git *) Bash(gh *) Bash(python3 *) Bash(mkdir *) Bash(find *) Agent
 ---
@@ -145,7 +108,7 @@ the Partner Center value for the Store; default `CN=<developer-name>`), `publish
 gitflow`, `1.0.0` for `main-only`), `rids` (default `win-x64;win-arm64` — WinUI `RuntimeIdentifiers`/`Platforms` and
 the packaging script's default), `msix` (`yes`/`no`; `ui: winui` is always packaged → `yes`; WPF/WinForms default
 `yes` when `distribution` ≠ `none`, else `no`), `ui-tests` (`flaui`/`none`, default `flaui`), `branching`
-(`gitflow`/`main-only`, default `gitflow`), `accessibility` (`enforce`/`report`/`off`, default `enforce` — the
+(`gitflow`/`main-only`, default `gitflow`), `accessibility` (`enforce`/`report`/`off`/`none`, default `enforce` — the
 automated accessibility level written to `.ui-quality.yml`: `enforce` makes Axe.Windows violations fail the UI tests,
 `report` lists them, `off` skips the scan), `license`, `developer-name`, `developer-email`, `organization-url`,
 `open-source` (`yes`/`no`), `visibility`, `ci`, `sonar` (+ `sonar-organization`/`sonar-project-key`/`sonar-host-url`
@@ -158,6 +121,15 @@ found is resolved — skip its question in Step 2. Unknown keys from a full shar
 group. Only `on-existing` skips that question (`keep` = create only missing files; `update`/`replace` applied to
 every existing group; the warning is still printed). Orchestrators forward `on-existing` only when their own `args`
 received it.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (Axe.Windows), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — `AutomationProperties.Name`/`HelpText` on icon buttons and images, keyboard access and tab order for Narrator, system font scaling and high-contrast resources — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey the repository
 
@@ -228,7 +200,7 @@ Then, with `AskUserQuestion` (skip any resolved):
 - **ui-tests** — **FlaUI UI tests (Recommended)** — say plainly it is third-party, runs only on Windows with an
   interactive desktop, and that Microsoft has no current desktop UI-test recommendation — / **None**.
 - **accessibility** — only when `ui-tests: flaui` and stand-alone (an orchestrator resolves it; otherwise default
-  `enforce`): "Automated accessibility checks in UI tests?" — **Enforce (Recommended)** (Axe.Windows violations fail
+  `enforce`): "Support accessibility and assistive technologies?" — **Enforce (Recommended)** (Axe.Windows violations fail
   the UI tests) / **Report only** (listed in `.ui-screenshots/a11y-report.txt`, never failing) / **Off** (not run;
   the coding defaults still apply).
 - **license** — MIT License (recommended for an app) / Apache License 2.0 / No license (proprietary) / Other. If one is

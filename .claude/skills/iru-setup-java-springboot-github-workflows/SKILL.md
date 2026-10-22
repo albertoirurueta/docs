@@ -1,55 +1,12 @@
 ---
 name: iru-setup-java-springboot-github-workflows
-description: >-
-  Create the GitHub Actions workflows for a Spring Boot service repository — in Java (Maven) or Kotlin (Maven, or
-  Gradle Kotlin DSL), read from the manifest's `project.language`/`project.buildTool` (absent ⇒ `java`/`maven`, the
-  unchanged Java path) — a build workflow (`build.yml`) that runs on pushes to the integration and main branches and
-  on pull requests, executing unit tests via Surefire and Testcontainers-backed integration tests via Failsafe,
-  Checkstyle/PMD/SpotBugs static analysis (detekt + ktlint for Kotlin), aggregated JaCoCo coverage, optionally a
-  SonarCloud/SonarQube scan via `mvn sonar:sonar` or `./gradlew sonar` (gated by the manifest's `sonar.mode`), the
-  Antora documentation build, Javadoc (Dokka for Kotlin), and the generated API documentation — OpenAPI, protobuf, the
-  AsyncAPI HTML produced by `@asyncapi/html-template`, and the GraphQL reference produced by `spectaql` and
-  `graphql-voyager` — publishing all of it to GitHub Pages; when the manifest's `frontend` is `hilla`, `build.yml`
-  also sets up Node via `actions/setup-node`, runs `vaadin:prepare-frontend` before it, then `npm ci` and `npx vitest
-  run --coverage` in the web module, and packages with `-Pproduction -Dvaadin.ci.build=true`; on Gradle every job uses
-  `gradle/actions/setup-gradle` (open-source `basic` cache provider) with `./gradlew
-  test`/`integrationTest`/`:coverage:testCodeCoverageReport`/`detekt ktlintCheck`/`dokkaGeneratePublicationHtml`; a
-  `deploy.yml` that builds and pushes the container image (`spring-boot:build-image`, or `bootBuildImage` tagged with
-  the `gradle.properties` version on Gradle), authenticates to AWS or Google Cloud via keyless OIDC, and applies the
-  OpenTofu configuration for a chosen environment behind a GitHub Environment approval gate; an `undeploy.yml` that
-  scales the service to zero or destroys an environment's infrastructure, guarded by a typed-confirmation input and a
-  protected environment; a `security.yml` that runs a `dependency-review` job (`actions/dependency-review-action@v5`),
-  a CodeQL job (`github/codeql-action@v4`, `java-kotlin` with autobuild on Maven or a manual `./gradlew` compile on
-  Gradle, matrix including `javascript-typescript` when `frontend` is `hilla`), on Gradle a `dependency-submission`
-  job (`gradle/actions/dependency-submission`) feeding the dependency graph that dependency review compares, an
-  OSV-Scanner job (the `google/osv-scanner-action` reusable workflow), and a `gitleaks` job
-  (`gitleaks/gitleaks-action@v3`) — each individually omittable; and a `.github/dependabot.yml` with grouped weekly
-  updates for the `maven` (or `gradle`), `docker`, and `github-actions` ecosystems, plus `npm` (pointed at the real
-  web module's directory) when the manifest's `frontend` isn't `none`. Reads `sonar.mode` from `springboot-stack.yml`
-  as the source of truth for whether the Sonar step and `SONAR_TOKEN` secret are generated at all, rather than asking
-  reactively, and reads the manifest's `visibility` and `ci:` block (`ci.tests` = `unit` ⇒ Surefire only with
-  `-DskipITs` and no Testcontainers/Docker stack in CI, `full` ⇒ Surefire + Failsafe + Testcontainers; `ci.pages` =
-  `no` ⇒ the docs are still built but uploaded as a workflow artifact instead of deployed to GitHub Pages) — `args`
-  may override them, and when invoked standalone with no `ci:` block it resolves `visibility` (args, then `gh repo
-  view`, then asks) and asks `ci-tests`/`pages` (and `sonar` when the manifest has none) itself, stating the
-  Actions-minutes/SonarCloud/Pages cost facts for a private repository. Announces whether it is creating the workflows
-  from scratch or updating existing ones, and for every workflow/config file that already exists warns and asks Update
-  / Keep as is / Replace (or applies `on-existing` from `args`). Derives the pipeline from `springboot-stack.yml` and
-  the actual reactor/`infra/` layout on disk, lists every required repository secret and environment, and never writes
-  a credential into a workflow file. Invoke as `/iru-setup-java-springboot-github-workflows`, or with `args`
-  (`stack-file:`, `integration-branch:`, `main-branch:` lines, plus
-  `security-dependency-review`/`security-codeql`/`security-osv`/`security-gitleaks`, each `yes`/`no`, default `yes`,
-  and the shared `visibility` (`public`/`private`/`internal`), `ci-tests` (`unit`/`full`), `pages` (`yes`/`no`),
-  `sonar`, `mode` (`new`/`existing`), and `on-existing` (`ask`/`keep`/`update`/`replace`) keys) when called from
-  `iru-setup-java-springboot`. Use whenever a Spring Boot service needs its CI/CD pipeline bootstrapped instead of
-  hand-writing the YAML for testing, analysis, documentation publishing, deployment, teardown, and
-  dependency/secret/code security scanning.
+description: "Invoked as `/iru-setup-java-springboot-github-workflows` (args: `stack-file`, branches, `security-*`, `ci-tests`, `pages`, `sonar`, `on-existing`), normally by `iru-setup-java-springboot`. Creates build, deploy, undeploy (optionally staged-rollout and promote) and security workflows plus Dependabot for a Spring Boot service, from the manifest."
 model: sonnet
 ---
 
 # Setup Java Spring Boot GitHub Workflows
 
-Generate three workflows for a Spring Boot service. This is deliberately a different pipeline from the
+Generate the workflows for a Spring Boot service (three, plus `promote.yml` when rolling deployments are enabled). This is deliberately a different pipeline from the
 library-oriented `iru-setup-java-github-workflows`: a service is not published to Maven Central and is not
 GPG-signed — it is built into a container image and deployed. The shared stages (test, analyse, Sonar, Antora,
 GitHub Pages) follow the same house pattern as that skill, so the two are recognisably related; the publish/sign/
@@ -58,13 +15,38 @@ sync stages are replaced by image build, OpenTofu apply, and teardown.
 | Workflow | Trigger | Does |
 |---|---|---|
 | `build.yml` | push to integration/main branch, and every pull request | build, unit tests, integration tests (only when `ci.tests: full`), static analysis, coverage, Sonar (when `sonar.mode` isn't `none`), docs; publishes Pages from the main branch only when `ci.pages: yes`, otherwise uploads the built docs as a workflow artifact |
-| `deploy.yml` | `workflow_dispatch` (environment input) and optionally on release published | build + push image, OIDC auth, `tofu apply`, smoke check |
+| `deploy.yml` | `workflow_dispatch` (environment input) and optionally on release published | build + push image, OIDC auth, `tofu apply`, smoke check — or, with rolling deployments, a staged rollout (Step 2b) |
+| `promote.yml` | `workflow_dispatch` (environment + target inputs); **only with rolling deployments** (not for `strategy: rolling`) | advance a rollout one step, or roll back / abort it (Step 2c) |
 | `undeploy.yml` | `workflow_dispatch` only, with typed confirmation | scale to zero, or `tofu destroy` an environment |
 | `security.yml` | push to main branch, every pull request, weekly schedule | dependency review, CodeQL, OSV-Scanner, gitleaks — each individually omittable |
 | `.github/dependabot.yml` | n/a (config, not a workflow) | grouped weekly updates for `maven`, `docker`, `github-actions`, and `npm` when a frontend is present |
 
 **No credential is ever written into a workflow file.** Cloud access is keyless via OIDC; everything else is a
 repository or environment secret referenced by name.
+
+## Templates
+
+Every workflow and configuration template this skill writes is a file under `templates/<variant>/<path of the generated file>`, holding the exact bytes of that template; the steps below point at them. Read only the files for the variant resolved in Step 0 ("Language and build tool", plus whether rolling deployments are enabled), each in full, before filling placeholders; never read the others:
+
+| Generated file | Template | Applies when |
+|---|---|---|
+| `.github/workflows/build.yml` | `templates/maven/.github/workflows/build.yml` | `java` + `maven`; `kotlin` + `maven` (the base that the Kotlin + Maven deltas of Step 1 modify) |
+| `.github/workflows/build.yml` | `templates/kotlin-gradle/.github/workflows/build.yml` | `kotlin` + `gradle` |
+| `.github/workflows/deploy.yml` | `templates/maven/.github/workflows/deploy.yml` | Single-job `deploy.yml` (rolling deployments off, or `strategy: rolling`); `maven` variants |
+| `.github/workflows/deploy.yml (Gradle variant steps)` | `templates/kotlin-gradle/.github/workflows/deploy.yml.jdk-tag-image` | `kotlin` + `gradle`: replaces the JDK, tag and image steps of the single-job `deploy.yml` |
+| `step `Load rollout functions` of deploy.yml, promote.yml and undeploy.yml (written to `$RUNNER_TEMP/rollout.sh`)` | `templates/rolling/rollout-functions/common.sh` | Rolling deployments with `strategy` `blue-green`, `canary` or `linear`: the runtime-independent helpers, first in every rollout library |
+| `step `Load rollout functions` of deploy.yml, promote.yml and undeploy.yml (appended after the common helpers)` | `templates/rolling/rollout-functions/ecs.sh` | Rolling deployments on AWS ECS Fargate |
+| `step `Load rollout functions` of deploy.yml, promote.yml and undeploy.yml (appended after the common helpers)` | `templates/rolling/rollout-functions/cloud-run.sh` | Rolling deployments on Google Cloud Run |
+| `step `Load rollout functions` of deploy.yml, promote.yml and undeploy.yml (appended after the common helpers)` | `templates/rolling/rollout-functions/kubernetes.sh` | Rolling deployments on EKS / GKE Autopilot (Argo Rollouts) |
+| `.github/workflows/deploy.yml (staged)` | `templates/rolling/workflows/deploy.yml` | Rolling deployments with `strategy` `blue-green`, `canary` or `linear` (replaces the single-job `deploy.yml`) |
+| `.github/workflows/promote.yml` | `templates/rolling/workflows/promote.yml` | Rolling deployments with `strategy` other than `rolling` |
+| `.github/workflows/undeploy.yml` | `templates/common/.github/workflows/undeploy.yml` | Every variant (the rolling deltas are described after the template) |
+| `.github/workflows/security.yml` | `templates/maven/.github/workflows/security.yml` | `java`/`kotlin` + `maven` (the Gradle changes are the fragments below); skipped entirely when all four `security-*` flags are `no` |
+| `.github/workflows/security.yml (dependency-submission job)` | `templates/kotlin-gradle/.github/workflows/security.yml.dependency-submission` | `kotlin` + `gradle`, when `security-dependency-review` is on (the template lines carry the indent of the numbered list item they sit in, which the generated workflow file does not have) |
+| `.github/workflows/security.yml (dependency-review job)` | `templates/kotlin-gradle/.github/workflows/security.yml.dependency-review` | `kotlin` + `gradle`, when `security-dependency-review` is on (the template lines carry the indent of the numbered list item they sit in, which the generated workflow file does not have) |
+| `.github/workflows/security.yml (CodeQL job)` | `templates/kotlin-gradle/.github/workflows/security.yml.codeql-build` | `kotlin` + `gradle`, when `security-codeql` is on: replaces the matrix and the `Autobuild` step (the template lines carry the indent of the numbered list item they sit in, which the generated workflow file does not have) |
+| `.github/dependabot.yml` | `templates/maven/.github/dependabot.yml` | `java`/`kotlin` + `maven` (always generated) |
+| `.github/dependabot.yml (Gradle entry)` | `templates/kotlin-gradle/.github/dependabot.yml.gradle-entry` | `kotlin` + `gradle`: replaces the `maven` entry |
 
 ## Step 0 — Survey and resolve inputs
 
@@ -91,6 +73,12 @@ on-existing: ask
   **`sonar`** (`cloud`/`self-hosted`/`none`) — overrides for the manifest's `visibility`, `ci.tests`, `ci.pages`,
   and `sonar.mode` (see "Resolving the CI choices" below). Normally absent: `iru-setup-java-springboot` records
   them in the manifest, which is enough.
+- **`rolling`** (`yes`/`no`), **`deployment-strategy`** (`rolling`/`blue-green`/`canary`/`linear`), **`advance`**
+  (`auto`/`manual`/`hybrid`), **`steps`** (comma list of percentages), **`bake-minutes`** — rolling deployments (see
+  "Rolling deployments" below). Normally absent: the manifest's `deploy.rolling` block is the source of truth when
+  `stack-file` is given; the `args` lines apply when there is no such block or when the caller passes them
+  explicitly. Absent or `rolling: no` ⇒ rolling is off and Steps 2b/2c, the `promote.yml` rows and every "rolling"
+  paragraph below are skipped.
 - **`mode`** (`new`/`existing`) — informational; this skill still decides scratch-vs-update per file from what's on
   disk, and `mode: existing` does **not** mean "update silently" — existing files are still asked about below.
 - **`on-existing`** (`ask`/`keep`/`update`/`replace`, default `ask`) — how to treat each workflow/config file that
@@ -143,6 +131,16 @@ Step 3b. Then survey what's actually on disk — the workflows must match realit
 - Whether `infra/envs/<env>/` directories exist and which environments they define. If `infra/` doesn't exist,
   still generate `deploy.yml`/`undeploy.yml` but mark the OpenTofu steps as requiring
   `/iru-setup-java-springboot-platform` first, and say so in the report.
+- **Rolling deployments.** Resolve `deploy.rolling` (`enabled`, `strategy`, `advance`, `steps`, `bakeMinutes`) as
+  described above and validate it like the orchestrator does (`steps` ascending, ending in 100, `blue-green` is
+  `[100]`; `rolling` with `manual`/`hybrid` is contradictory — ask which to change). Rolling is **forced off** when
+  `ci.enabled: false` (no workflows exist to drive it — say so). When on, survey `infra/envs/*` for the OpenTofu
+  outputs `rollout_candidate_url`, `rollout_gate`, `rollout_alarm_names`, `rollout_target_groups`, `rollout_name`
+  (grep the `outputs.tf` files): which runtime they imply (`cloudwatch` ⇒ ECS, `cloud-monitoring` ⇒ Cloud Run,
+  `prometheus` ⇒ Kubernetes) decides the rollout-functions block and the auth/kubeconfig steps in Step 2b. If they
+  are missing, still generate the workflows but mark the rollout steps as requiring
+  `/iru-setup-java-springboot-platform` (with `rolling: yes`) first and say so in the report. For `strategy:
+  rolling` only Step 2's single-job template (plus the settle step) is generated.
 - The branch model: run `git branch -a`, don't assume gitflow. Confirm the integration and main branch names.
 - Whether GitHub Environments already exist (`gh api repos/{owner}/{repo}/environments`) — `deploy.yml` and
   `undeploy.yml` depend on them for approval gates.
@@ -221,7 +219,16 @@ only and not written back unless the user agrees.
 ### Existing workflow files
 
 Say up front whether this run is **creating the workflows from scratch** (none of `build.yml`, `deploy.yml`,
-`undeploy.yml`, `security.yml`, `.github/dependabot.yml` exist) or **updating existing ones** (list which exist).
+`promote.yml`, `undeploy.yml`, `security.yml`, `.github/dependabot.yml` exist) or **updating existing ones** (list
+which exist), and **whether rolling deployments are on or off** (strategy, advance, steps, bake minutes when on) with
+the state of the two files it changes — `deploy.yml`: *absent*, *single-job* (today's template), or *staged*
+(contains `deploy-green`); `promote.yml`: *absent*, *present*, or *partial* (exists but does not match the current
+`steps`/`advance`/runtime). The usual Update / Keep as is / Replace / Stop prompt applies to `promote.yml` like any
+other file, with these rolling-specific warnings: switching `deploy.yml` between single-job and staged is a
+**behavioural change** (replace/update it only with an explicit yes — a rollout in flight must not be orphaned, so
+check the cloud split via `/iru-springboot-rolling-deployments`'s in-progress check first); a `promote.yml` found
+while rolling is off is *stale* (offer to remove it — never delete without confirmation); `promote.yml` carries
+the `target` options generated from `steps`, so a changed `steps` list makes an existing one *partial*.
 For each one that exists, warn and — unless `on-existing` is `keep`/`update`/`replace`, in which case apply it to
 every file without asking (still print the warning) — ask with `AskUserQuestion` (up to 4 files per call, one
 question each), stating concretely where the existing file contradicts this run's choices (e.g. "your current
@@ -238,237 +245,18 @@ question each), stating concretely where the existing file contradicts this run'
   file is lost (recoverable only from git history).
 - **Stop** — end this skill now without changing any file.
 
+**Accessibility opt-out.** Read the repository's `.ui-quality.yml` `accessibility` level (UI contract §8). When it is
+`none` (opted out entirely), emit no accessibility report artifact, upload or step: do not collect `a11y-report.txt`
+or other accessibility reports into the `ui-screenshots` artifacts, and drop any accessibility-only job or step;
+the UI test run and the screenshot upload are unaffected. With `enforce`, `report` or `off` the workflows are
+generated exactly as below (`off` runs no automated checks, so no accessibility report exists to upload either).
+
 ## Step 1 — `build.yml`
 
 Structure it as two jobs so a pull request gets fast feedback and Pages publishing only happens on the main branch.
 The template below is the `ci.tests: full` / `ci.pages: yes` shape; the `unit` and `pages: no` variants follow it.
 
-```yaml
-name: Build
-
-on:
-  push:
-    branches: [ <integration-branch>, <main-branch> ]
-  pull_request:
-    branches: [ <integration-branch>, <main-branch> ]
-
-# A new push to the same branch/PR makes the previous run obsolete.
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build, test and analyse
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-        with:
-          # Sonar needs full history to attribute issues to blame data.
-          fetch-depth: 0
-
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-          cache: maven
-
-      # Only when the manifest's frontend: hilla. Must come before the Maven build step below: the Vaadin
-      # plugin's `prepare-frontend`/`build-frontend` goals (bound in <web-module>/pom.xml by
-      # iru-setup-java-springboot-hilla) need Node on PATH, and without a pre-installed Node the plugin falls
-      # back to downloading its own into ~/.vaadin, which adds real time to every uncached run.
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          # The real path npm writes its lock file to: vaadin:prepare-frontend generates package.json/
-          # package-lock.json at the web module's root, next to its pom.xml — never inside
-          # src/main/frontend/. Confirmed by an actual generated project; don't use
-          # src/main/frontend/package-lock.json here.
-          cache-dependency-path: <web-module>/package-lock.json
-
-      - name: Build, unit tests and integration tests
-        # `verify` runs Surefire, then Failsafe against the Testcontainers stack, then the JaCoCo
-        # aggregate report. Docker is available on ubuntu-latest runners, so no extra setup is needed.
-        # -Pproduction -Dvaadin.ci.build=true only apply when frontend: hilla: the production profile builds
-        # the real Vite bundle instead of leaving the frontend in dev-bundle mode, and vaadin.ci.build=true
-        # (confirmed against the plugin's own parameter metadata) makes it run `npm ci` instead of
-        # `npm install` so the committed package-lock.json is never silently rewritten by CI.
-        run: mvn -B -ntp clean verify -Pproduction -Dvaadin.ci.build=true
-
-      # Only when the manifest's frontend: hilla. Must run after the Maven step above, not before: both
-      # vite.config.ts and vitest.config.ts import <web-module>/vite.generated.ts, which itself imports
-      # helper scripts under <web-module>/target/plugins/ — files that exist only once a Maven build has
-      # reached vaadin:prepare-frontend. Running this step first fails on a module-not-found error that has
-      # nothing to do with the frontend tests themselves. Confirmed by an actual local run.
-      - name: Frontend unit tests and coverage
-        working-directory: <web-module>
-        run: |
-          npm ci
-          npx vitest run --coverage
-
-      # Only when frontend: hilla, ci.tests: full, and the web module has a playwright.config.ts (written by
-      # iru-setup-java-springboot-hilla). Runs the Playwright component tests against the standalone Vite gallery
-      # in the same job (no extra runner); captures land in .ui-screenshots/ per the catalog's UI contract.
-      - name: Frontend UI tests
-        working-directory: <web-module>
-        env:
-          CI: "true"
-          UI_SCREENSHOTS_DIR: ${{ github.workspace }}/.ui-screenshots
-        run: |
-          npx playwright install --with-deps chromium
-          npx playwright test
-
-      - name: Upload UI screenshots
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ui-screenshots
-          path: .ui-screenshots/
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Static analysis and site report
-        run: mvn -B -ntp site -DskipTests -Djacoco.skip
-
-      - name: Run SonarCloud analysis
-        # Only present at all when the manifest's sonar.mode isn't `none` — see Step 0. Skipped on pull
-        # requests from forks, where SONAR_TOKEN is not available.
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: mvn -B -ntp sonar:sonar -Dsonar.token=${{ secrets.SONAR_TOKEN }}
-
-      - name: Upload test reports
-        # `always()` so a failing build still yields the reports that explain why.
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-reports
-          path: |
-            **/target/surefire-reports/**
-            **/target/failsafe-reports/**
-            coverage/target/site/jacoco-aggregate/**
-            <web-module>/coverage/**
-          retention-days: 7
-
-  docs:
-    name: Build and publish documentation
-    needs: build
-    if: github.ref == 'refs/heads/<main-branch>' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-          cache: maven
-
-      - name: Install Node
-        # v7 — confirmed the current major via the live GitHub API at the time of writing, and kept in step
-        # with the `build` job's own Set up Node step (frontend: hilla) so both jobs use one version.
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          # Every npm toolchain in the repository: the Antora site, the AsyncAPI
-          # generators, and the GraphQL ones. Omit any path the repository doesn't have.
-          cache-dependency-path: |
-            docs/package-lock.json
-            apis/messaging/docs/package-lock.json
-            apis/graphql-server/docs/package-lock.json
-
-      - name: Generate API documentation and the Maven site
-        # generate-resources runs the OpenAPI html2 and protoc-gen-doc executions;
-        # `site` produces the Javadoc/Surefire/JaCoCo/Checkstyle/PMD/SpotBugs/JXR reports.
-        # The npm-driven generators (AsyncAPI, GraphQL) are skipped here and run as their
-        # own steps below, so this job doesn't generate them twice; the `build` job above
-        # still exercises the frontend-maven-plugin wiring, because `mvn clean verify`
-        # passes through generate-resources like any other build.
-        run: |
-          mvn -B -ntp clean generate-resources -Dasyncapi.docs.skip=true -Dgraphql.docs.skip=true
-          mvn -B -ntp site -DskipTests -Djacoco.skip
-
-      - name: Generate AsyncAPI documentation
-        # The official AsyncAPI HTML generator, run against the committed toolchain in
-        # apis/messaging/docs — see iru-setup-java-springboot-apis.
-        if: hashFiles('apis/messaging/docs/package.json') != ''
-        working-directory: apis/messaging/docs
-        env:
-          # Committed file with analyticsEnabled=false, so the CLI reports nothing anywhere.
-          ASYNCAPI_METRICS_CONFIG_PATH: .asyncapi-analytics
-        run: |
-          npm ci --no-audit --no-fund
-          out="$GITHUB_WORKSPACE/target/generated-docs/messaging"
-          for spec in ../*-async-api-v*.yaml; do
-            v="$(basename "$spec" .yaml | sed -e 's/.*-async-api-//')"     # v1, v2, ...
-            npx asyncapi validate "$spec"
-            npx asyncapi generate fromTemplate "$spec" @asyncapi/html-template \
-              -o "$out/$v" --force-write -p singleFile=true
-          done
-
-      - name: Generate GraphQL documentation
-        # SpectaQL renders the static reference from the SDL; the small build-voyager.mjs
-        # script renders the interactive schema graph beside it. Both read the SDL directly,
-        # so neither needs a running service or an introspection endpoint in CI.
-        if: hashFiles('apis/graphql-server/docs/package.json') != ''
-        working-directory: apis/graphql-server/docs
-        run: |
-          npm ci --no-audit --no-fund
-          out="$GITHUB_WORKSPACE/target/generated-docs/graphql-server"
-          for sdl in ../*-v*.graphqls; do
-            v="$(basename "$sdl" .graphqls | sed -e 's/.*-\(v[0-9]*\)$/\1/')"      # v1, v2, ...
-            npx spectaql "spectaql-$v.yml" --target-dir "$out/$v"
-            # Drop this line if the Voyager schema graph wasn't wanted.
-            node build-voyager.mjs "$sdl" "$out/$v/voyager" "GraphQL schema $v"
-          done
-
-      - name: Install Antora
-        working-directory: docs
-        run: npm ci
-
-      - name: Build Antora docs
-        working-directory: docs
-        run: npx antora antora-playbook.yml
-
-      - name: Merge documentation
-        run: |
-          touch ./docs/build/site/.nojekyll
-          cp -r ./docs/build/site ./doc
-          cp -r ./target/site ./doc/mvn-site
-          # Generated API documentation, published alongside so the Antora pages can link to
-          # it. Every generator in the repository writes under some `target/generated-docs`
-          # — the OpenAPI html2 and protoc-gen-doc executions into their module's, the
-          # AsyncAPI step above into the root one — so copying the *contents* of each such
-          # directory merges rest-server/, grpc-server/ and messaging/ under ./doc/api
-          # without needing to know which module produced which. The result is
-          # doc/api/rest-server/v1/, doc/api/grpc-server/v1/, doc/api/messaging/v1/.
-          mkdir -p ./doc/api
-          while IFS= read -r root; do
-            cp -r "$root"/. ./doc/api/
-          done < <(find . -type d -path '*/target/generated-docs')
-
-      - name: Deploy to GitHub Pages
-        if: success()
-        uses: crazy-max/ghaction-github-pages@v5
-        with:
-          target_branch: gh-pages
-          build_dir: ./doc
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
+Template: `templates/maven/.github/workflows/build.yml` — read it in full before filling placeholders
 
 Adjust to the survey: `npm ci` only works if `docs/package-lock.json` is committed — if it isn't, fall back to the
 explicit `npm i` list `iru-setup-antora` uses, **including `asciidoctor-kroki`** if the playbook requires it, or a
@@ -605,236 +393,7 @@ A Gradle build has no `mvn site`, Surefire/Failsafe or `report-aggregate`; the e
 template below is the `ci.tests: full` / `ci.pages: yes` / `sonar.mode` ≠ `none` shape with every optional step
 present; apply the same variant rules as the Maven template (drop what the manifest/survey rules out):
 
-```yaml
-name: Build
-
-on:
-  push:
-    branches: [ <integration-branch>, <main-branch> ]
-  pull_request:
-    branches: [ <integration-branch>, <main-branch> ]
-
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    name: Build, test and analyse
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-        with:
-          # Sonar needs full history to attribute issues to blame data.
-          fetch-depth: 0
-
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-
-      - name: Set up Gradle
-        # Caches the Gradle User Home (dependencies, wrapper distribution) and validates the committed wrapper
-        # jar's checksum. cache-provider: basic is the MIT-licensed actions/cache-backed provider; the v6 default
-        # ("enhanced") is a proprietary component governed by the Gradle Technologies Terms of Use (free for public
-        # repositories, a free preview for private ones). Switching to it is the repository owner's call, not
-        # something to accept silently on their behalf.
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          cache-provider: basic
-
-      # Only when the manifest's frontend: hilla — same reasoning and ordering as the Maven template: the Vaadin
-      # Gradle plugin's vaadinPrepareFrontend/vaadinBuildFrontend tasks need Node on PATH.
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: <web-module>/package-lock.json
-
-      - name: Build and unit tests
-        # `test` excludes **/*IT* (iru.integration-test convention), so nothing here needs Docker.
-        # -Pvaadin.productionMode=true -Pvaadin.ci.build=true only when frontend: hilla — the Gradle plugin reads
-        # both as Gradle properties (vaadin.ci.build makes it run `npm ci`, never rewriting the lock file).
-        # Pass the same two flags to every later ./gradlew call in this job too, or Gradle sees different
-        # inputs and re-runs the frontend tasks in development mode. vaadinPrepareFrontend is named explicitly
-        # because a plain `build` doesn't depend on it — the frontend unit-test step below needs its output.
-        # Without frontend: hilla the command is just `./gradlew build -x integrationTest`.
-        run: ./gradlew :boot:vaadinPrepareFrontend build -x integrationTest -Pvaadin.productionMode=true -Pvaadin.ci.build=true
-
-      - name: Integration tests
-        # ci.tests: full only. *IT classes start the Testcontainers/compose stack; Docker is available on
-        # ubuntu-latest runners.
-        run: ./gradlew integrationTest
-
-      - name: Aggregated coverage report
-        # jacoco-report-aggregation in the coverage project: one XML over every module's test (and, with
-        # ci.tests: full, integrationTest) execution data — the file Sonar reads.
-        run: ./gradlew :coverage:testCodeCoverageReport
-
-      # Only when the manifest's frontend: hilla, and after the Gradle build for the same vite.generated.ts reason
-      # as the Maven template (its helpers live under <web-module>/build/ once vaadinPrepareFrontend has run).
-      - name: Frontend unit tests and coverage
-        working-directory: <web-module>
-        run: |
-          npm ci
-          npx vitest run --coverage
-
-      # Only when frontend: hilla, ci.tests: full, and the web module has a playwright.config.ts (written by
-      # iru-setup-java-springboot-hilla). Runs the Playwright component tests against the standalone Vite gallery
-      # in the same job (no extra runner); captures land in .ui-screenshots/ per the catalog's UI contract.
-      - name: Frontend UI tests
-        working-directory: <web-module>
-        env:
-          CI: "true"
-          UI_SCREENSHOTS_DIR: ${{ github.workspace }}/.ui-screenshots
-        run: |
-          npx playwright install --with-deps chromium
-          npx playwright test
-
-      - name: Upload UI screenshots
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ui-screenshots
-          path: .ui-screenshots/
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Static analysis (detekt + ktlint)
-        # Already part of `check` (hence of `build` above); run explicitly with --continue so one tool's failure
-        # still yields the other's report, and so the reports exist before the Sonar step reads them.
-        run: ./gradlew detekt ktlintCheck --continue
-
-      - name: Run SonarCloud analysis
-        # Only present when sonar.mode isn't `none`. The org.sonarqube plugin's `sonar` task reads SONAR_TOKEN
-        # from the environment. Skipped on pull requests from forks, where SONAR_TOKEN is not available.
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        run: ./gradlew sonar
-
-      - name: Upload test reports
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: test-reports
-          path: |
-            **/build/test-results/**
-            **/build/reports/tests/**
-            **/build/reports/detekt/**
-            **/build/reports/ktlint/**
-            coverage/build/reports/jacoco/testCodeCoverageReport/**
-            <web-module>/coverage/**
-          retention-days: 7
-
-  docs:
-    name: Build and publish documentation
-    needs: build
-    if: github.ref == 'refs/heads/<main-branch>' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          cache-provider: basic
-
-      - name: Install Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            docs/package-lock.json
-            apis/messaging/docs/package-lock.json
-            apis/graphql-server/docs/package-lock.json
-
-      - name: Generate KDoc and API documentation
-        # dokkaGeneratePublicationHtml is Dokka 2's HTML task; <api-doc-tasks> are the non-npm API documentation
-        # tasks the survey found (OpenAPI html2, protoc-gen-doc) — they write <module>/build/generated-docs/.
-        run: ./gradlew dokkaGeneratePublicationHtml <api-doc-tasks>
-
-      - name: Generate AsyncAPI documentation
-        if: hashFiles('apis/messaging/docs/package.json') != ''
-        working-directory: apis/messaging/docs
-        env:
-          ASYNCAPI_METRICS_CONFIG_PATH: .asyncapi-analytics
-        run: |
-          npm ci --no-audit --no-fund
-          out="$GITHUB_WORKSPACE/build/generated-docs/messaging"
-          for spec in ../*-async-api-v*.yaml; do
-            v="$(basename "$spec" .yaml | sed -e 's/.*-async-api-//')"
-            npx asyncapi validate "$spec"
-            npx asyncapi generate fromTemplate "$spec" @asyncapi/html-template \
-              -o "$out/$v" --force-write -p singleFile=true
-          done
-
-      - name: Generate GraphQL documentation
-        if: hashFiles('apis/graphql-server/docs/package.json') != ''
-        working-directory: apis/graphql-server/docs
-        run: |
-          npm ci --no-audit --no-fund
-          out="$GITHUB_WORKSPACE/build/generated-docs/graphql-server"
-          for sdl in ../*-v*.graphqls; do
-            v="$(basename "$sdl" .graphqls | sed -e 's/.*-\(v[0-9]*\)$/\1/')"
-            npx spectaql "spectaql-$v.yml" --target-dir "$out/$v"
-            node build-voyager.mjs "$sdl" "$out/$v/voyager" "GraphQL schema $v"
-          done
-
-      - name: Install Antora
-        working-directory: docs
-        run: npm ci
-
-      - name: Build Antora docs
-        working-directory: docs
-        run: npx antora antora-playbook.yml
-
-      - name: Merge documentation
-        run: |
-          touch ./docs/build/site/.nojekyll
-          cp -r ./docs/build/site ./doc
-          mkdir -p ./doc/api/kdoc
-          # Dokka: the root-aggregated site when the root project aggregates, otherwise one site per module
-          # under doc/api/kdoc/<module-path>/.
-          if [ -f ./build/dokka/html/index.html ]; then
-            cp -r ./build/dokka/html/. ./doc/api/kdoc/
-          else
-            while IFS= read -r dir; do
-              module="$(dirname "$(dirname "$(dirname "$dir")")")"; module="${module#./}"
-              mkdir -p "./doc/api/kdoc/$module" && cp -r "$dir"/. "./doc/api/kdoc/$module/"
-            done < <(find . -type d -path '*/build/dokka/html' -not -path './node_modules/*' -not -path './build-logic/*')
-          fi
-          # Generated API documentation — same merge as the Maven template, from build/ instead of target/.
-          while IFS= read -r root; do
-            cp -r "$root"/. ./doc/api/
-          done < <(find . -type d -path '*/build/generated-docs' -not -path './node_modules/*')
-
-      - name: Deploy to GitHub Pages
-        if: success()
-        uses: crazy-max/ghaction-github-pages@v5
-        with:
-          target_branch: gh-pages
-          build_dir: ./doc
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
+Template: `templates/kotlin-gradle/.github/workflows/build.yml` — read it in full before filling placeholders
 
 Gradle-specific variant rules, on top of the Maven template's:
 
@@ -857,103 +416,7 @@ Gradle-specific variant rules, on top of the Maven template's:
 
 ## Step 2 — `deploy.yml`
 
-```yaml
-name: Deploy
-
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: Target environment
-        required: true
-        type: choice
-        options: [ dev, prod ]        # from the infra/envs/* directories found in Step 0
-      image_tag:
-        description: Image tag to deploy (defaults to the commit SHA)
-        required: false
-        type: string
-
-concurrency:
-  # Never let two deploys to the same environment interleave.
-  group: deploy-${{ inputs.environment }}
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-  id-token: write        # required for OIDC; this is the whole reason no access key is needed
-  packages: write
-
-jobs:
-  deploy:
-    name: Deploy to ${{ inputs.environment }}
-    runs-on: ubuntu-latest
-    # The GitHub Environment is where the approval gate and the environment-scoped secrets live.
-    environment: ${{ inputs.environment }}
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-          cache: maven
-
-      - name: Resolve image tag
-        id: meta
-        run: echo "tag=${{ inputs.image_tag || github.sha }}" >> "$GITHUB_OUTPUT"
-
-      # --- Cloud authentication: keyless, via OIDC. No stored access key. ---
-      # AWS variant:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-      # Google Cloud variant (use instead of the above):
-      # - uses: google-github-actions/auth@v3
-      #   with:
-      #     workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-      #     service_account: ${{ secrets.GCP_DEPLOY_SERVICE_ACCOUNT }}
-
-      - name: Build and push the container image
-        # spring-boot:build-image uses Cloud Native Buildpacks — no Dockerfile to maintain, and the
-        # resulting image is layered so unchanged dependencies aren't re-pushed.
-        run: |
-          mvn -B -ntp -pl boot -am spring-boot:build-image -DskipTests \
-            -Dspring-boot.build-image.imageName=${{ vars.IMAGE_REPOSITORY }}:${{ steps.meta.outputs.tag }} \
-            -Dspring-boot.build-image.publish=true \
-            -Ddocker.publishRegistry.username=${{ secrets.REGISTRY_USERNAME }} \
-            -Ddocker.publishRegistry.password=${{ secrets.REGISTRY_PASSWORD }}
-
-      - name: Set up OpenTofu
-        uses: opentofu/setup-opentofu@v2
-
-      - name: Tofu init
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: tofu init
-
-      - name: Tofu plan
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: tofu plan -input=false -var="image_tag=${{ steps.meta.outputs.tag }}" -out=tfplan
-
-      - name: Tofu apply
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: tofu apply -input=false -auto-approve tfplan
-
-      - name: Smoke check
-        # Fail the deploy if the service never becomes healthy, rather than reporting success
-        # because `apply` returned 0.
-        run: |
-          url="$(cd infra/envs/${{ inputs.environment }} && tofu output -raw service_health_url)"
-          for _ in $(seq 1 30); do
-            if curl -fsS "$url" >/dev/null; then echo "Healthy"; exit 0; fi
-            sleep 10
-          done
-          echo "::error::Service did not become healthy within 5 minutes"
-          exit 1
-```
+Template: `templates/maven/.github/workflows/deploy.yml` — read it in full before filling placeholders
 
 Points to resolve from the survey rather than copy blindly:
 
@@ -978,53 +441,7 @@ Points to resolve from the survey rather than copy blindly:
 Same workflow, triggers, concurrency, permissions, OIDC and OpenTofu steps; replace the JDK, tag and image steps
 with:
 
-```yaml
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          cache-provider: basic
-
-      - name: Resolve image tag
-        id: meta
-        # The project version lives in gradle.properties (`version=`), the Gradle counterpart of the pom's
-        # <version>. The default tag is <version>-<short sha>: traceable to the release and still unique per
-        # commit, so an immutable-tag registry policy never rejects a redeploy of a SNAPSHOT.
-        env:
-          # Passed through env, not interpolated into the script, so a crafted input can't inject shell.
-          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
-        run: |
-          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' gradle.properties | tr -d '[:space:]')"
-          if [ -z "$version" ]; then
-            echo "::error::No version= line in gradle.properties"; exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=${IMAGE_TAG_INPUT:-${version}-${GITHUB_SHA::7}}" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to the container registry
-        # bootBuildImage has no command-line options for registry credentials; when none are configured in
-        # boot/build.gradle.kts it falls back to ~/.docker/config.json, which this step writes. For ECR or
-        # Artifact Registry use the OIDC-derived login instead (aws-actions/amazon-ecr-login, or
-        # `gcloud auth configure-docker`) and drop the two REGISTRY_* secrets.
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ vars.IMAGE_REGISTRY }}
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
-
-      - name: Build and push the container image
-        # bootBuildImage is the Gradle counterpart of spring-boot:build-image — Cloud Native Buildpacks, layered
-        # image, no Dockerfile. --imageName/--publishImage are the plugin's own command-line options.
-        run: |
-          ./gradlew :boot:bootBuildImage -x test -x integrationTest \
-            --imageName=${{ vars.IMAGE_REPOSITORY }}:${{ steps.meta.outputs.tag }} \
-            --publishImage
-```
+Template: `templates/kotlin-gradle/.github/workflows/deploy.yml.jdk-tag-image` — read it in full before filling placeholders
 
 - `:boot:` is the Gradle path of the `boot` project from `settings.gradle.kts` — use the real one from the survey.
 - `bootBuildImage` depends on `bootJar` (written to `boot/build/libs/`, not `boot/target/`); nothing else in the
@@ -1034,84 +451,155 @@ with:
 - `IMAGE_REGISTRY` (the registry host, e.g. `ghcr.io` or `<account>.dkr.ecr.<region>.amazonaws.com`) is one more
   environment variable than the Maven variant needs — list it in Step 4's table only for the Gradle variant.
 
+## Step 2b — Rolling `deploy.yml` (only when rolling deployments are enabled)
+
+Generated **instead of** the single-job `deploy.yml` of Step 2 when rolling is enabled (`deploy.rolling.enabled: true`
+in the manifest, or `rolling: yes` in `args`) **and** `strategy` is `blue-green`, `canary` or `linear`. With rolling
+disabled or absent, Step 2's template is used byte-for-byte as written — nothing in this Step applies.
+
+Design (decided by the platform skill, repeated here because the workflows implement it): **the workflow drives the
+traffic shifting and the rollout state lives in the cloud** — never in GitHub (no artifacts, variables or run
+history are read back). Every run first asks the platform "is a rollout in progress, what is the current split?", so
+`deploy.yml`, `promote.yml` and `undeploy.yml` are stateless and safe to re-run. A new version ("green", the
+*candidate*) always deploys at **0 % production traffic**, is smoke-tested on its candidate URL, and is then shifted
+in steps while the previous version ("blue", the *stable* one) keeps running for rollback.
+
+`strategy: rolling` has no second environment and no traffic split. For it, generate Step 2's single-job template
+plus **one extra step after `Tofu apply`** that waits for the runtime's native rolling update to settle and fail the
+deploy if it does not — ECS: `aws ecs wait services-stable --cluster "${{ vars.ECS_CLUSTER }}" --services "${{ vars.ECS_SERVICE }}"`
+(the deployment circuit breaker the platform skill enables rolls back on failure); Cloud Run: nothing extra (the
+revision only takes traffic once healthy); Kubernetes: `kubectl rollout status deployment/<name> --timeout=10m`. It
+generates **no `promote.yml`** (there is nothing to promote between) and `advance` is `auto`. Rollback is weaker: re-run
+`deploy.yml` with the previous `image_tag`. Say so in the report.
+
+### Contract with the platform skill
+
+The templates below rely on exactly this from `iru-setup-java-springboot-platform` (its "Rolling deployments"
+section); if the generated `infra/` disagrees, fix the mismatch in the generated workflows and report it:
+
+| Runtime | The workflow assumes |
+|---|---|
+| ECS Fargate | `tofu output -json rollout_target_groups` = `{"blue":{"name":…,"arn":…},"green":{…}}`; `rollout_alarm_names` = JSON list; slot services named `<ECS_SERVICE>-blue` / `<ECS_SERVICE>-green` in cluster `ECS_CLUSTER`; per-slot variables `image_tag_blue` / `image_tag_green`; the production listener is the only listener whose default action forwards to **both** target groups (the test listener forwards to green only) and has `ignore_changes` on its weights; the deploy role may also call `elasticloadbalancing:AddTags`, `RemoveTags`, `DescribeTags` on that listener (the workflow stores *which slot is the candidate* in a listener tag `rollout-candidate` — a 50/50 split cannot say which side is stable) |
+| Cloud Run | a service `CLOUD_RUN_SERVICE` whose `traffic` is pinned and `ignore_changes`-d, so a new revision gets 0 %; the deploy identity may update traffic and tags on that service; `image_tag` variable |
+| EKS / GKE Autopilot | `rollout_name` = an Argo `Rollout` in namespace `K8S_NAMESPACE` whose **first steps are `setWeight: 0` then `pause: {}`** (the new version is deployed at 0 %, and the first `promote` moves it to step 1) for `canary`, or `autoPromotionEnabled: false` for `blueGreen`; `image_tag` variable; for `auto`/`hybrid` an `AnalysisTemplate` referenced from the steps |
+
+### The rollout functions (runtime-specific, embedded in `deploy.yml` and `promote.yml` and `undeploy.yml`)
+
+Both workflows (and `undeploy.yml`) need the same logic, so each writes the same shell library to
+`$RUNNER_TEMP/rollout.sh` in a step called `Load rollout functions` and `source`s it. Use the block for the detected
+runtime and embed it **verbatim and identically** in every file. Shared contract of every block: `rollout_init`
+(read the state from the cloud), `rollout_active` (a rollout is in progress), `rollout_current` (candidate percent),
+`rollout_set <pct>`, `rollout_gate_ok`, `rollout_finalise`, `rollout_rollback` (restore 100 % stable, retire the
+candidate), `rollout_abort` (restore 100 % stable, leave the candidate running for debugging). The runtime-independent
+helpers `next_step` and `gate_wait` are identical everywhere and come first. The workflow passes `STEPS` (the
+manifest's steps, space-separated, e.g. `10 50 100`), `BAKE_MINUTES`, `ADVANCE` and `TF_DIR` as `env`.
+
+Template: `templates/rolling/rollout-functions/common.sh` — read it in full before filling placeholders
+
+**AWS — ECS Fargate** (needs `ECS_CLUSTER`, `ECS_SERVICE` environment variables):
+
+Template: `templates/rolling/rollout-functions/ecs.sh` — read it in full before filling placeholders
+
+(`scale_slot_down` scales *the slot it is given* to zero and clears the `rollout-candidate` marker: the old stable slot at
+finalise, the candidate at rollback.)
+
+**Google Cloud — Cloud Run** (needs `CLOUD_RUN_SERVICE`; `GCP_REGION`, `GCP_PROJECT_ID`; optional `ERROR_RATE_MAX`,
+default `0.02`). State is two revision **tags**: `stable` on the revision serving production and `candidate` on the new one.
+
+Template: `templates/rolling/rollout-functions/cloud-run.sh` — read it in full before filling placeholders
+
+**EKS / GKE Autopilot — Argo Rollouts** (needs `K8S_NAMESPACE`; the `kubectl-argo-rollouts` plugin is installed by a
+workflow step, see the templates). Percentages are derived from the `Rollout`'s `currentStepIndex`; the analysis
+(`AnalysisTemplate`) runs inside the cluster, so the gate is "the Rollout is not Degraded/aborted".
+
+Template: `templates/rolling/rollout-functions/kubernetes.sh` — read it in full before filling placeholders
+
+### The staged `deploy.yml`
+
+Maven shown; the Gradle variant swaps only the JDK/Gradle/tag/registry/image steps exactly as in Step 2's Gradle
+variant (and publishes the same `tag` job output). The AWS ECS runtime is shown; the other runtimes are the swaps
+listed under the template. `<…>` are filled from the survey and manifest; `STEPS`/`BAKE_MINUTES`/`ADVANCE`/
+`STRATEGY` are written as literals from `deploy.rolling` — they are not secrets.
+
+Template: `templates/rolling/workflows/deploy.yml` — read it in full before filling placeholders
+
+Notes on the template, to apply when generating:
+
+- **`advance: manual`** — omit the `shift` job (and `shift` from `rollback`'s `needs`/`if`) and add a last job
+  `announce` (`needs: smoke-candidate`) that writes the candidate URL and "run **promote.yml** with target `next`" to
+  `$GITHUB_STEP_SUMMARY`. The run ends with the new version deployed at 0 %.
+- **`blue-green`** — `STEPS: "100"`: the shift is a single cutover. With `advance: hybrid` the human confirmation is
+  the whole point of the strategy, so on `prod` the cutover must wait for `promote.yml`: add
+  `&& inputs.environment != 'prod'` to the `shift` job's `if` and generate the `announce` job (as for `manual`) with
+  `if: inputs.environment == 'prod'`; `dev` auto-advances.
+- **First deploy** of an environment (no rollout outputs yet) is applied at 100 % and the staged jobs are skipped.
+- **Cloud Run** — auth with `google-github-actions/auth@v3` + `google-github-actions/setup-gcloud@v3`; env
+  `CLOUD_RUN_SERVICE`, `GCP_REGION`, `GCP_PROJECT_ID`, optional `ERROR_RATE_MAX` from `vars`; the `Plan and apply`
+  step passes `-var="image_tag=$TAG"` and detects a first deploy with `has_output rollout_candidate_url`; after
+  `apply` it calls `rollout_mark_candidate` (the revision exists only now) followed by `echo "marked=true" >>
+  "$GITHUB_OUTPUT"`, then `echo "candidate_url=$(rollout_candidate_url)"` (fall back to `tfout rollout_candidate_url`) and the same
+  0 % guard; there is no slot or ECS scaling code.
+- **EKS / GKE** — after cloud auth add `aws eks update-kubeconfig --name "${{ vars.EKS_CLUSTER_NAME }}"` /
+  `google-github-actions/get-gke-credentials@v3` (`cluster_name: ${{ vars.GKE_CLUSTER_NAME }}`), install the Argo
+  Rollouts kubectl plugin (a **pinned** release from `argoproj/argo-rollouts`, checksum-verified against the
+  release's `argo-rollouts-checksums.txt`; resolve the current version live), `-var="image_tag=$TAG"`, and in the
+  candidate smoke test use `kubectl run smoke --rm -i --restart=Never --image=curlimages/curl -n "$K8S_NAMESPACE" --
+  -fsS "$CANDIDATE_URL"` when the URL is cluster-internal (`*.svc.cluster.local`) because the runner cannot resolve it.
+  The Rollout deploys paused at its first step (0 %); `rollout_active` is then true until it is promoted to 100 %.
+  Detect a first deploy with `has_output rollout_name`, and write `marked=true` to `$GITHUB_OUTPUT` right after the
+  `apply` that starts the new Rollout revision.
+- **`marked`** must be written to `$GITHUB_OUTPUT` before any later command can fail: outputs written by a step that
+  then fails are still published, which is what lets `rollback` act on a failed apply but not on a refused deploy.
+- Untrusted inputs never reach a shell as `${{ … }}` text: `image_tag` and `target` go through `env`
+  (`IMAGE_TAG_INPUT`, `TAG`, `TARGET`); the only `${{ inputs.environment }}` inside scripts is a `choice` input, whose
+  value is limited to the generated option list. The Gradle variant keeps its `meta` step as in Step 2.
+
+## Step 2c — `promote.yml` (only when rolling deployments are enabled and `strategy` is not `rolling`)
+
+The human "this step is safe" signal. A separate `workflow_dispatch` workflow — **not** a GitHub Environment
+approval: required reviewers on private repositories need GitHub Enterprise, so they cannot be the mechanism on
+every plan, and a job waiting for approval would hold a runner open between steps. `promote.yml` is stateless: it
+reads the current split from the cloud, validates, moves one step, and ends.
+
+Template: `templates/rolling/workflows/promote.yml` — read it in full before filling placeholders
+
+- The `target` options are generated from the manifest: `next`, every step as a quoted string, `rollback`, `abort`
+  (choice inputs are static, so a changed `steps` list means regenerating this file — that is what
+  `/iru-springboot-rolling-deployments` does).
+- Use the same cloud auth / kubeconfig / plugin steps as `deploy.yml` for the detected runtime (Cloud Run, EKS/GKE).
+  The `env:` block carries the same runtime variables as `deploy.yml`.
+- **Do not add `needs`-style approval or Environment reviewers here** — see Step 4's advice on who may dispatch it.
+
 ## Step 3 — `undeploy.yml`
 
 This workflow destroys things, so its guards are the feature, not the ceremony.
 
-```yaml
-name: Undeploy
+Template: `templates/common/.github/workflows/undeploy.yml` — read it in full before filling placeholders
 
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: Environment to undeploy
-        required: true
-        type: choice
-        options: [ dev, prod ]
-      mode:
-        description: stop = scale the service to zero (infrastructure kept); destroy = delete all infrastructure
-        required: true
-        type: choice
-        options: [ stop, destroy ]
-        default: stop
-      confirmation:
-        description: Type the environment name exactly to confirm
-        required: true
-        type: string
+**When rolling deployments are enabled** (and `strategy` is not `rolling`), change the template as follows — with
+rolling off it stays exactly as above:
 
-concurrency:
-  group: deploy-${{ inputs.environment }}     # same group as deploy.yml: never both at once
-  cancel-in-progress: false
-
-permissions:
-  contents: read
-  id-token: write
-
-jobs:
-  undeploy:
-    name: ${{ inputs.mode }} ${{ inputs.environment }}
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
-    steps:
-      - name: Verify the typed confirmation
-        # Cheap, and it has stopped a wrong-environment destroy more than once.
+- It already shares `concurrency: deploy-${{ inputs.environment }}` with `deploy.yml`; `promote.yml` uses the same
+  group, so a teardown never interleaves with a deploy or a promotion.
+- Add the workflow-level `env:` block (`TF_DIR`, and the runtime variables `ECS_CLUSTER`/`ECS_SERVICE`, or
+  `CLOUD_RUN_SERVICE`/`GCP_REGION`/`GCP_PROJECT_ID`, or `K8S_NAMESPACE`) and, after `Tofu init`, two steps — `Load
+  rollout functions` (the same block as `deploy.yml`) and **`Reset the rollout to the stable version`**:
+  ```yaml
+      - name: Reset the rollout to the stable version
+        # Never tear down (or scale to zero) an environment that is mid-rollout without first returning all traffic to
+        # the stable version: otherwise the "stop" leaves a half-shifted split behind for the next deploy to trip over.
         run: |
-          if [ "${{ inputs.confirmation }}" != "${{ inputs.environment }}" ]; then
-            echo "::error::Confirmation '${{ inputs.confirmation }}' does not match environment '${{ inputs.environment }}'."
-            exit 1
+          source "$RUNNER_TEMP/rollout.sh"
+          if has_output rollout_target_groups || has_output rollout_name || has_output rollout_gate; then
+            rollout_init
+            if rollout_active; then rollout_rollback; fi
           fi
-
-      - name: Check out code
-        uses: actions/checkout@v7
-
-      - name: Configure cloud credentials
-        # Same OIDC step as deploy.yml
-        run: echo "replace with the AWS or Google Cloud OIDC auth action"
-
-      - name: Set up OpenTofu
-        uses: opentofu/setup-opentofu@v2
-
-      - name: Tofu init
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: tofu init
-
-      - name: Stop the service (scale to zero)
-        if: inputs.mode == 'stop'
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: |
-          tofu apply -input=false -auto-approve -var="desired_count=0" -var="min_instances=0"
-
-      - name: Show the destroy plan
-        if: inputs.mode == 'destroy'
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: tofu plan -destroy -input=false -out=tfdestroy
-
-      - name: Destroy the environment
-        if: inputs.mode == 'destroy'
-        working-directory: infra/envs/${{ inputs.environment }}
-        run: tofu apply -input=false -auto-approve tfdestroy
-```
+  ```
+  (the guard makes it a no-op for an environment that was never deployed or has no rollout outputs, and fails the
+  teardown if the state cannot be read, rather than skipping the reset).
+- For `mode: stop`, scale **both** ECS slot services (`$ECS_SERVICE-blue`, `$ECS_SERVICE-green`) to zero as well as
+  passing the `desired_count`/`min_instances` variables the platform skill defines; on Cloud Run and Kubernetes the
+  existing variables already cover it.
 
 Additional guards to put in, and to explain in the report:
 
@@ -1121,7 +609,8 @@ Additional guards to put in, and to explain in the report:
   fails on them rather than silently deleting a production database. That means `destroy` on `prod` will error
   until someone deliberately removes the protection — which is correct behaviour, not a bug. Say this explicitly.
 - Recommend restricting `prod` in the Environment settings to required reviewers **and** a deployment branch rule,
-  so this workflow can't be dispatched from an arbitrary branch.
+  so this workflow can't be dispatched from an arbitrary branch (required reviewers on a *private* repository need
+  GitHub Enterprise; see "Who may promote" in Step 4).
 - Consider omitting `prod` from the `destroy` path entirely for a service holding real data, and say so as a
   recommendation.
 
@@ -1132,94 +621,7 @@ the library-repository equivalent). Four independent jobs, each gated by the mat
 Step 0 (default on) — omit a job's steps entirely when its flag is `no`, rather than disabling it with a
 permanently-false `if:`.
 
-```yaml
-name: Security
-
-on:
-  push:
-    branches: [ <main-branch> ]
-  pull_request:
-    branches: [ <integration-branch>, <main-branch> ]
-  schedule:
-    # Weekly, so a CVE disclosed after code was merged is still caught — not just at merge time.
-    - cron: '0 6 * * 1'
-  workflow_dispatch: {}
-
-permissions:
-  contents: read
-
-jobs:
-  dependency-review:
-    name: Dependency review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-      - name: Dependency review
-        uses: actions/dependency-review-action@v5
-
-  codeql:
-    name: CodeQL analysis
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        # java-kotlin covers the whole reactor. javascript-typescript is added here whenever the manifest's
-        # frontend: hilla — iru-setup-java-springboot-hilla scaffolds real TS/TSX source under
-        # <web-module>/src/main/frontend/ for CodeQL to actually analyse.
-        language: [ java-kotlin, javascript-typescript ]  # drop javascript-typescript when frontend: none
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-      - name: Set up JDK <java-version>
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: <java-version>
-          cache: maven
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: ${{ matrix.language }}
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v4
-      - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v4
-
-  osv-scanner:
-    name: OSV-Scanner
-    permissions:
-      contents: read
-      security-events: write
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.7.0
-    with:
-      scan-args: |-
-        --recursive
-        ./
-
-  gitleaks:
-    name: Secret scan (gitleaks)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out code
-        uses: actions/checkout@v7
-        with:
-          # gitleaks needs full history to scan commits already merged, not just the current tree.
-          fetch-depth: 0
-      - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@v3
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
+Template: `templates/maven/.github/workflows/security.yml` — read it in full before filling placeholders
 
 Drop whichever `jobs:` entries the matching `security-*` flag turned off — a job that never runs because its own
 condition is always false is dead YAML, same reasoning as the Sonar step above. If all four are off, still write
@@ -1237,98 +639,18 @@ CodeQL can't extract Kotlin without a real compilation:
    nothing to compare without it). It resolves the build's dependency graph with Gradle and submits it to GitHub,
    on pushes (the base snapshot) and on pull requests (the head snapshot the review compares against):
 
-   ```yaml
-     dependency-submission:
-       name: Submit Gradle dependency graph
-       # Needs contents: write, which a pull request from a fork never gets — skipped there.
-       if: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) }}
-       runs-on: ubuntu-latest
-       permissions:
-         contents: write
-       steps:
-         - name: Check out code
-           uses: actions/checkout@v7
-         - name: Set up JDK <java-version>
-           uses: actions/setup-java@v6
-           with:
-             distribution: temurin
-             java-version: <java-version>
-         - name: Generate and submit dependency graph
-           uses: gradle/actions/dependency-submission@v6
-           with:
-             cache-provider: basic
-   ```
+   Template: `templates/kotlin-gradle/.github/workflows/security.yml.dependency-submission` — read it in full before filling placeholders
 
    and make `dependency-review` wait for it and tolerate a snapshot still being processed:
 
-   ```yaml
-     dependency-review:
-       name: Dependency review
-       needs: dependency-submission
-       # !cancelled(): still runs when the submission job was skipped (fork PR), reviewing whatever graph exists.
-       if: ${{ !cancelled() && github.event_name == 'pull_request' }}
-       runs-on: ubuntu-latest
-       permissions:
-         contents: read
-         pull-requests: write
-       steps:
-         - name: Check out code
-           uses: actions/checkout@v7
-         - name: Dependency review
-           uses: actions/dependency-review-action@v5
-           with:
-             retry-on-snapshot-warnings: true
-             retry-on-snapshot-warnings-timeout: 600
-   ```
+   Template: `templates/kotlin-gradle/.github/workflows/security.yml.dependency-review` — read it in full before filling placeholders
 
    Also add `push: branches: [ <integration-branch>, <main-branch> ]` (both, not just main) so each base branch a
    pull request targets has a submitted snapshot to compare against.
 2. **CodeQL builds manually.** Replace the matrix and the `Autobuild` step with a per-language build mode
    (`build-mode: none` is not an option for Kotlin — CodeQL then skips every Kotlin file with a warning):
 
-   ```yaml
-       strategy:
-         fail-fast: false
-         matrix:
-           include:
-             - language: java-kotlin
-               build-mode: manual
-             # frontend: hilla only
-             - language: javascript-typescript
-               build-mode: none
-       steps:
-         - name: Check out code
-           uses: actions/checkout@v7
-         - name: Set up JDK <java-version>
-           if: matrix.build-mode == 'manual'
-           uses: actions/setup-java@v6
-           with:
-             distribution: temurin
-             java-version: <java-version>
-         - name: Set up Gradle
-           if: matrix.build-mode == 'manual'
-           uses: gradle/actions/setup-gradle@v6
-           with:
-             cache-provider: basic
-         - name: Initialize CodeQL
-           uses: github/codeql-action/init@v4
-           with:
-             languages: ${{ matrix.language }}
-             build-mode: ${{ matrix.build-mode }}
-         - name: Compile for CodeQL
-           if: matrix.build-mode == 'manual'
-           # CodeQL only sees what is actually compiled while it traces the build: `clean` + --no-build-cache stop
-           # Gradle restoring classes from a cache, --no-daemon keeps the compiler inside the traced process tree,
-           # and the in-process Kotlin strategy keeps kotlinc out of the separate Kotlin daemon. No tests, no
-           # detekt/ktlint — compilation (main + test sources, including codegen) is all CodeQL needs.
-           run: >-
-             ./gradlew --no-daemon --no-build-cache clean assemble testClasses
-             -Pkotlin.compiler.execution.strategy=in-process
-         - name: Perform CodeQL analysis
-           uses: github/codeql-action/analyze@v4
-           with:
-             category: /language:${{ matrix.language }}
-   ```
+   Template: `templates/kotlin-gradle/.github/workflows/security.yml.codeql-build` — read it in full before filling placeholders
 
    CodeQL supports a bounded Kotlin range (1.8.0 up to 2.4.x at the time of writing — see
    https://codeql.github.com/docs/codeql-overview/supported-languages-and-frameworks/); if `project.kotlinVersion` is
@@ -1338,48 +660,7 @@ CodeQL can't extract Kotlin without a real compilation:
 `.github/dependabot.yml` is **always** generated, independent of the four flags above — dependency-update PRs and
 vulnerability scanning are separate concerns, and this catalog's convention keeps Dependabot on unconditionally:
 
-```yaml
-version: 2
-updates:
-  - package-ecosystem: maven
-    directory: "/"
-    schedule:
-      interval: weekly
-    groups:
-      maven-dependencies:
-        patterns: [ "*" ]
-
-  - package-ecosystem: docker
-    # This reactor builds its image with Cloud Native Buildpacks (spring-boot:build-image), so there is
-    # normally no Dockerfile — but Dependabot's docker ecosystem also tracks image tags referenced from
-    # compose.yaml at the repository root (written by iru-setup-java-springboot-testcontainers), which is
-    # what this entry actually keeps current: Postgres/MongoDB/Kafka/etc. and the API-mock image.
-    directory: "/"
-    schedule:
-      interval: weekly
-    groups:
-      docker-dependencies:
-        patterns: [ "*" ]
-
-  # Only when the manifest's `frontend` field isn't `none` (e.g. `hilla`) — directory is the real web module
-  # iru-setup-java-springboot-hilla scaffolded the frontend into (survey Step 0; normally "/boot"), since
-  # that's where package.json/package-lock.json actually live, never "/" or "/<web-module>/src/main/frontend".
-  - package-ecosystem: npm
-    directory: "/boot"
-    schedule:
-      interval: weekly
-    groups:
-      npm-dependencies:
-        patterns: [ "*" ]
-
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      interval: weekly
-    groups:
-      github-actions-dependencies:
-        patterns: [ "*" ]
-```
+Template: `templates/maven/.github/dependabot.yml` — read it in full before filling placeholders
 
 Omit the `npm` entry entirely when the manifest's `frontend: none` — an ecosystem entry for a toolchain that
 doesn't exist yet gives Dependabot nothing to scan and just adds noise to its config. When `frontend: hilla`, set
@@ -1396,15 +677,7 @@ For **`buildTool: gradle`**, replace the `maven` entry with a `gradle` one. Depe
 `gradle/libs.versions.toml` and the build scripts, and also bumps the wrapper (`gradle-wrapper.properties`); the
 `build-logic/` included build declares plugin dependencies of its own, so list it as a second directory:
 
-```yaml
-  - package-ecosystem: gradle
-    directories: [ "/", "/build-logic" ]
-    schedule:
-      interval: weekly
-    groups:
-      gradle-dependencies:
-        patterns: [ "*" ]
-```
+Template: `templates/kotlin-gradle/.github/dependabot.yml.gradle-entry` — read it in full before filling placeholders
 
 Drop `"/build-logic"` if the survey finds no `build-logic/build.gradle.kts`. Kotlin + Maven keeps the `maven` entry.
 
@@ -1421,6 +694,9 @@ Report these as a table; this skill cannot create them.
 | `IMAGE_REPOSITORY` | environment variable | the registry path the image is pushed to |
 | `IMAGE_REGISTRY` | environment variable | the registry host `docker/login-action` logs in to — **Gradle variant only**, and only while the `REGISTRY_*` secrets below are used |
 | `REGISTRY_USERNAME`, `REGISTRY_PASSWORD` | environment secrets | registry push credentials — **only for a third-party registry**; omit both when the image goes to ECR or Artifact Registry through the OIDC-derived login (Step 2) |
+| `ECS_CLUSTER`, `ECS_SERVICE` | environment variables | **rolling, ECS only** — the cluster and the base service name (slot services are `<ECS_SERVICE>-blue` / `-green`); must match the platform skill's resources |
+| `CLOUD_RUN_SERVICE` | environment variable | **rolling, Cloud Run only** — the service whose revisions are tagged `stable`/`candidate`; reuses `GCP_PROJECT_ID`/`GCP_REGION`; optional `ERROR_RATE_MAX` (default `0.02`) tunes the 5xx gate |
+| `EKS_CLUSTER_NAME` or `GKE_CLUSTER_NAME`, `K8S_NAMESPACE` | environment variables | **rolling, Kubernetes only** — kubeconfig and the namespace of the Argo `Rollout` (its name comes from the `rollout_name` output) |
 | `<PROVIDER>_API_KEY` | environment secret | LLM provider key, if `stack.ai.enabled` — never in the repository |
 | third-party provider tokens (`MONGODB_ATLAS_*`, `CONFLUENT_CLOUD_*`, …) | environment secrets | needed by the OpenTofu providers for managed services outside the cloud account |
 
@@ -1434,7 +710,20 @@ The Gradle variant adds no secret either: `gradle/actions/setup-gradle` and `dep
 there is no Develocity/Gradle account or access key involved. Kotlin itself (detekt, ktlint, Dokka) needs nothing.
 Also required, and easy to miss:
 
-- **A GitHub Environment per deployment environment**, with required reviewers on `prod`.
+- **A GitHub Environment per deployment environment**, with required reviewers on `prod` where the plan allows it
+  (public repositories, or GitHub Pro/Team/Enterprise on private ones — for private repositories on the lower plans
+  required reviewers are an Enterprise feature) and a **deployment branch rule on `prod`** limiting it to the main
+  branch. The rolling templates also refuse a `prod` run from any other branch themselves, but the branch rule is
+  the control that holds.
+- **Who may promote (rolling deployments only).** `promote.yml` is a `workflow_dispatch` workflow, so anyone with
+  **repository write access** can dispatch it — including `target: 100`, `rollback` and `abort` on `prod`. This is
+  deliberately **not** gated by Environment required reviewers (unavailable on private repositories below Enterprise,
+  and a job waiting for approval would hold a runner open between steps). Treat that as a **security finding to
+  state in the report**: the "this step is safe" signal is as trustworthy as your write-access list. Mitigate by
+  restricting `prod` with a deployment branch rule, a ruleset/CODEOWNERS on `.github/workflows/`, keeping write
+  access small, and — on a private Enterprise repository — adding required reviewers to the `prod` Environment (the
+  `promote` job already declares `environment:`, so it then pauses for approval with no template change). The metric
+  gate still runs in `promote.yml`, so a human cannot promote past a failing gate.
 - **GitHub Pages** configured to serve from the `gh-pages` branch (Settings → Pages), or the docs job publishes
   into a branch nobody reads — only when `ci.pages: yes`. For a private/internal repository that needs GitHub
   Pro, Team, or Enterprise Cloud, and the site is public unless Enterprise Cloud private Pages access control is
@@ -1485,6 +774,13 @@ Also required, and easy to miss:
   a module-not-found error from `vite.generated.ts` (it imports compiled helpers under `<web-module>/target/`)
   that has nothing to do with the frontend tests — confirmed while writing `iru-setup-java-springboot-hilla`, and
   the single most likely way this ordering gets silently swapped in a future edit.
+- Rolling deployments: lint `deploy.yml` and `promote.yml` with `actionlint` the same way, run `bash -n` on the
+  embedded rollout-functions block for the runtime (it is a shell library — `shellcheck` it too when available), and
+  read `promote.yml`'s `target` options against the manifest's `steps`. Never trigger `deploy.yml`, `promote.yml` or
+  `undeploy.yml` as a test: the first real exercise should be a deploy to `dev` followed by `promote` steps and one
+  deliberate `rollback`, watched to completion. Anything that needs a live cloud (the PromQL query endpoint, ALB
+  listener discovery, `kubectl argo rollouts` semantics, the tag-based candidate marker) is **unverified** until that
+  `dev` rehearsal — report it as such.
 - Do **not** trigger `deploy.yml` or `undeploy.yml` as a test. Recommend instead: a dry run of `build.yml` by
   pushing to a throwaway branch with the trigger temporarily widened, and a first `deploy.yml` run against `dev`
   only, watched to completion.
@@ -1525,12 +821,21 @@ standard runner, Code scanning or Dependency graph not yet enabled for `security
 missing `<web-module>/src/main/frontend/` (`frontend: hilla` but `iru-setup-java-springboot-hilla` hasn't run
 yet).
 
+Also report the rolling-deployment outcome: **on or off** (and why — `ci: no` forces off), the strategy, advance
+mode, `steps`/`bakeMinutes`, the runtime the rollout functions were generated for, the `deploy.yml` shape
+(single-job / staged) and the action taken, `promote.yml`'s action (**created / updated / replaced / kept as is /
+not generated** — `strategy: rolling` or rolling off — **/ removed**), the new environment variables from Step 4, any
+`rollout_*` output the platform skill has not produced yet, the "who may promote" security finding, and which parts
+could not be verified without a live cloud.
+
 Warn explicitly:
 
 - **Review all workflows before pushing.** `deploy.yml` and `undeploy.yml` change and destroy real
   infrastructure; a wrong environment name or a missing approval gate has immediate consequences.
 - **Configure required reviewers on `prod` before the workflows land on the main branch**, not after — until then,
-  anyone with write access can dispatch a production deploy or teardown.
+  anyone with write access can dispatch a production deploy or teardown. With rolling deployments that includes
+  `promote.yml`; on plans without Environment reviewers the deployment branch rule and the write-access list are the
+  only controls (Step 4, "Who may promote").
 - **Verify the OIDC trust policy is scoped to the repository *and* the environment.**
 - With `ci.tests: full`, integration tests need Docker on the runner; if the compose stack is too heavy for
   `ubuntu-latest`, the first `build.yml` run will fail on resource exhaustion rather than on a code defect — deal

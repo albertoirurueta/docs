@@ -1,41 +1,6 @@
 ---
 name: iru-setup-rust-cli
-description: >-
-  Scaffold an agent-friendly Rust command-line tool at the repository root — a Cargo workspace (`Cargo.toml` with the
-  tool package, version `0.1.0-dev`, edition 2024, `rust-version` = the MSRV computed from the dependency graph, an
-  explicit `[[bin]]`, `[workspace.lints]` with `missing_docs`, `unsafe_code = "forbid"`, Clippy `pedantic` plus
-  `print_stdout`/`print_stderr`/`dbg_macro`, and a release profile with fat LTO, `codegen-units = 1`, stripped symbols
-  and `panic = "unwind"` kept on purpose; `Cargo.lock` committed), `rust-toolchain.toml` (stable + rustfmt, clippy,
-  llvm-tools), `rustfmt.toml`, `deny.toml` (cargo-deny advisories/licenses/bans/sources), `.cargo/config.toml` (the
-  `cargo xtask` alias), a thin `src/main.rs` and a library holding all logic — clap 4 derive tree with the global
-  flags `--format text|json|jsonl`/`--json`/`--no-color`/`--no-input`/`-q`/`-v`/`--log-format`/`--config`
-  (`<BIN>_FORMAT`/`<BIN>_NO_INPUT`/`<BIN>_CONFIG` through clap's `env`), the exit-code enum 0–7/130/143 in one file,
-  a `thiserror` error with the JSON error envelope on stderr, sorted-key compact JSON and a `jsonl` summary line,
-  colour per stream (TTY, `NO_COLOR`, `TERM=dumb`, `FORCE_COLOR`, `--no-color`, machine mode), prompts only on a
-  terminal and never under `--no-input`/`<BIN>_NO_INPUT`/`CI`, flags → env → TOML config file → defaults,
-  SIGINT/SIGTERM → 130/143 (immediate when nothing needs cleanup, deferred with a guard otherwise), broken pipe as a
-  quiet exit 0, a panic as exit 1 — and the commands `greet [NAME] [--ask]`, `completion <shell>`, `schema [COMMAND]`
-  (clap's `Command` walked into JSON with per-command exit codes and safety metadata), `version` and `--version`;
-  with `ui: tui` a Ratatui `browse` picker (TTY-gated → exit 2 with a pointer to `greet --json`, terminal restored on
-  panic and on SIGTERM, state and drawing unit-tested with `TestBackend`, the list rendering only the rows that fit,
-  and — per the catalog's UI contract — a `.ui-quality.yml` at the repository root, a test-only
-  `src/tui/ui_screenshots.rs` helper and UI tests capturing every picker state in each direction as
-  `.ui-screenshots/screen/App/<state>--<direction>--no-color.txt` with the asserted accessibility checks). Tests: in-process tests of `run` with
-  injected terminal facts and environment, assert_cmd + predicates + snapbox golden-file end-to-end tests of the
-  real binary, ~98% line coverage measured with cargo-llvm-cov (80% bar). An `xtask` member generates man pages
-  (clap_mangen), completions (clap_complete) and `docs/modules/ROOT/pages/cli-reference.adoc` (only when the Antora
-  module exists; `--check` for CI). Invoke as `/iru-setup-rust-cli`. Accepts pre-resolved inputs via `args`
-  (`key: value` lines) — `bin-name`, `crate-name`, `description`, `ui` (`none`/`tui`), `msrv`, `branching`
-  (`gitflow`/`main-only`), `license`, `developer-name`, `developer-email`, `organization-url`, `owner`,
-  `repository-url`, `accessibility` (`enforce`/`report`/`off`, `ui: tui` only), `open-source`, `visibility`, `ci`, `sonar` (+ `sonar-organization`/`sonar-project-key`/
-  `sonar-host-url`), `distribution` (`none`/`internal`/`store`), `mode` (`new`/`existing`) and `on-existing`
-  (`ask`/`keep`/`update`/`replace`) — so `iru-setup-cli-repository` can drive it without re-prompting. Announces
-  whether it is scaffolding from scratch or updating; for every file group it owns that already exists it warns and
-  asks Update / Keep as is / Replace / Stop (unless `on-existing` decides), never overwrites hand-written source, and
-  treats a foreign Cargo layout as foreign. Every crate version is looked up live on crates.io with a verified
-  2026-10-16 fallback table. Ends by running the contract's gates (fmt, clippy `-D warnings`, nextest, doctests,
-  rustdoc `-D warnings`, cargo-deny, cargo-llvm-cov, `cargo xtask docs`, an MSRV check) and smoke checks of the
-  release binary on pipes and on a pseudo-terminal.
+description: "/iru-setup-rust-cli [args] scaffolds an agent-friendly Rust command-line tool at the repository root: Cargo workspace with clap, optional Ratatui UI (ui: tui), xtask docs, tests and quality gates implementing the catalog CLI contract. key: value args let iru-setup-cli-repository run it without prompts; asks Update/Keep/Replace/Stop on existing files."
 model: sonnet
 allowed-tools: Read Write Edit AskUserQuestion Bash(cargo *) Bash(rustup *) Bash(rustc *) Bash(curl *) Bash(git *) Bash(gh repo view *) Bash(python3 *) Bash(jq *) Bash(bash *) Bash(mkdir *) Bash(mktemp *) Bash(ls *) Bash(find *) Bash(grep *) Bash(cat *) Bash(test *) Bash(command -v *) Bash(date *) Agent
 ---
@@ -118,7 +83,7 @@ Recognized keys:
   `no-license` condition: no `license` key, `publish = false`); `developer-name`, `developer-email` (→ `authors`);
   `organization-url`, `owner`, `repository-url` (→ `repository`; default `https://github.com/<owner>/<repo>` from
   Step 3).
-- **Shape (this skill)**: `ui` (`none`/`tui`, default `none`); `accessibility` (`enforce`/`report`/`off`, default
+- **Shape (this skill)**: `ui` (`none`/`tui`, default `none`); `accessibility` (`enforce`/`report`/`off`/`none`, default
   `enforce`; only used with `ui: tui` — the level written to `.ui-quality.yml`, which the TUI's UI tests read); `msrv` (the minimum supported Rust version written
   to `rust-version`; default computed in Step 4 — never lower than what Step 4 computes); `branching`
   (`gitflow` → version `0.1.0-dev`, `main-only` → `0.1.0`; default `gitflow`).
@@ -134,6 +99,15 @@ and named in the report. `mode: existing` never means "update silently": Step 1 
 every pre-existing file group. Only `on-existing` skips that question (`keep` = create only missing files;
 `update`/`replace` applied to every existing group; the warning is still printed). Orchestrators forward
 `on-existing` only when their own `args` received it.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (the terminal UI's asserted accessibility checks), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — selection visible without colour, key help on screen, every action reachable by key — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey the repository
 
@@ -198,8 +172,7 @@ Then, with `AskUserQuestion` (skip any resolved):
 - **ui** — **No terminal UI (Recommended)** (`none`: every command is a plain command; styled, TTY-aware output is
   still there) / **Ratatui terminal UI** (`tui`: adds `browse`, a full-screen picker for people; agents and scripts
   keep using `greet --json`; adds ratatui + crossterm and raises the MSRV to 1.88).
-- **accessibility** — only with `ui: tui` and stand-alone (an orchestrator resolves it): "Automated accessibility
-  checks in UI tests?" — **Enforce (Recommended)** (violations fail the UI tests) / **Report only** (listed, never
+- **accessibility** — only with `ui: tui` and stand-alone (an orchestrator resolves it): "Support accessibility and assistive technologies?" — **Enforce (Recommended)** (violations fail the UI tests) / **Report only** (listed, never
   failing) / **Off** (not run). For a terminal UI these are the asserted checks (selection visible without colour,
   key help on screen), not an automated audit.
 - **license** — **MIT OR Apache-2.0 (Recommended)** "the Rust ecosystem's dual license" / **MIT** / **Apache-2.0** /

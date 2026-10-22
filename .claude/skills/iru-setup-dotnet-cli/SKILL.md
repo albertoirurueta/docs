@@ -1,44 +1,6 @@
 ---
 name: iru-setup-dotnet-cli
-description: >-
-  Scaffold an agent-friendly .NET 10 / C# 14 command-line tool at the repository root — `global.json` (SDK pinned,
-  `rollForward: latestFeature`), `Directory.Build.props` (the tool `<Version>` `0.1.0-dev`, nullable, implicit usings,
-  warnings as errors, `AnalysisLevel latest-recommended`, code style enforced in the build, XML docs,
-  `InvariantGlobalization`, one SARIF analyzer log per project), central package management in
-  `Directory.Packages.props` (StyleCop.Analyzers as a `GlobalPackageReference`), `.editorconfig`, `stylecop.json`, a
-  `<ToolName>.slnx` solution, a framework-free `src/<ToolName>.Core` (`net10.0`, `IsAotCompatible`) holding the whole
-  CLI contract — the exit-code enum 0–7/130/143, the JSON error envelope on stderr, deterministic System.Text.Json
-  source-generated output (sorted keys, compact, no reflection), the colour policy per stream (`Console.Is*Redirected`,
-  `NO_COLOR`, `TERM=dumb`, `FORCE_COLOR`, `--no-color`, machine mode), the prompt policy (`--no-input`,
-  `<BIN>_NO_INPUT`, `CI`), SIGINT/SIGTERM through `PosixSignalRegistration` → 130/143 with a second-signal immediate
-  exit, the `schema` model, static bash/zsh/fish/PowerShell completion scripts and an AsciiDoc CLI reference + man
-  page generated from the command tree — and a thin `src/<ToolName>` executable (`AssemblyName <bin>`, Native AOT
-  `PublishAot`, `PackAsTool` with .NET 10 RID-specific tool packages + an `any` fallback for `dotnet tool install`/
-  `dnx`) built on System.CommandLine 2.0 stable (`RootCommand`-free root `Command` named after the binary, `Option<T>`/
-  `Argument<T>`/`SetAction`, `ParserConfiguration` with response files off, usage errors → exit 2, default exception
-  handler and its signal handling off) and Spectre.Console for styled output that obeys the colour policy, with the
-  commands `greet [NAME]`, `completion <shell>`, `schema`, `--version`, a hidden `gen-docs`, and with `ui: tui` a
-  TTY-gated full-screen Terminal.Gui v2 `browse` command whose view (`Tui/BrowseView`) gets UI tests per the catalog's
-  UI contract — rendered on Terminal.Gui's ANSI driver, every state × `.ui-quality.yml` direction captured as
-  `.ui-screenshots/screen/BrowseView/<state>--<direction>--no-color.txt`, with the asserted terminal accessibility
-  checks at the level of a root `.ui-quality.yml`; MSTest 4 + coverlet `tests/<ToolName>.Core.Tests` (~99% Core
-  line/branch coverage) and `tests/<ToolName>.Cli.Tests` running the command tree in-process with captured
-  stdout/stderr (every exit code, JSON goldens, no-TTY/`NO_COLOR` behaviour) plus opt-in published-binary smoke tests;
-  `tests/coverlet.runsettings` and a DocFX `docfx.json` for the Core API. Invoke as `/iru-setup-dotnet-cli`. Accepts
-  pre-resolved inputs via `args` (`key: value` lines) — `tool-name` (PascalCase solution/project name), `bin-name`
-  (the command), `package-id`, `description`, `ui` (`none`/`tui`), `accessibility` (`enforce`/`report`/`off`, only
-  with `ui: tui`), `version`, `branching`, `license`,
-  `developer-name`, `developer-email`, `organization-url`, `owner`, `open-source`, `visibility`, `ci`, `sonar`
-  (+ `sonar-organization`/`sonar-project-key`/`sonar-host-url`), `distribution` (`none`/`internal`/`store`),
-  `channels`, `mode` (`new`/`existing`) and `on-existing` (`ask`/`keep`/`update`/`replace`) — so
-  `iru-setup-cli-repository` can supply them without re-prompting. Announces whether it is scaffolding from scratch
-  or updating; for every file group it owns that already exists it warns and asks Update / Keep as is / Replace / Stop
-  (unless `on-existing` decides), never overwrites hand-written source, and treats a foreign layout (a single-project
-  `dotnet new console` app, System.CommandLine betas, a Spectre.Console.Cli app, a `.sln` with other projects) as
-  foreign — add alongside or stop, never convert. Every version is looked up at run time (NuGet flat-container API,
-  .NET release metadata) with a verified 2026-10-16 fallback table. Use whenever a new .NET command-line tool
-  repository needs its solution, contract plumbing, quality tooling, tests and docs bootstrapped from this house
-  template.
+description: "Invoked as /iru-setup-dotnet-cli with optional key: value args, usually by iru-setup-cli-repository. Scaffolds an agent-friendly .NET 10 / C# command-line tool: slnx solution, framework-free Core, thin System.CommandLine executable with Native AOT, optional Terminal.Gui UI, MSTest tests and DocFX."
 model: sonnet
 allowed-tools: Read Write Edit AskUserQuestion Bash(dotnet *) Bash(docfx *) Bash(curl *) Bash(git *) Bash(gh *) Bash(python3 *) Bash(mkdir *) Bash(find *) Bash(uname *) Agent
 ---
@@ -126,7 +88,7 @@ namespace; default: `bin-name` PascalCased), `bin-name` (the command users type 
 `^[a-z][a-z0-9-]*$`; default: the repository directory name lower-cased), `package-id` (NuGet package id of the .NET
 tool, `[A-Za-z0-9._-]`; default `bin-name` — check `https://api.nuget.org/v3-flatcontainer/<id>/index.json` returns
 404, else warn that the id is taken), `description` (one line: what the tool does and when to use it), `ui`
-(`none`/`tui`, default `none`), `accessibility` (`enforce`/`report`/`off`, default `enforce`; only meaningful with
+(`none`/`tui`, default `none`), `accessibility` (`enforce`/`report`/`off`/`none`, default `enforce`; only meaningful with
 `ui: tui` — the level written to `.ui-quality.yml` for the terminal UI's asserted accessibility checks; ignored and
 named in the report with `ui: none`), `version` (default `0.1.0-dev` for `branching: gitflow`, `0.1.0` for `main-only`),
 `branching` (`gitflow`/`main-only`, default `gitflow`), `license`, `developer-name`, `developer-email`,
@@ -143,6 +105,15 @@ keys from a full shared-args set (`language`, `ci-tests`, `pages`, `cross-os-ci`
 group. Only `on-existing` skips that question (`keep` = create only missing files; `update`/`replace` applied to
 every existing group; the warning is still printed). Orchestrators forward `on-existing` only when their own `args`
 received it.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (the terminal UI's asserted accessibility checks), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — selection visible without colour, key help on screen, every action reachable by key — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey the repository
 
@@ -205,7 +176,7 @@ Then, with `AskUserQuestion` (skip any resolved):
   command). If Step 4 finds no stable (non-prerelease) Terminal.Gui 2.x at all, say so and do not offer `tui` — the
   templates for it target the v2 API.
 - **accessibility** — only with `ui: tui`, stand-alone (an orchestrator resolves it; otherwise default `enforce`):
-  "Automated accessibility checks in UI tests?" — **Enforce (Recommended)** (violations fail the UI tests) / **Report
+  "Support accessibility and assistive technologies?" — **Enforce (Recommended)** (violations fail the UI tests) / **Report
   only** (listed in `.ui-screenshots/a11y-report.txt`, never failing) / **Off** (not run; the coding defaults still
   apply). Say that for a terminal UI these are asserted checks — the selection readable without colour, the key help
   on screen, every action on a key — since no automated accessibility audit exists for terminals.

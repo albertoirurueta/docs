@@ -1,7 +1,6 @@
 ---
 name: iru-typescript-test
-description: >-
-  Run a TypeScript/npm project's unit test suite through whichever runner the project actually has wired — Vitest (`vitest run`), Jest (`jest`), or the Angular CLI's Vitest-backed unit-test builder (`ng test --watch=false`) — optionally scoped to a file, directory, or test-name pattern. Also recognizes NestJS (`@nestjs/core` — ESM/Vitest with `vitest.config.ts` + `vitest.config.e2e.ts`, or CommonJS/Jest with `jest.config.ts` + `test/jest-e2e.json`; unit `*.spec.ts` by default, the `test/*.e2e-spec.ts` suite only on an explicit `e2e` selector, reporting a missing database/Docker/Testcontainers runtime as an environment failure rather than a test failure) and Next.js (`next` — Vitest via `vitest.config.mts` or Jest via `next/jest`; Playwright end-to-end tests, which build and start the app, only on an explicit `e2e` selector, never by default) and React Native for both toolchains (`expo` — Jest with the `jest-expo` preset; `metro`, a bare React Native CLI app — Jest with `@react-native/jest-preset`, or the legacy `react-native` preset on older templates; untranspiled-package `transformIgnorePatterns` failures, missing native-module mocks, and un-awaited React Native Testing Library 14 calls are named as such; device end-to-end tests — Maestro `.maestro/` flows by default, Detox when `.detoxrc.js` is present — only on an explicit `e2e` selector, needing a booted simulator/emulator and Metro on port 8081, serialized repository-wide behind the shared atomic-`mkdir` `.integration-test.lock` (owner file, stale after 60 minutes, released on every exit path; a caller that already holds it passes `lock: held`), and reported "unverified" — never silently skipped — when no device is available) and web UIs with Playwright wired (React/Vite, Angular, Ionic, Next.js — `@playwright/test` + `playwright.config.*`). Every Playwright or Maestro/Detox run is a **UI run** under the catalog's UI contract: it sets `UI_SCREENSHOTS_DIR` (default `<repo root>/.ui-screenshots`), clears that directory at the start of a full (unscoped) UI run, lets Playwright tests write captures there through the project's helper, passes it to Maestro (`-e UI_SCREENSHOTS_DIR`, re-running `ui-flow`-tagged flows once per `.ui-quality.yml` theme with the simulator/emulator switched to light/dark) or to Detox's `e2e/support/ui-screenshots.ts`, collects captures the tools left elsewhere into the contract layout `<kind>/<Id>/<state>--<direction>--<theme>[--<variant>…].png`, validates every file name, and reports screenshot counts per kind, malformed names, accessibility violations (axe rule ids from Playwright's `accessibility-scan-results` attachments, `react-native-a11y/*` ESLint rule ids on React Native — never raw dumps) and the `.ui-quality.yml` level applied. Invoke as `/iru-typescript-test` to run every unit test, or `/iru-typescript-test <selector>` where `<selector>` is a file path, a directory, or a `-t "<name pattern>"` filter (combinable with a file/directory), optionally prefixed with `e2e` or its alias `ui` (NestJS/Next.js/React Native/Playwright-wired web apps only; `ui` is not accepted for NestJS, which has no UI) to run the end-to-end/UI suite instead. Report-only — never fixes a failing test or modifies source/test code. Use whenever the user wants to run, re-run, or narrow down TypeScript/JavaScript unit (or, on request, NestJS/Next.js/React Native end-to-end) tests instead of invoking the runner by hand.
+description: "/iru-typescript-test [e2e|ui] [path|dir|-t \"name\"] - runs a TypeScript/npm project's unit tests through its wired runner (Vitest, Jest, ng test); the optional e2e/ui prefix runs end-to-end or UI suites (NestJS, Next.js, React Native, Playwright). Report-only; never edits code."
 model: haiku
 ---
 
@@ -298,7 +297,7 @@ skill owns the run-level half of that; the tests themselves own the captures.
 
 1. **Resolve the settings** at the repository root (`git rev-parse --show-toplevel`, else the current directory):
    - `UI_SCREENSHOTS_DIR` from the environment (must be absolute) or `<repo root>/.ui-screenshots`.
-   - `.ui-quality.yml`: `accessibility` (`enforce`/`report`/`off`), `directions`, `themes` — a missing file or key
+   - `.ui-quality.yml`: `accessibility` (`enforce`/`report`/`off`/`none`), `directions`, `themes` — a missing file or key
      means `enforce`, `[ltr, rtl]`, `[light, dark]`. Read the three keys with a line match
      (`^accessibility:\s*(\w+)`, `^directions:\s*\[(.*)\]`, `^themes:\s*\[(.*)\]`); anything else is reported
      as "unparsed `.ui-quality.yml`, defaults applied".
@@ -339,6 +338,8 @@ skill owns the run-level half of that; the tests themselves own the captures.
 7. **Apply the level** — `enforce`: any violation makes the UI run **failed** (named as an accessibility failure,
    separate from assertion failures); `report`: violations listed, the run's pass/fail unaffected; `off`: say the
    automated check is off and don't count.
+
+**Accessibility level `none`/`off`.** If `.ui-quality.yml` says `accessibility: none` (opted out entirely) or `off` (rules apply, checks not run), accessibility checks are not applicable: skip them and report "accessibility: opted out" (`none`) or "accessibility checks off" (`off`) - never "unverified" and never a failure.
 
 ## Step 3 — Run with a JSON reporter and parse it
 
