@@ -1,36 +1,6 @@
 ---
 name: iru-setup-php-wordpress
-description: >-
-  Scaffold (or bring up to date) a WordPress plugin or block theme repository on this catalog's PHP toolchain.
-  `flavor: plugin` writes the main plugin file (full header — Plugin Name, Description, Version `x.y.z-dev`,
-  Requires at least, Requires PHP, Author, License GPL-2.0-or-later, Text Domain, Domain Path — plus an
-  `ABSPATH` guard and a `<PREFIX>_VERSION` constant), a namespaced PSR-4 `src/` loaded through Composer's
-  autoloader (a composition root, a filter service with a documented custom hook, a settings page whose
-  `admin-post.php` handler checks nonce and capability, a REST route with a `permission_callback`),
-  `uninstall.php`, `languages/`, a WordPress.org `readme.txt`, and `.distignore`; with `blocks: yes` it also wires
-  `@wordpress/scripts` and a first block. `flavor: theme` writes a block theme — `style.css` header, `theme.json`
-  v3, `templates/index.html`, `parts/header.html`/`footer.html`, translatable `patterns/`, and a small
-  `functions.php` that requires namespaced classes. Both get `composer.json` (PSR-4, `config.platform.php` pinned to
-  the floor; scripts `test`, `test:coverage`, `test:integration`, `lint`, `lint:report`, `format`,
-  `format:check`), `phpcs.xml.dist` (WordPress-Extra + WordPress-Docs + PHPCompatibilityWP with `testVersion`,
-  `minimum_wp_version`, text domain and prefixes), `phpstan.neon.dist` (phpstan-wordpress, level 6), a Brain Monkey
-  `unit` suite (`phpunit.xml.dist`) and a `WP_UnitTestCase` `integration` suite (`phpunit-integration.xml.dist`) run
-  inside a dedicated `@wordpress/env` environment (`.wp-env.json` + `.wp-env.test.json`, `package.json` used only
-  for wp-env/`@wordpress/scripts`), sample tests, Clover/JUnit under `build/logs/`, browser UI tests per the
-  catalog's UI contract (`.ui-quality.yml`, `playwright.config.ts` extending `wp-scripts test-playwright` against the
-  wp-env tests instance, `@axe-core/playwright`, the shared `tests/e2e/support/ui-screenshots.ts` helper, a test-only
-  RTL mu-plugin, and a sample spec — the plugin's `ContentNotice` component or the theme's `Index` screen — captured
-  into `.ui-screenshots/` across left-to-right/right-to-left × light/dark with an accessibility check), and
-  `sonar-project.properties` when `sonar` is not `none`. Resolves every dependency, the PHP floor, and the
-  WordPress floor/tested-up-to versions live (Packagist, npm, php.net, api.wordpress.org), installs, and verifies
-  the scaffold with its own gates. Invoke as `/iru-setup-php-wordpress`, or with `args` (`key: value` lines) — `flavor` (`plugin`/`theme`,
-  asked when missing), `name`, `slug`, `vendor`, `namespace`, `prefix`, `description`, `license`,
-  `developer-name`, `developer-email`, `organization-url`, `php-version`, `wp-version`, `blocks`, `open-source`,
-  `visibility`, `ci`, `distribution` (`none`/`internal`/`store`), `sonar` (+ `sonar-organization`/
-  `sonar-project-key`/`sonar-host-url`), `accessibility` (`enforce`/`report`/`off`), `mode` (`new`/`existing`),
-  `on-existing` (`ask`/`keep`/`update`/`replace`) — as `iru-setup-php-repository` passes them. Announces whether it creates from scratch or updates; for every
-  owned file that already exists it warns and asks Update / Keep as is / Replace. Use whenever a WordPress plugin or
-  block theme repository needs its code skeleton, tests, and quality tooling bootstrapped from this house template.
+description: "Invoked as /iru-setup-php-wordpress with optional key: value args (flavor: plugin|theme), usually by iru-setup-php-repository. Scaffolds a WordPress plugin or block theme (or upgrades one): Composer toolchain, PHPCS, PHPStan, Brain Monkey and wp-env tests, Playwright UI tests, and optional Sonar."
 model: sonnet
 allowed-tools: Read Write Edit AskUserQuestion Bash(composer *) Bash(php *) Bash(vendor/bin/*) Bash(npm *) Bash(npx *) Bash(docker *) Bash(curl *) Bash(git remote *) Bash(git branch *) Bash(gh repo view *) Bash(command -v *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(basename *) Bash(mkdir *) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Bash(python3 *)
 ---
@@ -87,12 +57,21 @@ as synonyms), `name`, `slug`, `vendor`, `namespace`, `prefix` (function/option/h
 plugin only), `open-source` (`yes`/`no`), `visibility` (`public`/`private`/`internal`), `ci` (`yes`/`no` — only
 consulted for the Sonar recommendation), `distribution` (`none`/`internal`/`store`), `sonar`
 (`cloud`/`self-hosted`/`none`) plus `sonar-organization`/`sonar-project-key`/`sonar-host-url`, `accessibility`
-(`enforce`/`report`/`off` — the automated accessibility level of the browser UI tests, written to `.ui-quality.yml`;
+(`enforce`/`report`/`off`/`none` — the automated accessibility level of the browser UI tests, written to `.ui-quality.yml`;
 default `enforce`), `mode` (`new`/`existing`), `on-existing` (`ask`/`keep`/`update`/`replace`, default `ask`).
 Ignore unknown keys. Everything resolved here is never asked again.
 
 `mode: existing` means "this is an established repository": Step 1 announces an update and still asks per
 pre-existing file unless `on-existing` says otherwise — `mode: existing` alone never means "update silently".
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (axe-core in the browser UI tests), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — semantic landmarks/block markup, labelled form controls, `alt` on images, relative font sizes, `prefers-reduced-motion` guards — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Flavor, survey, per-file decisions
 
@@ -167,7 +146,7 @@ Ask only what Steps 0–1 left open, in plain conversation unless noted, confirm
   source). For `store`, also ask for the WordPress.org username(s) for `readme.txt`'s `Contributors:`.
 - **blocks** (plugin only, `AskUserQuestion`): **No (Recommended for a start)** / **Yes** — "adds a `blocks/`
   source directory built by `@wordpress/scripts` and a first dynamic block".
-- **accessibility** (`AskUserQuestion`, header `Accessibility`, "Automated accessibility checks in UI tests?"):
+- **accessibility** (`AskUserQuestion`, header `Accessibility`, "Support accessibility and assistive technologies?"):
   **Enforce (Recommended)** — "axe-core violations fail the browser UI tests" / **Report only** — "listed in the
   test output, never failing" / **Off** — "not run; the coding rules still apply". Written to `.ui-quality.yml`.
 - **sonar** — recommend **cloud** only for a public, open-source repository (resolve `visibility` from `args`, else

@@ -1,34 +1,6 @@
 ---
 name: iru-nextjs-code-one-task-group
-description: >-
-  Implement one bucket of Next.js tasks from a plan's task group end-to-end — detects the project profile once
-  (Next.js 14/15/16, App vs Pages Router, `cacheComponents` on or off, `src/` layout, `output` mode, Vitest or Jest,
-  Playwright, package manager), captures a single pre-change quality baseline for the whole bucket (and, when the
-  bucket modifies existing routes, a baseline `next build` route table), runs `iru-nextjs-code-one-task` once per
-  task (in parallel agents when the group is marked parallelizable), then validates the entire bucket once,
-  cheapest first, every check delegated to an `iru-gate-runner` agent so no raw report lands in this context —
-  license headers via `iru-check-license`, TSDoc via `iru-typescript-tsdoc`, scoped unit tests via
-  `iru-typescript-test`, an 80% coverage gate via `iru-typescript-coverage` measured from unit tests alone (async
-  Server Component pages/layouts that only compose data and are reachable only end-to-end are reported as named
-  exceptions, never waved through and never failed blindly), the full unit suite, ESLint/Biome plus
-  `next typegen` + `tsc --noEmit` via `iru-typescript-code-quality` diffed against the baseline, then one
-  `next build` whose route table (static/SSG/dynamic/partial-prerender symbols) is parsed for the bucket's routes and
-  compared against the baseline table and each task's declared intent, flagging any route whose rendering mode
-  changed unexpectedly, and last the Playwright end-to-end suite via `iru-typescript-test` with the `e2e` selector —
-  which, when the bucket touched UI, is also the UI stage of the catalog's UI contract: the component-gallery and
-  screen/flow specs run, every added/changed page and Client Component must have captures in `.ui-screenshots/` for
-  each visual state × `.ui-quality.yml` direction × theme, and the axe results are applied at the configured
-  `enforce`/`report`/`off` level.
-  Because `next build` refuses to run twice in one project and Playwright's web server builds and serves the same
-  app, the build and e2e stages are serialized repository-wide behind the same atomic `mkdir`-based
-  `.integration-test.lock` as `iru-java-springboot-code-one-task-group` (owner file, stale after 60 minutes, give up
-  after about 45 minutes and report the stage unverified, released on every exit path). A missing Playwright browser,
-  an occupied port, or a build that needs unavailable environment variables is reported as unverified, never as a
-  pass. `iru-nextjs-code-one-task` checks off each task's box itself with a "group validation pending" note; this
-  skill backfills any that didn't land and replaces each note with the final outcome. Invoke as
-  `/iru-nextjs-code-one-task-group <bucket text>`, passing every task/sub-task in the bucket with its own text, the
-  group's `Parallelizable` verdict, and any relevant "Current code state" context. The Next.js counterpart to
-  `iru-typescript-code-one-task-group`; used by `iru-code-one-task-group` for its `nextjs`-tagged tasks.
+description: "Invoked as /iru-nextjs-code-one-task-group <bucket text> (group tasks, Parallelizable verdict, code state) via Skill. Implements one Next.js task bucket: one baseline, iru-nextjs-code-one-task per task (parallel when allowed), then validates once (license, TSDoc, tests, 80% coverage, lint/tsc, next build routes, locked Playwright); finalizes checkboxes."
 model: sonnet
 allowed-tools: Read Edit Write Bash(npm *) Bash(npx *) Bash(pnpm *) Bash(yarn *) Bash(node -p *) Bash(perl *) Bash(lsof *) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(mkdir .integration-test.lock*) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Skill Agent
 ---
@@ -60,6 +32,8 @@ Three things differ from the plain TypeScript group skill, and they shape the wh
    `.next/` directory on a fixed port. Two groups doing either at once fail or — worse — test each other's build.
 
 It uses a medium model on purpose: the plan carries the hard reasoning; this skill drives execution of it.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Read this before running `next build` or Playwright
 
@@ -352,6 +326,10 @@ run and an explicit "unverified" when it can't.**
    On **every** exit path — passed, failed, unverified, a blocked task, a user interruption, a hard stop. A lock left
    behind blocks every other group for an hour. If you took it, you release it before returning. Also delete
    `.next-build.log` if a failed agent left it behind.
+
+**Accessibility opt-out (`accessibility: none`).** When `.ui-quality.yml` says `none`, the user opted out of accessibility support entirely (see `reference/ui-contract.md` §8, "Opting out and existing code"): do not apply the accessibility rules, do not run or require the accessibility checks (axe, ATF/semantics audit, `performAccessibilityAudit()`, Axe.Windows, a11y lint rules, TUI asserted checks), and report them as "accessibility: opted out" in the group report - never "unverified", and never a failure. `off` differs: the rules still apply when writing code, only the automated checks are not run.
+
+**Missing `.ui-quality.yml` in a repository that already has UI code.** The level was never chosen, so don't assume the `enforce` default — that default is only for a new UI project with no UI code yet. Before the first UI task of the bucket, resolve it once per `reference/ui-contract.md` §8 ("Opting out and existing code"): reuse the `Accessibility:` line of an `iru-explore` report in the plan's "Current code state" or this conversation (otherwise apply the detection rules of `iru-explore`'s `reference/accessibility-detection.md`), ask the user via `AskUserQuestion` with the setup's pre-selection (`present` → Enforce, `partial` → Report only with the mixed-compliance warning, `absent` → None with the half-compliance warning), and write `.ui-quality.yml` with the chosen level and the default `directions`/`themes`, so the per-task skills and the test gates read the same value. This is a decision only the user can make, so it is an allowed pause.
 
 ## Step 4 — Finalize progress notes and notify the user
 

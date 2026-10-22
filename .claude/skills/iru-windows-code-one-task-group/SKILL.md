@@ -1,31 +1,6 @@
 ---
 name: iru-windows-code-one-task-group
-description: >-
-  Implement one bucket of Windows desktop app (.NET 10 — WPF, WinUI 3, or Windows Forms) tasks from a plan's task
-  group end-to-end — detects the shape once (UI stack from the app csproj, MVVM `ViewModels/` vs MVC `Controllers/` in
-  the UI-free `src/<App>.Core`, the Core and UI test projects, the test runner, and whether the host is Windows),
-  captures a single pre-change analyzer baseline for the whole bucket via `iru-dotnet-code-quality`, runs
-  `iru-windows-code-one-task` once per task (in parallel `iru-isolated-skill-executor` agents when the group is
-  marked parallelizable) to implement each one with its tests and per-project compile-check, then validates the
-  entire bucket once, cheapest first, every check delegated to an `iru-gate-runner` agent so no raw report lands in
-  this context — license headers via `iru-check-license`, XML doc comments via `iru-dotnet-docfx`, scoped Core tests
-  via `iru-dotnet-test`, an 80% line-coverage gate on the Core project via `iru-dotnet-coverage` (the UI layer —
-  XAML, code-behind, forms, the app project — is reported "not measured", never 0%, and never fails the gate), the
-  full suite excluding `[TestCategory("UI")]` tests, an analyzer regression check against the baseline, and — last —
-  the FlaUI UI tests (`iru-dotnet-test` selector `ui`) only on a Windows host, serialized repository-wide behind the
-  shared atomic-`mkdir` `.integration-test.lock` (owner file, stale after 60 minutes, bounded ~45-minute wait,
-  released on every exit path) and passed to the gate as `lock: held`, followed by the UI-contract check — every
-  screen/component the bucket added or changed must have its `.ui-screenshots/` captures for each visual state ×
-  `.ui-quality.yml` direction × theme, and Axe.Windows violations fail the bucket at `accessibility: enforce` or are
-  listed at `report`; on a non-Windows host the UI stage, the WinUI
-  app build, app launch and packaging are reported "unverified (needs Windows)" — never silently skipped and never
-  "passed" — while the Core tests and the `EnableWindowsTargeting` compile of WPF/WinForms still run.
-  `iru-windows-code-one-task` checks off each task's box itself with a "group validation pending" note; this skill
-  backfills any that didn't land and replaces each note with the final outcome. Invoke as
-  `/iru-windows-code-one-task-group <bucket text>`, passing every task/sub-task in the bucket with its own text, the
-  group's `Parallelizable` verdict, and any relevant "Current code state" context. The Windows desktop counterpart to
-  `iru-dotnet-code-one-task-group` (plain .NET libraries/services) and `iru-kmp-code-one-task-group`; used by
-  `iru-code-one-task-group`, which invokes it once per plan group for its `windows`-tagged tasks.
+description: "Invoked as /iru-windows-code-one-task-group <bucket text> (group tasks, Parallelizable verdict, code state) via Skill. Implements one Windows desktop (.NET 10) task bucket: one baseline, iru-windows-code-one-task per task (parallel when allowed), then validates once (license, XML docs, Core tests, 80% Core coverage, analyzers, locked FlaUI UI (Windows only)); finalizes checkboxes."
 model: sonnet
 allowed-tools: Read Edit Write Bash(dotnet *) Bash(uname *) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(git rev-parse *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(mkdir .integration-test.lock*) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Skill Agent
 ---
@@ -51,6 +26,8 @@ Three things shape the validation order:
    gate; cheaper gates run first so a bucket that's red on Core never holds the lock.
 
 It uses a medium model on purpose: the plan carries the hard reasoning; this skill drives execution of it.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Read this before running anything that drives the desktop
 
@@ -91,7 +68,7 @@ Detect once and reuse for every gate call below (the same facts `iru-windows-cod
 Record this once as the bucket's **validation scope** and reuse it. When the UI stage is in scope, also record the
 bucket's **UI inventory** from the tasks' reported `Screen › Region › Component` trees (and, failing that, the
 windows/pages/forms/`UserControl`s the diff added or changed): each screen/component `Id` with its visual states, plus
-`.ui-quality.yml` at the repository root (`accessibility`, `directions`, `themes`; missing file → `enforce`,
+`.ui-quality.yml` at the repository root (`accessibility`, `directions`, `themes`; missing (new UI project) file → `enforce`,
 `[ltr, rtl]`, `[light, dark]`). Step 3.7c checks captures against it.
 
 Then collect the files every task is expected to touch and capture a single pre-change baseline via `iru-gate-runner`:
@@ -110,6 +87,10 @@ Agent({
 
 Record it as the bucket's baseline — empty if every file is new. Step 3.6 diffs against it. Skip if
 `iru-dotnet-code-quality` isn't installed, and say so in Step 5.
+
+**Accessibility opt-out (`accessibility: none`).** When `.ui-quality.yml` says `none`, the user opted out of accessibility support entirely (see `reference/ui-contract.md` §8, "Opting out and existing code"): do not apply the accessibility rules, do not run or require the accessibility checks (axe, ATF/semantics audit, `performAccessibilityAudit()`, Axe.Windows, a11y lint rules, TUI asserted checks), and report them as "accessibility: opted out" in the group report - never "unverified", and never a failure. `off` differs: the rules still apply when writing code, only the automated checks are not run.
+
+**Missing `.ui-quality.yml` in a repository that already has UI code.** The level was never chosen, so don't assume the `enforce` default — that default is only for a new UI project with no UI code yet. Before the first UI task of the bucket, resolve it once per `reference/ui-contract.md` §8 ("Opting out and existing code"): reuse the `Accessibility:` line of an `iru-explore` report in the plan's "Current code state" or this conversation (otherwise apply the detection rules of `iru-explore`'s `reference/accessibility-detection.md`), ask the user via `AskUserQuestion` with the setup's pre-selection (`present` → Enforce, `partial` → Report only with the mixed-compliance warning, `absent` → None with the half-compliance warning), and write `.ui-quality.yml` with the chosen level and the default `directions`/`themes`, so the per-task skills and the test gates read the same value. This is a decision only the user can make, so it is an allowed pause.
 
 ## Step 2 — Implement each task via `iru-windows-code-one-task`
 

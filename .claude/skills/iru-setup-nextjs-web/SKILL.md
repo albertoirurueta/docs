@@ -1,36 +1,6 @@
 ---
 name: iru-setup-nextjs-web
-description: >-
-  Scaffold a new Next.js web application with `npx create-next-app@<latest>` driven entirely by explicit flags
-  (TypeScript, App or Pages Router, ESLint, Tailwind or CSS Modules, `src/`, `@/*` alias, package manager, React
-  Compiler off, Cache Components on or off, AGENTS.md — saved create-next-app preferences can never leak in), or
-  bring an existing Next.js app up to this catalog's toolchain, then post-process it — `0.1.0-dev.0` version, the
-  shared npm script names the workflows skill calls (`lint` = ESLint flat config with `eslint-config-next` since
-  `next lint` is gone, `format`/`format:check` = Prettier, `typecheck` = `next typegen && tsc --noEmit`, `test`/
-  `coverage` = Vitest + React Testing Library + jsdom with an 80% v8 threshold and lcov at `coverage/lcov.info`,
-  `test:e2e` = Playwright against the production build, `build`, `start`, `docs` = TypeDoc), `output: 'export'`
-  with `basePath` from `PAGES_BASE_PATH` for GitHub Pages or a server build (`output: 'standalone'` plus a
-  non-root multi-stage `Dockerfile` with a health-check route when the image is distributed), a tested sample
-  feature that follows the `iru-nextjs-code-one-task` references (async Server Component page with a
-  `server-only` data layer, Client Component leaf, Server Action with Zod validation and an auth stub, Route
-  Handlers, metadata, `loading`/`error`/`not-found`, all adapted to static export or the Pages Router), per the
-  catalog's UI contract a `.ui-quality.yml` at the repository root and — with `e2e: playwright` — a Playwright
-  component-testing project against a standalone Vite component gallery (Playwright's built-in `mount()` fixture,
-  `next/link`/`next/navigation`/`next/image` stand-ins), `@axe-core/playwright`, the shared
-  `e2e/support/ui-screenshots.ts` helper, and specs capturing `.ui-screenshots/component/LikeButton/` and
-  `.ui-screenshots/screen/Home/` across left-to-right/right-to-left × light/dark with an accessibility check, and
-  `sonar-project.properties` when Sonar is enabled. Invoke as `/iru-setup-nextjs-web`. Accepts pre-resolved inputs
-  via `args` (`key: value` lines) — `app-name`, `description`, `license`, `developer-name`, `developer-email`,
-  `organization-url`, `open-source`, `sonar` (+ `sonar-organization`/`sonar-project-key`/`sonar-host-url`),
-  `router` (`app`/`pages`), `output` (`server`/`static`), `cache-components` (`yes`/`no`), `styling`
-  (`tailwind`/`css-modules`), `e2e` (`playwright`/`none`), `distribution` (`none`/`internal`), `docs-tool`
-  (`typedoc`/`none`), `agents-md` (`yes`/`no`), `package-manager` (`npm`/`pnpm`/`yarn`), `node-version`,
-  `visibility`, `ci`, `accessibility` (`enforce`/`report`/`off`, default `enforce`), `mode` (`new`/`existing`),
-  `on-existing` (`ask`/`keep`/`update`/`replace`) — and asks
-  whatever `args` didn't resolve. Announces whether it is scaffolding from scratch or updating an existing app and,
-  for every artifact it owns that already exists, asks Update / Keep as is / Replace (or Stop). Use whenever a
-  repository needs a Next.js app bootstrapped with its full test/lint/e2e/deploy toolchain from this house
-  template, instead of running `create-next-app` and wiring the rest by hand.
+description: "Invoked as /iru-setup-nextjs-web with optional key: value args, usually by iru-setup-typescript-repository. Scaffolds a Next.js app with explicit create-next-app flags (or upgrades an existing one), then adds the shared npm scripts, Vitest, Playwright UI tests with accessibility checks, static or standalone-server output, and optional Sonar."
 model: sonnet
 allowed-tools: Read Write Edit AskUserQuestion Bash(npx *) Bash(npm *) Bash(pnpm *) Bash(yarn *) Bash(node *) Bash(docker *) Bash(curl *) Bash(git *) Bash(gh repo view *) Bash(mktemp *) Bash(mv *) Bash(cp *) Bash(rm *) Bash(mkdir *) Bash(ls *) Bash(find *) Bash(grep *) Bash(cat *) Bash(test *) Bash(command -v *) Bash(head *) Bash(date *)
 ---
@@ -106,7 +76,7 @@ Recognized keys:
 | `node-version` | Node major | `24` (current LTS) — the `Dockerfile`'s `NODE_VERSION` |
 | `visibility` | `public`/`private`/`internal` | resolved only if the Sonar question is asked |
 | `ci` | `yes`/`no` | `yes` (only consulted for the Sonar recommendation) |
-| `accessibility` | `enforce`/`report`/`off` | asked with `e2e: playwright`, else `enforce` — the UI tests' automated accessibility level written to `.ui-quality.yml` |
+| `accessibility` | `enforce`/`report`/`off`/`none` | asked with `e2e: playwright`, else `enforce` — the UI tests' automated accessibility level written to `.ui-quality.yml` |
 | `mode` | `new`/`existing` | derived in Step 1 |
 | `on-existing` | `ask`/`keep`/`update`/`replace` | `ask` |
 
@@ -125,6 +95,15 @@ Contradictions are resolved, not obeyed, and reported in Step 10:
 
 `mode: existing` marks the run as an update, but never means "update silently": Step 1 still asks per artifact
 unless `on-existing` says otherwise.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (axe-core in the Playwright tests and `eslint-plugin-jsx-a11y`), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — semantic landmarks, accessible names on icon-only buttons, `alt` on images (`next/image`), `rem`/relative font sizes, `prefers-reduced-motion` guards, visible focus — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey the repository
 
@@ -224,8 +203,7 @@ confirm it in one line instead of asking.
 - **docs-tool**: **TypeDoc** (Recommended — `npm run docs` writes `docs/api`, which the workflows skill merges
   under the Antora site; also lets `iru-typescript-tsdoc` verify instead of running audit-only) or **None**.
 
-- **accessibility** (only with `e2e: playwright`; `AskUserQuestion`): "Automated accessibility checks in UI
-  tests?" — **Enforce (Recommended)** (axe violations fail the UI tests) / **Report only** (listed, never failing) /
+- **accessibility** (only with `e2e: playwright`; `AskUserQuestion`): "Support accessibility and assistive technologies?" — **Enforce (Recommended)** (axe violations fail the UI tests) / **Report only** (listed, never failing) /
   **Off** (not run; the coding defaults still apply).
 
 Do not ask `router`, `styling`, `e2e`, `agents-md`, or `package-manager` unless the user brings them up — their

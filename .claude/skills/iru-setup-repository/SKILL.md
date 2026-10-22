@@ -1,47 +1,6 @@
 ---
 name: iru-setup-repository
-description: >-
-  End-to-end bootstrap front door for this entire catalog — invoke as `/iru-setup-repository` and use
-  it as THE one entry point new users should reach for to bootstrap any repository, instead of hunting for which
-  of this catalog's stack-specific orchestrators applies. Covers every project type this catalog can scaffold —
-  `java-library`, Spring Boot services (`java-springboot`, `java-springboot-hilla`, `kotlin-springboot`,
-  `kotlin-springboot-hilla`), Quarkus services (`java-quarkus`, `kotlin-quarkus`), `typescript-library`,
-  `react-web`, `nextjs`, `angular-web`, `nestjs`, PHP (`php-laravel`, `php-wordpress-plugin`,
-  `php-wordpress-theme`, `php-prestashop-module`), Python (`python-fastapi`, `python-django`), `android-library`, `android-app`, `swift-library`, `apple-app`
-  (`ios`/`ipados`/`macos`/`watchos`/`visionos`, SwiftUI or UIKit, MVVM or MVC), `react-native-app` (`expo`/`metro` toolchain), `ionic-app` (`angular`/`react`),
-  `kmp-app` (Kotlin Multiplatform for Android + iOS, `compose`/`native` UI), and the desktop apps `macos-app`
-  (native macOS, `swiftui`/`appkit`) and `windows-app` (.NET 10, `wpf`/`winui`/`winforms`), and agent-friendly
-  command-line tools `cli-tool` (`rust`/`go`/`swift`/`dotnet`, optional terminal UI) — by surveying the
-  working directory (running `iru-explore` first when it already holds code) to detect which one applies, asking
-  only the shared, cross-cutting questions the detected/chosen type still needs, then delegating the actual
-  scaffold to the matching stack orchestrator (`iru-setup-java-library-repository`, `iru-setup-java-springboot`,
-  `iru-setup-quarkus-repository`, `iru-setup-typescript-repository`, `iru-setup-php-repository`,
-  `iru-setup-python-repository`, `iru-setup-android-repository`, `iru-setup-swift-repository`,
-  `iru-setup-kmp-repository`, `iru-setup-macos-repository`, `iru-setup-windows-repository`, or
-  `iru-setup-cli-repository`) via
-  `iru-isolated-skill-executor`. Accepts
-  `args` (`key: value` lines) to pre-resolve `project-type`, `open-source`, `visibility`
-  (`public`/`private`/`internal`, otherwise detected via `gh repo view` or asked), `ci` (`yes`/`no`), `ci-tests`
-  (`unit`/`full`), `pages` (`yes`/`no`), `publish`, `distribution`, `sonar`
-  (+ `sonar-organization`/`sonar-project-key`/`sonar-host-url`), `mode` (`new`/`existing`), `on-existing`
-  (`ask`/`keep`/`update`/`replace`, scripted runs only), `flavor`, the stack-shape keys `language` (JVM
-  `java`/`kotlin`, or a command-line tool's `rust`/`go`/`swift`/`dotnet`), `build-tool`,
-  `layout`, and `frontend` (JVM services), `accessibility` (`enforce`/`report`/`off` — UI types: how strictly the UI
-  tests' automated accessibility checks gate, recorded in `.ui-quality.yml`), `python-version`, `platforms`, `framework`, `toolchain` (React Native
-  `expo`/`metro`), `native-builds`, `ui` (Kotlin Multiplatform `compose`/`native`, macOS `swiftui`/`appkit`,
-  Windows `wpf`/`winui`/`winforms`, a command-line tool's `none`/`tui`), `architecture` (desktop apps'
-  `mvvm`/`mvc`), `integration-branch`,
-  `stable-branch`, `license`, `developer-name`, `developer-email`, and `organization-url` — forwarding each only
-  to the delegated orchestrator whose own `args` contract actually accepts it, and never asking a question
-  `args` already answered or one the delegated orchestrator asks itself. Asks whether CI workflows are wanted,
-  whether Sonar receives CI reports, whether CI runs unit-only or the full test suite, and (private repos) whether
-  docs go to GitHub Pages, stating the Actions-minutes / SonarCloud / Pages cost differences between public and
-  private repositories. Announces whether it is setting up from scratch or updating an existing repository (with
-  an inventory of the prior setup it found); on an existing repository it runs `iru-explore` first and forces
-  `mode: existing`, and every delegated component then warns about each pre-existing artifact and asks whether to
-  keep, update, or replace it. Use whenever a user wants to bootstrap (or catch up) a repository and either
-  doesn't know or shouldn't have to know which of this catalog's twelve stack-specific setup orchestrators to
-  invoke directly.
+description: "/iru-setup-repository [args] is the single front door for bootstrapping any repository in this catalog. It surveys the working directory (running iru-explore first when code exists), detects or asks the project type (JVM, Web and Node, PHP, Python, Mobile and Apple, desktop, command-line tool), asks only the shared cross-cutting questions still needed (CI, Sonar, CI test scope, Pages, accessibility, with public vs private cost notes), then delegates to the matching stack orchestrator via iru-isolated-skill-executor. Announces from-scratch vs update mode; key: value args pre-resolve answers. Use to bootstrap or catch up a repository when you do not know which setup orchestrator applies."
 model: sonnet
 ---
 
@@ -55,6 +14,8 @@ stack orchestrators, each of which asks its own project-identity questions (grou
 slug, etc.) and its own stack-shape questions (JVM language/build tool/layout/frontend, NestJS ORM, Next.js output,
 PHP version floor, Python version/database/ORM/API, Kotlin Multiplatform UI approach, desktop UI framework and
 MVVM/MVC architecture, a command-line tool's terminal UI and package channels, ...) and does the actual scaffolding.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Resolve inputs
 
@@ -91,12 +52,13 @@ library types only), `distribution` (`none`/`internal`/`store` — app types onl
 Step 2's follow-up resolves), `build-tool`
 (`maven`/`gradle`), `frontend` (`none`/`hilla` — Spring Boot only), and `layout` (`single`/`hexagonal` — Quarkus
 only) — **never asked here** (the delegated orchestrator asks them itself), only forwarded when supplied via `args`
-or pre-set by Step 1's detection — `platforms` (Apple app / Swift library), `framework` (Ionic's `angular`/`react`),
+or pre-set by Step 1's detection — `rolling-deployments` (`yes`/`no`), `deployment-strategy` (`rolling`/`blue-green`/`canary`/`linear`) and `advance` (`auto`/`manual`/`hybrid`) (Spring Boot only, meaningful only with `ci: yes`; blue/green rolling deployments are a stack-shape choice that `iru-setup-java-springboot` asks itself in its Step 3c, so they are likewise **never asked here**, only forwarded when supplied via `args`) — `platforms` (Apple app / Swift library), `framework` (Ionic's `angular`/`react`),
 `toolchain` (React Native's `expo`/`metro`), `native-builds` (React Native's `eas`/`local` — Expo toolchain
 only), `ui` (Kotlin Multiplatform's `compose`/`native`, macOS's `swiftui`/`appkit`, Windows' `wpf`/`winui`/
 `winforms`, a command-line tool's `none`/`tui` — never asked here, only forwarded), `architecture` (desktop apps' `mvvm`/`mvc` — likewise only
-forwarded), `accessibility` (`enforce`/`report`/`off` — UI types only; how strictly the UI tests' automated
-accessibility checks gate, recorded by the UI scaffold in `.ui-quality.yml`), `python-version` (Python only — likewise never asked here), plus the
+forwarded), `accessibility` (`enforce`/`report`/`off`/`none` — UI types only; whether accessibility
+support is wanted (`none` = opted out entirely) and how strictly the UI tests' automated accessibility checks gate,
+recorded by the UI scaffold in `.ui-quality.yml`), `python-version` (Python only — likewise never asked here), plus the
 pass-through-only keys `integration-branch`, `stable-branch`, `license`, `developer-name`, `developer-email`,
 `organization-url` (see Step 3's closing note — this skill never asks for these itself, it only forwards them when
 supplied). Every key found here is resolved — skip the matching question below. Any **other** `key: value` line
@@ -559,12 +521,25 @@ them in the order below — `visibility` and `ci` change the recommendations of 
    `cli-tool` — whose `frontend`/`ui` the orchestrator asks — leave it to the orchestrator) — "Run automated
    accessibility checks in the UI tests?" Every UI scaffold follows the catalog's UI contract: composed
    components with explicit inputs and events, virtualized lists, UI tests across states, left-to-right and
-   right-to-left, light and dark, screenshots reused by the Antora docs, and automated accessibility checks
-   (axe-core on the web, Android's Accessibility Test Framework, Xcode's accessibility audit, Axe.Windows).
-   Options: **Enforce (Recommended)** — "violations fail the UI tests"; **Report only** — "violations are listed in
-   test reports but never fail the build"; **Off** — "no automated checks (accessible coding defaults still
-   apply)". The choice is written to `.ui-quality.yml` at the repository root, where the coding and test skills
-   read it; it can be changed there later by hand.
+   right-to-left, light and dark, screenshots reused by the Antora docs, and — unless opted out — accessibility
+   and assistive-technology support (semantic/ARIA markup on the web, TalkBack, VoiceOver, Narrator; adjustable
+   font sizes, contrast) with automated checks (axe-core on the web, Android's Accessibility Test Framework,
+   Xcode's accessibility audit, Axe.Windows).
+
+   Ask it as **"Support accessibility and assistive technologies?"**. Options: **Enforce (Recommended for new
+   projects)** — "AT rules apply; violations fail the UI tests"; **Report only** — "rules apply; violations are
+   listed in test reports but never fail the build"; **Off** — "rules apply, no automated checks run"; **None —
+   opt out entirely** — "no accessibility rules, checks or docs (e.g. a mandated non-compliant design)". The
+   choice is written to `.ui-quality.yml` at the repository root, where the coding and test skills read it; it can
+   be changed there later by hand.
+
+   In `mode: existing`, before asking, take the `Accessibility:` line from the Step 1 `iru-explore` run (run or
+   reuse it; follow `reference/accessibility-detection.md`, byte-identical to `iru-explore`'s copy), show the
+   evidence it printed, and apply that file's pre-selection table: `present` → recommend **Enforce**; `partial` →
+   recommend **Report only** and warn about mixed compliance (new code follows the rules, old code only
+   partly); `absent` → recommend **None** and warn that enabling it makes only new code compliant, leaving a
+   half-compliant app; a prior `.ui-quality.yml` value is shown but never decides alone. New (empty) repositories
+   recommend **Enforce**. The user always decides. An `args` value of `accessibility` skips the question.
 
 `integration-branch`, `stable-branch`, `license`, `developer-name`, `developer-email`, and `organization-url` are
 **never actively asked here** — this front door only forwards them when they arrived via its own `args`
@@ -635,10 +610,10 @@ and `pages` (when `ci: yes`), and `on-existing` (when supplied via `args`), per 
 - **Spring Boot** (`java-springboot`, `java-springboot-hilla`, `kotlin-springboot`, `kotlin-springboot-hilla`, or
   the manual "Spring Boot service" pick) → `iru-setup-java-springboot`, `args`: `mode`, `open-source`, the cost/CI
   keys, `sonar` (+ detail keys), and `language`/`build-tool`/`frontend` **only** when Step 1's detection pre-set
-  them or this skill's own `args` supplied them (otherwise omitted, so its Step 3/3b asks them) — no
+  them or this skill's own `args` supplied them (otherwise omitted, so its Step 3/3b asks them), and — only with `ci: yes` and only when supplied via `args` — `rolling-deployments`/`deployment-strategy`/`advance` (otherwise omitted, so its Step 3c asks; with `ci: no` they are never sent, since rolling deployments need the generated workflows) — no
   `publish`/`distribution`/branch/license/developer keys exist on this skill either. It validates the pair itself
   (Java is Maven-only) and records `language`/`buildTool`/`ci`/`ci-tests`/`pages` in its `springboot-stack.yml`
-  manifest for its sub-skills.
+  manifest (plus the optional `deploy.rolling` block) for its sub-skills.
 - **Quarkus** (`java-quarkus`, `kotlin-quarkus`, or the manual "Quarkus service" pick) →
   `iru-setup-quarkus-repository`, `args`: `mode`, `open-source`, the cost/CI keys, `distribution`
   (`registry`/`none`), `sonar` (+ detail keys), `language` when detected or supplied, `build-tool`/`layout`/
@@ -696,7 +671,7 @@ and `pages` (when `ci: yes`), and `on-existing` (when supplied via `args`), per 
   `module-path`, `go-version`, `package-name`, `swift-version`, `platforms`, `tool-name`, `package-id`) when
   supplied. Never send `publish` or `flavor`.
 
-**`accessibility`**: send it, when Step 3 resolved it (or `args` supplied it), to every orchestrator above whose
+**`accessibility`** (`enforce|report|off|none`): send it, when Step 3 resolved it (or `args` supplied it), to every orchestrator above whose
 on-disk Step 0 recognizes it — `iru-setup-typescript-repository` (UI flavors), `iru-setup-php-repository`,
 `iru-setup-python-repository` (`django`), `iru-setup-android-repository`, `iru-setup-swift-repository` (`app`),
 `iru-setup-kmp-repository`, `iru-setup-macos-repository`, `iru-setup-windows-repository`,
@@ -733,7 +708,7 @@ Summarize for the user:
   whether `mode` came from Step 1's survey or an explicit `args`/user answer, and every shared input from Step 3 as
   actually applied (`open-source`, `visibility` and whether it was supplied/detected via `gh`/asked, `ci`,
   `ci-tests`, `pages` — noting when `pages: yes` was defaulted because the repository is public —
-  `publish`/`distribution`, `sonar` + detail keys, `accessibility` for a UI type (and that `.ui-quality.yml`
+  `publish`/`distribution`, `sonar` + detail keys, `accessibility` for a UI type (`enforce|report|off|none`, whether it was pre-selected from the detection result, and that `.ui-quality.yml`
   records it), `on-existing` if supplied, and any conditional flavor-specific input).
 - A **per-component table** — the Step 1 inventory's rows, each with what the delegated orchestrator (named
   explicitly) reported doing: **created / updated / replaced / kept as is / skipped (ci: no)** and the file paths
@@ -747,6 +722,7 @@ Summarize for the user:
   `sonar: cloud`, and — when `pages: yes` — that Pages needs Pro/Team/Enterprise Cloud and the site is public unless
   on Enterprise Cloud with private access control (with `pages: no`, the docs are uploaded as a workflow artifact
   instead).
+- For Spring Boot types, one line on rolling deployments as the orchestrator reported them: enabled or not (with `ci: no`, "not offered — needs the workflows"), and when enabled the strategy, advance mode, whether `promote.yml` was generated (a `rolling` strategy keeps the single-job `deploy.yml` and generates none), and that `/iru-springboot-rolling-deployments enable|disable` switches it later.
 - When `ci: no`: that no workflows were generated, that the shared security block (Dependabot, dependency-review,
   CodeQL, OSV-Scanner, gitleaks) was skipped with them (and, for Spring Boot, the deploy/undeploy workflows), that
   any Sonar configuration is build-side only with no CI step sending reports, and that re-running the stack's

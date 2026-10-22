@@ -1,32 +1,7 @@
 ---
 name: iru-setup-kmp-repository
-description: >-
-  End-to-end bootstrap for a Kotlin Multiplatform (Android + iOS) app repository — collects `ui`
-  (`compose` = Compose Multiplatform shared UI, `native` = Jetpack Compose on Android + SwiftUI on iOS over shared
-  logic; asked via `AskUserQuestion` when absent), `branching` (`gitflow`/`main-only`), the app's identity
-  (`app-name`, `application-id`, `bundle-id`, `namespace`, plus license and developer name/email/organization URL),
-  and the shared pipeline parameters (integration branch `develop`, stable branch `main`, Java `17`, min SDK `26`,
-  iOS deployment target, `open-source`, the repository `visibility` (detected via `gh repo view` or asked), `ci`,
-  `ios-ci` (when the ~10×-cost macOS job runs: `all`/`stable`/`none`), `ci-tests` (`unit`, or `full` = also the
-  iOS app's XCTest bundle on a simulator), `pages` (GitHub Pages vs. a workflow artifact for the Antora + Dokka
-  docs), `distribution` (`none`/`internal`/`store` — Google Play/Firebase + TestFlight), `accessibility`
-  (`enforce`/`report`/`off` — the UI tests' automated accessibility level, written by the scaffold to
-  `.ui-quality.yml`), `sonar` plus its detail keys — each question stating the Actions-minutes / macOS-multiplier / SonarCloud / Pages cost facts for that
-  visibility) once, prints a setup-mode statement (from scratch, or an inventory of the prior setup it found), then
-  orchestrates `iru-setup-kmp-app` → `iru-setup-antora` → `iru-setup-kmp-gitignore` → `iru-setup-kmp-github-workflows`
-  → `iru-setup-changelog` → `iru-setup-readme`, in that order, via `iru-isolated-skill-executor`, so nothing is
-  asked twice — skipping the workflows step entirely (security block included) when `ci: no`. Invoke as
-  `/iru-setup-kmp-repository`, optionally with `args` (`key: value` lines) to pre-resolve `ui`, `branching`, `mode`
-  (`new`/`existing`), `open-source`, `visibility`, `ci`, `ios-ci`, `ci-tests`, `pages`, `accessibility`, `on-existing`
-  (`ask`/`keep`/`update`/`replace`, forwarded only when supplied), `distribution`, `sonar` (+ `sonar-organization`/
-  `sonar-project-key`/`sonar-host-url`), `integration-branch`, `stable-branch`, `java-version`, `min-sdk`,
-  `compile-sdk`, `ios-deployment-target`, `runner`, `xcode-version`, `team-id`, and every identity field, skipping
-  the matching question. On an existing repository every component sub-skill warns about the prior setup it owns
-  and asks Update / Keep as is / Replace per file (unless `on-existing` decides), and the final report states the
-  action taken per component. Use whenever bootstrapping (or catching up) a Kotlin Multiplatform mobile app
-  repository's full Gradle/Xcode/docs/gitignore/CI/changelog/README scaffold in one pass, instead of running six
-  skills separately and re-answering the same questions each time.
-model: haiku
+description: "Invoke as `/iru-setup-kmp-repository`, optionally with `args` (key: value lines such as `ui`, `branching`, `mode`, `ci`, `ios-ci`, `distribution`, `sonar`, `on-existing`, identity fields) to skip matching questions. End-to-end bootstrap of a Kotlin Multiplatform Android + iOS app repository: collects identity and pipeline choices once, then runs `iru-setup-kmp-app`, `iru-setup-antora`, `iru-setup-kmp-gitignore`, `iru-setup-kmp-github-workflows`, `iru-setup-changelog` and `iru-setup-readme` in order. Use when bootstrapping or catching up a KMP mobile app repository in one pass."
+model: sonnet
 ---
 
 # Setup KMP Repository
@@ -51,6 +26,8 @@ Unlike `iru-setup-android-repository`/`iru-setup-swift-repository`, there is no 
 KMP setup only scaffolds **apps** (a shared KMP module consumed by an Android app and an iOS app). A KMP *library*
 published to Maven Central is out of scope — say so if the user asks for one, and suggest
 `iru-setup-java-library-repository`/`iru-setup-android-repository` for the publishing pipeline shape instead.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Resolve inputs
 
@@ -86,7 +63,7 @@ Recognized keys:
 - **Shared pipeline vocabulary**: `open-source` (`yes`/`no`), `visibility` (`public`/`private`/`internal`), `ci`
   (`yes`/`no`), `ios-ci` (`all`/`stable`/`none`), `ci-tests` (`unit`/`full`), `pages` (`yes`/`no`), `on-existing`
   (`ask`/`keep`/`update`/`replace` — never asked; forwarded to the component sub-skills only when it arrived here
-  via `args`), `distribution` (`none`/`internal`/`store`), `accessibility` (`enforce`/`report`/`off` — both `ui`
+  via `args`), `distribution` (`none`/`internal`/`store`), `accessibility` (`enforce`/`report`/`off`/`none` — both `ui`
   values render UI, so it always applies), `sonar` (`cloud`/`self-hosted`/`none`) plus, only when
   set, `sonar-organization`/`sonar-project-key`/`sonar-host-url`, `integration-branch`, `stable-branch`,
   `java-version`, `runner` (macOS runner label), `xcode-version`.
@@ -245,9 +222,9 @@ current pricing" (verified October 2026 against docs.github.com) and tell the us
   **`internal`** recommended. `internal` = Firebase App Distribution for Android + TestFlight (internal testers)
   for iOS; `store` = Google Play + TestFlight/App Store Connect; `none` = local installs only.
 
-- **accessibility** — "Automated accessibility checks in UI tests?" **Enforce (Recommended)** ("violations fail the
+- **accessibility** — "Support accessibility and assistive technologies?" **Enforce (Recommended)** ("violations fail the
   UI tests") / **Report only** ("listed in test reports, never failing") / **Off** ("not run; the coding defaults
-  still apply"). Written by `iru-setup-kmp-app` to `.ui-quality.yml`; asked once here alongside the other shared
+  still apply"). **None — opt out entirely** ("no accessibility rules, checks or docs"; written as `accessibility: none`). In `mode: existing`, pre-select from `iru-explore`'s `Accessibility:` line per `iru-setup-repository`'s `reference/accessibility-detection.md` (`present` → Enforce, `partial` → Report only with a mixed-compliance warning, `absent` → None) and never silently flip an existing `.ui-quality.yml` value. Written by `iru-setup-kmp-app` to `.ui-quality.yml`; asked once here alongside the other shared
   inputs, never again by the scaffold.
 
 These values pass through unchanged to Step 4 (`iru-setup-kmp-app`) and Step 7 (`iru-setup-kmp-github-workflows`),
@@ -389,7 +366,7 @@ State explicitly what was wired or deliberately omitted, and why:
 - **`ci-tests`**: `unit`/`full` — whether CI runs the iOS app's XCTest bundle.
 - **`pages`**: `yes` (Antora + Dokka deployed to GitHub Pages) or `no` (uploaded as a workflow artifact).
 - **`distribution`**: which release jobs and signing secrets exist (Play/Firebase, TestFlight).
-- **`accessibility`**: the level written to `.ui-quality.yml` (`enforce`/`report`/`off`) and that the UI tests
+- **`accessibility`**: the level written to `.ui-quality.yml` (`enforce`/`report`/`off`/`none`) and that the UI tests
   capture `.ui-screenshots/` (gitignored; CI uploads it as a 7-day artifact).
 - **`sonar`**: whether the root `sonar {}` block and the CI Sonar step were included; if `none`, whether that's the
   expected default or a user choice; if configured with `ci: no`, that no CI step sends reports.

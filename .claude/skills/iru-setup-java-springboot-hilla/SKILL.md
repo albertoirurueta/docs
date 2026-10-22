@@ -1,44 +1,12 @@
 ---
 name: iru-setup-java-springboot-hilla
-description: >-
-  Scaffold a Hilla (Vaadin) React frontend into one module of an existing Spring Boot hexagonal build — Java (Maven)
-  or Kotlin (Maven, or Gradle Kotlin DSL), read from `springboot-stack.yml`'s `project.language`/`project.buildTool`
-  (absent ⇒ `java`/`maven`, the unchanged Java path) — the Vaadin BOM and `hilla-spring-boot-starter`/
-  `vaadin-spring-boot-starter` dependencies, the `vaadin-maven-plugin` execution wired into that module's pom (on
-  Gradle the `com.vaadin` plugin — `vaadinPrepareFrontend`/`hillaGenerate`/`vaadinBuildFrontend` — applied to the
-  `:boot` project with the BOM, starters and plugin in `gradle/libs.versions.toml`), Kotlin `@BrowserCallable`
-  conventions (Hilla 25 maps Kotlin's own nullability to the TypeScript client natively — `String` required,
-  `String?` optional — so no `@Nonnull` annotations), `src/main/frontend/` (file-based-routing `views/@index.tsx` +
-  `views/@layout.tsx`, a customized `index.html`), the module-root `vitest.config.ts` extending Vaadin's generated
-  Vite config with `@vitest/coverage-v8` lcov output, a sample `@testing-library/react` test, `eslint.config.js`
-  (flat config, `typescript-eslint` + `eslint-plugin-react-hooks` + `eslint-config-prettier`) plus
-  `.prettierrc.json`/`.prettierignore`, `package.json` `test`/`coverage`/`lint`/`format`/`test:ui` scripts, per the
-  catalog's UI contract a Playwright component-testing setup in the web module (a standalone Vite component gallery
-  driven by Playwright's built-in `mount()` fixture, `@axe-core/playwright`, the shared `e2e/support/ui-screenshots.ts`
-  helper, a `HomeView` story and a spec capturing `.ui-screenshots/screen/HomeView/` across left-to-right/right-to-left
-  × light/dark with an accessibility check) and `.ui-quality.yml` at the repository root (its `accessibility` level
-  from `args`, else the manifest's top-level `accessibility`, else `enforce`), the `.gitignore`
-  additions this frontend needs, and — only when the manifest's `sonar.mode` isn't `none` — the `sonar.sources`/
-  `sonar.tests`/`sonar.javascript.lcov.reportPaths` additions to the root pom (Gradle: the root `sonar {}` block).
-  The frontend files are identical for every language and build tool. Announces whether it is scaffolding the
-  frontend from scratch or updating an existing one, and for every frontend file/build wiring it owns that already
-  exists warns and asks Update (fill gaps) / Keep as is / Replace / Stop — or applies `on-existing` from `args`.
-  Invoke as `/iru-setup-java-springboot-hilla`, optionally with `args` (a `stack-file` line naming the manifest
-  path, default `springboot-stack.yml` at the repository root, plus optional `mode:` (`new`/`existing`),
-  `on-existing:` (`ask`/`keep`/`update`/`replace`) and `accessibility:` (`enforce`/`report`/`off`) lines). Runs standalone against any build created by
-  `iru-setup-java-springboot-modules`, or is invoked by `iru-setup-java-springboot`'s Step 8 (via
-  `iru-isolated-skill-executor`) right after `iru-setup-java-springboot-apis` whenever the manifest's `frontend` is
-  `hilla`. Reads `springboot-stack.yml` for the module layout, language, build tool and `sonar.mode`, and looks up
-  the Vaadin BOM version and every npm devDependency version live (Maven Central and the npm registry) rather than
-  from memory. The root pom's `vaadin.version` property, `dependencyManagement` import, `pluginManagement` entry,
-  and `production` profile (Gradle: the catalog's `vaadin` version, `vaadin-bom` library and `com.vaadin` plugin
-  alias) are primarily written by `iru-setup-java-springboot-pom` — this skill only fills that gap itself when
-  running standalone against a build where it's missing. Use whenever a Spring Boot service needs its Hilla frontend
-  module actually scaffolded, instead of hand-wiring the Vaadin/Hilla build and npm toolchains file by file.
-model: haiku
+description: "Invoked as `/iru-setup-java-springboot-hilla` (args: `stack-file`, `mode`, `on-existing`, `accessibility`), normally by `iru-setup-java-springboot`. Scaffolds a Hilla (Vaadin) React frontend into the web module of a Spring Boot build: Vaadin build wiring, `src/main/frontend/`, Vitest, ESLint/Prettier and Playwright UI tests."
+model: sonnet
 ---
 
 # Setup Java Spring Boot Hilla Frontend
+
+Runs standalone against any build created by `iru-setup-java-springboot-modules`, or is invoked by `iru-setup-java-springboot`'s Step 8 (via `iru-isolated-skill-executor`) right after `iru-setup-java-springboot-apis` whenever the manifest's `frontend` is `hilla`.
 
 Scaffold a Hilla React frontend into the module of a Spring Boot hexagonal reactor that runs the web server. Two
 things about Hilla in the Vaadin 25.x line are easy to get wrong and were confirmed empirically while writing this
@@ -66,6 +34,8 @@ all three combinations. Both Kotlin paths were verified on Spring Boot 4.1.1 + V
 Kotlin `@BrowserCallable` service compiled, the TypeScript client was generated from it, and a production bundle
 was built — on Maven with `vaadin-maven-plugin` and on Gradle 8.14 with the `com.vaadin` plugin.
 
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
+
 ## Step 0 — Resolve inputs
 
 Parse `args` for `key: value` lines:
@@ -80,7 +50,7 @@ accessibility: enforce
 `mode` (`new`/`existing`) is informational — it never means "update silently"; `on-existing`
 (`ask`/`keep`/`update`/`replace`, default `ask`) pre-answers Step 1's existing-frontend question for every file.
 
-`accessibility` (`enforce`/`report`/`off`) is the UI tests' automated accessibility level written to
+`accessibility` (`enforce`/`report`/`off`/`none`) is the UI tests' automated accessibility level written to
 `.ui-quality.yml` (Step 4b). Resolve it from `args` first, else the manifest's top-level `accessibility` key
 (written by `iru-setup-java-springboot`, meaningful only with `frontend: hilla`), else `enforce` — never ask.
 
@@ -91,6 +61,15 @@ doesn't scaffold a reactor from nothing, only a frontend into one that already e
 actually set; if it's `none`, ask via `AskUserQuestion` whether to proceed anyway (the user may be adding a
 frontend after the fact) or stop, and if proceeding, update the manifest's `frontend:` field to `hilla` before
 writing anything else, so a later re-run of `iru-setup-java-springboot` sees the choice that was actually made.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (axe-core in the Playwright UI tests), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — semantic landmarks, accessible names on icon-only buttons, `alt` on images, relative font sizes, `prefers-reduced-motion` guards — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey
 
@@ -437,7 +416,7 @@ instead. Vitest browser mode stays the behaviour-test runner.
 
    ```yaml
    # .ui-quality.yml — at the repository root; written by the iru-setup-* scaffolds, read by the coding and test skills.
-   accessibility: enforce      # enforce: violations fail the UI tests | report: listed, never failing | off: not run
+   accessibility: enforce      # enforce: violations fail the UI tests | report: listed, never failing | off: not run | none: opted out entirely
    directions: [ltr, rtl]      # screenshot matrix directions
    themes: [light, dark]       # screenshot matrix themes
    ```

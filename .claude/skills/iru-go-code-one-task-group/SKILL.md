@@ -1,33 +1,6 @@
 ---
 name: iru-go-code-one-task-group
-description: >-
-  Implement one bucket of Go tasks from a plan's task group end-to-end — in any Go module (an agent-friendly Cobra /
-  Bubble Tea v2 command-line tool scaffolded by `iru-setup-go-cli`, or any other Go library, service or CLI): detects
-  the shape once (module path and `go` directive, `go.work` workspace, `cmd/<bin>/` + `internal/` layout, CLI
-  framework, Bubble Tea, testscript `testdata/script/*.txtar` end-to-end tests, teatest, container-backed tests behind
-  the `integration` build tag, golangci-lint v2 config, cgo availability for the race detector), captures a single
-  pre-change quality baseline for the whole bucket via `iru-go-code-quality`, runs `iru-go-code-one-task` once per
-  task (in parallel `iru-isolated-skill-executor` agents when the group is marked parallelizable; tasks sharing
-  `root.go`, the exit-code/envelope files, `go.mod`, or a golden file always sequential) to implement each one with
-  its tests, formatting and `go build`/`go vet` compile-check, then validates the entire bucket once, cheapest first,
-  every check delegated to an `iru-gate-runner` agent so no raw report lands in this context — license headers on
-  `.go` files via `iru-check-license`, doc comments via `iru-go-godoc`, scoped tests via `iru-go-test`, an 80%
-  statement-coverage gate per changed file via `iru-go-coverage` (`-coverpkg=./...`, so in-process testscript and
-  Cobra tests count; container-free tests only; branch coverage "not available in Go"), the full suite with `-race`,
-  and golangci-lint v2 + gofmt/goimports + `go vet` + govulncheck via `iru-go-code-quality` diffed against the
-  baseline; for a bucket that added or changed Bubble Tea screens/components, a UI stage checking that every one of
-  them has `.txt` captures in `.ui-screenshots/` for each of its states × `.ui-quality.yml` directions × themes and
-  applying the accessibility level (enforce → violations fail the bucket, report → listed) — and last, only when the
-  repository has `integration`-tagged tests, the container-backed stage
-  (`iru-go-test` with `tags: integration`) serialized repository-wide behind the shared atomic-`mkdir`
-  `.integration-test.lock` (owner file, stale after 60 minutes, bounded ~45-minute wait, released on every exit path,
-  `lock: held` passed to the gate); plain CLI end-to-end tests (testscript) need no lock, and Docker unavailable makes
-  the container stage "unverified", never silently skipped. `iru-go-code-one-task` checks off each task's box itself
-  with a "group validation pending" note; this skill backfills any that didn't land and replaces each note with the
-  final outcome. Invoke as `/iru-go-code-one-task-group <bucket text>`, passing every task/sub-task in the bucket with
-  its own text, the group's `Parallelizable` verdict, and any relevant "Current code state" context. The Go
-  counterpart to `iru-rust-code-one-task-group` and `iru-fastapi-code-one-task-group`; used by
-  `iru-code-one-task-group`, which invokes it once per plan group for its `go`-tagged tasks.
+description: "Invoked as /iru-go-code-one-task-group <bucket text> (the group's tasks, Parallelizable verdict, code-state context) via Skill. Implements one Go task bucket: one quality baseline, iru-go-code-one-task per task (parallel when allowed), then validates the bucket once (license, godoc, tests, 80% coverage, golangci-lint, UI captures, locked integration stage) and finalizes checkboxes."
 model: sonnet
 allowed-tools: Read Edit Write Bash(go *) Bash(gofmt *) Bash(command -v *) Bash(docker info*) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(git rev-parse *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(mkdir .integration-test.lock*) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Skill Agent
 ---
@@ -55,6 +28,8 @@ Three things shape the validation order:
    repository-wide `.integration-test.lock` (Step 0) — and only when the repository has any.
 
 It uses a medium model on purpose: the plan carries the hard reasoning; this skill drives execution of it.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Read this before running anything container-backed
 
@@ -85,7 +60,7 @@ Detect once and reuse for every gate call below (the same facts `iru-go-code-one
 - **Quality tools wired**: `.golangci.yml` (v2 when `version: "2"`), `command -v golangci-lint`, `command -v
   govulncheck`; a missing tool is reported, not installed by this skill.
 - **Terminal UI** — `charm.land/bubbletea/v2` (or v1) in `go.mod`, the TUI package(s) (`internal/tui/`), the capture
-  helper (`ui_screenshots_test.go`) and `.ui-quality.yml` at the repository root (missing = `accessibility: enforce`,
+  helper (`ui_screenshots_test.go`) and `.ui-quality.yml` at the repository root (missing (new UI project) = `accessibility: enforce`,
   `directions: [ltr, rtl]`, `themes: [light, dark]`). Note whether the TUI adapts to the background (a `Theme` built
   with `lipgloss.LightDark` from `tea.BackgroundColorMsg`) — the themes 3.5a expects are the listed ones it defines
   plus `no-color` (only `no-color` for a single palette).
@@ -107,6 +82,10 @@ Agent({
 
 Record it as the bucket's baseline — empty if every file is new. Step 3.6 diffs against it so only issues this bucket
 introduces are flagged. Skip if `iru-go-code-quality` isn't installed, and say so in Step 5.
+
+**Accessibility opt-out (`accessibility: none`).** When `.ui-quality.yml` says `none`, the user opted out of accessibility support entirely (see `reference/ui-contract.md` §8, "Opting out and existing code"): do not apply the accessibility rules, do not run or require the accessibility checks (axe, ATF/semantics audit, `performAccessibilityAudit()`, Axe.Windows, a11y lint rules, TUI asserted checks), and report them as "accessibility: opted out" in the group report - never "unverified", and never a failure. `off` differs: the rules still apply when writing code, only the automated checks are not run.
+
+**Missing `.ui-quality.yml` in a repository that already has UI code.** The level was never chosen, so don't assume the `enforce` default — that default is only for a new UI project with no UI code yet. Before the first UI task of the bucket, resolve it once per `reference/ui-contract.md` §8 ("Opting out and existing code"): reuse the `Accessibility:` line of an `iru-explore` report in the plan's "Current code state" or this conversation (otherwise apply the detection rules of `iru-explore`'s `reference/accessibility-detection.md`), ask the user via `AskUserQuestion` with the setup's pre-selection (`present` → Enforce, `partial` → Report only with the mixed-compliance warning, `absent` → None with the half-compliance warning), and write `.ui-quality.yml` with the chosen level and the default `directions`/`themes`, so the per-task skills and the test gates read the same value. This is a decision only the user can make, so it is an allowed pause.
 
 ## Step 2 — Implement each task via `iru-go-code-one-task`
 
