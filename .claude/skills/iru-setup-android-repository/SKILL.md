@@ -1,32 +1,7 @@
 ---
 name: iru-setup-android-repository
-description: End-to-end bootstrap for an Android/Gradle repository of either flavor — collects `flavor`
-  (`library`/`app`, asked via `AskUserQuestion` when absent), `branching` (`gitflow`/`main-only`), the project's
-  identity (group/artifact id + namespace + description for a library, application id + namespace + app name for
-  an app, plus license and developer name/email/organization URL), and the shared pipeline parameters (integration
-  branch `develop`, stable branch `main`, Java `17`, min SDK `26`, emulator API level `35`, `open-source`, the
-  repository `visibility` (detected via `gh repo view` or asked), `ci` (GitHub Actions wanted at all), `sonar`
-  plus its detail keys, `ci-tests` (`unit`, or `full` = unit + emulator instrumented tests), `pages` (GitHub
-  Pages vs. a workflow artifact for the docs), `publish` for libraries, `distribution` for apps, `accessibility` (`enforce`/`report`/`off` — the automated
-  accessibility level of the UI tests, written by the scaffold to `.ui-quality.yml`; both flavors render UI, the
-  library through its `app/` sample) — each question
-  stating the Actions-minutes / SonarCloud / Pages cost facts for that visibility) once, prints a setup-mode
-  statement (from scratch, or an inventory of the prior setup it found), then
-  orchestrates the flavor's scaffold skill (`iru-setup-android-library` / `iru-setup-android-app`) →
-  `iru-setup-antora` → `iru-setup-android-gitignore` → `iru-setup-android-github-workflows` → `iru-setup-changelog`
-  → `iru-setup-readme`, in that order, via `iru-isolated-skill-executor`, so nothing is asked twice — skipping the
-  workflows step entirely (security block included) when `ci: no`. Invoke as `/iru-setup-android-repository`,
-  optionally with `args` (`key: value` lines) to pre-resolve `flavor`, `branching`, `mode` (`new`/`existing`),
-  `open-source`, `visibility`, `ci`, `ci-tests`, `pages`, `on-existing` (`ask`/`keep`/`update`/`replace`, forwarded
-  only when supplied), `publish`, `distribution`, `accessibility`, `sonar` (+ `sonar-organization`/`sonar-project-key`/
-  `sonar-host-url`), `integration-branch`, `stable-branch`, `java-version`, `min-sdk`, `compile-sdk`, `api-level`,
-  `run-instrumented-tests`, and every identity field, skipping the matching question. On an existing repository
-  every component sub-skill warns about the prior setup it owns and asks Update / Keep as is / Replace per file
-  (unless `on-existing` decides), and the final report states the action taken per component. Use whenever bootstrapping
-  (or catching up) an Android library or app repository's full Gradle/docs/gitignore/CI/changelog/README scaffold
-  in one pass, whichever flavor it is, instead of running six skills separately and re-answering the same
-  questions each time.
-model: haiku
+description: "Invoke as /iru-setup-android-repository [key: value args]. End-to-end bootstrap of an Android/Gradle library or app repository: asks flavor, branching, identity and shared pipeline inputs once, then chains scaffold, Antora docs, gitignore, GitHub workflows, changelog and README via iru-isolated-skill-executor. Use to create or catch up a full Android repository setup in one pass instead of running six skills separately."
+model: sonnet
 ---
 
 # Setup Android Repository
@@ -48,6 +23,8 @@ sub-skill re-derives whatever it needs from the filesystem this orchestrator has
 completion summary needs to flow back, keeping all six sub-skills' full transcripts (and the Android scaffold's
 very long template listings) out of this orchestrator's own context. Every sub-agent is launched with
 `run_in_background: false` — each step depends on the previous one's files being on disk.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Resolve inputs
 
@@ -83,7 +60,7 @@ Recognized keys:
   (`yes`/`no`), `ci-tests` (`unit`/`full`), `pages` (`yes`/`no`), `on-existing` (`ask`/`keep`/`update`/`replace` —
   never asked; forwarded to the component sub-skills only when it arrived here via `args`), `publish` (`yes`/`no` —
   `library` only),
-  `distribution` (`none`/`internal`/`store` — `app` only), `accessibility` (`enforce`/`report`/`off` — both
+  `distribution` (`none`/`internal`/`store` — `app` only), `accessibility` (`enforce`/`report`/`off`/`none` — both
   flavors; forwarded to the scaffold skill, which writes it to `.ui-quality.yml`), `sonar` (`cloud`/`self-hosted`/`none`) plus, only when
   set, `sonar-organization`/`sonar-project-key`/`sonar-host-url`, `integration-branch`, `stable-branch`,
   `java-version`, `min-sdk`, `compile-sdk`, `api-level`, `run-instrumented-tests` (`yes`/`no` — the workflows
@@ -294,7 +271,7 @@ October 2026 against docs.github.com) and tell the user to double-check their ow
   outcome from `app/build.gradle.kts` afterward.
 - **accessibility** — both flavors (the library's `app/` sample has a UI test too): "Automated accessibility
   checks in UI tests?" — **Enforce (Recommended)** ("Accessibility Test Framework violations fail the UI tests"),
-  **Report only** ("listed in test output, never failing"), **Off** ("not run; the coding defaults still apply").
+  **Report only** ("listed in test output, never failing"), **Off** ("not run; the coding defaults still apply"). **None — opt out entirely** ("no accessibility rules, checks or docs"; written as `accessibility: none`). In `mode: existing`, pre-select from `iru-explore`'s `Accessibility:` line per `iru-setup-repository`'s `reference/accessibility-detection.md` (`present` → Enforce, `partial` → Report only with a mixed-compliance warning, `absent` → None) and never silently flip an existing `.ui-quality.yml` value.
   Asked once here, alongside the other shared inputs, and forwarded to the scaffold skill (Step 4), which writes it
   to `.ui-quality.yml`.
 
@@ -529,7 +506,7 @@ State explicitly which of publishing/distribution and Sonar analysis were wired,
   source, private/internal, or `ci: no`) or a direct user choice; if configured with `ci: no`, that no CI step
   sends reports.
 - **`run-instrumented-tests`**: yes/no — whether the emulator (KVM) job was generated.
-- **`accessibility`**: `enforce`/`report`/`off` as written to `.ui-quality.yml` (and the file's action), the sample
+- **`accessibility`**: `enforce`/`report`/`off`/`none` as written to `.ui-quality.yml` (and the file's action), the sample
   UI test's capture count the scaffold reported, and that every CI run uploads `.ui-screenshots/` as a 7-day
   `ui-screenshots` artifact (ci: yes only).
 - **Toolchain versions**: which came from a live lookup versus the recorded fallback, as reported by the scaffold

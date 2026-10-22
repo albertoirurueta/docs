@@ -1,40 +1,6 @@
 ---
 name: iru-setup-macos-app
-description: >-
-  Scaffold a new native macOS desktop app (Swift 6, Xcode 27, Apple silicon + Intel universal) at the repository
-  root — an XcodeGen `project.yml` with one macOS app target `<AppName>` (scheme `<AppName>`), a hosted Swift
-  Testing unit-test target `<AppName>Tests`, an XCUITest target `<AppName>UITests` and the local package's
-  `CoreTests` in the same scheme; `MARKETING_VERSION`/`CURRENT_PROJECT_VERSION` in `settings.base` (where
-  `iru-swift-bump-version` rewrites them), `SWIFT_STRICT_CONCURRENCY = complete`, hardened runtime, an
-  entitlements file with the App Sandbox (`sandbox: yes`, default), a generated Info.plist (`INFOPLIST_KEY_*`); a
-  UI-framework-free local package `Packages/Core` (Foundation + Observation only: `Models/`, `Services/`, plus
-  `ViewModels/` for `architecture: mvvm` or `Controllers/` + a passive-view protocol for `architecture: mvc`) whose
-  Swift Testing suite covers 100% of its lines; the `App/` UI layer per `ui` — `swiftui` (`WindowGroup` +
-  `Settings` + a `Commands` menu driven by a focused value, MVVM with a per-window `@Observable` view model) or
-  `appkit` (programmatic: `main.swift` + `AppDelegate`, the main menu built in code, `NSWindowController` +
-  `NSViewController` with Auto Layout in `loadView()`; `mvc` Cocoa controller core or `mvvm` with AppKit
-  Observation tracking in `viewWillLayout()`); a `--uitesting` launch argument and accessibility identifiers on
-  every control; per the catalog's UI contract, a `.ui-quality.yml` at the root, the shared
-  `App/Tests/Support/UIScreenshots.swift` capture helper compiled into both test targets, and UI tests capturing the
-  main window in every left-to-right/right-to-left × light/dark cell into `.ui-screenshots/` plus a
-  `performAccessibilityAudit()` test at the configured level; an empty AppIcon/AccentColor asset catalog; `ExportOptions-*.plist` per `distribution`
-  (`none` = copy-app export, `internal` = Developer ID, `store` = App Store Connect upload); `scripts/make-dmg.sh`
-  (hdiutil UDZO + optional codesign); `.swiftlint.yml` (with `missing_docs`), `.swift-format`, and
-  `sonar-project.properties` (omitted when `sonar: none`). The generated `.xcodeproj` is never committed. Invoke as
-  `/iru-setup-macos-app`. Accepts pre-resolved inputs via `args` (`key: value` lines) — `ui` (`swiftui`/`appkit`),
-  `architecture` (`mvvm`/`mvc`; `mvc` only with `appkit`), `app-name`, `bundle-id`, `team-id`, `min-macos`,
-  `generator` (`xcodegen` only), `sandbox` (`yes`/`no`), `version`, `build-number`, `category`, `license`,
-  `developer-name`, `developer-email`, `organization-url`, `open-source`, `visibility`, `ci`, `sonar`
-  (+ `sonar-organization`/`sonar-project-key`/`sonar-host-url`), `distribution` (`none`/`internal`/`store`),
-  `branching`, `accessibility` (`enforce`/`report`/`off`, default `enforce`), `mode` (`new`/`existing`) and
-  `on-existing` (`ask`/`keep`/`update`/`replace`) — so
-  `iru-setup-macos-repository` can supply them without re-prompting; stand-alone it asks `open-source` first and
-  derives the `sonar` default from it. Announces whether it is scaffolding from scratch or updating; for every file
-  group it owns that already exists it warns and asks Update / Keep as is / Replace / Stop (unless `on-existing`
-  decides) and never overwrites hand-written source. Versions are looked up at run time with a dated October 2026
-  fallback table. Use whenever a new macOS desktop app repository needs its Xcode project, testable core,
-  quality tooling, tests and packaging bootstrapped from this house template; use `iru-setup-apple-app` for a
-  multi-platform (iOS/watchOS + macOS) app instead.
+description: "Invoke as `/iru-setup-macos-app`, optionally with `args` (key: value lines such as `ui`, `architecture`, `app-name`, `bundle-id`, `distribution`, `on-existing`); normally called by `iru-setup-macos-repository`. Scaffolds a native macOS app (Swift 6, XcodeGen, SwiftUI or AppKit, UI-free `Packages/Core`) with tests, quality tooling and DMG packaging. Multi-platform Apple apps: `iru-setup-apple-app`."
 model: sonnet
 allowed-tools: Read Write Edit AskUserQuestion Bash(git *) Bash(gh *) Bash(curl *) Bash(xcodegen *) Bash(xcodebuild *) Bash(xcrun *) Bash(swift *) Bash(swiftlint *) Bash(python3 *) Bash(plutil *) Bash(chmod *) Bash(mkdir *) Bash(sw_vers *) Agent
 ---
@@ -131,13 +97,22 @@ Recognized keys (every key found is resolved — skip its question in Step 2):
 | `open-source`, `visibility`, `ci`, `sonar` (+ coordinates) | the `sonar` recommendation, as in `iru-setup-kmp-app` |
 | `distribution` | `none` (copy-app export, local/QA builds) / `internal` (Developer ID + notarized DMG on GitHub Releases) / `store` (Mac App Store via App Store Connect); default `internal` (a notarized DMG on GitHub Releases is the natural public download, open source or not; `store` only when asked) |
 | `branching` | `gitflow` / `main-only` — informational: the macOS app carries no pre-release marker in-tree (`iru-swift-bump-version` Step 5), so the files are identical either way |
-| `accessibility` | `enforce` (default) / `report` / `off` — the UI tests' automated accessibility level, written to `.ui-quality.yml` (UI contract §8) |
+| `accessibility` | `enforce` (default) / `report` / `off` / `none` — the UI tests' automated accessibility level, written to `.ui-quality.yml` (UI contract §8) |
 | `mode`, `on-existing` | as in every catalog setup skill (default `ask`) |
 
 Unknown keys from a full shared-args set (`publish`, `ci-tests`, `pages`, `integration-branch`, `stable-branch`,
 `runner`, `macos-ci`, …) are ignored and named in the report. `mode: existing` never means "gap-fill silently":
 Step 1 still warns about and asks about every pre-existing file group; only `on-existing` skips that question.
 Orchestrators forward `on-existing` only when their own `args` received it.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (`performAccessibilityAudit()`), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — `accessibilityLabel`/roles on icon buttons and images, Dynamic Type-safe text styles, VoiceOver-friendly ordering, keyboard access — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey the repository
 
@@ -220,7 +195,7 @@ Then **sandbox** (unless resolved): **Yes (Recommended)** — required for the M
 builds too (irurueta docs: apps/apple/macos.adoc, "The App Sandbox"); **No** — only for tools that need
 unrestricted file/process access. `sandbox: no` + `distribution: store` is contradictory: warn and ask again.
 
-Then **accessibility** (unless resolved), `AskUserQuestion` "Automated accessibility checks in UI tests?":
+Then **accessibility** (unless resolved), `AskUserQuestion` "Support accessibility and assistive technologies?":
 **Enforce (Recommended)** (`enforce` — every `performAccessibilityAudit()` issue fails the UI tests) / **Report
 only** (`report` — issues attached and listed, never failing) / **Off** (`off` — the audit test skips; labels,
 contrast and keyboard access are still coded). Written to `.ui-quality.yml`.

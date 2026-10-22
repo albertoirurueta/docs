@@ -1,36 +1,7 @@
 ---
 name: iru-setup-angular-web
-description: Scaffold a new Angular web application with `npx -p @angular/cli@latest ng new <name> --standalone
-  --style=scss --routing --skip-git --package-manager=npm --defaults --ssr=false` (Angular 22's own defaults
-  already give a zoneless, Vitest-backed, standalone-component workspace — the flags above only make every prompt
-  non-interactive), then wires up the full toolchain on top of it: confirms `angular.json`'s `test` target uses the
-  `@angular/build:unit-test` builder with `runner: vitest`, adds `coverageReporters: ["text","lcov"]` and an
-  80%-lines `coverageThresholds` gate, installs a matching-major `@vitest/coverage-v8`; `ng add angular-eslint`
-  (auto-pins its major to the installed Angular major) plus `eslint-config-prettier`; normalizes the CLI's own
-  scaffold with the `.prettierrc` it already ships (adding a `.prettierignore`); Stylelint 17 for SCSS
-  (`stylelint-config-standard-scss`); Playwright via `ng add playwright-ng-schematics` (and fixes the schematic's
-  own hardcoded `/MyApp/` title assertion) — plus, per the catalog's UI contract, a Playwright component-testing
-  project driven by Playwright's built-in `mount()` fixture against a component gallery served by a `gallery`
-  configuration in `angular.json`, `@axe-core/playwright`, the shared `e2e/support/ui-screenshots.ts` helper, a
-  sample screen spec capturing `.ui-screenshots/screen/App/` across left-to-right/right-to-left × light/dark with an
-  accessibility check, and a `.ui-quality.yml` at the repository root; Compodoc (`@compodoc/compodoc`, a `docs` script into `docs/api`);
-  optional Storybook (`@storybook/angular-vite`, asked); and, when `sonar` ≠ `none`, `sonar-project.properties`
-  (`sonar.sources=src`, `sonar.tests=src`, `sonar.test.inclusions=**/*.spec.ts`,
-  `sonar.javascript.lcov.reportPaths=coverage/<project>/lcov.info`). Invoke as `/iru-setup-angular-web`. Accepts
-  pre-resolved inputs via `args` (`key: value` lines) — `name`, `directory`, `license`, `developer-name`,
-  `developer-email`, `organization-url`, `open-source`, `sonar` (+ `sonar-organization`/`sonar-project-key`/
-  `sonar-host-url`), `storybook`, `visibility` (`public`/`private`/`internal` — SonarCloud is only recommended for
-  a public open-source repository), `ci` (`yes`/`no` — with `ci: no`, `none` is recommended for Sonar),
-  `accessibility` (`enforce`/`report`/`off`, default `enforce` — written to `.ui-quality.yml`), `on-existing`
-  (`ask`/`keep`/`update`/`replace`, default `ask`), `mode` (`new`/`existing`) — so an orchestrating skill can supply
-  them without re-prompting; invoked stand-alone, it asks `open-source` first and derives the `sonar` question's
-  default from that answer. Announces whether it is scaffolding from scratch or updating an existing workspace; for
-  every artifact it owns that already exists (`angular.json` test options, ESLint, Prettier, Stylelint, Playwright,
-  the component gallery and UI-test helper, `.ui-quality.yml`, Compodoc script, Storybook, `sonar-project.properties`), warns and asks Update (merge, keep customizations) / Keep
-  as is / Replace (regenerate from the template), explaining each option's consequences. Use whenever a new Angular web application needs its scaffold, test/coverage
-  config, lint/format/style tooling, e2e tests, API docs, and Sonar wiring bootstrapped from this house template,
-  instead of hand-running each `ng add`/`npm install` separately.
-model: haiku
+description: "Invoked as /iru-setup-angular-web with optional key: value args, usually by iru-setup-typescript-repository. Scaffolds an Angular web app with ng new, then wires Vitest with an 80% coverage gate, ESLint, Prettier, Stylelint, Playwright UI tests with accessibility checks, Compodoc, optional Storybook and Sonar."
+model: sonnet
 ---
 
 # Setup Angular Web
@@ -79,7 +50,7 @@ repository root — see Step 3), `license`, `developer-name`, `developer-email`,
 `sonar-organization`/`sonar-project-key`/`sonar-host-url`, `storybook` (`yes`/`no`), `visibility`
 (`public`/`private`/`internal` — the GitHub repository's visibility, used only to key Step 2's Sonar
 recommendation), `ci` (`yes`/`no` — whether the run invoking this skill generates GitHub Actions workflows at all;
-only consulted by Step 2's Sonar question), `accessibility` (`enforce`/`report`/`off`, default `enforce` — the UI
+only consulted by Step 2's Sonar question), `accessibility` (`enforce`/`report`/`off`/`none`, default `enforce` — the UI
 tests' automated accessibility level, written to `.ui-quality.yml` in Step 10b), `on-existing`
 (`ask`/`keep`/`update`/`replace`, default `ask` — how
 Step 1 treats each pre-existing artifact; meant for scripted runs), and `mode` (`new`/`existing`).
@@ -91,6 +62,15 @@ pre-existing artifact unless `on-existing` says otherwise; it never means "updat
 There is no `publish` or `distribution` key here — an Angular web app isn't published to a package registry or an
 app store the way a library or a native app is; it's built and deployed as static assets, which is
 `iru-setup-typescript-github-workflows`'s concern, not this skill's.
+
+**Accessibility level `none` and assistive-technology templates.** `accessibility` takes `enforce`, `report`, `off` or
+`none` (UI contract §8; the stand-alone question gains a fourth option, **None — opt out entirely**, e.g. a mandated
+non-compliant design). With `none`: write `accessibility: none` to `.ui-quality.yml`, do not install or configure the
+accessibility test tooling (axe-core and the Angular template accessibility lint rules), and omit the accessibility-specific attributes from the generated templates.
+With `enforce`, `report` or `off`: include the assistive-technology attributes from the contract's §8 platform
+subsections in every generated template — semantic landmarks, `aria-label` on icon-only buttons, `alt` on images, `rem`/relative font sizes, `prefers-reduced-motion` guards, visible focus — and, for `enforce`/`report` only, the automated checks. In
+`mode: existing`, a prior `.ui-quality.yml` follows this skill's existing Update / Keep / Replace prompt and its
+`accessibility` value is never silently flipped (**Update** sets it only when `args` supplied it).
 
 ## Step 1 — Survey the repository
 
@@ -190,8 +170,7 @@ Then resolve `open-source` and `sonar` — skip either one Step 0 already resolv
 Then, unless Step 0 already resolved it, ask **storybook** (`AskUserQuestion`, default **No**): whether to also
 scaffold Storybook (`@storybook/angular-vite`) for isolated component development/visual review. Most Angular apps
 don't need it; recommend Yes only if the user mentions a component library or design-system use case. In the same
-`AskUserQuestion` call, unless Step 0 resolved it, ask **accessibility**: "Automated accessibility checks in UI
-tests?" — **Enforce (Recommended)** (axe violations fail the UI tests) / **Report only** (listed, never failing) /
+`AskUserQuestion` call, unless Step 0 resolved it, ask **accessibility**: "Support accessibility and assistive technologies?" — **Enforce (Recommended)** (axe violations fail the UI tests) / **Report only** (listed, never failing) /
 **Off** (not run; the coding defaults still apply).
 
 ## Step 3 — Look up tool versions
@@ -468,7 +447,7 @@ templates — keep it; it is the static half of the accessibility check).
 
    ```yaml
    # .ui-quality.yml — at the repository root; written by the iru-setup-* scaffolds, read by the coding and test skills.
-   accessibility: enforce      # enforce: violations fail the UI tests | report: listed, never failing | off: not run
+   accessibility: enforce      # enforce: violations fail the UI tests | report: listed, never failing | off: not run | none: opted out entirely
    directions: [ltr, rtl]      # screenshot matrix directions
    themes: [light, dark]       # screenshot matrix themes
    ```

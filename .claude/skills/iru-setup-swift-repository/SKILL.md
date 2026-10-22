@@ -1,36 +1,7 @@
 ---
 name: iru-setup-swift-repository
-description: End-to-end bootstrap for a Swift repository of either flavor — collects `flavor` (`library`, a SwiftPM
-  package, or `app`, an XcodeGen/Tuist-generated native iOS/iPadOS/macOS/watchOS/visionOS app, SwiftUI or (for the
-  iOS/iPadOS target) UIKit; asked via `AskUserQuestion`
-  when absent and not detectable from disk), `branching` (`gitflow`/`main-only`), the project's identity
-  (`package-name` for a library; `app-name` + `bundle-id-prefix` for an app; plus license and developer
-  name/email/organization URL), the flavor-specific inputs (`platforms`, `min-deployment-targets`/
-  `min-deployment-target`, `generator` and `signing` for an app), and the shared pipeline parameters
-  (`integration-branch` `develop`, `stable-branch` `main`, `runner` `macos-26`, `open-source`, `publish` for
-  libraries, `distribution` for apps, `visibility`, `ci`, `ci-tests`, `pages`, `sonar` plus its detail keys — asked
-  with visibility-aware cost guidance, stressing that macOS runner minutes cost ~10× Linux on private repositories)
-  once, then orchestrates the flavor's scaffold
-  skill (`iru-setup-swift-library` / `iru-setup-apple-app`) → `iru-setup-antora` → `iru-setup-swift-gitignore` →
-  `iru-setup-swift-github-workflows` (skipped entirely when `ci: no`) → `iru-setup-changelog` → `iru-setup-readme`,
-  in that order, via
-  `iru-isolated-skill-executor`, so nothing is asked twice and no sub-skill receives a key its own Step 0 doesn't
-  accept. Invoke as `/iru-setup-swift-repository`, optionally with `args` (`key: value` lines) to pre-resolve
-  `flavor`, `branching`, `mode` (`new`/`existing`), `platforms`, `generator`, `signing`, `ui`, `architecture`,
-  `open-source`, `publish`,
-  `distribution`, `visibility`, `ci`, `ci-tests`, `pages`, `accessibility` (`app` only — the UI tests' automated
-  accessibility level the scaffold writes to `.ui-quality.yml`), `on-existing`, `sonar` (+ `sonar-organization`/
-  `sonar-project-key`/`sonar-host-url`), `integration-branch`,
-  `stable-branch`, `runner`, `xcode-version`, `release-please`, `formatter`, `min-deployment-targets`/
-  `min-deployment-target`, `package-resolved`, and every identity field, skipping the matching question. Announces
-  up front whether it is setting the repository up from scratch or updating an existing one (with an inventory of
-  every component it owns marked absent/present/partial); each sub-skill then warns about and asks Update / Keep
-  as is / Replace for every pre-existing file it owns (`on-existing` answers for all of them in scripted runs),
-  and the final report states per component whether it was created, updated, replaced, kept as is, or skipped
-  (`ci: no`). Use whenever bootstrapping (or catching up) a Swift package or Apple app
-  repository's full scaffold/docs/gitignore/CI/changelog/README pipeline in one pass, whichever flavor it is,
-  instead of running six skills separately and re-answering the same questions each time.
-model: haiku
+description: "/iru-setup-swift-repository [args] bootstraps a Swift repository end to end, library (SwiftPM package) or app (XcodeGen/Tuist iOS/iPadOS/macOS/watchOS/visionOS): collects flavor, identity and the shared pipeline parameters once (with visibility-aware cost guidance, macOS minutes ~10x Linux), then runs iru-setup-swift-library or iru-setup-apple-app, iru-setup-antora, iru-setup-swift-gitignore, iru-setup-swift-github-workflows (skipped when ci: no), iru-setup-changelog and iru-setup-readme via iru-isolated-skill-executor. Announces from-scratch vs update with a component inventory; key: value args pre-resolve answers. Use to bootstrap or catch up a Swift repository in one pass."
+model: sonnet
 ---
 
 # Setup Swift Repository
@@ -51,6 +22,8 @@ sub-skill re-derives whatever it needs from the filesystem this orchestrator has
 completion summary needs to flow back, keeping all six sub-skills' full transcripts (and the two scaffold skills'
 very long template listings) out of this orchestrator's own context. Every sub-agent is launched with
 `run_in_background: false` — each step depends on the previous one's files being on disk.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Resolve inputs
 
@@ -88,7 +61,7 @@ Recognized keys:
   whether GitHub Actions workflows are generated/updated at all), `ci-tests` (`unit`/`full` — only meaningful when
   `ci: yes`), `pages` (`yes`/`no` — only meaningful when `ci: yes`), `on-existing` (`ask`/`keep`/`update`/
   `replace` — how every component sub-skill treats prior setup it finds; never asked, and forwarded only when it
-  arrived here via `args`), `accessibility` (`enforce`/`report`/`off` — `app` only: the level of the UI tests'
+  arrived here via `args`), `accessibility` (`enforce`/`report`/`off`/`none` — `app` only: the level of the UI tests'
   automated accessibility checks, written by `iru-setup-apple-app` to `.ui-quality.yml`; ignored for `library`).
 - **Flavor-specific inputs** named in Step 3: `platforms`, `min-deployment-targets` (`library`),
   `min-deployment-target` (`app`), `generator` (`xcodegen`/`tuist` — `app` only), `signing`
@@ -379,10 +352,10 @@ already resolved):
   integration-test target stay local" (recommended for private/internal) / **Unit + UI tests** — "unit tests plus
   XCUITest UI tests on every selected simulator/platform destination (complete verification, uses considerably more
   macOS minutes — each UI-test run boots a simulator and launches the app)" (recommended for public).
-- **accessibility** (`app` only; skip for `library`) — "Automated accessibility checks in UI tests?" —
+- **accessibility** (`app` only; skip for `library`) — "Support accessibility and assistive technologies?" —
   **Enforce (Recommended)** (`enforce`: every `performAccessibilityAudit()` issue fails the UI tests) / **Report
   only** (`report`: issues listed, never failing) / **Off** (`off`: the audit isn't run; labels, contrast and Dynamic
-  Type are still coded). Written by the scaffold to `.ui-quality.yml`, read by the UI tests and the Swift coding/test
+  Type are still coded). **None — opt out entirely** ("no accessibility rules, checks or docs"; written as `accessibility: none`). In `mode: existing`, pre-select from `iru-explore`'s `Accessibility:` line per `iru-setup-repository`'s `reference/accessibility-detection.md` (`present` → Enforce, `partial` → Report only with a mixed-compliance warning, `absent` → None) and never silently flip an existing `.ui-quality.yml` value. Written by the scaffold to `.ui-quality.yml`, read by the UI tests and the Swift coding/test
   skills.
 - **pages** (only when `ci: yes`; the DocC + Antora site) — public: **`yes`** without asking (state it in Step
   11). Private/internal: ask — **No (Recommended)** — "CI still builds the docs and uploads them as a workflow
@@ -627,7 +600,7 @@ State explicitly which of publishing/distribution and Sonar analysis were wired,
   roughly 10× against it.
 - **`ci-tests`** (`ci: yes` only): `unit` (UI-test bundles skipped via `-skip-testing:` for an app; any library
   integration-test target skipped) or `full`.
-- **`accessibility`** (`app`): the level written to `.ui-quality.yml` (`enforce`/`report`/`off`) and whether it came
+- **`accessibility`** (`app`): the level written to `.ui-quality.yml` (`enforce`/`report`/`off`/`none`) and whether it came
   from `args` or the user; the scaffold's UI tests capture the sample screen into `.ui-screenshots/` (gitignored) and
   CI uploads those captures as a 7-day artifact.
 - **`pages`** (`ci: yes` only): `yes` (deployed to GitHub Pages — defaulted without asking for a public

@@ -1,37 +1,7 @@
 ---
 name: iru-setup-cli-repository
-description: >-
-  End-to-end bootstrap for a command-line tool repository — a native, agent-friendly CLI in Rust (clap, optional
-  Ratatui terminal UI), Go (Cobra, optional Bubble Tea terminal UI), Swift (swift-argument-parser) or C#/.NET 10
-  (System.CommandLine + Spectre.Console, Native AOT, optional full-screen terminal UI) — that follows one contract
-  across languages: data on stdout and messages on stderr, a documented exit-code taxonomy (0–7, 130/143),
-  `--format text|json|jsonl` with a JSON error envelope, TTY/`NO_COLOR`-aware colour, no prompts without a terminal
-  (`--no-input`/`--yes`), `--dry-run` for mutations, `completion`/`schema` commands and a CLI reference generated
-  from the command tree. Collects `language` (`rust`/`go`/`swift`/`dotnet`), `ui` (`none`/`tui`; not offered for
-  Swift), `accessibility` (`enforce`/`report`/`off` — only with `ui: tui`: the level of the terminal UI's asserted
-  accessibility checks, written by the scaffold to `.ui-quality.yml`), `branching` (`gitflow`/`main-only`), the tool's identity (`bin-name`, `description`, license, developer
-  name/email/organization URL, `owner`) and the shared pipeline parameters (integration branch `develop`, stable
-  branch `main`, `open-source`, repository `visibility` (detected via `gh repo view` or asked), `ci`, `cross-os-ci`
-  (when the ~10×-cost macOS and ~1.7×-cost Windows test legs run: `all`/`stable`), `ci-tests`, `pages`,
-  `distribution` (`none` / `internal` = native binaries + SHA256SUMS + build-provenance attestations on GitHub
-  Releases / `store` = also package channels such as crates.io, Homebrew, Scoop, WinGet or a NuGet .NET tool),
-  `channels`, `sonar` plus its detail keys — each question stating the Actions-minutes / runner-multiplier /
-  SonarCloud / Pages cost facts for that visibility) once, prints a setup-mode statement (from scratch, or an
-  inventory of the prior setup it found), then orchestrates the language's scaffold (`iru-setup-rust-cli`,
-  `iru-setup-go-cli`, `iru-setup-swift-cli`, or `iru-setup-dotnet-cli`) → `iru-setup-antora` → the language's
-  gitignore skill (`iru-setup-rust-gitignore`, `iru-setup-go-gitignore`, `iru-setup-swift-gitignore` with
-  `flavor: cli`, or `iru-setup-dotnet-gitignore`) → `iru-setup-cli-github-workflows` → `iru-setup-changelog` →
-  `iru-setup-readme`, in that order, via `iru-isolated-skill-executor`, so nothing is asked twice — skipping the
-  workflows step entirely (security block included) when `ci: no`. Invoke as `/iru-setup-cli-repository`,
-  optionally with `args` (`key: value` lines) to pre-resolve `language`, `ui`, `accessibility`, `branching`, `mode`
-  (`new`/`existing`), `open-source`, `visibility`, `ci`, `cross-os-ci`, `ci-tests`, `pages`, `distribution`,
-  `channels`, `homebrew-tap`, `on-existing` (`ask`/`keep`/`update`/`replace`, forwarded only when supplied),
-  `sonar` (+ `sonar-organization`/`sonar-project-key`/`sonar-host-url`), `integration-branch`, `stable-branch`, and
-  every identity field, skipping the matching question. On an existing repository every component sub-skill warns
-  about the prior setup it owns and asks Update / Keep as is / Replace per file (unless `on-existing` decides), and
-  the final report states the action taken per component. Use whenever bootstrapping (or catching up) a CLI tool
-  repository's full skeleton/docs/gitignore/CI/release/changelog/README scaffold in one pass.
-model: haiku
+description: "Invoke as /iru-setup-cli-repository [key: value args]. End-to-end bootstrap of an agent-friendly command-line tool repository in Rust, Go, Swift or C#/.NET (optional terminal UI): asks language, ui, branching, identity and shared pipeline inputs once, then chains the language scaffold, Antora docs, gitignore, GitHub workflows, changelog and README via iru-isolated-skill-executor. Use to create or catch up a full CLI repository in one pass."
+model: sonnet
 ---
 
 # Setup CLI Repository
@@ -67,6 +37,8 @@ tool is equally usable by a person, a script, and an AI agent.
 Scope: a single command-line tool (one binary) per repository. A library without a binary, a service, or a desktop
 app is out of scope — point the user at `/iru-setup-repository`.
 
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
+
 ## Step 0 — Resolve inputs
 
 Invoked stand-alone (`/iru-setup-cli-repository`) or by the catalog's `iru-setup-repository` front door (project
@@ -98,7 +70,7 @@ bin-name: logsift
 Recognized keys:
 
 - **Shape and mode**: `language` (`rust`/`go`/`swift`/`dotnet`), `ui` (`none`/`tui`), `accessibility`
-  (`enforce`/`report`/`off` — meaningful only with `ui: tui`; ignored and named in the report otherwise), `branching`
+  (`enforce`/`report`/`off`/`none` — meaningful only with `ui: tui`; ignored and named in the report otherwise), `branching`
   (`gitflow`/`main-only`), `mode` (`new`/`existing`).
 - **Shared pipeline vocabulary**: `open-source` (`yes`/`no`), `visibility` (`public`/`private`/`internal`), `ci`
   (`yes`/`no`), `cross-os-ci` (`all`/`stable`), `ci-tests` (`unit`/`full`), `pages` (`yes`/`no`), `on-existing`
@@ -154,9 +126,9 @@ Unless `ui` was supplied via `args`, resolve it:
     non-interactive command with `--json`."
 
 With `ui: tui`, unless `accessibility` was supplied via `args` (or an existing `.ui-quality.yml` already sets it —
-confirm that value instead), ask it once with `AskUserQuestion`: "Automated accessibility checks in UI tests?" —
+confirm that value instead), ask it once with `AskUserQuestion`: "Support accessibility and assistive technologies?" —
 **Enforce (Recommended)** ("violations fail the UI tests") / **Report only** ("listed in the test report, never
-failing") / **Off** ("not run; the coding defaults still apply"). Say that for a terminal UI these are the asserted
+failing") / **Off** ("not run; the coding defaults still apply"). **None — opt out entirely** ("no accessibility rules, checks or docs"; written as `accessibility: none`). In `mode: existing`, pre-select from `iru-explore`'s `Accessibility:` line per `iru-setup-repository`'s `reference/accessibility-detection.md` (`present` → Enforce, `partial` → Report only with a mixed-compliance warning, `absent` → None) and never silently flip an existing `.ui-quality.yml` value. Say that for a terminal UI these are the asserted
 checks the UI tests run — the selection visible without colour, the key help on screen, every action on a key — since
 no automated accessibility audit exists for terminals. With `ui: none` it is never asked or forwarded.
 

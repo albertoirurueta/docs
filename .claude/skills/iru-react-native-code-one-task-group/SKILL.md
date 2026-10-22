@@ -1,42 +1,6 @@
 ---
 name: iru-react-native-code-one-task-group
-description: >-
-  Implement one bucket of React Native tasks from a plan's task group end-to-end, for either toolchain — `expo`
-  (Expo framework, Continuous Native Generation) or `metro` (bare React Native Community CLI app with committed
-  `android/`/`ios/`). Detects the project profile once (toolchain by the catalog rule — `expo` in `dependencies` →
-  expo even when prebuild output exists; `react-native` without `expo` → metro — Jest preset `jest-expo` or
-  `@react-native/jest-preset`, package manager, Maestro or Detox, which native sides exist), captures a single
-  pre-change quality baseline for the whole bucket, runs `iru-react-native-code-one-task` once per task (in parallel
-  agents when the group is marked parallelizable), then validates the entire bucket once, cheapest first, every check
-  delegated to an `iru-gate-runner` agent so no raw report lands in this context — license headers via
-  `iru-check-license`, TSDoc via `iru-typescript-tsdoc`, scoped Jest unit tests via `iru-typescript-test`, an 80%
-  coverage gate via `iru-typescript-coverage` measured from Jest unit tests alone (Codegen specs, route-only files
-  and native code excluded), the full unit suite, ESLint + `tsc --noEmit` + Prettier via `iru-typescript-code-quality`
-  diffed against that one baseline, then the native stages the bucket actually needs: for **metro**, when the bucket
-  touched `android/`, Android Lint + JVM unit tests + a debug build run from `android/` (`./gradlew lint
-  testDebugUnitTest assembleDebug`, through `iru-android-code-quality`/`iru-android-test` only when they can target the
-  `android/` Gradle root), and when it touched `ios/`, `pod install` + an `xcodebuild build` of the
-  `ios/<AppName>.xcworkspace` scheme for a simulator destination (macOS with full Xcode only, otherwise unverified);
-  for **expo**, never touching generated native directories — when the bucket changed app config `plugins`, a local
-  config plugin, or a local Expo module, an `npx expo config --type introspect` check plus a `CI=1 npx expo prebuild
-  --no-install` into a throwaway copy outside the repository (with a native compile of that copy only when local
-  Expo module native code changed). Last, the e2e stage — Maestro flows (or Detox when the project uses it) via
-  `iru-typescript-test` with the `e2e` selector, plus any XCTest run that boots a simulator — which needs a booted
-  simulator/emulator, an installed app build, and Metro on port 8081, so it always runs serialized repository-wide
-  behind the same atomic `mkdir`-based `.integration-test.lock` as the other group skills (owner file, stale after 60
-  minutes, bounded ~45-minute wait, released on every exit path); no device means "unverified", never silently
-  skipped, and e2e never counts toward the coverage gate. When the bucket touched UI, that same device run is the UI
-  run (the gallery capture flows under `.maestro/ui/` and flow captures, written by the gate into `.ui-screenshots/`),
-  followed by a UI evidence check: every added/changed screen and component must have a capture for each of its
-  states × `.ui-quality.yml` directions × themes (per platform run), and `eslint-plugin-react-native-a11y` findings
-  are applied at the `.ui-quality.yml` accessibility level (enforce fails the group, report lists them); no device
-  makes the captures "unverified". `iru-react-native-code-one-task` checks off each task's box
-  itself with a "group validation pending" note; this skill backfills any that didn't land and replaces each note
-  with the final outcome, notifying the user as each phase completes. Invoke as
-  `/iru-react-native-code-one-task-group <bucket text>`, passing every task/sub-task in the bucket with its own text,
-  the group's `Parallelizable` verdict, and any relevant "Current code state" context. The React Native counterpart to
-  `iru-typescript-code-one-task-group`; used by `iru-code-one-task-group`, which invokes it once per plan group for its
-  `react-native`-tagged tasks.
+description: "Invoked as /iru-react-native-code-one-task-group <bucket text> (group tasks, Parallelizable verdict, code state) via Skill. Implements one React Native (Expo or Metro) task bucket: one baseline, iru-react-native-code-one-task per task (parallel when allowed), then validates once (license, TSDoc, Jest, 80% coverage, lint/tsc, native builds, locked device e2e); finalizes checkboxes."
 model: sonnet
 allowed-tools: Read Edit Write Bash(npm *) Bash(npx *) Bash(pnpm *) Bash(yarn *) Bash(node -p *) Bash(git status *) Bash(git diff *) Bash(git log *) Bash(git ls-files *) Bash(git rev-parse *) Bash(find *) Bash(grep *) Bash(ls *) Bash(cat *) Bash(date *) Bash(uname *) Bash(lsof *) Bash(xcode-select *) Bash(xcrun *) Bash(adb *) Bash(maestro *) Bash(rsync *) Bash(ln -s *) Bash(mktemp *) Bash(mkdir .integration-test.lock*) Bash(rmdir .integration-test.lock*) Bash(rm -f .integration-test.lock/owner) Skill Agent
 ---
@@ -71,6 +35,8 @@ Four things differ from the plain TypeScript group skill, and they shape the val
    serialized behind the repository-wide lock (Step 0, Step 3.10a).
 
 It uses a medium model on purpose: the plan carries the hard reasoning; this skill drives execution of it.
+
+Agent dispatch: call the catalog agents as `subagent_type: "<agent-name>"` (for example `"iru-gate-runner"`) when installed under `.claude/agents/`, or as `"iru-core:<agent-name>"` when installed as a plugin — use whichever name appears in your available agent types. Every `subagent_type` below is written in the first form.
 
 ## Step 0 — Read this before running anything on a device
 
@@ -436,7 +402,7 @@ Then run, in this order — cheapest first; **3.1–3.9 gate the bucket, 3.10 ru
    stop. If you took the lock, you own releasing it before this skill returns.
 
 11. **UI evidence check — only when the bucket's UI scope (Step 3 above) is non-empty.** No lock needed (it only
-   reads files). Read `.ui-quality.yml` at the repository root (missing file → `accessibility: enforce`,
+   reads files). Read `.ui-quality.yml` at the repository root (missing (new UI project) file → `accessibility: enforce`,
    `directions: [ltr, rtl]`, `themes: [light, dark]`), then for every screen/component in the UI scope list what
    `.ui-screenshots/<component|screen>/<Id>/` holds (`$UI_SCREENSHOTS_DIR` when set) and compare against
    `<state>--<direction>--<theme>--<platform>.png` for each declared state × direction × theme on the platform 3.10
@@ -457,6 +423,10 @@ Then run, in this order — cheapest first; **3.1–3.9 gate the bucket, 3.10 ru
      target size) are not automated on React Native.
    `.ui-screenshots/` is gitignored evidence — never commit it and never copy it anywhere here (the documentation
    skills do that).
+
+**Accessibility opt-out (`accessibility: none`).** When `.ui-quality.yml` says `none`, the user opted out of accessibility support entirely (see `reference/ui-contract.md` §8, "Opting out and existing code"): do not apply the accessibility rules, do not run or require the accessibility checks (axe, ATF/semantics audit, `performAccessibilityAudit()`, Axe.Windows, a11y lint rules, TUI asserted checks), and report them as "accessibility: opted out" in the group report - never "unverified", and never a failure. `off` differs: the rules still apply when writing code, only the automated checks are not run.
+
+**Missing `.ui-quality.yml` in a repository that already has UI code.** The level was never chosen, so don't assume the `enforce` default — that default is only for a new UI project with no UI code yet. Before the first UI task of the bucket, resolve it once per `reference/ui-contract.md` §8 ("Opting out and existing code"): reuse the `Accessibility:` line of an `iru-explore` report in the plan's "Current code state" or this conversation (otherwise apply the detection rules of `iru-explore`'s `reference/accessibility-detection.md`), ask the user via `AskUserQuestion` with the setup's pre-selection (`present` → Enforce, `partial` → Report only with the mixed-compliance warning, `absent` → None with the half-compliance warning), and write `.ui-quality.yml` with the chosen level and the default `directions`/`themes`, so the per-task skills and the test gates read the same value. This is a decision only the user can make, so it is an allowed pause.
 
 ## Step 4 — Finalize progress notes and notify the user
 
