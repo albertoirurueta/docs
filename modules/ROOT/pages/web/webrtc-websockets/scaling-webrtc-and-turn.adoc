@@ -1,0 +1,937 @@
+= Scaling WebRTC and TURN
+:description: Capacity planning for WebRTC media -- a worked SFU capacity model, mediasoup workers and nodes, multi-node LiveKit behind Redis, cascading and geo-distribution, TURN sizing and placement with coturn, UDP port ranges and firewalls, Kubernetes with hostNetwork, bandwidth cost drivers and monitoring with Prometheus, all checked in Docker.
+:keywords: WebRTC scaling, SFU capacity planning, mediasoup worker, consumers per worker, pipeToRouter, PipeTransport, LiveKit, Redis, node_selector, regionaware, Jitsi Videobridge, relay, Octo, cascading, geo-distribution, TURN, coturn, relay port range, min-port, max-port, total-quota, bps-capacity, drain mode, SIGUSR1, hostNetwork, DaemonSet, UDP mux, egress bandwidth, Prometheus, turn_total_allocations, promtool, Huddle
+
+include::partial$webrtc-websockets-disclaimer.adoc[]
+
+A WebRTC product scales along two axes that have little in common with the WebSocket tier of the same application. The
+signalling server is an ordinary stateful service that grows with connections, and the section covers it on
+xref:web/webrtc-websockets/scaling-websockets.adoc[Scaling WebSockets]. The media tier is different: its unit of work
+is a stream of small UDP packets that must be forwarded within a few milliseconds, its limit is usually CPU per core and
+network bandwidth per node, a room cannot be split freely across machines, and the TURN relay in front of it is billed
+by the gigabyte. This page turns those facts into numbers. It builds a small capacity model for Huddle (the
+videoconference of the section), shows how mediasoup, LiveKit and Jitsi spread rooms over workers and nodes, explains
+cascading and geo-distribution, sizes and places coturn, lists the UDP ports a firewall has to open, runs coturn on
+Kubernetes, and ends with the metrics and alerts that tell you a media server is running out of room.
+
+Versions were checked on 2026-10-24: mediasoup 3.31.0, LiveKit server 1.13.10 (Docker image
+`livekit/livekit-server:v1.13.10`), coturn 4.18.0 (Docker image `coturn/coturn:4.18.0`), Redis 8.8.3, Node.js 24 and
+`prom-client` 15.1.3 (deprecated on npm in favour of `@prometheus-io/client`, see the version notes of xref:web/webrtc-websockets/observability.adoc[Observability]), with Docker 29 and Prometheus `promtool` 3.5. The examples ran in Docker and in Node.js on a laptop:
+the coturn, LiveKit and Redis parts as containers, the mediasoup part with the real worker binary, and the capacity model
+as a plain script. A laptop is not a data centre, so every capacity figure below is an arithmetic model or a vendor
+figure, not a benchmark of the hardware you will rent; the way to turn it into a real plan is on
+xref:web/webrtc-websockets/load-testing-and-capacity-planning.adoc[Load Testing and Capacity Planning].
+
+== What scales and what does not
+
+Three tiers carry a call, and each one has a different shape of load.
+
+[cols="2,3,3,3",options="header"]
+|===
+| Tier | What it does | What limits it | How it scales
+| Signalling | Joins, SDP, ICE candidates, room events over WebSocket | Connections, memory, backplane fan-out | Stateless or sharded nodes behind a load balancer; see xref:web/webrtc-websockets/scaling-websockets.adoc[Scaling WebSockets]
+| Media (SFU) | Receives each published stream and forwards it to subscribers | CPU per forwarded stream, network card, UDP ports | More workers per node, more nodes, and a placement rule that keeps a room together or cascades it
+| Relay (TURN) | Carries media for clients that cannot reach the SFU or a peer directly | Bandwidth, relay ports, allocations | More nodes with their own public addresses; the cost is almost entirely bandwidth
+|===
+
+Two properties drive every decision on this page:
+
+* *A room has a home.* The participants of a room must reach the same SFU process (or processes connected to each
+  other), because the SFU is where their streams meet. mediasoup keeps a room's router inside one worker, and LiveKit
+  documents that "a room must fit on a single node" in a self-hosted cluster. You scale by adding rooms to more workers
+  and nodes, not by spreading one room thinly over many.
+* *Media does not go through the HTTP load balancer.* Signalling can hide behind any Layer 7 balancer, but the media
+  address is advertised to the client inside ICE candidates, so each media node needs an address (or at least a UDP port)
+  that clients can reach directly. The consequences for firewalls, Kubernetes and load balancers are in
+  <<_udp_ports_firewalls_and_load_balancers>>.
+
+The topologies themselves (mesh, SFU, MCU) are compared on
+xref:web/webrtc-websockets/topologies-mesh-sfu-mcu.adoc[Topologies: Mesh, SFU and MCU]; this page assumes the SFU.
+
+== SFU capacity planning
+
+Capacity planning starts from streams, not from users. An SFU does not mix media, so the work it does for a room is the
+number of (publisher, subscriber) pairs it forwards, and the bandwidth it needs is the sum of the bitrates of those
+forwarded streams. Three quantities describe a room:
+
+* *Producers* (published tracks): a participant who sends audio and video publishes two.
+* *Consumers* (forwarded tracks): every track a subscriber receives. mediasoup counts these explicitly. A four-person
+  room in which everybody sends and receives audio and video has 4 x 3 x 2 = 24 consumers.
+* *Egress*: the sum of the bitrates of the consumers, which grows with the square of the room size when everyone
+  receives everyone.
+
+The last point is why large rooms never forward everything to everyone. Real products apply *last-N* forwarding (only the
+few most recent speakers are sent in full quality), show the others as thumbnails or not at all, and use simulcast or SVC
+so that a small tile receives a low layer; see
+xref:web/webrtc-websockets/codecs-simulcast-and-svc.adoc[Codecs, Simulcast and SVC]. The model below takes those two limits
+as inputs: `audioTiles` and `videoTiles`, the maximum number of audio and video streams one participant receives.
+
+=== Example 1: a capacity model for Huddle
+
+The script computes consumers, ingress and egress per room, converts them into workers and nodes with the documented
+mediasoup rule of thumb (about 500 consumers per worker, one worker per core), keeps 40 percent headroom, and estimates
+the TURN bandwidth and the number of relay ports for the share of participants that need the relay.
+
+[source,javascript]
+----
+// Huddle capacity model: how many workers, nodes and TURN bandwidth do N concurrent calls need?
+const kbit = (n) => n * 1000;
+
+/** Load of one room. `senders` publish audio and video; every participant receives at most
+ *  `audioTiles` audio streams and `videoTiles` video streams (last-N forwarding). */
+export function roomLoad({ participants, senders = participants, audioTiles = 3, videoTiles = 4,
+  audioKbps = 32, videoUpKbps = 1200, videoDownKbps = 600 }) {
+  const audioIn = (self) => Math.min(senders - (self < senders ? 1 : 0), audioTiles);
+  const videoIn = (self) => Math.min(senders - (self < senders ? 1 : 0), videoTiles);
+  let consumers = 0, egressBps = 0;
+  for (let p = 0; p < participants; p++) {
+    consumers += audioIn(p) + videoIn(p);
+    egressBps += kbit(audioIn(p) * audioKbps + videoIn(p) * videoDownKbps);
+  }
+  const ingressBps = senders * kbit(audioKbps + videoUpKbps);
+  const upBps = kbit(audioKbps + videoUpKbps);                   // what a sender publishes
+  const downBps = kbit(audioIn(participants - 1) * audioKbps + videoIn(participants - 1) * videoDownKbps);
+  return { producers: senders * 2, consumers, ingressBps, egressBps, upBps, downBps };
+}
+
+export function plan({ rooms, consumersPerWorker = 500, headroom = 0.6, coresPerNode = 8, nicBps = 10e9,
+  relayedShare = 0.15, ...roomInputs }) {
+  const room = roomLoad(roomInputs);
+  const consumers = rooms * room.consumers;
+  const ingress = rooms * room.ingressBps;
+  const egress = rooms * room.egressBps;
+  // Never plan beyond a fraction of the measured per-worker limit.
+  const workers = Math.ceil(consumers / Math.floor(consumersPerWorker * headroom));
+  // One worker per core, and keep one core free for Node.js and the OS.
+  const nodesByCpu = Math.ceil(workers / (coresPerNode - 1));
+  const nodesByNic = Math.ceil(Math.max(ingress, egress) / (nicBps * headroom));
+  const nodes = Math.max(nodesByCpu, nodesByNic, 1);
+  // A relayed participant passes its media through TURN twice: in from one side, out to the other.
+  const relayed = Math.round(rooms * roomInputs.participants * relayedShare);
+  const senderShare = (roomInputs.senders ?? roomInputs.participants) / roomInputs.participants;
+  const turnBps = relayed * (room.upBps * senderShare + room.downBps) * 2;
+  return { room, consumers, workers, nodesByCpu, nodesByNic, nodes, relayed, turnBps, ingress, egress };
+}
+
+/** Gigabytes per month for a bit rate sustained during the busy hours of every day. */
+export function monthlyGB(bps, busyHoursPerDay = 6, days = 30) {
+  return (bps / 8) * 3600 * busyHoursPerDay * days / 1e9;
+}
+
+/** UDP relay ports to open: one port per allocation, a few allocations per peer connection, plus slack. */
+export function relayPorts({ relayedParticipants, peerConnectionsEach, allocationsPerConnection = 2, slack = 1.3 }) {
+  return Math.ceil(relayedParticipants * peerConnectionsEach * allocationsPerConnection * slack);
+}
+
+/** Traffic on the links between nodes when a room is cascaded over `nodes` nodes and every node
+ *  holds at least one subscriber: each published stream crosses the link once per extra node. */
+export function cascadeBps({ senders, upBps, nodes }) {
+  return senders * upBps * (nodes - 1);
+}
+
+/** Cloud providers bill outbound traffic only, which is half of what the relay's network card carries. */
+export const costPerMonth = (bps, pricePerGB, busyHoursPerDay = 6) => monthlyGB(bps / 2, busyHoursPerDay) * pricePerGB;
+
+const mbps = (v) => (v / 1e6).toFixed(0) + ' Mbit/s';
+if (process.argv[1] === new URL(import.meta.url).pathname) {
+  const scenarios = [
+    { name: 'standups: 100 rooms of 5', rooms: 100, participants: 5 },
+    { name: 'classes: 40 rooms of 25', rooms: 40, participants: 25 },
+    { name: 'town hall: 1 room of 400 with 3 speakers', rooms: 1, participants: 400, senders: 3, videoTiles: 3 },
+  ];
+  // Mesh needs one peer connection per remote participant; an SFU needs one in total.
+  console.log('relay ports, 75 relayed participants: SFU', relayPorts({ relayedParticipants: 75, peerConnectionsEach: 1 }),
+    'mesh of 5', relayPorts({ relayedParticipants: 75, peerConnectionsEach: 4 }));
+  // 3 speakers, 300 viewers spread over 4 nodes (75 each): streams crossing between nodes.
+  const up = roomLoad({ participants: 1 }).upBps;
+  console.log('cascaded: 3 x 3 =', 3 * 3, 'streams between nodes,', mbps(cascadeBps({ senders: 3, upBps: up, nodes: 4 })),
+    '; without cascading the origin sends', 225 * 3, 'streams to the viewers on the other nodes');
+  for (const { name, ...input } of scenarios) {
+    const p = plan(input);
+    console.log(name);
+    console.log(`  consumers=${p.consumers} workers=${p.workers} nodes=${p.nodes} (cpu ${p.nodesByCpu}, nic ${p.nodesByNic})`);
+    console.log(`  SFU ingress=${mbps(p.ingress)} egress=${mbps(p.egress)}`);
+    console.log(`  relayed participants=${p.relayed} TURN in+out=${mbps(p.turnBps)} => ${monthlyGB(p.turnBps / 2).toFixed(0)} GB/month billed outbound, ${costPerMonth(p.turnBps, 0.05).toFixed(0)} at 0.05 per GB`);
+  }
+}
+----
+
+Running it prints, for three Huddle workloads (the last two lines of each block are the TURN bandwidth and the cost at a
+placeholder price of 0.05 per gigabyte):
+
+[source,text]
+----
+relay ports, 75 relayed participants: SFU 195 mesh of 5 780
+cascaded: 3 x 3 = 9 streams between nodes, 11 Mbit/s ; without cascading the origin sends 675 streams to the viewers on the other nodes
+standups: 100 rooms of 5
+  consumers=3500 workers=12 nodes=2 (cpu 2, nic 1)
+  SFU ingress=616 Mbit/s egress=1248 Mbit/s
+  relayed participants=75 TURN in+out=559 Mbit/s => 22648 GB/month billed outbound, 1132 at 0.05 per GB
+classes: 40 rooms of 25
+  consumers=7000 workers=24 nodes=4 (cpu 4, nic 1)
+  SFU ingress=1232 Mbit/s egress=2496 Mbit/s
+  relayed participants=150 TURN in+out=1118 Mbit/s => 45295 GB/month billed outbound, 2265 at 0.05 per GB
+town hall: 1 room of 400 with 3 speakers
+  consumers=2394 workers=8 nodes=2 (cpu 2, nic 1)
+  SFU ingress=4 Mbit/s egress=757 Mbit/s
+  relayed participants=60 TURN in+out=229 Mbit/s => 9259 GB/month billed outbound, 463 at 0.05 per GB
+----
+
+A few readings of these results are worth stating:
+
+* The 100 stand-up rooms of five need 3,500 consumers. With a budget of 300 consumers per worker (60 percent of 500) that
+  is 12 workers, which fit on two 8-core nodes. The network card is not the limit at about 1.2 Gbit/s of egress.
+* The classes have twice the participants of the stand-ups (1,000 against 500) and twice the consumers (7,000 against
+  3,500), because each student receives at most 3 audio and 4 video streams whatever the room size. Last-N is what keeps
+  a class of 25 from costing five times what a stand-up of 5 costs per participant.
+* The town hall shows the single-room limit. Its 2,394 consumers fit on eight workers in total, but one mediasoup router
+  cannot be split, so the viewers must be spread over routers on several workers with `pipeToRouter`
+  (see <<_workers_and_nodes>>). Its egress is dominated by the audience, not by the speakers.
+* Relayed participants, not total participants, set the TURN size, and the share (15 percent here) is an assumption to
+  replace with a measurement; see <<_sizing_turn>>.
+
+The numbers are only as good as their inputs. The inputs that matter, and how to get them:
+
+* *Bitrate per layer.* Take them from the browser, not from a document: sum `bytesSent` deltas per `ssrc` from `getStats()`
+  for a few real calls (xref:web/webrtc-websockets/stats-quality-and-bandwidth.adoc[Stats, Quality and Bandwidth]).
+  Screen sharing at 1.5 to 3 Mbit/s changes the average a lot.
+* *Consumers per worker.* The 500 is mediasoup's own figure and "depends on the CPU". Run a load test that adds consumers
+  until a worker reaches 70 to 80 percent of a core, and use that number.
+* *Headroom.* A node that runs at 90 percent of a core drops packets when a burst of keyframe requests arrives. Plan for
+  60 percent of the measured limit, and make the autoscaler act well before it.
+* *Peak concurrency, not accounts.* Plan for the busiest hour of the busiest day, which is usually a Monday morning for a
+  work product and an evening for a social one.
+
+Source: https://mediasoup.org/documentation/v3/scalability/[mediasoup: Scalability]
+
+== Workers and nodes
+
+=== Example 2: mediasoup workers, routers and a node-level allocator
+
+A mediasoup worker is a C++ subprocess that uses one CPU core. A router (one per room) lives in exactly one worker, and a
+worker hosts many routers. The practical rules are the ones in the official guide: start at most one worker per core
+(leave one core for the Node.js process and the kernel), place each new room on the least loaded worker, and when one
+room is larger than a worker can carry, pipe its producers to routers on other workers. Several hosts need your own
+directory service, because mediasoup has no cluster protocol: a store such as Redis maps room names to the node that owns
+them.
+
+The module below is the node-level part for Huddle. It starts the workers, reserves consumer budget when a room is created,
+refuses a room when the node is full (so that the directory can try another node), supports a drain mode for deploys, and
+exports the numbers to Prometheus.
+
+[source,javascript]
+----
+import http from 'node:http';
+import os from 'node:os';
+import * as mediasoup from 'mediasoup';
+import client from 'prom-client';
+
+const WORKERS = Number(process.env.WORKERS ?? Math.max(1, os.availableParallelism() - 1));
+const CONSUMER_BUDGET = Number(process.env.CONSUMER_BUDGET ?? 300); // 60% of the ~500 consumers a worker handles
+const MEDIA_CODECS = [{ kind: 'audio', mimeType: 'audio/opus', clockRate: 48000, channels: 2 }];
+
+const registry = new client.Registry();
+const consumersGauge = new client.Gauge({ name: 'huddle_sfu_consumers', help: 'Consumers per worker', labelNames: ['worker'], registers: [registry] });
+const roomsGauge = new client.Gauge({ name: 'huddle_sfu_rooms', help: 'Routers (rooms) per worker', labelNames: ['worker'], registers: [registry] });
+const cpuGauge = new client.Gauge({ name: 'huddle_sfu_worker_cpu_seconds', help: 'CPU seconds used by a worker', labelNames: ['worker'], registers: [registry] });
+const diedCounter = new client.Counter({ name: 'huddle_sfu_worker_died_total', help: 'Workers that exited unexpectedly', registers: [registry] });
+
+export const slots = [];
+
+export async function start() {
+  for (let i = 0; i < WORKERS; i++) {
+    const worker = await mediasoup.createWorker({ logLevel: 'warn' });
+    const slot = { id: String(worker.pid), worker, rooms: 0, consumers: 0, draining: false };
+    worker.on('died', () => { diedCounter.inc(); process.exit(1); }); // the supervisor restarts the node
+    slots.push(slot);
+  }
+}
+
+/** Least loaded worker that still has budget; null means "this node is full, ask another node". */
+export function pickWorker(expectedConsumers) {
+  const open = slots.filter((s) => !s.draining && s.consumers + expectedConsumers <= CONSUMER_BUDGET);
+  if (open.length === 0) return null;
+  return open.reduce((a, b) => (a.consumers <= b.consumers ? a : b));
+}
+
+export async function createRoom(expectedConsumers) {
+  const slot = pickWorker(expectedConsumers);
+  if (!slot) return null;
+  const router = await slot.worker.createRouter({ mediaCodecs: MEDIA_CODECS });
+  slot.rooms++;
+  slot.consumers += expectedConsumers;     // reserve; adjusted by the real counts below
+  router.observer.on('close', () => { slot.rooms--; slot.consumers -= expectedConsumers; });
+  return { router, slot };
+}
+
+export async function refreshMetrics() {
+  for (const s of slots) {
+    const usage = await s.worker.getResourceUsage();
+    cpuGauge.set({ worker: s.id }, usage.ru_utime / 1e6 + usage.ru_stime / 1e6); // microseconds in, seconds out
+    roomsGauge.set({ worker: s.id }, s.rooms);
+    consumersGauge.set({ worker: s.id }, s.consumers);
+  }
+  return registry.metrics();
+}
+
+export function serveMetrics(port) {
+  return http.createServer(async (req, res) => {
+    if (req.url !== '/metrics') { res.writeHead(404).end(); return; }
+    res.writeHead(200, { 'content-type': registry.contentType }).end(await refreshMetrics());
+  }).listen(port);
+}
+
+/** Graceful drain: stop accepting rooms; the node exits when its rooms are gone. */
+export function drain() { for (const s of slots) s.draining = true; }
+----
+
+The script below exercised it with the real `mediasoup-worker` binary (two workers, a budget of 300 consumers each):
+
+[source,javascript]
+----
+import { start, createRoom, serveMetrics, drain, slots } from './sfu-node.mjs';
+await start();
+const server = serveMetrics(18530);
+const rooms = [];
+for (let i = 0; i < 4; i++) rooms.push(await createRoom(100));
+console.log('rooms per worker', slots.map((s) => s.rooms));
+console.log('fifth room refused when the budget is spent:', (await createRoom(300)) === null);
+drain();
+console.log('after drain:', (await createRoom(1)) === null ? 'refused' : 'accepted');
+const text = await (await fetch('http://127.0.0.1:18530/metrics')).text();
+console.log(text.split('\n').filter((l) => l.startsWith('huddle_')).join('\n'));
+rooms.forEach((r) => r.router.close());
+console.log('rooms after close', slots.map((s) => s.rooms));
+server.close();
+for (const s of slots) s.worker.close();
+----
+
+It printed `rooms per worker [ 2, 2 ]`, then `true` for the refused fifth room and `refused` after `drain()`; the metrics
+endpoint returned `huddle_sfu_consumers`, `huddle_sfu_rooms` and `huddle_sfu_worker_cpu_seconds` per worker, and
+closing the routers brought the room counts back to zero. The reservation counts the expected consumers of a room
+instead of the live ones, which is the conservative choice when rooms fill up gradually; replace it with the real count
+(from the `newconsumer` observer events) if your rooms are very uneven.
+
+For a room that outgrows one worker, `+router.pipeToRouter({ producerId, router: otherRouter })+` pipes a producer to a
+router on another worker of the same host, and `PipeTransport` does the same between hosts; the official guide notes that
+`pipeToRouter()` covers co-located routers only, so crossing hosts needs your own signalling. Viewers then consume from
+the piped routers, which also spreads the keyframe requests that a large audience sends to the broadcaster (mediasoup
+limits the producer to one PLI or FIR per second). The mediasoup page shows the related allocator and the `WebRtcServer`
+that keeps the port count at one per worker: xref:web/webrtc-websockets/mediasoup.adoc[mediasoup].
+
+Source: https://mediasoup.org/documentation/v3/mediasoup/api/[mediasoup: API reference]
+
+=== Example 3: LiveKit nodes behind Redis
+
+LiveKit is designed for the multi-node case: every node runs the same server, Redis is the shared store and message bus
+("Redis is required" for a distributed setup), and a node selector chooses the node for a new room. A room still lives on
+one node. The three settings that matter for scaling are `redis`, `node_selector` and the UDP mux port of the node.
+
+[source,yaml]
+----
+# One node of a Huddle LiveKit cluster; every node uses the same file except node_ip
+port: 7880
+log_level: info
+keys:
+  huddle-dev-key: example-secret-at-least-32-characters-long
+redis:
+  address: redis:6379
+rtc:
+  udp_port: 7882          # one multiplexed UDP port per node
+  tcp_port: 7881
+  use_external_ip: false
+  node_ip: 127.0.0.1
+prometheus:
+  port: 6789
+node_selector:
+  kind: sysload
+  sysload_limit: 0.7
+----
+
+The selector kinds documented in the server's Go selector package are `any`, `cpuload`, `sysload` and `regionaware`; a node is a candidate only when its utilisation is
+below `sysload_limit`, and `regionaware` adds the `regions` list (name, latitude, longitude) and picks the node closest to
+the signalling instance. The Compose file below starts two nodes and Redis:
+
+[source,yaml]
+----
+name: huddle-livekit-cluster
+services:
+  redis:
+    image: redis:8.8.3-alpine
+  lk1:
+    image: livekit/livekit-server:v1.13.10
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes: ["./livekit.yaml:/etc/livekit.yaml:ro"]
+    ports: ["18520:7880", "18521:6789", "18522:7882/udp"]
+  lk2:
+    image: livekit/livekit-server:v1.13.10
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes: ["./livekit.yaml:/etc/livekit.yaml:ro"]
+    ports: ["18523:7880", "18524:6789", "18525:7882/udp"]
+----
+
+Verification: both containers started with the configuration above, the logs showed `starting LiveKit server` for
+version 1.13.10 on each, `HLEN nodes` in Redis returned `2` (each node registers itself), and `curl` against the
+Prometheus port answered with `livekit_room_total`, `livekit_participant_total` and the other metrics of
+<<_monitoring_media_servers>>. A node that receives SIGTERM, SIGINT or SIGQUIT enters draining mode: it keeps serving
+the rooms it has, refuses new rooms, and exits when the last participant leaves, so a rolling deploy needs a
+termination grace period as long as your longest call. Put the HTTP port behind a TLS-terminating load balancer
+(any instance can serve any client, whatever the room), publish `rtc.udp_port` on each node, and remember that the
+`prometheus_port` key is deprecated in favour of the `prometheus` block (the old key logged a warning in 1.13.10).
+
+Source: https://docs.livekit.io/transport/self-hosting/distributed/[LiveKit docs: Distributed setup]
+
+LiveKit's own capacity guidance and its managed alternative are on xref:web/webrtc-websockets/livekit.adoc[LiveKit].
+
+=== Jitsi and Janus
+
+Jitsi Videobridge scales by adding bridges: Jicofo, the conference focus, assigns each conference to a bridge using a
+selection strategy, and a region-based strategy keeps participants close to their bridge. A single conference can span
+several bridges (see <<_cascading_and_geo_distribution>>), and each bridge reports a stress level that the selector uses
+to avoid overloaded bridges. Janus has no cluster protocol: a VideoRoom lives in one Janus instance, and larger systems
+put a directory in front of many instances and forward RTP between them. Both are described on
+xref:web/webrtc-websockets/janus-and-jitsi.adoc[Janus and Jitsi].
+
+== Cascading and geo-distribution
+
+*Cascading* connects media servers to each other so that each participant connects to the nearest one and a published
+stream crosses the link between two servers once, however many subscribers are behind the far server. It solves two
+problems at once: rooms larger than a node, and participants spread over continents, where a single server forces some
+of them onto a long, lossy path.
+
+The saving is easy to compute. Take a webinar with three speakers and 300 viewers spread evenly over four nodes. Without
+cascading the origin node forwards each speaker to every viewer on the other nodes. With cascading, the origin sends each
+speaker once to each other node and those nodes fan out locally. The model of the example above answers it:
+
+[source,text]
+----
+cascaded: 3 x 3 = 9 streams between nodes, 11 Mbit/s ; without cascading the origin sends 675 streams to the viewers on the other nodes
+----
+
+Nine inter-node streams of about 1.2 Mbit/s each, instead of 675 streams of the forwarded layers. The price is
+operational: servers need to authenticate each other, the room directory must know which nodes hold a room, latency
+adds one hop, and a failed link splits a room. How each server cascades:
+
+* *mediasoup:* pipe transports between routers, on one host or across hosts, driven by your signalling. Piped producers
+  keep all their simulcast streams, so the far side can still pick a layer.
+* *Jitsi Videobridge:* relays (the successor of Octo, "secure Octo") connect every pair of bridges that serve the same
+  conference over ICE and DTLS-SRTP, with the colibri WebSocket for control; Jicofo's region-based strategy decides where
+  new participants go.
+* *LiveKit:* self-hosted clusters keep a room on one node; LiveKit Cloud runs a global mesh of SFUs where each participant
+  connects to the nearest edge (see the comparison on xref:web/webrtc-websockets/livekit.adoc[LiveKit]).
+* *Janus:* the VideoRoom plugin can forward RTP to another instance, and the building blocks (RTP forwarding, plain
+  transports) are enough to build a cascade yourself.
+
+*Geo-distribution* decides which region serves a participant. The pieces are the same for every server: a latency-based
+or geolocation DNS name per region (or an anycast address) for the signalling entry point, a node selector or room
+directory that prefers a node in the participant's region, TURN servers in the same regions, and a data store for the
+directory that is itself reachable from every region. Start with one region and a CDN-style edge for the web client; add a
+second region only when the measured round-trip times of a significant group of users justify it, because every region
+multiplies the number of nodes you keep warm.
+
+Source: https://github.com/jitsi/jitsi-videobridge/blob/master/doc/relay.md[Jitsi Videobridge: relays (secure Octo)]
+
+== UDP ports, firewalls and load balancers
+
+WebRTC media runs over UDP. A client learns the address of the media server from an ICE candidate, so a firewall, a
+cloud security group or a Kubernetes service has to let that UDP traffic reach the node. Compare how the servers of the
+section use ports:
+
+[cols="2,3,3",options="header"]
+|===
+| Server | Media ports | How to keep the range small
+| mediasoup | Whatever the transports bind to; `rtcMinPort` and `rtcMaxPort` (defaults 10000 and 59999, deprecated in favour of a port range in the listen info) for per-transport sockets | A `WebRtcServer` per worker binds one UDP and one TCP port that all transports of the worker share
+| LiveKit | `rtc.port_range_start` to `rtc.port_range_end` (50000 to 60000 by default, two ports per participant), plus 7881 TCP | Set `rtc.udp_port` (for example 7882) to multiplex all UDP on one port; the range is then unused
+| Jitsi Videobridge | 10000 UDP by default (`JVB_PORT` in the Docker setup) | Already one port per bridge
+| Janus | The `rtp_port_range` of `janus.jcfg` | Narrow the range to what the expected number of participants needs
+| coturn | 3478 UDP and TCP for control, 5349 or 443 for TLS, and the relay range `min-port` to `max-port` | The relay range cannot be multiplexed: it is one port per allocation (see <<_sizing_turn>>)
+|===
+
+Rules that follow from this:
+
+* *Publish the same port on both sides.* The candidate carries the container's port number. A Compose mapping such as
+  `18510:3478` breaks ICE silently for media, while `18510-18513:18510-18513/udp` keeps the number unchanged. The
+  mediasoup and LiveKit pages explain the symptom ("connects but has no video").
+* *Prefer a multiplexed port* for SFUs so that a firewall rule, a security group and a Kubernetes service stay short, and
+  for the same reason restrictive corporate networks that only allow a few ports can still reach you.
+* *Keep a TCP and TLS fallback.* Networks that block UDP need TCP (LiveKit 7881, mediasoup `enableTcp`) or TURN over TLS on
+  443; see xref:web/webrtc-websockets/ice-stun-and-turn.adoc[ICE, STUN and TURN].
+* *A Layer 7 load balancer is not for media.* Put WebSocket signalling and the HTTP API behind it; give the media nodes
+  their own addresses. A Layer 4 balancer can front the TURN control port, but the relay address that coturn hands back in
+  `XOR-RELAYED-ADDRESS` is the node's own address, so each TURN node still needs a directly reachable public address and
+  its relay range open. The balancer settings for the signalling side are on
+  xref:web/webrtc-websockets/proxies-load-balancers-and-deployment.adoc[Proxies, Load Balancers and Deployment].
+* *Use the cloud's allow-list model.* Create one security group per role (SFU, TURN, signalling) and open only the ports of
+  the table for that role. TURN additionally needs egress rules that stop it from reaching private ranges
+  (<<_security>>).
+
+=== Example 5: Kubernetes with hostNetwork and one DaemonSet per role
+
+A relay range of thousands of UDP ports does not fit a `NodePort` service (the default NodePort range is 30000 to 32767 and
+the port number must match the candidate), and a pod IP changes on every restart. The usual answers are `hostNetwork: true`
+on nodes that have a public address and are dedicated to media or TURN, a `hostPort` for a single multiplexed port, or a
+provider-specific UDP load balancer per node. The manifest below runs coturn as a DaemonSet on nodes labelled for TURN,
+with a drain on shutdown.
+
+[source,yaml]
+----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coturn-config
+  namespace: huddle
+data:
+  turnserver.conf: |
+    listening-port=3478
+    min-port=49152
+    max-port=65535
+    use-auth-secret
+    realm=turn.huddle.example.test
+    no-multicast-peers
+    denied-peer-ip=10.0.0.0-10.255.255.255
+    denied-peer-ip=172.16.0.0-172.31.255.255
+    denied-peer-ip=192.168.0.0-192.168.255.255
+    denied-peer-ip=169.254.0.0-169.254.255.255
+    denied-peer-ip=127.0.0.0-127.255.255.255
+    user-quota=12
+    total-quota=20000
+    max-bps=500000
+    prometheus
+    prometheus-port=9641
+    fingerprint
+    # Remove no-tls and set cert and pkey to serve TURN over TLS
+    no-tls
+    log-file=stdout
+    simple-log
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: coturn
+  namespace: huddle
+spec:
+  selector:
+    matchLabels: { app: coturn }
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { app: coturn }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9641"
+    spec:
+      hostNetwork: true                       # the relay range is too wide for a NodePort service
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        huddle.example.test/role: turn         # dedicated, labelled nodes with a public address
+      tolerations:
+        - { key: huddle.example.test/role, operator: Equal, value: turn, effect: NoSchedule }
+      terminationGracePeriodSeconds: 3600      # long enough for calls to finish after the drain signal
+      containers:
+        - name: coturn
+          image: coturn/coturn:4.18.0
+          args:
+            - "-c"
+            - "/etc/coturn/turnserver.conf"
+            - "--static-auth-secret=$(TURN_SECRET)"
+            - "--external-ip=$(PUBLIC_IP)/$(POD_IP)"
+          env:
+            - name: TURN_SECRET
+              valueFrom: { secretKeyRef: { name: coturn-secret, key: static-auth-secret } }
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: PUBLIC_IP               # patched per node pool, for example with Kustomize
+              value: "203.0.113.10"
+          ports:
+            - { name: turn-udp, containerPort: 3478, protocol: UDP }
+            - { name: turn-tcp, containerPort: 3478, protocol: TCP }
+            - { name: metrics, containerPort: 9641, protocol: TCP }
+          volumeMounts:
+            - { name: config, mountPath: /etc/coturn, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /, port: 9641 }   # the metrics port answers / as a health check
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "kill -USR1 1"]   # drain: finish live allocations, refuse new ones
+          resources:
+            requests: { cpu: "1", memory: 256Mi }
+            limits: { memory: 1Gi }
+      volumes:
+        - name: config
+          configMap: { name: coturn-config }
+----
+
+The `ConfigMap` content was written to a file and used with the same container image and the arguments of the
+DaemonSet (secret and external IP on the command line): coturn parsed it without errors (it only warned about the default certificate paths and the absence of an explicit listener address), answered
+`200` on the metrics port `/` (the readiness probe), and logged `Draining then terminating on signal 10` when sent
+`SIGUSR1`, which is what the `preStop` hook sends. The manifest itself was parsed as YAML only; there was no cluster to
+apply it to. In a real cluster:
+
+* Label and taint the nodes (`huddle.example.test/role=turn`) so that only TURN pods run there, and give each a public
+  IP; set `PUBLIC_IP` per node pool (a Kustomize patch per pool, or an init step that reads the cloud metadata service).
+* Keep the secret in a `Secret` (here `coturn-secret`), never in the ConfigMap; see
+  xref:backend/kubernetes/secrets.adoc[Secrets].
+* Give the pod a `terminationGracePeriodSeconds` as long as the calls you are willing to wait for; Kubernetes sends
+  SIGTERM after the `preStop` hook returns, so the drain starts first.
+* Scale the SFU the same way (a DaemonSet or a StatefulSet per node pool with `hostNetwork`), and scale on CPU or on the
+  consumer metric, not on memory. Autoscaling concepts are on xref:backend/kubernetes/autoscaling.adoc[Autoscaling] and
+  the pod lifecycle on xref:backend/kubernetes/health-probes-and-lifecycle.adoc[Health Probes and Lifecycle].
+* Restrict who may reach the metrics port with a network policy
+  (xref:backend/kubernetes/network-policies.adoc[Network Policies]); the node's public interface should expose 3478,
+  the relay range and, if used, 443 only.
+
+Source: https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy[Kubernetes: Pod's DNS policy (ClusterFirstWithHostNet)]
+
+== Sizing TURN
+
+A relay is sized by bandwidth and by ports, almost never by CPU. A relayed stream goes in once and out once, so a
+participant who sends 1.2 Mbit/s and receives 2.5 Mbit/s through the relay costs the server about
+2 x (1.2 + 2.5) = 7.4 Mbit/s of network card capacity, and about 3.7 Mbit/s of billed outbound traffic. The capacity script
+of Example 1 does this arithmetic with `turnBps`; for 75 relayed participants of the stand-up workload that is 559 Mbit/s
+through the relay, or about 22,600 GB per month of outbound traffic if the busy hours are six per day.
+
+Three limits decide how many nodes you need:
+
+* *Bandwidth.* Divide the planned relay bandwidth by 60 percent of the node's network card. A 1 Gbit/s node carries about
+  600 Mbit/s of relayed traffic (in plus out), a 10 Gbit/s node about 6 Gbit/s. Cap the damage of one abusive session
+  with `max-bps` (bytes per second per session) and of the whole node with `bps-capacity`.
+* *Relay ports.* Every allocation uses one UDP port from the range `min-port` to `max-port`, so the range size is a hard
+  limit on concurrent allocations. A browser typically gathers a relay candidate for each TURN URL in `iceServers`, so a client with
+  a UDP, a TCP and a TLS URL can hold several allocations per peer connection, and a mesh call holds one set per remote
+  participant. The script gives a planning figure: 75 relayed participants need about 195 ports behind an SFU
+  (two allocations per connection, 30 percent slack) and 780 in a five-person mesh; the default coturn range of
+  16,384 ports is generous for either, but a firewall policy that opens only a small range is not.
+* *Allocations.* `total-quota` bounds the allocations of the whole node and `user-quota` those of one user. Keep `user-quota`
+  above two times the number of peer connections a client can hold.
+
+Port exhaustion is visible and recoverable: when the range is full the server answers the allocation request with the
+STUN error 508, Insufficient Capacity. This is the verified behaviour with a deliberately tiny range of four ports:
+
+[source,text]
+----
+INFO IPv4. Received relay addr: 172.18.0.2:18510
+INFO IPv4. Received relay addr: 172.18.0.2:18512
+INFO IPv4. Received relay addr: 172.18.0.2:18513
+INFO error 508 ()
+----
+
+The browser reports this as a failed relay candidate (`icecandidateerror`), and the call falls back to whatever other
+candidates work, which for a relay-only participant means no call. Alert before it happens (<<_alerts>>).
+
+=== Example 4: a TURN node
+
+The configuration below is the node used in the Kubernetes example, as a plain file. The shared secret is supplied
+separately (here on the command line, in production from a secret store), and `external-ip` is set when the node sits
+behind a one-to-one NAT as most cloud virtual machines do.
+
+[source,ini]
+----
+listening-port=3478
+min-port=49152
+max-port=65535
+use-auth-secret
+realm=turn.huddle.example.test
+no-multicast-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+user-quota=12
+total-quota=20000
+max-bps=500000
+prometheus
+prometheus-port=9641
+fingerprint
+# Remove no-tls and set cert and pkey to serve TURN over TLS
+no-tls
+log-file=stdout
+simple-log
+----
+
+What each group does:
+
+* `min-port` and `max-port` define the relay range, the firewall rule, and the capacity in ports.
+* `use-auth-secret` turns on the ephemeral credentials of the TURN REST API (an expiring username and an HMAC password),
+  so no static password reaches a browser. Every node of the fleet shares the secret and the `realm`, which is what lets
+  a client use any of them with one credential from the application server.
+* `denied-peer-ip` and `no-multicast-peers` stop the relay from reaching private ranges; this is the SSRF defence
+  described on xref:web/webrtc-websockets/ice-stun-and-turn.adoc[ICE, STUN and TURN] and in <<_security>>.
+* `user-quota`, `total-quota`, `max-bps` and `bps-capacity` are the limits discussed above.
+* `prometheus` serves metrics on port 9641 under `/metrics`, and the same port answers `/` as a health check.
+* The command line interface of coturn is off unless `cli` is set; `no-cli` is deprecated in 4.18 and logs an error
+  line, so it does not appear in the file. `no-tls` is there because the lab has no certificate (DTLS listeners are off by default in 4.18, and `no-dtls` is no longer a valid option).
+
+The Compose file below runs it with a small relay range and a `turnutils_peer` that echoes packets. The `--allowed-peer-ip`
+argument exempts the Docker network from the SSRF list so that the lab peer can be reached; do not use it in production.
+
+[source,yaml]
+----
+name: huddle-scaling
+services:
+  coturn:
+    image: coturn/coturn:4.18.0
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=example-shared-secret-change-me"
+      - "--min-port=18510"
+      - "--max-port=18513"
+      - "--allowed-peer-ip=172.16.0.0-172.31.255.255"
+    volumes: ["./turnserver.conf:/etc/coturn/turnserver.conf:ro"]
+    ports:
+      - "18500:3478/udp"
+      - "18501:9641/tcp"
+      - "18510-18513:18510-18513/udp"
+  peer:
+    image: coturn/coturn:4.18.0
+    entrypoint: ["turnutils_peer", "-p", "3480"]
+----
+
+A load generator from the same image then created allocations with the shared secret of the TURN REST API (`-W`) and
+exchanged packets with the peer:
+
+[source,bash]
+----
+docker run --rm --network huddle-scaling_default --entrypoint turnutils_uclient \
+  coturn/coturn:4.18.0 -u alice -W example-shared-secret-change-me \
+  -e PEER_IP -r 3480 -n 20 -m 3 -c TURN_IP
+----
+
+It reported `Total lost packets 0 (0.000000%)` for three clients and 20 packets each, the relay addresses it received were
+in the configured range, and the metric `+turn_total_allocations{type="UDP"}+` on the published metrics port counted the
+allocations afterwards. With `-m 4` and `--max-port=18513` the same tool received the 508 error shown above.
+
+Source: https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf[coturn: examples/etc/turnserver.conf]
+
+=== Placement and scaling out
+
+* *Close to the users and close to the SFU.* A relay adds a hop, so put TURN in the regions where the participants are, and
+  put the SFU-side relay (when the SFU is behind a restrictive network) next to the SFU. Each region is a pool of nodes.
+* *Several URLs, not one load balancer.* Give the client the TURN URLs of the nearest pool (and a second pool as a fallback)
+  in `iceServers`; the browser gathers from all of them and ICE selects the pair that works. Per-node TURN state is
+  not shared, so a client that already has an allocation on node A must keep using node A, which a stable DNS name per
+  node, or a Layer 4 balancer that hashes on the client address, provides.
+* *Anycast or latency DNS* for a short list of well-known names (`turn-eu.huddle.example.test`), and one DNS name per node
+  for operations.
+* *TLS on 443* needs its own address: a TURN server that takes port 443 cannot share it with a web server on the same
+  address. Use a dedicated IP per node or a TLS-terminating proxy that routes by SNI.
+* *Drain, then replace.* `SIGUSR1` puts coturn in drain mode: it keeps its allocations and refuses new ones, and
+  terminates when the allocations are gone (or when they drop to `--drain-min-allocations`). Combine it with removing the
+  node's name from the `iceServers` list your credentials endpoint returns, so new calls go elsewhere while the node
+  empties.
+* *Rotate the secret with overlap.* coturn accepts several `static-auth-secret` lines and eturnal a list of secrets, so a
+  rotation does not break credentials that are still valid.
+
+The credentials endpoint that issues the ephemeral username and password is built on
+xref:web/webrtc-websockets/ice-stun-and-turn.adoc[ICE, STUN and TURN].
+
+== Cost drivers
+
+For a WebRTC product the bill is dominated by outbound bandwidth, then by the number of nodes needed to carry it, and
+only then by anything else.
+
+[cols="2,4,3",options="header"]
+|===
+| Cost | Driver | Lever
+| Outbound traffic of the SFU | Participants x forwarded streams x bitrate, in the busy hours | Last-N forwarding, simulcast and SVC so that tiles use low layers, audio-only mode, capped screen-share frame rate, dynacast-style pausing of unused layers
+| Outbound traffic of TURN | Relayed share of participants x their send and receive bitrate, counted once outbound | Reduce the relayed share (UDP reachability of the SFU, a TCP port, correct `iceServers`), cap `max-bps`, short credentials
+| Compute | Consumers per core; encoders if you record or transcode | One worker per core, no MCU unless needed, recording only for rooms that ask for it
+| Inter-region traffic | Cascading links and a shared database between regions | Cascade only large or multi-continent rooms
+| Recording and storage | Egress or composite processing, object storage | See xref:web/webrtc-websockets/recording-and-media-processing.adoc[Recording and Media Processing]
+| Idle capacity | Warm nodes in every region | Autoscale on the consumer metric and keep one spare node per region
+|===
+
+Practical notes:
+
+* Cloud providers bill *outbound* traffic from their network to the Internet and often include a free allowance, while
+  inbound is free or cheap. Because an SFU receives one copy of each stream and sends many, nearly all the cost is egress.
+  Dedicated and bare-metal hosts often include a very large monthly allowance or an unmetered port, which makes TURN and
+  SFU nodes much cheaper than on hyperscale clouds. Compare providers on price per gigabyte or per committed megabit,
+  not on instance price.
+* The model above converts to money with `costPerMonth(bps, pricePerGB)`: at a placeholder 0.05 per gigabyte, the TURN
+  traffic of the stand-up workload costs about 1,100 per month, and that of the 25-person classes about 2,300. These
+  figures are a method; take the real price from your provider.
+* Measure the relayed share instead of assuming it. After every call, log the candidate type and protocol of the selected
+  candidate pair (`getStats()`), and chart the percentage of calls that used `relay`. If it is above 20 to 25 percent,
+  look at why direct connections fail before buying bandwidth. LiveKit Cloud and the managed TURN services bill per
+  gigabyte, which makes the same measurement the basis for a build-or-buy decision.
+* Mesh is the most expensive topology for the relay and the participant's upload; moving rooms to an SFU early (see
+  xref:web/webrtc-websockets/building-a-videoconference-app.adoc[Building a Videoconference App]) is the cheapest scaling
+  step.
+
+== Monitoring media servers
+
+Media servers fail by degrading, not by crashing: CPU saturates, packets drop, and users see frozen video while every
+health check is green. Watch resources, work, and quality together, and keep the viewpoint of the participant.
+
+[cols="2,4,3",options="header"]
+|===
+| Signal | Where it comes from | Why it matters
+| CPU per worker or per core | mediasoup `worker.getResourceUsage()`, node exporter, LiveKit node stats | The first thing to saturate; forwarding is single-threaded per worker
+| Consumers, producers, rooms per worker | Your allocator (Example 2), LiveKit participant and room metrics | The unit the capacity model is written in
+| Egress and ingress bandwidth, packet drops | Network interface metrics, LiveKit packet counters | Network card and dropped-packet limits
+| TURN allocations versus ports | `turn_total_allocations` | Port exhaustion (error 508)
+| TURN authentication failures and 401 rate | `turn_auth_credential_failures`, `turn_unauthenticated_401_requests` | Expired credentials, a wrong secret, or probing
+| Share of relayed calls and ICE failure rate | Client `getStats()` reports sent to your backend | Whether TURN is under- or oversized
+| Call quality per participant | Round-trip time, jitter, packet loss, quality-limitation reason from `getStats()` | The ground truth that infrastructure metrics approximate
+| Worker deaths and restarts | The `died` event of mediasoup, process supervisor | A dead worker drops all its rooms
+|===
+
+The sources, per server:
+
+* *coturn* exposes Prometheus metrics when `prometheus` is set (default port 9641, path `/metrics`; options
+  `prometheus-port`, `prometheus-address`, `prometheus-path`, and TLS). The metrics used in the lab were
+  `+turn_total_allocations{type="UDP"}+`, counters of authentication failures and unauthenticated 401 requests, the
+  traffic counters `turn_traffic_sentb` and `turn_traffic_rcvb` (finished sessions) and their `+turn_total_traffic_*+`
+  totals, and packet counters. Do not publish the metrics port to the Internet.
+* *LiveKit* serves Prometheus metrics on the `prometheus.port` of its configuration; in the lab it exposed
+  `livekit_room_total`, `livekit_participant_total`, `livekit_node_packet_total`, `livekit_forward_latency`,
+  `livekit_quality_score` and `livekit_webhook_queue_length`. Metric names differ by version, so list `/metrics` on your
+  build before writing queries.
+* *Jitsi Videobridge* exposes statistics as JSON on the private REST interface and Prometheus-format metrics on `/metrics`
+  there; its stress level is the value Jicofo uses to pick a bridge.
+* *mediasoup* has no built-in exporter: export `worker.getResourceUsage()` (CPU time and memory), your own room and
+  consumer counts, and, per transport, `transport.getStats()` as in Example 2.
+* *Browsers* send the quality view: round-trip time, jitter, loss and the relay indicator, aggregated per call and per
+  region. The reporter is built on xref:web/webrtc-websockets/stats-quality-and-bandwidth.adoc[Stats, Quality and Bandwidth],
+  and the metric catalogue of the whole section is on xref:web/webrtc-websockets/observability.adoc[Observability].
+
+=== Alerts
+
+Alert on saturation before the user notices, and on the change of the failure rate rather than on single failures. The
+rules below match the metrics of the examples; `promtool check rules` accepted them (4 rules found).
+
+[source,yaml]
+----
+groups:
+  - name: huddle-media
+    rules:
+      - alert: TurnRelayPortsNearlyExhausted
+        # 16384 ports in 49152-65535; one port per allocation
+        expr: turn_total_allocations > 0.8 * 16384
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "coturn {{ $labels.instance }} uses more than 80 percent of its relay ports"
+      - alert: TurnAuthenticationFailures
+        expr: sum by (instance) (rate(turn_auth_credential_failures[5m])) > 5
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "coturn {{ $labels.instance }} rejects credentials: expired, wrong secret or probing"
+      - alert: SfuWorkerNearLimit
+        # a worker handles roughly 500 consumers; alert at 80 percent
+        expr: max by (instance, worker) (huddle_sfu_consumers) > 0.8 * 500
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "mediasoup worker {{ $labels.worker }} on {{ $labels.instance }} is close to its consumer limit"
+      - alert: SfuWorkerDied
+        expr: increase(huddle_sfu_worker_died_total[10m]) > 0
+        labels: { severity: page }
+        annotations:
+          summary: "a mediasoup worker exited on {{ $labels.instance }}"
+----
+
+Page on port exhaustion and on a dead worker; open a ticket for authentication failures. Scrape the metrics with the
+Prometheus Kubernetes service discovery and the pod annotations of the DaemonSet, or with static targets in Compose; the
+Kubernetes side is on xref:backend/kubernetes/observability-logging-and-metrics.adoc[Observability, Logging and Metrics].
+
+Source: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/[Prometheus: Alerting rules]
+
+== Autoscaling and deploys
+
+* *Scale on the unit of work.* CPU per worker, or consumers per node, with a scale-out threshold at 60 percent of the
+  measured limit and a minimum of one spare node per region. Connection count alone is a poor signal because one
+  participant can be a thumbnail viewer or a presenter.
+* *Scale in slowly and by draining.* A node must stop accepting rooms, wait for its rooms to end, and only then be
+  removed (LiveKit does this on SIGTERM, coturn on `SIGUSR1`, and the mediasoup allocator above through `drain()`).
+  Never kill a node that holds live rooms to save an hour of cost.
+* *Pre-warm for scheduled events.* A webinar at nine o'clock cannot wait for the autoscaler: scale up by hand before it,
+  and run a smoke test (a headless browser with fake devices, see
+  xref:web/webrtc-websockets/load-testing-and-capacity-planning.adoc[Load Testing and Capacity Planning]).
+* *Plan for the reconnection storm.* When a node dies, every client reconnects within seconds. Clients must back off with
+  jitter, and the signalling tier needs headroom, as explained on
+  xref:web/webrtc-websockets/scaling-websockets.adoc[Scaling WebSockets].
+
+== Security
+
+* *TURN is a proxy.* An attacker with a valid credential can ask the relay to forward UDP to addresses it can reach.
+  Keep `denied-peer-ip` for private, loopback, link-local and carrier-grade ranges in production (the lab above
+  exempts the Docker network, production must not), run TURN in a network zone without sensitive neighbours, and allow
+  only the media server's address with `allowed-peer-ip` when the SFU is in a private range.
+* *Never an open relay.* Keep authentication on, the secret long and random, and the credential lifetime short; see
+  xref:web/webrtc-websockets/security.adoc[Security].
+* *Do not expose metrics, the CLI or admin interfaces* to the Internet. The Prometheus port and the Kubernetes probes
+  belong on the internal network.
+* *Bandwidth is a denial-of-service surface.* `max-bps`, `bps-capacity`, quotas and rate limits on the credentials
+  endpoint are what stop one account from becoming the bill.
+* *Per-hop encryption.* DTLS-SRTP protects each leg, so a cascade link between media servers must be authenticated and
+  encrypted (secure relays in Jitsi, a private network or TLS tunnel for mediasoup pipe transports).
+
+== Common errors and pitfalls
+
+* *Connects but no video after a scale-out.* The new node advertises a private or wrong address (LiveKit `node_ip`,
+  mediasoup `announcedAddress`, coturn `external-ip`) or its UDP port is not open in the security group.
+* *Exactly the corporate users fail.* No TCP or TLS fallback, or the TLS port is not 443. Test from a network that blocks UDP.
+* *A deploy kills active calls.* Pods without a drain hook or with a short grace period. Use the drain modes above and a
+  grace period as long as the longest call.
+* *TURN works at launch and fails at peak.* The relay range was sized for a small number of allocations, or `total-quota`
+  and `user-quota` were left at values that cut off busy users. Look for error 508 and quota errors, and alert on the ratio.
+* *Skewed workers.* All big rooms landed on one worker because allocation counted rooms instead of consumers. Count
+  consumers, and spread large rooms with `pipeToRouter`.
+* *A hot room.* One broadcast to thousands of viewers on a single router; pipe it across workers and nodes.
+* *Pods rescheduled onto nodes without a public address.* Use node selectors and taints for `hostNetwork` workloads.
+* *`NodePort` for the relay range.* The port numbers of the candidates must equal the published ports; use
+  `hostNetwork` or a per-node address.
+* *Cost surprises.* Long recordings, screen shares at full frame rate, relayed calls assumed to be rare, and cross-region
+  traffic that nobody tracked. Alert on bandwidth, not only on CPU.
+
+== Version and ecosystem notes
+
+* mediasoup 3.31.0 keeps the worker-per-core model and the `WebRtcServer` that lets the transports of a worker share one port; the scalability guide quotes about 500 consumers per worker and 200 to 300 viewers per router before piping.
+* LiveKit 1.13.10 uses the `prometheus` configuration block (the `prometheus_port` key is deprecated) and requires
+  Redis only for multi-node deployments; a single node needs no Redis.
+* coturn 4.18.0 turns the command line interface off by default (`no-cli` is deprecated) and DTLS off by default (`no-dtls` is rejected as a bad configuration line), hides the software attribute
+  by default, supports drain mode with `SIGUSR1` and `--drain-min-allocations`, and serves Prometheus metrics with
+  `prometheus`. Check the release notes of the version you pin.
+* The TURN REST API credential scheme is an expired draft implemented by every relay server and browser; the TURN protocol
+  itself is RFC 8656.
+
+== Related pages
+
+* xref:web/webrtc-websockets/ice-stun-and-turn.adoc[ICE, STUN and TURN] for the protocol, coturn and eturnal and the
+  credentials endpoint.
+* xref:web/webrtc-websockets/topologies-mesh-sfu-mcu.adoc[Topologies: Mesh, SFU and MCU] for the choice that sets the
+  traffic pattern.
+* xref:web/webrtc-websockets/mediasoup.adoc[mediasoup], xref:web/webrtc-websockets/livekit.adoc[LiveKit] and
+  xref:web/webrtc-websockets/janus-and-jitsi.adoc[Janus and Jitsi] for each server's configuration.
+* xref:web/webrtc-websockets/load-testing-and-capacity-planning.adoc[Load Testing and Capacity Planning] to measure the
+  inputs of the model.
+* xref:web/webrtc-websockets/observability.adoc[Observability] and
+  xref:web/webrtc-websockets/stats-quality-and-bandwidth.adoc[Stats, Quality and Bandwidth] for metrics.
+* xref:web/webrtc-websockets/videoconference-architecture.adoc[Videoconference Architecture] for the whole picture.
+* xref:backend/docker/networking.adoc[Docker networking] and xref:backend/kubernetes/services.adoc[Kubernetes services] for
+  the container side of ports.
+
+== References
+
+* https://mediasoup.org/documentation/v3/scalability/[mediasoup: Scalability]
+* https://mediasoup.org/documentation/v3/mediasoup/api/[mediasoup: API reference]
+* https://docs.livekit.io/transport/self-hosting/distributed/[LiveKit docs: Distributed setup]
+* https://docs.livekit.io/transport/self-hosting/ports-firewall/[LiveKit docs: Ports and firewall]
+* https://github.com/jitsi/jitsi-videobridge/blob/master/doc/relay.md[Jitsi Videobridge: relays (secure Octo)]
+* https://github.com/jitsi/jitsi-videobridge/blob/master/doc/statistics.md[Jitsi Videobridge: statistics]
+* https://github.com/coturn/coturn[coturn on GitHub]
+* https://github.com/coturn/coturn/blob/master/examples/etc/turnserver.conf[coturn: examples/etc/turnserver.conf]
+* https://www.rfc-editor.org/rfc/rfc8656[RFC 8656: Traversal Using Relays around NAT (TURN)]
+* https://www.rfc-editor.org/rfc/rfc8445[RFC 8445: Interactive Connectivity Establishment (ICE)]
+* https://datatracker.ietf.org/doc/html/draft-uberti-behave-turn-rest-00[draft-uberti-behave-turn-rest-00: A REST API For Access To TURN Services]
+* https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/[Prometheus: Alerting rules]
+* https://github.com/siimon/prom-client[prom-client on GitHub]
+* https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/[Kubernetes: DNS for services and pods]
+* https://www.w3.org/TR/webrtc-stats/[W3C: Identifiers for WebRTC's Statistics API]
