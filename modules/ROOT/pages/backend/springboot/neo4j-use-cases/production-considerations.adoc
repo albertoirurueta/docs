@@ -1,0 +1,367 @@
+= Production Considerations
+:description: Running Spring Boot 4.1 and Spring Data Neo4j graph services in production: schema management at startup, UNWIND batching, cluster routing and causal consistency, GDS on a dedicated analytics instance, separating transactional and analytical load, driver metrics, slow-query logging, timeouts and least-privilege database users.
+:keywords: Spring Boot, Spring Data Neo4j, Neo4j, production, schema migration, Neo4j-Migrations, UNWIND, batching, cluster, routing, bookmarks, causal consistency, GDS, analytics instance, OLTP, OLAP, Micrometer, slow query log, timeouts, least privilege, RBAC
+
+include::partial$springboot-disclaimer.adoc[]
+
+The use-case pages of this section run on a single container, which hides most of what changes on a real deployment: who
+creates the constraints, how bulk data gets in, where a read goes in a cluster, where a multi-gigabyte GDS projection is
+allowed to live, how a slow query is noticed and which privileges the application's user really needs. This page
+collects those decisions. Each topic points to the reference page that explains the Neo4j side; only the Spring Boot
+wiring is shown here.
+
+== Schema management at startup
+
+Spring Data Neo4j maps entities and runs queries, but it does not create constraints or indexes for them. The
+use-case pages create their schema with a small `ApplicationRunner` that executes idempotent statements, for example
+the one in xref:backend/springboot/neo4j-use-cases/fraud-detection.adoc#_schema[Fraud Detection]. The statements are the
+`+CREATE CONSTRAINT ... IF NOT EXISTS+` and `+CREATE INDEX ... IF NOT EXISTS+` forms described in
+xref:database/neo4j/indexes-and-constraints.adoc[Indexes and Constraints].
+
+A runner is the right size for a service with a handful of constraints. It stops being enough when:
+
+* several instances start at once and one of them is rolled back to an older version;
+* a change is not idempotent, such as renaming a property or backfilling a new one;
+* operations wants a record of which schema change ran, and when.
+
+At that point use a migration tool that keeps a history in the database and applies each versioned script once.
+*Neo4j-Migrations* is a third-party tool, maintained outside Neo4j and the Spring projects, that offers a Spring Boot
+starter and versioned Cypher migrations; evaluate it against your own policy before adopting it. See
+https://michael-simons.github.io/neo4j-migrations/[Neo4j-Migrations documentation].
+
+Whichever mechanism you pick, three rules hold:
+
+. Make every schema statement idempotent or versioned, so that a restart or a second instance does no harm.
+. Create constraints before the first data load. Adding a uniqueness constraint to a populated graph fails if it
+  already contains a duplicate, and building an index on a large graph takes time during which it is not yet used.
+. Give the schema runner a database user that may manage the schema, and give the running application one that may not
+  (see <<_least_privilege_users>>).
+
+[source,java]
+----
+import java.util.List;
+
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.core.annotation.Order;
+import org.springframework.data.neo4j.core.Neo4jClient;
+import org.springframework.stereotype.Component;
+
+@Component
+@Order(0)
+class SchemaRunner implements ApplicationRunner {
+
+    private static final List<String> STATEMENTS = List.of(
+        "CREATE CONSTRAINT account_number IF NOT EXISTS FOR (a:Account) REQUIRE a.accountNumber IS UNIQUE",
+        "CREATE INDEX account_flagged IF NOT EXISTS FOR (a:Account) ON (a.flagged)");
+
+    private final Neo4jClient client;
+
+    SchemaRunner(Neo4jClient client) {
+        this.client = client;
+    }
+
+    @Override
+    public void run(ApplicationArguments args) {
+        STATEMENTS.forEach(statement -> client.query(statement).run());
+    }
+}
+----
+
+Derived from https://neo4j.com/docs/cypher-manual/current/constraints/[Cypher Manual -- Constraints] and
+https://docs.spring.io/spring-boot/reference/features/spring-application.html#features.spring-application.command-line-runner[Spring Boot -- Using the ApplicationRunner].
+
+In a cluster, a schema command is a write that goes through the leader. Run it from one place, such as a migration job
+started before the application, rather than from every replica of the service.
+
+== Batching writes with UNWIND
+
+A write per node or per relationship pays a network round trip and a transaction for each one. The upserts of the
+use-case pages already send a whole list in one statement with `UNWIND $rows AS row`, and the same shape is the way to
+load bulk data from a Spring service:
+
+[source,java]
+----
+import java.util.List;
+import java.util.Map;
+
+import org.springframework.data.neo4j.core.Neo4jClient;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+class AccountLoader {
+
+    private static final int BATCH_SIZE = 5_000;
+
+    private final Neo4jClient client;
+
+    AccountLoader(Neo4jClient client) {
+        this.client = client;
+    }
+
+    public void load(List<Map<String, Object>> accounts) {
+        for (int from = 0; from < accounts.size(); from += BATCH_SIZE) {
+            var batch = accounts.subList(from, Math.min(from + BATCH_SIZE, accounts.size()));
+            writeBatch(batch);
+        }
+    }
+
+    @Transactional
+    void writeBatch(List<Map<String, Object>> batch) {
+        client.query("""
+                UNWIND $rows AS row
+                MERGE (a:Account {accountNumber: row.accountNumber})
+                SET a.flagged = row.flagged
+                """)
+            .bind(batch).to("rows")
+            .run();
+    }
+}
+----
+
+The listing calls `writeBatch` through `this`, so in a real class it lives in a separate bean or the loop is in the
+caller; otherwise the transaction proxy is bypassed. Keep a batch to a few thousand rows so that one transaction does not
+exhaust the transaction memory of the server, and `MERGE` on a constrained property so that a retry repeats nothing.
+Derived from https://neo4j.com/docs/cypher-manual/current/clauses/unwind/[Cypher Manual -- UNWIND] and
+https://neo4j.com/docs/cypher-manual/current/clauses/merge/[Cypher Manual -- MERGE].
+
+For loads that start from files rather than from a service, `LOAD CSV` with `+CALL { ... } IN TRANSACTIONS+` and the offline
+import tool are the better tools; xref:database/neo4j/importing-data.adoc[Importing Data] explains how to choose among
+them.
+
+== Clusters: routing, bookmarks and consistency
+
+A Neo4j cluster has one writer per database and several readers. The Java driver decides where a transaction runs from
+the URI scheme and from the access mode of the transaction:
+
+* A `neo4j://` (or `neo4j+s://`) URI makes the driver fetch a routing table and send each transaction to a suitable
+  server. A `bolt://` URI connects to one server and never routes. Use the routing scheme for any clustered
+  deployment, as described in xref:database/neo4j/clustering-and-multi-database.adoc[Clustering and Multi-Database].
+* Spring Data Neo4j opens a read transaction for `@Transactional(readOnly = true)` and a write transaction otherwise,
+  so the annotation the use-case services already carry is what sends a query to a secondary. A query method without it
+  runs as a write on the leader. The semantics are explained in
+  xref:backend/springboot/spring-data-neo4j.adoc#_transactions[Spring Data Neo4j -- Transactions].
+
+[source,properties]
+----
+spring.neo4j.uri=neo4j+s://graph.example.com:7687
+spring.neo4j.authentication.username=${NEO4J_USER}
+spring.neo4j.authentication.password=${NEO4J_PASSWORD}
+----
+
+Derived from https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.data[Spring Boot -- Application properties]
+and https://neo4j.com/docs/java-manual/current/connect-advanced/[Java driver -- Advanced connection information].
+
+Secondaries replicate asynchronously, so a read routed to one right after a write can miss it. The mechanism that fixes
+that is the *bookmark*, explained in
+xref:database/neo4j/transactions-and-drivers.adoc#_causal_consistency_and_bookmarks[Causal Consistency and Bookmarks].
+Within one application instance the driver and Spring Data Neo4j chain bookmarks between transactions, so a service
+that writes and then reads sees its own write. Two things are not covered by that:
+
+* *Across instances.* A write handled by one replica of the service and a read handled by another do not share
+  bookmarks. If a user flow depends on it, return a bookmark to the client or keep the flow on the leader with a
+  write transaction.
+* *Across threads started by you.* Work handed to an executor outside Spring's transaction management does not inherit the
+  caller's bookmarks.
+
+In the use cases, the ring detection results are written by a batch job and read later by an API, so they tolerate the
+replication delay; the real-time payment check of Fraud Detection reads data that was written moments earlier by a
+listener, so it is the one that benefits from a causally consistent read or from running on the leader.
+
+== GDS and the analytics instance
+
+A GDS projection is held in the heap of one server, and the algorithms run there. In a cluster, the plugin is
+installed on the servers that will run it, and the projection is not shared between servers. The projection and the
+algorithm compete with the transactional workload for memory and CPU, which is why the setup notes of
+xref:backend/springboot/neo4j-use-cases/calling-gds-from-spring-boot.adoc[Calling GDS from Spring Boot] insist on estimating
+memory before projecting.
+
+The usual production answer is a *dedicated analytics instance*: a secondary or a separate server that holds a copy of
+the data, has the GDS plugin and a large heap, and takes no application traffic. The analytics job connects to it with its
+own driver, and writes the results back to the primary or reads them from the analytics instance itself:
+
+[source,java]
+----
+import org.neo4j.driver.AuthTokens;
+import org.neo4j.driver.Driver;
+import org.neo4j.driver.GraphDatabase;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.data.neo4j.core.Neo4jClient;
+
+@Configuration
+class AnalyticsConfig {
+
+    @Bean(destroyMethod = "close", defaultCandidate = false)
+    @Qualifier("analytics")
+    Driver analyticsDriver(@Value("${analytics.neo4j.uri}") String uri,
+                           @Value("${analytics.neo4j.username}") String username,
+                           @Value("${analytics.neo4j.password}") String password) {
+        return GraphDatabase.driver(uri, AuthTokens.basic(username, password));
+    }
+
+    @Bean(defaultCandidate = false)
+    @Qualifier("analytics")
+    Neo4jClient analyticsClient(@Qualifier("analytics") Driver analyticsDriver) {
+        return Neo4jClient.create(analyticsDriver);
+    }
+
+    @Bean(defaultCandidate = false)
+    @Qualifier("analytics")
+    GdsGraphs analyticsGraphs(@Qualifier("analytics") Neo4jClient analyticsClient) {
+        return new GdsGraphs(analyticsClient);
+    }
+}
+----
+
+`defaultCandidate = false` keeps the three beans out of ordinary injection: an unqualified `Driver` or `Neo4jClient`
+still resolves to the auto-configured one, and Spring Boot's `@ConditionalOnMissingBean` checks ignore beans that are not
+default candidates, so the application's own driver, client, template and repositories are still created and still point
+at the cluster. Without it, a second `Driver` or `Neo4jClient` bean would replace the auto-configured one and silently
+send the whole application to the analytics instance.
+
+The scheduled jobs of the use-case pages then inject *both* `@Qualifier("analytics") Neo4jClient` and
+`@Qualifier("analytics") GdsGraphs`. The pair matters: the helper projects through the client it was built with, so a
+job that runs its algorithms on the analytics client while projecting through the default `GdsGraphs` would create the
+projection on one server and look for it on another. Derived from
+https://docs.spring.io/spring-framework/reference/core/beans/java/bean-annotation.html[Spring Framework -- Using the @Bean annotation],
+https://docs.spring.io/spring-boot/how-to/data-access.html#howto.data-access.configure-two-datasources[Spring Boot -- Configure two DataSources]
+(the same `defaultCandidate = false` pattern),
+https://docs.spring.io/spring-data/neo4j/reference/appendix/neo4j-client.html[Spring Data Neo4j -- Neo4j Client] and
+https://neo4j.com/docs/graph-data-science/current/production-deployment/[GDS -- Production deployment].
+
+If you do not want to operate the instance, the managed alternative mentioned in the foundation page is Aura Graph
+Analytics, see xref:backend/springboot/neo4j-use-cases/calling-gds-from-spring-boot.adoc#_managed_analytics_on_aura[Managed analytics on Aura].
+
+== Separating transactional and analytical load
+
+Even without a second server, keep the two kinds of work apart:
+
+* *Transactional (OLTP) paths* are short, bounded and latency sensitive: the payment check, the permission check, the
+  route lookup. They read data that the batch jobs have already persisted, such as a community id, a score or a
+  `SIMILAR` relationship, and they never project a graph.
+* *Analytical (OLAP) paths* are long, memory hungry and tolerant of delay: projections, community detection,
+  similarity. They run on a schedule or on request, outside the request thread, with ShedLock so that only one instance
+  starts a given job (see xref:backend/springboot/scheduling-and-shedlock.adoc[Scheduling and ShedLock]).
+* *Results flow one way.* Analytics write properties or relationships back (`write` mode, or `mutate` followed by a
+  controlled write); the request path reads them with ordinary repositories and caches them if useful
+  (see xref:backend/springboot/caching.adoc[Caching]).
+* *Bound everything the request path can trigger.* Use hop limits, `LIMIT` and paging so that a user cannot start
+  an unbounded traversal.
+
+This is the same split that the use-case pages follow, and it makes the two halves scalable on their own: more service
+replicas for the request path, a bigger analytics instance for the jobs.
+
+== Observability: driver metrics, slow queries and timeouts
+
+=== Driver metrics with Micrometer
+
+Spring Boot can publish the Java driver's connection pool metrics to Micrometer. Enable them with a property; with
+Micrometer on the classpath, the pool meters appear under the `neo4j.driver` prefix and can be exposed by Actuator:
+
+[source,properties]
+----
+spring.neo4j.pool.metrics-enabled=true
+management.endpoints.web.exposure.include=health,metrics,prometheus
+----
+
+Watch the number of connections in use against the pool size and the time requests spend waiting to acquire one:
+sustained waiting means the pool is too small or transactions are too long. The setup of the registry, Actuator and
+Prometheus is in xref:backend/springboot/metrics-and-observability.adoc[Metrics and Observability]. Derived from
+https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.data[Spring Boot -- Application properties]
+(the `spring.neo4j.pool.*` group).
+
+=== Slow-query logging
+
+Slow queries are logged by the server, not by the driver. On an Enterprise server, enable the query log and a threshold in
+`neo4j.conf`:
+
+[source,properties]
+----
+db.logs.query.enabled=INFO
+db.logs.query.threshold=1s
+----
+
+The log records the query text, its parameters, the elapsed time and the user, so it is the starting point for finding
+the traversal that needs an index or a hop bound, and for finding a GDS job that runs longer than planned. Treat the file
+as sensitive, because parameters can contain business data. See
+https://neo4j.com/docs/operations-manual/current/monitoring/logging/#query-logging[Operations Manual -- Query logging].
+
+=== Timeouts
+
+Three timeouts protect the service, and they work at different levels:
+
+[cols="2,3,3",options="header"]
+|===
+|Level |Setting |Effect
+
+|Connection pool
+|`spring.neo4j.pool.connection-acquisition-timeout`
+|How long a request waits for a free connection before failing, instead of piling up.
+
+|Connection
+|`spring.neo4j.connection-timeout`
+|How long the driver waits to establish a connection to a server.
+
+|Transaction
+|`db.transaction.timeout` on the server
+|Terminates any transaction that runs longer than the limit, which is the safety net for a runaway traversal.
+|===
+
+Set the transaction timeout lower for the cluster that serves requests than for the analytics instance, where
+projections legitimately run for minutes. Derived from
+https://docs.spring.io/spring-boot/appendix/application-properties/index.html#appendix.application-properties.data[Spring Boot -- Application properties] and
+https://neo4j.com/docs/operations-manual/current/configuration/configuration-settings/#config_db.transaction.timeout[Operations Manual -- Configuration settings].
+
+== Least-privilege users
+
+Do not run the application as the `neo4j` administrator. Create roles for what each part of the system does and
+give the application the narrowest one:
+
+* The *request path* needs to read and, for a writing API, to write graph data. It needs no schema or administration
+  privileges.
+* The *schema runner or migration job* needs index and constraint management, and nothing else.
+* The *analytics job* needs to execute the `gds` procedures and, if it uses `apoc`, only the APOC procedures it calls,
+  plus read access and, for `write` mode, write access.
+
+[source,cypher]
+----
+CREATE ROLE graph_reader IF NOT EXISTS;
+GRANT ACCESS ON DATABASE neo4j TO graph_reader;
+GRANT MATCH {*} ON GRAPH neo4j TO graph_reader;
+
+CREATE ROLE graph_analytics IF NOT EXISTS;
+GRANT ACCESS ON DATABASE neo4j TO graph_analytics;
+GRANT MATCH {*} ON GRAPH neo4j TO graph_analytics;
+GRANT WRITE ON GRAPH neo4j TO graph_analytics;
+GRANT EXECUTE PROCEDURE gds.* ON DBMS TO graph_analytics;
+
+CREATE ROLE graph_schema IF NOT EXISTS;
+GRANT ACCESS ON DATABASE neo4j TO graph_schema;
+GRANT INDEX MANAGEMENT ON DATABASE neo4j TO graph_schema;
+GRANT CONSTRAINT MANAGEMENT ON DATABASE neo4j TO graph_schema;
+
+CREATE USER app_service IF NOT EXISTS SET PASSWORD $password CHANGE NOT REQUIRED;
+GRANT ROLE graph_reader TO app_service;
+----
+
+Each role is granted to a distinct user, and the credentials reach the application through the environment or a secret
+store, as in the connection properties above, never through the repository. The full privilege grammar, authentication
+providers and auditing are in
+xref:database/neo4j/security-and-administration.adoc[Neo4j Security and Administration]; the role and privilege syntax is
+in https://neo4j.com/docs/operations-manual/current/authentication-authorization/[Operations Manual -- Authentication and authorization].
+A role that is more restrictive than the application's needs shows up as an error in the first integration test that
+runs against it, so run the container-backed tests of
+xref:backend/springboot/neo4j-use-cases/testing-graph-use-cases.adoc[Testing Graph Use Cases] with the same roles when you can.
+
+== Checklist
+
+* Schema statements are idempotent or versioned, and run from one place.
+* Bulk writes use `UNWIND` batches of a few thousand rows over constrained keys.
+* A clustered deployment uses a routing URI, and read-only services are marked `@Transactional(readOnly = true)`.
+* GDS runs on a sized, dedicated analytics instance, and the request path reads persisted results.
+* Pool metrics are exported, the query log is on with a sensible threshold, and timeouts are set at each level.
+* The application's user has only the privileges its role needs.
