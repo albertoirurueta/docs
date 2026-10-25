@@ -1,0 +1,1609 @@
+= Django Channels
+:description: Build the Chatterbox chat protocol, Redis presence with expiry and a Pixel Arena game loop on Django Channels 4.3 with Daphne or Uvicorn: an AsyncJsonWebsocketConsumer with acknowledgements and idempotent ids, history in the ORM through database_sync_to_async, per-room sequence numbers, typing throttling, receipts and resume, channel layer tuning, a ChannelNameRouter worker, and tests with WebsocketCommunicator.
+:keywords: Django Channels, Channels 4, WebSocket, ASGI, Daphne, Uvicorn, channels_redis, RedisChannelLayer, channel layer, AsyncJsonWebsocketConsumer, ChannelNameRouter, runworker, database_sync_to_async, WebsocketCommunicator, presence, Redis, redis-py, idempotency, Chatterbox, Pixel Arena, game loop, chat
+
+include::partial$webrtc-websockets-disclaimer.adoc[]
+
+This page builds two real-time servers on Django Channels: the *Chatterbox* chat server, which speaks the shared JSON wire
+protocol defined in xref:web/webrtc-websockets/message-design-and-serialization.adoc[Message Design and Serialization],
+and the authoritative game loop of *Pixel Arena*. It does not explain Channels itself. Consumers, `ProtocolTypeRouter`,
+`URLRouter`, `AuthMiddlewareStack`, origin validators, the channel-layer API, Daphne's options and the Channels 2 to 4
+migration table are in the reference page xref:web/django/channels-and-websockets.adoc[Channels & WebSockets]; read it
+first, and use this page for the patterns that sit on top of it.
+
+The baseline is Django 6.1.2 (released 2026-10-06), Python 3.13 (the `python:3.13.17-slim-trixie` image), Channels
+4.3.2 (2025-11-20), Daphne 4.2.3 (2026-07-21), channels_redis 4.3.0 (2025-07-22), redis-py 7.4.1, Uvicorn 0.54.0 and
+Redis server 8.8.3 (the `8.8.3-alpine` image), all checked on 2026-10-24. Channels 4.3.2 declares Django 6.0 as its
+newest classifier; it ran unchanged under Django 6.1.2. Every listing below was run with Docker Compose: a Node 24.21
+conformance client (the global `WebSocket`, no library) passed all 36 checks against Daphne and again against Uvicorn,
+and three `WebsocketCommunicator` tests passed.
+
+*Who uses what.* The chat scenario uses everything on this page: the consumer, history in the database, presence, typing,
+receipts and resume. The game scenario uses the worker and the second, short-lived channel layer. The videoconference
+scenario (Huddle) needs only a signalling relay, which is the same consumer pattern with `offer`, `answer` and `candidate`
+payloads instead of chat messages (see
+xref:web/webrtc-websockets/signaling-and-perfect-negotiation.adoc[Signaling and Perfect Negotiation]).
+
+== What this page adds
+
+[cols="3,5",options="header"]
+|===
+| Need | Where it is solved
+
+| One consumer for all twelve Chatterbox message types
+| <<consumer>>: a single `AsyncJsonWebsocketConsumer` with a dispatch table, errors with close codes, a hello timeout, a heartbeat watchdog and a token-bucket rate limit.
+
+| Acknowledgements that survive retries
+| <<store>>: the ack row is written in the same transaction as the change, so a resent id returns the original ack with `dup` true.
+
+| Ordering and history
+| <<store>>: a per-room counter updated before it is read, history paging on `seq`, edits applied on read.
+
+| Who is online
+| <<presence>>: Redis sorted sets whose entries and keys expire by themselves, plus a 15-second grace period.
+
+| Typing, receipts, resume
+| <<extras>>: a Redis `SET NX PX` throttle, validated receipts, and a replay on reconnect.
+
+| A game loop that is not the web process
+| <<game>>: a `ChannelNameRouter` worker started with `runworker`, and a second layer tuned for stale data.
+
+| Capacity and expiry
+| <<settings>>: two channel layers with different `capacity`, `expiry` and `channel_capacity`.
+
+| Daphne or Uvicorn, and tests
+| <<servers>> and <<testing>>.
+|===
+
+[#architecture]
+== Architecture
+
+Two processes and two Redis uses. The web process (Daphne or Uvicorn) holds the WebSockets and runs one
+`ChatConsumer` per connection. The worker process owns the game world. Redis carries three things: the chat channel
+layer, the game channel layer, and the presence and ticket keys. The database holds what must not be lost: rooms,
+memberships, events and the idempotency table.
+
+.Where each piece of state lives
+[mermaid]
+....
+flowchart LR
+    B1["Browser A"] -->|"JSON envelope"| C1["ChatConsumer A"]
+    C1 -->|"1 one transaction: seq, event, ack"| DB[("SQLite or PostgreSQL")]
+    C1 -->|"2 group_send room-general"| L[("Redis: chat layer")]
+    L --> C1
+    L --> C2["ChatConsumer B"]
+    C2 --> B2["Browser B"]
+    C1 -.->|"presence, tickets, typing"| R[("Redis keys cb:*")]
+    P["Player socket"] --> AC["ArenaConsumer"]
+    AC -->|"send arena"| G[("Redis: game layer")]
+    G --> W["ArenaWorker via runworker --layer game arena"]
+    W -->|"group_send arena-state, 20 Hz"| G
+    G --> AC
+....
+
+The numbers 1 and 2 on the first arrows are the order that matters: the database commit comes before the broadcast, so
+the layer never announces a message that does not exist. The reverse failure, a commit followed by a lost broadcast, is
+handled by sequence numbers (<<pitfalls>>).
+
+[#setup]
+== Dependencies, container image and Compose file
+
+Pin every package. The pins below are the exact set that ran.
+
+[source,text]
+----
+Django==6.1.2
+channels==4.3.2
+daphne==4.2.3
+channels-redis==4.3.0
+redis==7.4.1
+----
+
+The `redis==7.4.1` line is deliberate. channels_redis 4.3.0 declares only `redis>=4.6`, so an unpinned install takes
+redis-py 8.1.0 today, and redis-py 8.0.0 changed the defaults: `socket_timeout` and `socket_connect_timeout` are now 5
+seconds, according to its release notes, which also warn that a socket timeout can break blocking commands such as
+`BLPOP` and `BRPOP`. channels_redis waits for messages with exactly such commands. With redis-py 8.1.0 the
+`runworker` process of this page crashed at start-up with a `TimeoutError` ("Timeout reading from redis:6379"), and a standalone `BZPOPMIN` with a 10-second timeout failed after 5.0 seconds; with 7.4.1 the same probe
+waited the full 10 seconds and the worker ran. Keep `redis` below 8 until channels_redis documents support for it.
+
+[source,dockerfile]
+----
+FROM python:3.13.17-slim-trixie
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+CMD ["daphne", "-b", "0.0.0.0", "-p", "8000", "config.asgi:application"]
+----
+
+[source,yaml]
+----
+# docker compose -p chatterbox up --build
+services:
+  redis:
+    image: redis:8.8.3-alpine
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  web:
+    build: .
+    command: sh -c "python manage.py migrate --noinput && daphne -b 0.0.0.0 -p 8000 --websocket-max-message-size 65536 config.asgi:application"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SECRET_KEY: change-me
+      ALLOWED_HOSTS: localhost,127.0.0.1
+      CHATTERBOX_ORIGINS: http://localhost:8000
+      SQLITE_PATH: /data/db.sqlite3
+    volumes:
+      - data:/data
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: python manage.py runworker --layer game arena
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SECRET_KEY: change-me
+      SQLITE_PATH: /data/db.sqlite3
+    volumes:
+      - data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  data:
+----
+
+The compose file starts three services: Redis with a health check, the web process (it runs the migrations and then
+Daphne) and the worker. The web port and the Redis port are overridable with `WEB_PORT` and `REDIS_PORT`, and both bind to
+`127.0.0.1` so that nothing is exposed by accident. Secrets are placeholders (`change-me`); a real deployment reads
+them from the environment or a secret store. `--websocket-max-message-size 65536` makes Daphne refuse oversized messages
+before they reach Python; the application enforces the protocol's own 16384-byte limit afterwards, so the client gets a
+proper `too_large` error and close code 4413.
+
+Source: https://docs.docker.com/reference/compose-file/[Compose file reference], https://hub.docker.com/_/python[python image] and https://hub.docker.com/_/redis[redis image]
+
+The project layout:
+
+[source,text]
+----
+chatterbox/
+    compose.yaml  Dockerfile  requirements.txt  manage.py
+    config/   settings.py  asgi.py  urls.py
+    chat/
+        models.py          # Room, Membership, Event, Processed
+        protocol.py        # envelope helpers, ChatError, validation
+        store.py           # synchronous ORM half (run in threads)
+        presence.py        # Redis: presence, tickets, typing throttle, sessions
+        redis_client.py    # one redis-py client per event loop
+        consumers.py       # ChatConsumer
+        arena.py           # ArenaWorker and ArenaConsumer
+        security.py        # OptionalOriginValidator
+        routing.py  views.py  management/commands/mint_ticket.py
+        tests/test_chat.py
+----
+
+[#settings]
+== Settings: two channel layers
+
+One layer is rarely enough. Chat events are worth keeping for a while; game snapshots are worth nothing a second after
+they were sent. Channels lets a consumer pick a layer by alias (`channel_layer_alias`), so the two kinds of traffic get
+different limits and cannot starve each other.
+
+[source,python]
+----
+# config/settings.py (excerpt)
+CHATTERBOX_ORIGINS = os.environ.get("CHATTERBOX_ORIGINS", "http://localhost:8000").split(",")
+REDIS_URL = os.environ.get("REDIS_URL")
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": os.environ.get("SQLITE_PATH", BASE_DIR / "db.sqlite3"),
+        # BEGIN IMMEDIATE: take the write lock at the start of atomic(), so the
+        # per-room seq counter cannot be read stale (Django 5.1+).
+        "OPTIONS": {"transaction_mode": "IMMEDIATE", "timeout": 20},
+    }
+}
+
+if REDIS_URL:
+    CHANNEL_LAYERS = {
+        # chat: durable-ish events, a minute of grace for slow consumers
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [REDIS_URL],
+                "prefix": "chatterbox",
+                "expiry": 60,
+                "capacity": 200,
+            },
+        },
+        # game: snapshots are worthless after a second, so expire fast and
+        # keep the queues short; the worker's own queue gets more room
+        "game": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [REDIS_URL],
+                "prefix": "arena",
+                "expiry": 1,
+                "capacity": 10,
+                "channel_capacity": {"arena": 500},
+            },
+        },
+    }
+else:
+    CHANNEL_LAYERS = {
+        "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
+        "game": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
+    }
+----
+
+Source: https://channels.readthedocs.io/en/latest/topics/channel_layers.html#configuration[Channel layers: configuration], https://github.com/django/channels_redis[channels_redis README] and https://docs.djangoproject.com/en/6.1/ref/databases/#transaction-behavior[Django: SQLite transaction behavior]
+
+What each knob does, and why the two layers differ:
+
+[cols="2,2,2,2,5",options="header"]
+|===
+| Option | Default | Chat layer | Game layer | Reasoning
+
+| `expiry`
+| 60 s
+| 60
+| 1
+| Undelivered messages are dropped after this many seconds. A chat event may wait for a slow consumer; a snapshot older than a second is already wrong.
+
+| `capacity`
+| 100
+| 200
+| 10
+| Messages one channel can hold. When it is full, `send` raises `ChannelFull` and `group_send` silently skips that receiver. At 20 snapshots per second, 10 is half a second of backlog. Snapshots carry full state, so a skipped one costs nothing.
+
+| `channel_capacity`
+| none
+| none
+| `+{"arena": 500}+`
+| Per-channel override by name (glob or compiled regular expression). The worker's named channel receives the input of every player, so it needs more room than a player's own channel.
+
+| `group_expiry`
+| 86400 s
+| default
+| default
+| How long a channel stays in a group after `group_add`. It must not be shorter than the server's WebSocket timeout (Daphne's `--websocket_timeout`, 86400 s by default), or a live socket falls out of its rooms.
+
+| `prefix`
+| `asgi`
+| `chatterbox`
+| `arena`
+| Redis key prefix. Layers that share a Redis server need distinct prefixes.
+|===
+
+Three further points. First, `InMemoryChannelLayer` is for development and tests only: each process has its own, so two
+server processes never see each other's rooms. Since Channels 4.2 it honours `expiry` and per-channel capacities, which
+makes tests of the limits possible. Second, `RedisPubSubChannelLayer` (also in channels_redis) is labelled Beta in its
+README and can drop messages during a network partition; it offers `on_disconnect` and `on_reconnect` hooks to re-sync.
+The page uses the core layer, whose queues give the capacity and expiry semantics above. Third, the SQLite option
+`transaction_mode` set to `IMMEDIATE` (Django 5.1 and later) takes the write lock when `atomic()` begins, which the
+sequence counter in <<store>> relies on; PostgreSQL gets the same guarantee from the row lock of the `UPDATE`.
+
+[#handshake]
+== asgi.py and the handshake
+
+[source,python]
+----
+# config/asgi.py
+import os
+
+from django.core.asgi import get_asgi_application
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+django_asgi_app = get_asgi_application()  # django.setup() before model imports
+
+from channels.auth import AuthMiddlewareStack  # noqa: E402
+from channels.routing import ChannelNameRouter, ProtocolTypeRouter, URLRouter  # noqa: E402
+from django.conf import settings  # noqa: E402
+
+from chat import routing  # noqa: E402
+from chat.arena import ArenaWorker  # noqa: E402
+from chat.security import OptionalOriginValidator  # noqa: E402
+
+application = ProtocolTypeRouter(
+    {
+        "http": django_asgi_app,
+        "websocket": OptionalOriginValidator(
+            AuthMiddlewareStack(URLRouter(routing.websocket_urlpatterns)),
+            settings.CHATTERBOX_ORIGINS,
+        ),
+        "channel": ChannelNameRouter({"arena": ArenaWorker.as_asgi()}),
+    }
+)
+----
+
+[source,python]
+----
+# chat/security.py
+from channels.security.websocket import OriginValidator
+
+
+class OptionalOriginValidator(OriginValidator):
+    """Allow-list the Origin header, but let clients that send none through.
+
+    Browsers always send Origin, and a hostile page cannot remove it, so the
+    cross-site hijacking check still holds. Non-browser clients (scripts,
+    mobile apps) send no Origin and authenticate with a ticket instead.
+    """
+
+    def valid_origin(self, parsed_origin):
+        if parsed_origin is None:
+            return True
+        return self.validate_origin(parsed_origin)
+----
+
+Source: https://channels.readthedocs.io/en/latest/topics/routing.html[Routing] and https://channels.readthedocs.io/en/latest/topics/security.html[Channels: Security]
+
+Four choices in these two files deserve a sentence each.
+
+* *`"http"` is routed explicitly* to `get_asgi_application()`. Channels 4 removed `AsgiHandler` and the automatic routing
+of the `http` protocol, so a project that forgets the key cannot serve a single page.
+* *The origin allow-list is the first defence.* Browsers do not apply the same-origin policy to WebSocket handshakes and
+send cookies automatically, so a hostile page can open a socket to your server with your user's session. The browser
+always adds an `Origin` header and a page cannot remove or forge it, so the validator wraps everything else. The stock
+`OriginValidator` also refuses a connection with no `Origin` at all. The Chatterbox protocol accepts non-browser clients
+that send none, so `OptionalOriginValidator` lets those through and leaves their authentication to the ticket.
+An origin check is not authorisation: a script can send any `Origin` it likes, which is why every action is checked again
+inside the consumer.
+* *Tickets replace headers.* The browser `WebSocket` API cannot set an `Authorization` header, and a URL is a poor place
+for a credential. Chatterbox sends the one-time ticket in the first frame instead (`hello.payload.token`). A browser that
+is logged in to the Django site needs no ticket at all: the session cookie authenticates the handshake through
+`AuthMiddlewareStack`, and `hello` can omit the token.
+* *The `"channel"` entry* maps the worker's named channel to the game worker (<<game>>).
+
+Source: https://channels.readthedocs.io/en/latest/topics/authentication.html[Channels: Authentication]
+
+[#data]
+== The data model
+
+Four tables are enough for everything the protocol keeps.
+
+[source,python]
+----
+# chat/models.py
+from django.conf import settings
+from django.db import models
+
+
+class Room(models.Model):
+    name = models.CharField(max_length=64, primary_key=True)
+    last_seq = models.PositiveIntegerField(default=0)  # per-room counter
+
+
+class Membership(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    room = models.ForeignKey(Room, on_delete=models.CASCADE)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "room"], name="one_membership")
+        ]
+
+
+class Event(models.Model):
+    """One row per seq: a message, an edit of a message or a reaction."""
+
+    class Kind(models.TextChoices):
+        MESSAGE = "message"
+        EDIT = "edit"
+        REACT = "react"
+
+    room = models.ForeignKey(Room, on_delete=models.CASCADE)
+    seq = models.PositiveIntegerField()
+    kind = models.CharField(max_length=8, choices=Kind)
+    ref = models.CharField(max_length=36)  # message id, or the target of edit/react
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    data = models.JSONField()
+    ts = models.BigIntegerField()  # server time, epoch milliseconds
+
+    class Meta:
+        ordering = ["seq"]
+        constraints = [
+            models.UniqueConstraint(fields=["room", "seq"], name="seq_unique_per_room"),
+            models.UniqueConstraint(
+                fields=["ref"],
+                condition=models.Q(kind="message"),
+                name="message_id_unique",
+            ),
+        ]
+
+
+class Processed(models.Model):
+    """Idempotency table: the first ack of every (user, envelope id)."""
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    env_id = models.CharField(max_length=36)
+    ack = models.JSONField()
+    created = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "env_id"], name="one_ack_per_id")
+        ]
+----
+
+Source: https://docs.djangoproject.com/en/6.1/ref/models/constraints/[Django: constraints] and https://docs.djangoproject.com/en/6.1/ref/models/fields/#jsonfield[Django: JSONField]
+
+* `Room.last_seq` is the per-room counter. `seq` is one number line shared by messages, edits and reactions, so it has
+gaps in a history page that returns only messages, as the protocol states.
+* `Event` stores all three ordered kinds. `ref` is the message id for a message and the target message id for an edit or
+a reaction. The unique constraint on `(room, seq)` makes a duplicate sequence number impossible even if the counter code
+were wrong, and the conditional constraint on `ref` makes "the id of a message is its id forever" a database rule.
+* `Processed` is the idempotency table: `(user, env_id)` is unique and `ack` holds the first acknowledgement. The
+protocol asks the server to remember ids for at least 24 hours; delete rows older than that with a periodic job (the
+`created` column is there for it).
+
+[#consumer]
+== The Chatterbox consumer
+
+One class handles the connection. Its shape is a pipeline: size and type checks, a rate limit, envelope validation, then a
+dispatch to a method named after the message type. The group handler `chat_envelope` turns every event published to a
+room into one outbound frame.
+
+[source,python]
+----
+# chat/consumers.py
+import asyncio
+import logging
+import secrets
+import time
+from collections import deque
+
+from channels.db import database_sync_to_async
+from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from django.contrib.auth import get_user_model
+from django.db import IntegrityError
+
+from . import presence, store
+from .protocol import (
+    HEARTBEAT_MS, ID_RE, MAX_FRAME_BYTES, ROOM_RE, SUBPROTOCOL, ChatError,
+    ack_envelope, envelope, error_envelope, parse_envelope,
+)  # fmt: skip
+
+log = logging.getLogger("chatterbox")
+GRACE_SECONDS = 15  # offline is announced this long after the last socket closes
+_background = set()  # strong references: the loop only keeps weak ones
+
+
+def room_group(room):
+    return f"room-{room}"  # [a-z0-9-] is valid in a group name
+
+
+class TokenBucket:
+    def __init__(self, rate=20.0, capacity=40.0):
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self.stamp = capacity, time.monotonic()
+
+    def take(self):
+        now = time.monotonic()
+        self.tokens = min(self.capacity, self.tokens + (now - self.stamp) * self.rate)
+        self.stamp = now
+        if self.tokens >= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+
+async def announce_offline_later(user_id, name, rooms, layer):
+    await asyncio.sleep(GRACE_SECONDS)
+    if await presence.status_of(user_id) != "offline":
+        return  # reconnected during the grace period
+    for room in rooms:
+        payload = {"userId": user_id, "name": name, "status": "offline"}
+        await layer.group_send(
+            room_group(room),
+            {"type": "chat.envelope", "envelope": envelope("presence", payload, room),
+             "exclude_user": user_id},
+        )  # fmt: skip
+
+
+class ChatConsumer(AsyncJsonWebsocketConsumer):
+    user = None
+    uid = None
+    session_id = None
+    watchdog_task = None
+    rooms = ()
+    closing = False  # set once we sent a close: later frames are ignored
+
+    # ---- connection lifecycle -------------------------------------------
+    async def connect(self):
+        offered = self.scope.get("subprotocols", [])
+        if offered and SUBPROTOCOL not in offered:
+            await self.close()  # handshake refused: HTTP 403
+            return
+        self.rooms = set()
+        self.bucket = TokenBucket()
+        self.limit_hits = deque()
+        self.last_rx = time.monotonic()
+        self.said_hello = asyncio.Event()
+        await self.accept(SUBPROTOCOL if offered else None)
+        self.watchdog_task = asyncio.create_task(self._watchdog())
+
+    async def _watchdog(self):
+        try:
+            await asyncio.wait_for(self.said_hello.wait(), 5)
+        except asyncio.TimeoutError:
+            await self._close(4408)  # no hello within 5 s
+            return
+        while True:
+            await asyncio.sleep(HEARTBEAT_MS / 1000)
+            if time.monotonic() - self.last_rx > 2 * HEARTBEAT_MS / 1000:
+                await self._close(4408)  # two heartbeats of silence
+                return
+
+    async def disconnect(self, code):
+        if self.watchdog_task:
+            self.watchdog_task.cancel()
+        if self.user is None:
+            return
+        for room in self.rooms:
+            await self.channel_layer.group_discard(room_group(room), self.channel_name)
+        if await presence.drop(self.uid, self.channel_name) == 0:
+            await presence.save_session(self.session_id, self.uid, presence.SESSION_TTL_S)
+            task = asyncio.create_task(
+                announce_offline_later(
+                    self.uid, self.user.get_username(), list(self.rooms), self.channel_layer
+                )
+            )
+            _background.add(task)
+            task.add_done_callback(_background.discard)
+
+    # ---- inbound frames ---------------------------------------------------
+    async def _close(self, code):
+        self.closing = True
+        await self.close(code=code)
+
+    async def receive(self, text_data=None, bytes_data=None, **kwargs):
+        if self.closing:
+            return  # frames queued behind the one that got us closed
+        self.last_rx = time.monotonic()
+        if bytes_data is not None or text_data is None:
+            await self._close(4400)  # text frames only
+            return
+        if len(text_data.encode()) > MAX_FRAME_BYTES:
+            await self._send_error(None, None, ChatError("too_large", "frame too large", close=4413))
+            return
+        try:
+            frame = await self.decode_json(text_data)
+        except ValueError:
+            await self._send_error(None, None, ChatError("bad_request", "not JSON"))
+            return
+        await self.receive_json(frame)
+
+    async def receive_json(self, frame, **kwargs):
+        ref = room = None
+        if isinstance(frame, dict):  # echo ids back only when they look valid
+            ref = frame["id"] if isinstance(frame.get("id"), str) and ID_RE.match(frame["id"]) else None
+            room = frame["room"] if isinstance(frame.get("room"), str) and ROOM_RE.match(frame["room"]) else None
+        try:
+            self._rate_limit()
+            await self._dispatch(parse_envelope(frame))
+        except ChatError as err:
+            await self._send_error(ref, room, err)
+        except IntegrityError:  # lost a race on a unique constraint
+            await self._send_error(ref, room, ChatError("conflict", "id already used"))
+        except Exception:
+            log.exception("unhandled error in chat consumer")
+            await self._send_error(ref, room, ChatError("internal", "internal error"))
+
+    def _rate_limit(self):
+        if self.bucket.take():
+            return
+        now = time.monotonic()
+        self.limit_hits.append(now)
+        while self.limit_hits and now - self.limit_hits[0] > 10:
+            self.limit_hits.popleft()
+        close = 4429 if len(self.limit_hits) >= 10 else None
+        raise ChatError("rate_limited", "slow down", close=close)
+
+    async def _send_error(self, ref, room, err):
+        await self.send_json(error_envelope(ref, room, err))
+        if err.close:
+            await self._close(err.close)
+
+    async def _dispatch(self, env):
+        if env["type"] == "hello":
+            return await self._on_hello(env)
+        if self.user is None:
+            raise ChatError("unauthorized", "send hello first", close=4401)
+        await getattr(self, f"_on_{env['type']}")(env)
+
+    # ---- helpers ----------------------------------------------------------
+    @staticmethod
+    def _room(env):
+        if env["room"] is None:
+            raise ChatError("bad_request", "room is required")
+        return env["room"]
+
+    async def _db(self, fn, *args):
+        return await database_sync_to_async(fn)(*args)
+
+    async def _fanout(self, room, env, exclude_user=None):
+        await self.channel_layer.group_send(
+            room_group(room),
+            {"type": "chat.envelope", "envelope": env, "exclude_user": exclude_user},
+        )
+
+    async def _attach(self, room):
+        """Make sure this socket receives the room's events (idempotent)."""
+        if room not in self.rooms:
+            self.rooms.add(room)
+            await self.channel_layer.group_add(room_group(room), self.channel_name)
+
+    async def _acked(self, env, handler):
+        out = await self._db(store.run_once, self.user, env["id"], handler)
+        return out
+
+    async def _finish(self, env, out):
+        await self.send_json(ack_envelope(env["id"], env["room"], out.seq, out.dup, out.result))
+        for b in out.broadcast:
+            await self._fanout(b.room, b.envelope, b.exclude_user)
+
+    async def _presence_env(self, room, status):
+        payload = {"userId": self.uid, "name": self.user.get_username(), "status": status}
+        return envelope("presence", payload, room)
+
+    async def chat_envelope(self, event):
+        """Group handler for 'chat.envelope': one frame per subscribed socket."""
+        if event["exclude_user"] == self.uid:
+            return
+        await self.send_json(event["envelope"])
+
+    # ---- message types ----------------------------------------------------
+    async def _on_hello(self, env):
+        if self.user is not None:
+            raise ChatError("conflict", "hello was already completed")
+        payload = env["payload"]
+        user = self.scope.get("user")
+        if user is None or not user.is_authenticated:  # no cookie: need a ticket
+            uid = await presence.redeem_ticket(payload.get("token"))
+            user = await get_user_model().objects.filter(pk=uid, is_active=True).afirst() if uid else None
+            if user is None:
+                raise ChatError("unauthorized", "invalid or expired ticket", close=4401)
+        self.user, self.uid = user, str(user.pk)
+        resume = payload.get("resume") if isinstance(payload.get("resume"), dict) else {}
+        resumed = bool(resume) and await presence.session_owner(resume.get("sessionId")) == self.uid
+        self.session_id = resume["sessionId"] if resumed else secrets.token_hex(16)
+        before = await presence.status_of(self.uid)
+        rooms = await self._db(store.rooms_of, user)
+        for room in rooms:
+            await self._attach(room)
+        await presence.beat(self.uid, self.channel_name, "online" if before == "offline" else before)
+        await presence.save_session(self.session_id, self.uid)
+        self.said_hello.set()
+        await self.send_json(envelope("hello", {
+            "userId": self.uid, "name": user.get_username(), "sessionId": self.session_id,
+            "heartbeatMs": HEARTBEAT_MS, "maxFrameBytes": MAX_FRAME_BYTES,
+            "resumed": resumed, "rooms": sorted(rooms), "ref": env["id"],
+        }))  # fmt: skip
+        if resumed and isinstance(resume.get("rooms"), dict):
+            for room, last in resume["rooms"].items():
+                if room in self.rooms and isinstance(last, int):
+                    for item in await self._db(store.replay, room, last):
+                        await self.send_json(item)
+        if before == "offline":
+            for room in self.rooms:
+                await self._fanout(room, await self._presence_env(room, "online"), self.uid)
+
+    async def _on_join(self, env):
+        room = self._room(env)
+        out = await self._acked(env, lambda: store.join(self.user, room, env["payload"]))
+        await self._attach(room)
+        for member in out.result["members"]:  # live data, so never cached
+            member["status"] = await presence.status_of(member["userId"])
+        await self._finish(env, out)
+        for item in out.replay:
+            await self.send_json(item)
+        if out.joined:
+            status = await presence.status_of(self.uid)
+            await self._fanout(room, await self._presence_env(room, status), self.uid)
+
+    async def _on_leave(self, env):
+        room = self._room(env)
+        out = await self._acked(env, lambda: store.leave(self.user, room))
+        self.rooms.discard(room)
+        await self.channel_layer.group_discard(room_group(room), self.channel_name)
+        await self._finish(env, out)
+
+    async def _on_message(self, env):
+        room = self._room(env)
+        out = await self._acked(env, lambda: store.post_message(self.user, room, env["id"], env["payload"]))
+        await self._attach(room)
+        await self._finish(env, out)
+
+    async def _on_edit(self, env):
+        room = self._room(env)
+        out = await self._acked(env, lambda: store.edit(self.user, room, env["payload"]))
+        await self._attach(room)
+        await self._finish(env, out)
+
+    async def _on_react(self, env):
+        room = self._room(env)
+        out = await self._acked(env, lambda: store.react(self.user, room, env["payload"]))
+        await self._attach(room)
+        await self._finish(env, out)
+
+    async def _on_history(self, env):
+        room = self._room(env)
+        out = await self._db(store.history, self.user, room, env["payload"])
+        await self._finish(env, out)
+
+    async def _on_presence(self, env):
+        status = env["payload"].get("status")
+        if status not in ("online", "away"):
+            raise ChatError("bad_request", "status must be online or away")
+        before = await presence.status_of(self.uid)
+        await presence.beat(self.uid, self.channel_name, status)  # also the heartbeat
+        await self.send_json(ack_envelope(env["id"], env["room"]))
+        if before != status:
+            for room in self.rooms:
+                await self._fanout(room, await self._presence_env(room, status), self.uid)
+
+    async def _on_typing(self, env):
+        room, state = self._room(env), env["payload"].get("state")
+        if state not in ("start", "stop"):
+            raise ChatError("bad_request", "state must be start or stop")
+        if room not in self.rooms:
+            raise ChatError("forbidden", "join the room first")
+        if state == "start" and not await presence.allow_typing(self.uid, room):
+            return  # throttled: dropped silently, fire-and-forget
+        payload = {"userId": self.uid, "state": state}
+        await self._fanout(room, envelope("typing", payload, room), self.uid)
+
+    async def _on_receipt(self, env):
+        room, p = self._room(env), env["payload"]
+        if p.get("kind") not in ("delivered", "read") or not isinstance(p.get("upTo"), int):
+            raise ChatError("bad_request", "kind and upTo are required")
+        if room not in self.rooms:
+            raise ChatError("forbidden", "join the room first")
+        if p["upTo"] > await self._db(store.last_seq, room):
+            raise ChatError("bad_request", "upTo is beyond the last seq")
+        payload = {"userId": self.uid, "kind": p["kind"], "upTo": p["upTo"]}
+        await self._fanout(room, envelope("receipt", payload, room), self.uid)
+----
+
+Source: https://channels.readthedocs.io/en/latest/topics/consumers.html#asyncjsonwebsocketconsumer[AsyncJsonWebsocketConsumer] and https://asgi.readthedocs.io/en/latest/specs/www.html#websocket[ASGI WebSocket specification]
+
+How the pieces map to the protocol:
+
+* *Handshake.* `connect()` accepts the `chatterbox.v1` subprotocol the client offered, and refuses (HTTP 403) a client
+that offered others. It starts a watchdog that closes with 4408 if no `hello` arrives within 5 seconds, then every 20
+seconds checks that something arrived in the last 40. A frame that is not `hello` before the hello completes answers
+`unauthorized` and closes with 4401.
+* *Validation before dispatch.* `parse_envelope` rejects anything that is not an object with `v` 1, a known type, an id of
+26 to 36 characters, a valid room name and an object payload. A wrong `v` answers `unsupported_version` and closes with 4426.
+Ids echoed back in an error are checked first, so a hostile `id` can never inject text into a reply.
+* *Frame limits.* Binary frames close with 4400. A text frame over 16384 UTF-8 bytes answers `too_large` and closes with 4413.
+The `closing` flag matters: after the server decides to close, frames that were already queued behind the offending
+one are ignored. Without it, those frames raise `Attempt to send on a closed protocol` in the server log when the 4429 close is sent.
+* *Rate limit.* A token bucket (20 tokens per second, capacity 40) runs before deduplication, so a retry storm is
+limited too. Ten `rate_limited` errors within ten seconds close the socket with 4429.
+* *Fan-out.* `_fanout` publishes `+{"type": "chat.envelope", ...}+` to the group `room-<name>`. Channels maps the dot to an
+underscore and calls `chat_envelope` on every consumer in the group, in every process. `exclude_user` implements "others
+only" for typing, receipts and presence, and the sender's own copy of a message, edit or reaction is how it learns the
+sequence number. `_finish` sends the ack first and the broadcast second, but clients must not rely on that order.
+* *Attach on demand.* `_attach` joins the room's group the first time a socket touches it. A user who joined the room in
+another tab, or whose membership was loaded at `hello`, therefore always receives the room's events on this socket.
+* *Errors.* A `ChatError` becomes an `error` envelope with `retryable` set from the code table; an `IntegrityError` from
+a lost race on a unique constraint becomes `conflict`; anything else is logged and becomes a retryable `internal`.
+
+[#store]
+== The ORM half: transactions, sequence numbers, history
+
+All database work is synchronous code in `store.py`, called through `database_sync_to_async` (the consumer's `_db`
+helper), so each call gets a worker thread, a transaction and clean-up of stale connections. The reasons for that choice
+over the async ORM are on the reference page; here it also keeps a whole multi-statement operation inside one
+`transaction.atomic()` block, which `await` points would break.
+
+[source,python]
+----
+# chat/store.py (excerpt)
+@dataclass
+class Broadcast:
+    room: str
+    envelope: dict
+    exclude_user: str | None = None  # "others only" types skip the sender
+
+
+@dataclass
+class Outcome:
+    seq: int | None
+    result: dict
+    dup: bool = False
+    broadcast: list = field(default_factory=list)
+    replay: list = field(default_factory=list)  # for this connection only
+    joined: bool = False
+
+
+def run_once(user, env_id, handler):
+    """Run handler() at most once per (user, envelope id), atomically.
+
+    The ack is stored in the same transaction as the change it acknowledges,
+    so a crash leaves either both or neither. A ChatError rolls everything
+    back, which is why errors are never cached.
+    """
+    with transaction.atomic():
+        done = Processed.objects.filter(user=user, env_id=env_id).first()
+        if done:
+            return Outcome(done.ack["seq"], done.ack["result"], dup=True)
+        outcome = handler()
+        Processed.objects.create(
+            user=user, env_id=env_id, ack={"seq": outcome.seq, "result": outcome.result}
+        )
+    return outcome
+
+
+def _next_seq(room):
+    # UPDATE first: the write lock (BEGIN IMMEDIATE / a row lock) is held
+    # before the value is read back, so two writers never see the same seq.
+    Room.objects.filter(pk=room).update(last_seq=F("last_seq") + 1)
+    return Room.objects.values_list("last_seq", flat=True).get(pk=room)
+
+
+def post_message(user, room, env_id, payload):
+    _require_member(user, room)
+    text = clean_text(payload.get("text"))
+    reply_to = payload.get("replyTo")
+    attachments = payload.get("attachments", [])
+    if not isinstance(attachments, list) or len(attachments) > 5:
+        raise ChatError("bad_request", "at most 5 attachments")
+    for a in attachments:
+        if not (isinstance(a, dict) and str(a.get("url", "")).startswith("https://")):
+            raise ChatError("bad_request", "attachments need an https url")
+    if reply_to is not None and not Event.objects.filter(
+        room_id=room, kind=Event.Kind.MESSAGE, ref=reply_to
+    ).exists():
+        raise ChatError("not_found", "replyTo is not a message of this room")
+    if Event.objects.filter(kind=Event.Kind.MESSAGE, ref=env_id).exists():
+        raise ChatError("conflict", "message id already used")
+    seq = _next_seq(room)
+    event = Event.objects.create(
+        room_id=room, seq=seq, kind=Event.Kind.MESSAGE, ref=env_id, user=user,
+        ts=now_ms(), data={"text": text, "replyTo": reply_to, "attachments": attachments},
+    )  # fmt: skip
+    return Outcome(seq, {}, broadcast=[Broadcast(room, _message_env(event))])
+
+
+def history(user, room, payload):
+    _require_member(user, room)
+    before, limit = payload.get("before"), payload.get("limit", 50)
+    if not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ChatError("bad_request", "limit must be 1..100")
+    rows = Event.objects.filter(room_id=room, kind=Event.Kind.MESSAGE)
+    if before is not None:
+        rows = rows.filter(seq__lt=before)
+    rows = list(rows.order_by("-seq").select_related("user")[: limit + 1])
+    page, size = [], 0
+    for event in rows[:limit]:
+        size += len(json.dumps(_message_env(event)))
+        if page and size > MAX_PAGE_BYTES:
+            break
+        page.append(event)
+    edits = {}  # apply the latest edit of every message in the page
+    for e in Event.objects.filter(
+        room_id=room, kind=Event.Kind.EDIT, ref__in=[m.ref for m in page]
+    ).order_by("seq"):
+        edits[e.ref] = e.data["text"]
+    messages = [
+        _message_env(m, edits.get(m.ref), m.ref in edits) for m in reversed(page)
+    ]
+    has_more = len(rows) > len(page)
+    nxt = page[-1].seq if has_more else None
+    return Outcome(None, {"messages": messages, "hasMore": has_more, "next": nxt})
+----
+
+Source: https://channels.readthedocs.io/en/latest/topics/databases.html[Channels: Database access], https://docs.djangoproject.com/en/6.1/topics/db/transactions/[Django: Database transactions] and https://docs.djangoproject.com/en/6.1/ref/models/expressions/#f-expressions[Django: F expressions]
+
+* *`run_once` is the idempotency guarantee.* The ack is inserted in the same transaction as the event it acknowledges.
+A crash leaves both or neither. A resent id finds the row and returns the original `seq` and `result` with `dup` true;
+the handler does not run again and nothing is broadcast. A `ChatError` raised inside the handler rolls the transaction
+back, so errors are never cached, exactly as the protocol requires.
+* *`_next_seq` updates before it reads.* The `pass:c[UPDATE ... SET last_seq = last_seq + 1]` takes the write lock first, then the
+value is read inside the same transaction, so two concurrent writers cannot receive the same number. A
+read-increment-write in Python would race.
+* *History is a keyset page on `seq`.* `before` is exclusive, the query fetches `limit + 1` rows to learn `hasMore`
+without a count, and `next` is the `seq` of the oldest message returned. The server keeps a page under 250000 bytes by
+returning fewer messages, because the protocol tells clients to accept at least 262144. Edits are applied on the way out,
+so the stored message is never rewritten.
+* *Reads and heartbeats are not deduplicated.* `history` and `presence` are idempotent by nature, and storing one row
+per 20-second heartbeat would fill the table, so their acks are always `dup` false. The protocol allows a server to
+treat repeats of side-effect-free requests this way; the state-changing types (`join`, `leave`, `message`, `edit`,
+`react`) are all deduplicated.
+* *Usernames are not identities.* The protocol's `userId` is the primary key as a string. Direct-message rooms
+are named `dm-<id>-<id>` with numeric ids, and `join` checks that the caller's id is one of the two.
+
+[#presence]
+== Presence with expiry in Redis
+
+Presence answers "who is online" without trusting `disconnect()`, which does not run when a process is killed or a
+network vanishes. Every piece of presence state therefore has a lifetime.
+
+[source,python]
+----
+# chat/presence.py
+"""Presence in Redis. Every key expires on its own, so a crashed worker cannot
+leave a user online forever. Nothing here ever calls KEYS or SCAN."""
+
+from .protocol import HEARTBEAT_MS
+from .redis_client import get_redis
+
+TTL_MS = 2 * HEARTBEAT_MS  # two missed heartbeats = gone
+TICKET_TTL_S = 30
+SESSION_TTL_S = 120
+
+
+async def _now_ms(r):
+    sec, usec = await r.time()  # Redis clock: no skew between app servers
+    return sec * 1000 + usec // 1000
+
+
+async def beat(user_id: str, channel: str, status: str) -> None:
+    """Register or refresh one connection of a user."""
+    r = get_redis()
+    now = await _now_ms(r)
+    async with r.pipeline(transaction=True) as p:
+        p.zadd(f"cb:conns:{user_id}", {channel: now + TTL_MS})
+        p.pexpire(f"cb:conns:{user_id}", TTL_MS * 2)
+        p.set(f"cb:status:{user_id}", status, px=TTL_MS * 2)
+        await p.execute()
+
+
+async def drop(user_id: str, channel: str) -> int:
+    """Remove one connection; return how many live connections remain."""
+    r = get_redis()
+    await r.zrem(f"cb:conns:{user_id}", channel)
+    return await live_connections(user_id)
+
+
+async def live_connections(user_id: str) -> int:
+    r = get_redis()
+    now = await _now_ms(r)
+    key = f"cb:conns:{user_id}"
+    await r.zremrangebyscore(key, "-inf", now)  # prune crashed connections
+    return await r.zcard(key)
+
+
+async def status_of(user_id: str) -> str:
+    if await live_connections(user_id) == 0:
+        return "offline"
+    return await get_redis().get(f"cb:status:{user_id}") or "online"
+
+
+async def allow_typing(user_id: str, room: str) -> bool:
+    """At most one typing 'start' per user and room every 3 seconds."""
+    return bool(await get_redis().set(f"cb:typing:{user_id}:{room}", 1, nx=True, px=3000))
+
+
+async def issue_ticket(user_id: str) -> str:
+    import secrets
+
+    token = secrets.token_urlsafe(24)
+    await get_redis().set(f"cb:ticket:{token}", user_id, ex=TICKET_TTL_S)
+    return token
+
+
+async def redeem_ticket(token) -> str | None:
+    if not isinstance(token, str) or not 8 <= len(token) <= 64:
+        return None
+    return await get_redis().getdel(f"cb:ticket:{token}")  # one use only
+
+
+async def save_session(session_id: str, user_id: str, ttl: int = 86400) -> None:
+    await get_redis().set(f"cb:session:{session_id}", user_id, ex=ttl)
+
+
+async def session_owner(session_id) -> str | None:
+    if not isinstance(session_id, str):
+        return None
+    return await get_redis().get(f"cb:session:{session_id}")
+----
+
+[source,python]
+----
+# chat/redis_client.py
+import asyncio
+import weakref
+
+from django.conf import settings
+from redis.asyncio import Redis
+
+_clients = weakref.WeakKeyDictionary()
+
+
+def get_redis() -> Redis:
+    """One client per running event loop (each test gets its own loop)."""
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None:
+        client = _clients[loop] = Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    return client
+----
+
+Source: https://redis.io/docs/latest/commands/zadd/[ZADD], https://redis.io/docs/latest/commands/zremrangebyscore/[ZREMRANGEBYSCORE], https://redis.io/docs/latest/commands/set/[SET], https://redis.io/docs/latest/commands/getdel/[GETDEL] and https://redis.io/docs/latest/commands/time/[TIME]
+
+The design in a few lines:
+
+* A user has one sorted set `cb:conns:<userId>` whose members are channel names and whose scores are expiry timestamps in
+milliseconds. `beat` adds or refreshes a member; `live_connections` first removes the members whose score is in the past,
+then counts. A crashed server's connections disappear after two heartbeat intervals (40 seconds) with nobody doing
+anything. The key itself also expires, so an abandoned user leaves no residue.
+* The current status (`online` or `away`) is a plain string key with a timeout. A user is `offline` when no live
+connection remains, whatever the string says.
+* The clock is Redis's own (`TIME`), so application servers with skewed clocks agree.
+* `GETDEL` (tickets) needs Redis 6.2 or newer; channels_redis itself needs 5.0 or newer.
+* Nothing calls `KEYS`. The `KEYS` command scans the whole keyspace and blocks Redis while it runs, which is why the
+reference page warns against polling it for presence.
+* *The 15-second grace period* is a task started in `disconnect()` when the last connection closes: it sleeps, checks the
+status again and, if the user is still offline, publishes `offline` to the rooms. A reload therefore never flickers.
+The task lives in the process that saw the last disconnect. If that process dies during the grace period no `offline`
+broadcast is sent, but every later `join` and `status_of` call still computes the truth from the expiring keys, so the
+error is a delayed announcement, never a wrong answer.
+* `get_redis()` caches one client per running event loop. A redis-py asyncio client is bound to the loop that created it,
+and the Django test runner starts a new loop for each async test.
+
+[#extras]
+== Typing, receipts and resume
+
+*Typing.* The protocol allows one `start` per three seconds per user and room and expects clients to throttle. The server
+does not trust that: `allow_typing` runs `SET key 1 NX PX 3000` and drops the frame silently when the key already exists,
+which is cheap, race-free and shared by every process. `stop` is never throttled. Typing, like receipts, is
+fire-and-forget, so errors for it go back with `ref` set but no ack ever exists.
+
+*Receipts.* A receipt is cumulative (`upTo`). The consumer rejects an `upTo` beyond the room's `last_seq` with
+`bad_request` and fans the receipt out to the other members. The receipts are not stored; a client that was offline asks
+history for the messages and computes its own unread count.
+
+*Resume.* `hello` returns a `sessionId`. When the last connection closes the session key is given a 120-second life; a
+`hello` that presents the same id, from the same user, within that time gets `resumed` true and a replay of every
+message, edit and reaction whose `seq` exceeds the `lastSeq` the client reports for each room it is still a member of.
+After 120 seconds `resumed` is false and the client joins again with `since`. The conformance run checks that a message
+posted while a client was away arrives with its original `seq` after the resumed hello.
+
+[#game]
+== The Pixel Arena game loop
+
+A game loop must tick at a fixed rate regardless of how many sockets are open, so it does not belong in a consumer (one
+instance per connection) and should not share a process with request handling. Channels has a place for it: a *worker*.
+`manage.py runworker` listens on named channels and feeds each event to a consumer routed by `ChannelNameRouter`. The web
+process forwards player input to the channel `arena` and receives snapshots through a group; the worker owns the world.
+
+[source,python]
+----
+# chat/arena.py
+"""Pixel Arena: an authoritative 20 Hz game loop in a channel-layer worker."""
+
+import asyncio
+import time
+
+from channels.consumer import AsyncConsumer
+from channels.generic.websocket import AsyncJsonWebsocketConsumer
+
+from . import presence
+
+TICK_HZ = 20
+SPEED = 120.0  # pixels per second
+WIDTH, HEIGHT = 800, 600
+STATE_GROUP = "arena-state"
+
+
+class ArenaWorker(AsyncConsumer):
+    """Runs under `manage.py runworker arena`; receives events sent to "arena".
+
+    One process owns the world, so run exactly one of these per arena.
+    """
+
+    channel_layer_alias = "game"
+
+    players = {}  # player id -> {"x", "y", "dx", "dy", "ack"}; class-level: one world
+    tick = 0
+    loop_task = None
+
+    async def arena_join(self, event):
+        self.players.setdefault(event["player"], {"x": 400.0, "y": 300.0, "dx": 0, "dy": 0, "ack": 0})
+        self._ensure_loop()
+
+    async def arena_leave(self, event):
+        self.players.pop(event["player"], None)
+
+    async def arena_input(self, event):
+        p = self.players.get(event["player"])
+        if p is not None and event["seq"] > p["ack"]:
+            p["dx"], p["dy"], p["ack"] = event["dx"], event["dy"], event["seq"]
+
+    def _ensure_loop(self):
+        if ArenaWorker.loop_task is None or ArenaWorker.loop_task.done():
+            ArenaWorker.loop_task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        dt = 1 / TICK_HZ
+        due = time.monotonic()
+        while self.players:
+            for p in self.players.values():  # simulate with the latest input
+                p["x"] = min(WIDTH, max(0.0, p["x"] + p["dx"] * SPEED * dt))
+                p["y"] = min(HEIGHT, max(0.0, p["y"] + p["dy"] * SPEED * dt))
+            ArenaWorker.tick += 1
+            snapshot = {pid: [round(p["x"], 1), round(p["y"], 1), p["ack"]] for pid, p in self.players.items()}
+            await self.channel_layer.group_send(
+                STATE_GROUP,
+                {"type": "arena.snapshot", "tick": self.tick, "players": snapshot},
+            )
+            due += dt  # fixed-step schedule: no drift when a tick runs long
+            await asyncio.sleep(max(0.0, due - time.monotonic()))
+
+
+class ArenaConsumer(AsyncJsonWebsocketConsumer):
+    """The player's socket: forwards inputs to the worker, relays snapshots."""
+
+    channel_layer_alias = "game"
+    player = None
+    deadline = None
+
+    async def connect(self):
+        await self.accept()
+        user = self.scope["user"]
+        if user.is_authenticated:  # browser with a session cookie
+            await self._enter(str(user.pk))
+        else:  # script or app: first frame must be {"type": "hello", "token": ...}
+            self.deadline = asyncio.get_running_loop().call_later(
+                5, lambda: asyncio.create_task(self.close(code=4401))
+            )
+
+    async def _enter(self, player):
+        if self.deadline:
+            self.deadline.cancel()
+        self.player = player
+        await self.channel_layer.group_add(STATE_GROUP, self.channel_name)
+        await self.channel_layer.send("arena", {"type": "arena.join", "player": player})
+        await self.send_json({"type": "welcome", "player": player, "tickHz": TICK_HZ})
+
+    async def disconnect(self, code):
+        if self.deadline:
+            self.deadline.cancel()
+        if self.player is not None:
+            await self.channel_layer.group_discard(STATE_GROUP, self.channel_name)
+            await self.channel_layer.send("arena", {"type": "arena.leave", "player": self.player})
+
+    async def receive_json(self, content, **kwargs):
+        if self.player is None:
+            player = await presence.redeem_ticket(content.get("token") if isinstance(content, dict) else None)
+            if player is None:
+                await self.close(code=4401)
+            else:
+                await self._enter(player)
+            return
+        try:
+            seq, dx, dy = int(content["seq"]), int(content["dx"]), int(content["dy"])
+        except (KeyError, TypeError, ValueError):
+            return  # ignore malformed input, never crash the loop
+        await self.channel_layer.send(
+            "arena",
+            {"type": "arena.input", "player": self.player, "seq": seq,
+             "dx": max(-1, min(1, dx)), "dy": max(-1, min(1, dy))},
+        )  # fmt: skip
+
+    async def arena_snapshot(self, event):
+        await self.send_json({"type": "snapshot", "tick": event["tick"], "players": event["players"]})
+----
+
+Source: https://channels.readthedocs.io/en/latest/topics/worker.html[Channels: Worker and background tasks] and https://docs.python.org/3/library/asyncio-eventloop.html[asyncio event loop]
+
+The compose file starts the worker with `python manage.py runworker --layer game arena`.
+
+* *`--layer game` is required.* `runworker` listens on the `default` layer unless told otherwise, while the consumers
+send to the `game` alias. Without the flag the worker started cleanly, listened on the wrong layer, and the client
+received a welcome message and never a snapshot. Nothing logged an error.
+* *The loop starts lazily.* A worker consumer has no start-up hook, so the first `arena_join` creates the loop task.
+Channels dispatches one event at a time to a consumer, but the task runs concurrently with that dispatch, and all state
+is touched from the single event-loop thread, so no lock is needed.
+* *Fixed-step timing.* `due += dt` schedules ticks against a running deadline rather than sleeping a fixed 50 ms after the
+work, so a slow tick does not stretch the whole timeline. The loop ends when the last player leaves.
+* *Full snapshots, not deltas.* Each snapshot is `+{"tick", "players": {id: [x, y, lastAckedInputSeq]}}+`. Because every
+snapshot is complete and carries the highest input sequence the server has applied, a snapshot that expires or is skipped
+by a full channel costs nothing, and a client can reconcile its prediction from any snapshot (see
+xref:web/webrtc-websockets/latency-compensation.adoc[Latency Compensation]).
+* *One worker per world.* The state is in the memory of one process. Running two workers on the same channel would split
+the players between two worlds, so scale by running one worker per arena name instead and have the consumer pick the
+channel name. The worker's own failure loses the world: persist anything that matters elsewhere.
+* *At most once.* The documentation is explicit that background channels give no retries and no return values. For a
+game that is correct (the next input replaces a lost one); for work that must complete, use a task queue.
+* *Input is clamped on the server.* The consumer converts `dx` and `dy` to integers in -1 to 1 and ignores malformed
+frames, so a client cannot move faster by sending `dx` 50. The same rule that applies to chat applies to the game: never
+trust the client with state.
+
+The full architecture of such a game is in
+xref:web/webrtc-websockets/multiplayer-game-architecture.adoc[Multiplayer Game Architecture], a framework alternative
+is in xref:web/webrtc-websockets/game-servers-and-colyseus.adoc[Game Servers and Colyseus], and the complete
+application is built in xref:web/webrtc-websockets/building-a-multiplayer-game.adoc[Building a Multiplayer Game].
+
+[#run]
+== Running it and proving it
+
+[source,bash]
+----
+docker compose -p chatterbox up -d --build      # redis, web (daphne) and worker
+node client.mjs                                 # 36 checks, under a minute
+docker compose -p chatterbox down -v            # stop and delete the volumes
+----
+
+The conformance client uses Node's global `WebSocket` only. It asks the web container for a one-time ticket per user
+(`manage.py mint_ticket alice` prints the user id and the ticket), then drives the server and asserts on the frames. The
+helper class and two of the sections, the message with its acknowledgement and the duplicate, show the method:
+
+[source,javascript]
+----
+// client.mjs (excerpt)
+// Conformance run for the Django Chatterbox server (Node 24, global WebSocket).
+import { execFileSync } from "node:child_process";
+import { setTimeout as sleep } from "node:timers/promises";
+
+const PORT = process.env.WEB_PORT ?? "8000";
+const URL = `ws://127.0.0.1:${PORT}/ws`;
+const PROJECT = process.env.COMPOSE_PROJECT ?? "chatterbox";
+let failures = 0;
+const check = (ok, label) => { console.log(`${ok ? "PASS" : "FAIL"}  ${label}`); if (!ok) failures++; };
+
+const alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const ulid = () => Array.from({ length: 26 }, () => alphabet[Math.floor(Math.random() * 32)]).join("");
+
+function ticket(name) {
+  const out = execFileSync("docker", ["compose", "-p", PROJECT, "exec", "-T", "web", "python", "manage.py", "mint_ticket", name]).toString().trim();
+  const [id, token] = out.split(" ");
+  return { id, token };
+}
+
+class Client {
+  frames = []; closed = null;
+  constructor(path = URL, protocol = "chatterbox.v1") {
+    this.ws = protocol ? new WebSocket(path, protocol) : new WebSocket(path);
+    this.opened = new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = () => rej(new Error("connect failed")); });
+    this.ws.onmessage = (e) => this.frames.push(JSON.parse(e.data));
+    this.ws.onclose = (e) => { this.closed = e.code; };
+  }
+  send(type, payload = {}, room = null, id = ulid()) {
+    this.ws.send(JSON.stringify({ v: 1, type, id, room, ts: 0, payload })); return id;
+  }
+  async next(pred, ms = 2000) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      const i = this.frames.findIndex(pred);
+      if (i >= 0) return this.frames.splice(i, 1)[0];
+      await sleep(10);
+    }
+    return null;
+  }
+  ack = (id, ms) => this.next((f) => f.type === "ack" && f.payload.ref === id, ms);
+  error = (id, ms) => this.next((f) => f.type === "error" && f.payload.ref === id, ms);
+  async closedWith(ms = 2000) { const end = Date.now() + ms; while (this.closed === null && Date.now() < end) await sleep(20); return this.closed; }
+}
+
+async function login(name) {
+  const t = ticket(name);
+  const c = new Client(); await c.opened;
+  c.send("hello", { token: t.token, client: "node/24" });
+  const hello = await c.next((f) => f.type === "hello");
+  return { c, hello, t };
+}
+
+// ... sections 1-4: handshake errors, hello, ticket replay, join and presence ...
+
+// 5. message, broadcast, ack
+const mid = ulid();
+a.send("message", { text: "Hello, Chatterbox", replyTo: null, attachments: [] }, "general", mid);
+ack = await a.ack(mid);
+check(ack?.payload.ok && ack.payload.seq === 1 && ack.payload.dup === false, "message -> ack seq 1, dup false");
+const toBob = await b.next((f) => f.type === "message" && f.id === mid);
+const toAlice = await a.next((f) => f.type === "message" && f.id === mid);
+check(toBob?.payload.seq === 1 && toBob.payload.from.name === "alice" && toAlice, "broadcast reaches bob and the sender, id = message id");
+// 6. duplicate
+a.send("message", { text: "Hello, Chatterbox", replyTo: null, attachments: [] }, "general", mid);
+ack = await a.ack(mid);
+check(ack?.payload.dup === true && ack.payload.seq === 1, "same id again -> ack dup:true, same seq");
+check((await b.next((f) => f.type === "message", 400)) === null, "duplicate is not broadcast again");
+
+// ... sections 7-15 ...
+----
+
+Source: https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/WebSocket[MDN: WebSocket constructor] and https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent/code[MDN: CloseEvent.code]
+
+The complete script covers the following behaviours, all of which passed against Daphne and against Uvicorn:
+
+[cols="3,5",options="header"]
+|===
+| Area | Checks
+
+| Handshake
+| frame before hello (`unauthorized`, close 4401); no hello in 5 s (close 4408); hello reply fields; replayed one-time ticket (close 4401)
+
+| Rooms and presence
+| join returns members with status; presence for a newcomer; presence away is acked and broadcast; `offline` after the 15-second grace
+
+| Messages
+| ack with `seq` 1 and `dup` false; broadcast to the sender and others; same id again gives `dup` true with the same `seq` and no second broadcast
+
+| Errors
+| post to an unjoined room (`forbidden`); empty text (`bad_request`); edit by a non-author (`forbidden`); unknown target (`not_found`); invalid JSON; reaction twice (`conflict`); someone else's DM room (`forbidden`)
+
+| Edits, reactions, typing, receipts
+| edit and reaction get the next `seq`; a second typing start within 3 s is dropped; a receipt beyond the last `seq` is `bad_request`
+
+| History and resume
+| two pages of history, ascending, `hasMore` and `next`, edit applied; resume replays the missed message with its original `seq`
+
+| Limits
+| 17000-byte frame (`too_large`, close 4413); binary frame (close 4400); `v` 2 (close 4426); 120 frames at once (`rate_limited`, then close 4429)
+
+| Pixel Arena
+| welcome after ticket; about 20 snapshots in one second; ticks increase; the player moved and its input sequence is acknowledged while the other did not move
+|===
+
+Source: https://www.rfc-editor.org/rfc/rfc6455[RFC 6455: The WebSocket Protocol]
+
+[#testing]
+== Testing with WebsocketCommunicator
+
+The conformance script tests the deployed system. Unit tests run in-process with `WebsocketCommunicator` and need no
+server socket. The tests below use the in-memory channel layer and the Redis service of the compose file (presence and
+tickets use Redis directly), and are run with `docker compose run --rm web python manage.py test chat`.
+
+[source,python]
+----
+# chat/tests/test_chat.py
+from unittest.mock import AsyncMock, patch
+
+from channels.routing import URLRouter
+from channels.testing import WebsocketCommunicator
+from django.contrib.auth import get_user_model
+from django.test import TransactionTestCase, override_settings
+
+from chat import routing
+from chat.protocol import SUBPROTOCOL
+
+IN_MEMORY = {
+    "default": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
+    "game": {"BACKEND": "channels.layers.InMemoryChannelLayer"},
+}
+ID = "01JAB3W7Q8Z4N5R6T7V8X9Y0Z{}"  # 26 characters once formatted
+
+
+def frame(type_, payload=None, room=None, n="A"):
+    return {"v": 1, "type": type_, "id": ID.format(n), "room": room, "ts": 0, "payload": payload or {}}
+
+
+# presence and tickets use Redis (the compose service); the layer is in memory
+@override_settings(CHANNEL_LAYERS=IN_MEMORY)
+@patch("chat.consumers.announce_offline_later", new=AsyncMock())
+class ChatConsumerTests(TransactionTestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.alice = User.objects.create_user("alice")
+        self.bob = User.objects.create_user("bob")
+
+    async def client_for(self, user):
+        router = URLRouter(routing.websocket_urlpatterns)
+        c = WebsocketCommunicator(router, "/ws", subprotocols=[SUBPROTOCOL])
+        c.scope["user"] = user  # skip cookies: the stack has its own tests
+        connected, subprotocol = await c.connect()
+        assert connected and subprotocol == SUBPROTOCOL
+        await c.send_json_to(frame("hello", n="H"))
+        assert (await c.receive_json_from())["type"] == "hello"
+        return c
+
+    async def until(self, client, type_):
+        """Next frame of the given type (presence frames can arrive in between)."""
+        while (item := await client.receive_json_from())["type"] != type_:
+            pass
+        return item
+
+    async def test_message_is_acked_broadcast_and_deduplicated(self):
+        a, b = await self.client_for(self.alice), await self.client_for(self.bob)
+        for c, n in ((a, "J"), (b, "K")):
+            await c.send_json_to(frame("join", {"since": None}, "general", n))
+            await self.until(c, "ack")
+        await self.until(a, "presence")  # alice sees bob arrive
+
+        msg = frame("message", {"text": "Hello, Chatterbox"}, "general", "M")
+        await a.send_json_to(msg)
+        ack = await self.until(a, "ack")
+        self.assertEqual((ack["payload"]["seq"], ack["payload"]["dup"]), (1, False))
+        self.assertEqual((await self.until(b, "message"))["payload"]["text"], "Hello, Chatterbox")
+
+        await a.send_json_to(msg)  # same id again
+        dup = await self.until(a, "ack")
+        self.assertEqual((dup["payload"]["dup"], dup["payload"]["seq"]), (True, 1))
+        self.assertTrue(await b.receive_nothing())  # nothing new for bob
+
+        await a.disconnect()
+        await b.disconnect()
+
+    async def test_non_member_cannot_post(self):
+        a = await self.client_for(self.alice)
+        await a.send_json_to(frame("message", {"text": "hi"}, "secret"))
+        reply = await a.receive_json_from()
+        self.assertEqual((reply["type"], reply["payload"]["code"]), ("error", "forbidden"))
+        await a.disconnect()
+
+    async def test_frame_before_hello_closes_with_4401(self):
+        router = URLRouter(routing.websocket_urlpatterns)
+        c = WebsocketCommunicator(router, "/ws")
+        c.scope["user"] = self.alice
+        await c.connect()
+        await c.send_json_to(frame("message", {"text": "hi"}, "general"))
+        self.assertEqual((await c.receive_json_from())["payload"]["code"], "unauthorized")
+        self.assertEqual((await c.receive_output())["code"], 4401)
+----
+
+Source: https://channels.readthedocs.io/en/latest/topics/testing.html[Channels: Testing] and https://docs.djangoproject.com/en/6.1/topics/testing/overview/[Django: Writing and running tests]
+
+* *Route to the consumer, not to `asgi.application`.* `AuthMiddlewareStack` overwrites `scope["user"]` from the session,
+so a test that injects a user must build `URLRouter(routing.websocket_urlpatterns)` itself. The full stack has separate
+tests, as on the reference page.
+* *`TransactionTestCase`.* The consumer touches the database from worker threads, which a `TestCase` transaction on the
+main thread cannot share.
+* *Skip frames you are not asserting on.* Presence frames interleave with acks; the `until` helper reads until the
+wanted type arrives. Remember that it discards what it skips.
+* *`receive_nothing()` proves absence.* It is how the duplicate test shows that bob gets no second broadcast.
+* *Patch the grace task.* `announce_offline_later` sleeps 15 seconds; the class decorator replaces it with an
+`AsyncMock` so no task outlives its event loop.
+* *Channels 4.3 changed `ApplicationCommunicator` timeouts.* A call that used to end with a timeout when the application
+had already finished now surfaces `asyncio.CancelledError`, so a test that expects the application to stop should assert
+that error (4.3.0 release notes). Tests also should not close database connections: since 4.2 Channels leaves them
+open in tests.
+
+[#servers]
+== Daphne or Uvicorn
+
+The same `config.asgi:application` ran under both servers and the whole conformance script passed against each.
+
+[cols="2,3,3",options="header"]
+|===
+| | Daphne 4.2.3 | Uvicorn 0.54.0
+
+| Install
+| `channels[daphne]`; add `daphne` first in `INSTALLED_APPS` for the ASGI `runserver`
+| `uvicorn[standard]` (adds a WebSocket implementation; this run installed `websockets` 17.3 and `httptools` 0.9.0)
+
+| Start
+| `daphne -b 0.0.0.0 -p 8000 config.asgi:application`
+| `uvicorn config.asgi:application --host 0.0.0.0 --port 8000 --lifespan off`
+
+| Lifespan
+| no lifespan events are sent, nothing is logged
+| `ProtocolTypeRouter` has no lifespan handler; `--lifespan off` silences the notice
+
+| Keep-alive pings
+| `--ping-interval` 20 s, `--ping-timeout` 30 s
+| `--ws-ping-interval` 20.0 s, `--ws-ping-timeout` 20.0 s
+
+| Message size
+| `--websocket-max-message-size`, 1 MiB by default
+| `--ws-max-size`, 16777216 bytes by default
+
+| Processes
+| one per process; run several behind a proxy or with a supervisor
+| `--workers N` built in
+
+| Fit for this page
+| the reference server of Channels; required by `ChannelsLiveServerTestCase`
+| common in container deployments; HTTP/1.1 only, while Daphne's start-up log notes that HTTP/2 needs its `http2` and `tls` extras
+|===
+
+Both send protocol-level pings every 20 seconds, which matches the 20000 ms `heartbeatMs` the hello reply announces; the
+application-level watchdog (two heartbeats of silence) is a separate, protocol-level check that also catches a client
+whose WebSocket library answers pings but whose application is stuck. Neither server is a reason to change the consumer
+code. Choose with the operational questions of
+xref:web/webrtc-websockets/proxies-load-balancers-and-deployment.adoc[Proxies, Load Balancers and Deployment], and size
+the number of processes with
+xref:web/webrtc-websockets/scaling-websockets.adoc[Scaling WebSockets].
+
+Source: https://channels.readthedocs.io/en/latest/deploying.html[Channels: Deploying], https://github.com/django/daphne[Daphne] and https://uvicorn.dev/settings/[Uvicorn settings]
+
+[#versions]
+== Channels 4.x changes that matter here
+
+* *Channels 4.0.* Daphne became optional: install `channels[daphne]` and list `daphne` before
+`django.contrib.staticfiles` (a system check enforces it). `AsgiHandler` and `AsgiRequest` were removed, so route
+`"http"` to `get_asgi_application()`. `runworker` stayed in the `channels` app, which is why `channels` is in
+`INSTALLED_APPS` of this project.
+* *Channels 4.2.* Async consumers close stale database connections before a new connection is opened, after a client
+message arrives and after disconnect; `aclose_old_connections` is for the quiet time in between. With Django 5.1 or later
+Channels uses Django's async session interface. `InMemoryChannelLayer` honours expiry and capacities, and Django 5.1 is
+supported.
+* *Channels 4.3.* `ApplicationCommunicator` returns its result when the application has already finished and tests that
+relied on a timeout should assert `CancelledError`. The minimum Python is 3.9 and asgiref 3.9.
+* *Channels 4.3.2* (2025-11-20) is the current release. It does not yet list Django 6.1, and it ran on 6.1.2 here.
+* *channels_redis 4.3.0* works with redis-py 7.4.1; redis-py 8.x currently does not (<<setup>>).
+
+[#pitfalls]
+== Common errors and pitfalls
+
+* *A worker that never sees a message.* `runworker` without `--layer` listens on the `default` alias (<<game>>).
+* *`TimeoutError` from the Redis layer after a dependency update.* redis-py 8's 5-second socket timeout against
+channels_redis's blocking reads (<<setup>>). Pin `redis<8`.
+* *An unrouted URL.* The outermost `URLRouter` raises `ValueError: No route found`, and Daphne answers the handshake with
+HTTP 500; add a catch-all if probes are expected.
+* *Committed but never announced.* The consumer commits, sends the ack, then broadcasts. A crash between commit and
+broadcast leaves a stored message that nobody saw live, and a retry of the same id returns `dup` true without
+broadcasting. The remedies are the protocol's own: clients detect a `seq` gap and ask `history` or `join` with `since`, and
+a transactional outbox is the next step if live delivery must be exact.
+* *Blocking in async code.* A synchronous ORM call in `receive_json` raises `SynchronousOnlyOperation`; all database
+work here goes through `store.py`.
+* *`group_send` with a type that has no handler.* A typo in the event type (`chat.envelop`) ends the receiving connection
+with `ValueError: No handler for message type`. Keep the type names in one module.
+* *Non-serialisable events.* The Redis layers serialise with msgpack; tuples return as lists and a `datetime` raises
+`TypeError`. The in-memory layer in tests hides this, so send only strings, numbers, booleans, `None`, lists and dicts.
+* *Group membership is not presence.* A group member may be gone; only the expiring keys know.
+* *Many processes with the in-memory layer.* Two Daphne processes with `InMemoryChannelLayer` never exchange events.
+* *Stale users on long connections.* The `scope["user"]` was read at the handshake. Re-check the session before
+privileged actions, as shown on the reference page.
+
+[#security]
+== Security checklist
+
+* Allow-list `Origin` (browsers) and require a one-time ticket or a session cookie (every client); an origin check alone
+is not authentication.
+* Tickets live 30 seconds, are consumed by `GETDEL`, and travel in the first frame, not in the URL, so they do not reach
+access logs. The signed, stateless alternative on the reference page is simpler but replayable within its lifetime; pick
+the one-time form when you already run Redis.
+* Validate every inbound field (type, length, room name, id format) and authorise every action against the database
+(membership, authorship). The consumer never trusts a user id from the payload.
+* Limit frame size, frame rate and attachment count; refuse non-HTTPS attachment URLs; always render received text with
+`textContent`, never `innerHTML`.
+* Run behind TLS (`wss://`) and a proxy that forwards `Upgrade`; see the deployment and security pages of this section.
+
+== Related pages
+
+* xref:web/django/channels-and-websockets.adoc[Channels & WebSockets] (the Django reference this page builds on)
+* xref:web/django/async-support.adoc[Async Support] and xref:web/django/security.adoc[Security]
+* xref:web/webrtc-websockets/message-design-and-serialization.adoc[Message Design and Serialization] (the protocol)
+* xref:web/webrtc-websockets/choosing-a-websocket-stack.adoc[Choosing a WebSocket Stack] and
+xref:web/webrtc-websockets/building-a-chat-app.adoc[Building a Chat App]
+* xref:web/webrtc-websockets/presence-typing-and-receipts.adoc[Presence, Typing and Receipts] and
+xref:web/webrtc-websockets/history-offline-delivery-and-moderation.adoc[History, Offline Delivery and Moderation]
+* xref:web/webrtc-websockets/authentication-and-authorization.adoc[Authentication and Authorization] and
+xref:web/webrtc-websockets/security.adoc[Security]
+* xref:web/webrtc-websockets/testing-real-time-apps.adoc[Testing Real-Time Apps]
+* xref:database/redis/streams-and-pub-sub.adoc[Redis streams and Pub/Sub] and
+xref:backend/fastapi/websockets.adoc[FastAPI WebSockets] (the same protocol on another Python stack)
+
+== References
+
+* https://channels.readthedocs.io/en/latest/[Django Channels documentation]
+* https://channels.readthedocs.io/en/latest/topics/consumers.html[Channels: Consumers]
+* https://channels.readthedocs.io/en/latest/topics/channel_layers.html[Channels: Channel layers]
+* https://channels.readthedocs.io/en/latest/topics/databases.html[Channels: Database access]
+* https://channels.readthedocs.io/en/latest/topics/worker.html[Channels: Worker and background tasks]
+* https://channels.readthedocs.io/en/latest/topics/testing.html[Channels: Testing]
+* https://channels.readthedocs.io/en/latest/topics/security.html[Channels: Security]
+* https://channels.readthedocs.io/en/latest/deploying.html[Channels: Deploying]
+* https://channels.readthedocs.io/en/latest/releases/4.0.0.html[Channels 4.0.0 release notes]
+* https://channels.readthedocs.io/en/latest/releases/4.2.0.html[Channels 4.2.0 release notes]
+* https://channels.readthedocs.io/en/latest/releases/4.3.0.html[Channels 4.3.0 release notes]
+* https://github.com/django/channels_redis[channels_redis README]
+* https://github.com/django/daphne[Daphne]
+* https://uvicorn.dev/settings/[Uvicorn: settings]
+* https://github.com/redis/redis-py/releases/tag/v8.0.0[redis-py 8.0.0 release notes]
+* https://redis.io/docs/latest/commands/zadd/[Redis: ZADD] and https://redis.io/docs/latest/commands/set/[SET]
+* https://docs.djangoproject.com/en/6.1/ref/databases/#transaction-behavior[Django: SQLite transaction behavior]
+* https://docs.djangoproject.com/en/6.1/topics/db/transactions/[Django: Database transactions]
+* https://docs.djangoproject.com/en/6.1/howto/deployment/asgi/[Django: How to deploy with ASGI]
+* https://asgi.readthedocs.io/en/latest/specs/www.html[ASGI HTTP and WebSocket specification]
+* https://www.rfc-editor.org/rfc/rfc6455[RFC 6455: The WebSocket Protocol]
+* https://developer.mozilla.org/en-US/docs/Web/API/WebSocket[MDN: WebSocket]
+* https://docs.docker.com/reference/compose-file/[Compose file reference]

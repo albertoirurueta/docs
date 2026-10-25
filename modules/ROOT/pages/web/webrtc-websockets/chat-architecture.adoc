@@ -1,0 +1,816 @@
+= Chat Architecture
+:description: Architecture of a production chat system, with Chatterbox as the example: gateway, chat service, presence, history store, fan-out, push and attachment storage, a PostgreSQL data model with per-room sequence numbers, at-least-once delivery with idempotent client IDs, ordering, unread counts, multi-device sync and the choice between a custom WebSocket protocol, XMPP and a hosted service.
+:keywords: chat architecture, Chatterbox, gateway, fan-out, Redis pub/sub, PostgreSQL, sequence numbers, idempotency, at-least-once delivery, ordering, unread counts, read receipts, multi-device sync, history, Web Push, XMPP, Socket.IO, WebSocket
+
+include::partial$webrtc-websockets-disclaimer.adoc[]
+
+A chat application looks simple from the outside: one person types, the others see the text. The difficulty is everything
+that surrounds that one hop: a person with two devices, a gateway that restarts in the middle of a send, a phone that
+loses its connection in a lift, two people typing in the same millisecond, a member who has been offline for a week. This
+page describes the components that a chat system is made of, the data model that makes ordering and catch-up cheap, and
+the delivery guarantees that hold the pieces together. The running example is *Chatterbox*, whose wire protocol is
+defined on xref:web/webrtc-websockets/message-design-and-serialization.adoc[Message Design and Serialization]; this page
+does not repeat the frames, it shows what a server has to do to honour them.
+
+The reference stack of the section is Socket.IO on Node.js with PostgreSQL and Redis, and the examples were written
+against PostgreSQL 18.6, Redis 8.8.3, Node.js 24.21, `pg` 8.23.1, `redis` (node-redis) 6.3.0 and `socket.io` 4.8.4. They
+were checked on 2026-10-24. The architecture itself does not depend on those products: every box below can be replaced
+(see xref:web/webrtc-websockets/choosing-a-websocket-stack.adoc[Choosing a WebSocket Stack]), but the guarantees
+(per-room order, idempotent writes, catch-up by sequence number) must survive the replacement.
+
+== Which scenarios use it
+
+* *Chatterbox* is what this page designs: rooms (public, private and direct messages), history, edits, reactions,
+  receipts, presence and offline push.
+* *Huddle* embeds a small chat next to the video grid. It reuses the same gateway and storage, or, for a call that has
+  no persistent room, a data channel (see xref:web/webrtc-websockets/webrtc-data-channels.adoc[Data Channels]).
+* *Pixel Arena* needs only a lobby chat. It is usually a room on the same chat service rather than a feature of the
+  game server, so that moderation and history come for free.
+
+== The components
+
+image::webrtc-websockets-chat-architecture-components.svg["Chatterbox components: web and second-device clients, reverse proxy, two gateways, Redis, PostgreSQL, push worker, browser push service and object storage",width=860]
+
+Each component has one job, and the boundaries are where the failure modes live.
+
+[cols="1,3,3", options="header"]
+|===
+| Component | Responsibility | State it owns
+
+| Reverse proxy or load balancer
+| Terminates TLS, upgrades the HTTP request to a WebSocket and keeps idle connections open. Its idle timeout must be
+longer than the heartbeat (see xref:web/webrtc-websockets/proxies-load-balancers-and-deployment.adoc[Proxies, Load Balancers and Deployment]).
+| None.
+
+| Gateway
+| Owns the sockets: handshake with `Origin` allow-list and ticket, `hello`, rate limiting, frame-size limits, heartbeats,
+and delivery of outbound envelopes to local sockets. Stateless apart from the sockets themselves.
+| Open connections, per-connection rate bucket, the set of rooms each local socket joined.
+
+| Chat service
+| Validates and persists `message`, `edit`, `react` and `receipt`, assigns the per-room `seq`, enforces membership and
+authorship, and emits the ack. In the reference server it is a module of the gateway process; at larger scale it
+becomes a separate service behind a queue.
+| Nothing durable; it is a function over the database.
+
+| History store
+| The durable record: conversations, memberships, messages, events and remembered acks. Answers `history`, `join` with
+`since`, unread counts and receipts.
+| Everything that must survive a restart (PostgreSQL here).
+
+| Fan-out layer
+| Carries a committed event from the gateway that accepted it to every gateway that has a member of the room. Redis
+publish and subscribe in the reference stack. It is a delivery optimisation, not a source of truth.
+| Nothing durable.
+
+| Presence service
+| Tracks who is online with short-lived keys that a heartbeat renews, and broadcasts changes with a grace period (see
+xref:web/webrtc-websockets/presence-typing-and-receipts.adoc[Presence, Typing and Receipts]).
+| Keys with a TTL in Redis.
+
+| Push worker
+| Sends Web Push messages to members who have no live connection, so that a closed tab still produces a notification
+(see xref:web/webrtc-websockets/history-offline-delivery-and-moderation.adoc[History, Offline Delivery and Moderation]).
+| A queue of pending notifications, push subscriptions per device.
+
+| Attachment storage
+| Object storage reached with pre-signed URLs: the browser uploads the bytes directly, and the message carries only the
+URL, name, MIME type and size. The gateway never proxies file bytes.
+| The objects.
+|===
+
+Two rules keep this tidy. *The database is the only source of truth*: every in-memory structure (a socket's room set,
+a Redis key, a subscriber list) can be rebuilt from PostgreSQL plus the clients' `lastSeq` values. And *the gateway
+never makes a decision that needs a transaction*: it forwards to the chat service, which is the only code that writes.
+
+== The data model
+
+A conversation is called a room in the protocol. The model needs five tables. The load-bearing idea is that
+*every room has its own counter* (`last_seq` on the conversation row), and every event that changes what a member sees
+takes the next value of it.
+
+[source,sql]
+----
+-- Chatterbox storage schema (PostgreSQL 18)
+CREATE TABLE users (
+  id           text PRIMARY KEY,
+  name         text NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE conversations (
+  name         text PRIMARY KEY CHECK (name ~ '^[a-z0-9-]{1,64}$'),
+  kind         text NOT NULL CHECK (kind IN ('public', 'private', 'dm')),
+  last_seq     bigint NOT NULL DEFAULT 0,          -- the per-room sequence counter
+  created_at   timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE memberships (
+  room            text   NOT NULL REFERENCES conversations (name),
+  user_id         text   NOT NULL REFERENCES users (id),
+  role            text   NOT NULL DEFAULT 'member' CHECK (role IN ('owner', 'moderator', 'member')),
+  joined_at       timestamptz NOT NULL DEFAULT now(),
+  delivered_seq   bigint NOT NULL DEFAULT 0,       -- cumulative delivered receipt
+  read_seq        bigint NOT NULL DEFAULT 0,       -- cumulative read receipt
+  PRIMARY KEY (room, user_id)
+);
+CREATE INDEX memberships_by_user ON memberships (user_id);
+
+-- One row per message; edits update text and edited_at, deletes set deleted_at.
+CREATE TABLE messages (
+  room         text   NOT NULL REFERENCES conversations (name),
+  seq          bigint NOT NULL,
+  id           text   NOT NULL UNIQUE,             -- the client-generated envelope id
+  sender_id    text   NOT NULL REFERENCES users (id),
+  text         text   NOT NULL CHECK (char_length(text) BETWEEN 1 AND 4000),
+  reply_to     text   REFERENCES messages (id),
+  attachments  jsonb  NOT NULL DEFAULT '[]',
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  edited_at    timestamptz,
+  deleted_at   timestamptz,
+  PRIMARY KEY (room, seq)
+);
+
+-- Edits and reactions share the room's counter, so replay can follow one ordering key.
+CREATE TABLE room_events (
+  room         text   NOT NULL REFERENCES conversations (name),
+  seq          bigint NOT NULL,
+  kind         text   NOT NULL CHECK (kind IN ('edit', 'react')),
+  id           text   NOT NULL,
+  user_id      text   NOT NULL REFERENCES users (id),
+  body         jsonb  NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (room, seq)
+);
+
+-- Remembered acknowledgements: (user, envelope id) -> what the client was told.
+CREATE TABLE acks (
+  user_id      text   NOT NULL REFERENCES users (id),
+  id           text   NOT NULL,
+  room         text,
+  seq          bigint,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, id)
+);
+CREATE INDEX acks_by_age ON acks (created_at);     -- for the 24 h retention sweep
+----
+
+Source: https://www.postgresql.org/docs/18/ddl-constraints.html[PostgreSQL documentation: Constraints]
+
+Design notes that are easy to get wrong:
+
+* *The primary key of `messages` is `(room, seq)`*, which makes the two hot queries (history before a cursor, replay
+  after a cursor) index range scans, and keeps one room's rows physically close. The envelope `id` is a separate unique
+  column, because edits, reactions and receipts address a message by id for ever.
+* *`edit` and `react` are rows of `room_events`, not changes to history.* They take a `seq` so that a client which was
+  offline can replay them in order. The current text lives on the `messages` row so that a history page needs no join.
+* *Receipt markers are two integers per membership, not a row per message.* Because receipts are cumulative (`upTo`),
+  `delivered_seq` and `read_seq` are enough, and the unread count of a room is simply `last_seq - read_seq`. A table
+  with one row per (message, reader) grows with room size times history and is almost never needed.
+* *Soft delete* (`deleted_at`) keeps the `seq` hole explicit and lets a moderator restore a message. Hard deletion for
+  legal reasons is a separate job that rewrites the row.
+* *Identifiers are text.* Client-generated UUIDv7 (RFC 9562) or ULID strings sort roughly by creation time and are
+  safe to generate offline; the server never trusts them for ordering, only for identity.
+* *A direct message is just a room* named `dm-<userA>-<userB>` with the two ids sorted, so there is exactly one DM
+  room per pair and no special code path for history, receipts or push.
+
+
+== The life of a message
+
+The sequence below follows one message from Ana's browser to Ben's, with the receipt coming back. Ana is connected to
+gateway A, Ben to gateway B, and the numbered steps are explained afterwards.
+
+[mermaid]
+....
+sequenceDiagram
+    autonumber
+    participant Ana as Ana's browser
+    participant GA as Gateway A
+    participant PG as PostgreSQL
+    participant R as Redis
+    participant GB as Gateway B
+    participant Ben as Ben's browser
+    participant PW as Push worker
+    Ana->>GA: message frame (id, room, text)
+    GA->>GA: check size, schema, rate limit, membership
+    GA->>PG: BEGIN, reserve (user, id), take next seq, insert
+    PG-->>GA: COMMIT, seq 42
+    GA-->>Ana: ack (ref, ok, seq 42, dup false)
+    GA->>R: PUBLISH cb:room:general
+    R-->>GA: message envelope
+    R-->>GB: message envelope
+    GA-->>Ana: message broadcast (seq 42, own copy)
+    GB-->>Ben: message broadcast (seq 42)
+    Ben->>GB: receipt (kind delivered, upTo 42)
+    GB->>PG: advance delivered_seq with GREATEST
+    GB->>R: PUBLISH receipt for the room
+    R-->>GA: receipt
+    GA-->>Ana: receipt (userId Ben, delivered, upTo 42)
+    opt a member has no live connection
+        GA->>PW: enqueue push for that member
+        PW-->>PW: Web Push to the browser push service
+    end
+....
+
+. *Frame in.* The gateway receives one text frame, rejects it if it is larger than `maxFrameBytes`, parses the JSON,
+  validates the envelope and refuses anything beyond the connection's rate bucket. Nothing is written yet.
+. *Persist.* The chat service runs one transaction (shown in the next section): reserve the `(userId, id)` pair, check
+  membership, take the next sequence number, insert the message. If anything fails, the transaction rolls back and no
+  sequence number is burnt.
+. *Ack.* After `COMMIT`, the sender is told `ok: true` with the assigned `seq`. The ack means "durably stored", not
+  "delivered to anyone".
+. *Fan-out.* The same gateway publishes the committed envelope on a per-room channel. Every gateway, including this
+  one, receives it from Redis and writes it to the local sockets of the room's members. The sender receives its own copy,
+  which is how it learns the `seq` of an edit or a reaction. Clients must not rely on whether the ack or the broadcast
+  arrives first.
+. *Receipt.* Ben's client reports `delivered` and later `read` with a cumulative `upTo`. The chat service advances the
+  marker monotonically and fans the receipt out to the other members.
+. *Offline members.* For each member without a live connection the push worker sends a Web Push notification, so that a
+  service worker can show it. The next connection catches up by `seq` (see "History and catch-up").
+
+Publishing happens *after* the commit, never inside it. A gateway that crashes between the two leaves a stored message
+that nobody was told about; the recipients notice a gap in `seq` on the next live event, or catch up on reconnect.
+A transactional outbox (an `outbox` table written in the same transaction and drained by a publisher) closes that window
+completely, at the cost of one more table and a poller.
+
+== Delivery semantics
+
+A network connection can fail after the server has stored a message and before the client has seen the ack. The client
+cannot tell "never arrived" from "arrived, ack lost", so it must resend. That gives *at-least-once delivery* on the
+wire. To make a resend harmless, every client-to-server envelope carries a client-generated `id`, the server remembers
+the answer it gave, and a repeat of the same `(userId, id)` returns the same answer with `dup: true` and changes
+nothing. At-least-once delivery plus an idempotent receiver behaves as exactly-once processing, which is the property
+users call "it never posts twice".
+
+The rules, all part of the Chatterbox contract:
+
+* The client keeps an *outbox* of unacknowledged envelopes in order and resends them after reconnecting with the *same*
+  ids (see xref:web/webrtc-websockets/connection-lifecycle-heartbeats-and-reconnection.adoc[Connection Lifecycle, Heartbeats and Reconnection]).
+* The server remembers acks for at least 24 hours. The `acks` table has a `created_at` index so a nightly job can delete
+  older rows. After the retention window a repeat of a very old id from the same sender hits the unique key of
+  `messages.id` and is answered with `conflict` rather than `dup`.
+* Errors are not remembered: a rejected envelope leaves no trace, so a resend is processed again.
+* Server-to-client broadcasts are also at-least-once (a replay after reconnect can repeat an envelope the client already
+  holds). The client deduplicates by `seq` and ignores a `seq` it has already applied.
+
+The persist transaction below is the heart of the chat service. It is plain Node.js with `pg`; the module also contains
+the fan-out subscriber and the history, unread-count and receipt queries used later on this page.
+
+[source,javascript]
+----
+// Chatterbox storage layer: idempotent persist, fan-out publish, history and unread counts.
+import pg from 'pg';
+import { createClient } from 'redis';
+
+export const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL ?? 'postgres://chatterbox:change-me@127.0.0.1:47000/chatterbox',
+  max: 10,
+});
+
+export class ChatError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/**
+ * Persist one "message" envelope. Returns the ack payload: { ok, seq, dup, result }.
+ * The whole function is one transaction, so a retry with the same envelope id can never
+ * create a second message or burn a second sequence number.
+ */
+export async function persistMessage(userId, env) {
+  const { id, room, payload } = env;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. Reserve the (user, id) pair. A concurrent duplicate waits here for the first
+    //    transaction to finish, then sees the committed row and inserts nothing.
+    //    Read the stored ack on the SAME client: asking the pool for a second connection while
+    //    holding one deadlocks as soon as every pooled connection is a waiting duplicate.
+    const reserve = await client.query(
+      'INSERT INTO acks (user_id, id, room) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING id',
+      [userId, id, room],
+    );
+    if (reserve.rowCount === 0) {
+      await client.query('ROLLBACK');
+      const prior = await client.query('SELECT room, seq FROM acks WHERE user_id = $1 AND id = $2', [userId, id]);
+      return { ok: true, seq: Number(prior.rows[0].seq), dup: true, result: {} };
+    }
+
+    // 2. Authorisation: only members may post.
+    const member = await client.query('SELECT 1 FROM memberships WHERE room = $1 AND user_id = $2', [room, userId]);
+    if (member.rowCount === 0) throw new ChatError('forbidden', 'not a member of ' + room);
+
+    // 3. replyTo must be a message of the same room.
+    if (payload.replyTo) {
+      const parent = await client.query('SELECT 1 FROM messages WHERE id = $1 AND room = $2', [payload.replyTo, room]);
+      if (parent.rowCount === 0) throw new ChatError('not_found', 'replyTo is not a message of this room');
+    }
+
+    // 4. Take the next sequence number. The row lock serialises writers of one room only.
+    const next = await client.query(
+      'UPDATE conversations SET last_seq = last_seq + 1 WHERE name = $1 RETURNING last_seq',
+      [room],
+    );
+    if (next.rowCount === 0) throw new ChatError('not_found', 'unknown room');
+    const seq = Number(next.rows[0].last_seq);
+
+    // 5. Store the message and complete the remembered ack.
+    await client.query(
+      `INSERT INTO messages (room, seq, id, sender_id, text, reply_to, attachments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [room, seq, id, userId, payload.text, payload.replyTo ?? null, JSON.stringify(payload.attachments ?? [])],
+    );
+    await client.query('UPDATE acks SET seq = $3 WHERE user_id = $1 AND id = $2', [userId, id, seq]);
+
+    await client.query('COMMIT');
+    return { ok: true, seq, dup: false, result: {} };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.code === '23505') throw new ChatError('conflict', 'message id already used by another sender'); // unique_violation on messages.id
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Fan-out: publish the committed message to every gateway. Called after COMMIT. */
+export async function publishMessage(pub, env, seq, from) {
+  const out = {
+    v: 1, type: 'message', id: env.id, room: env.room, ts: Date.now(),
+    payload: { from, text: env.payload.text, replyTo: env.payload.replyTo ?? null,
+               attachments: env.payload.attachments ?? [], seq, edited: false },
+  };
+  await pub.publish('cb:room:' + env.room, JSON.stringify(out));
+  return out;
+}
+
+/**
+ * Gateway side of the fan-out: one pattern subscription per gateway process, not one per room.
+ * deliver(room, envelope) writes to the sockets of that room that live in THIS process.
+ */
+export async function startFanout(sub, deliver) {
+  await sub.pSubscribe('cb:room:*', (raw, channel) => {
+    const room = channel.slice('cb:room:'.length);
+    deliver(room, JSON.parse(raw));
+  });
+}
+
+/** Cursor pagination on the sequence number, newest page first. */
+export async function history(room, before = null, limit = 50) {
+  const { rows } = await pool.query(
+    `SELECT m.seq, m.id, m.sender_id, u.name, m.text, m.reply_to, m.edited_at IS NOT NULL AS edited
+       FROM messages m JOIN users u ON u.id = m.sender_id
+      WHERE m.room = $1 AND m.deleted_at IS NULL AND ($2::bigint IS NULL OR m.seq < $2)
+      ORDER BY m.seq DESC LIMIT $3`,
+    [room, before, limit + 1],
+  );
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit).reverse();
+  return { messages: page, hasMore, next: hasMore ? Number(page[0].seq) : null };
+}
+
+/** Unread count per room for a user: everything above the cumulative read marker. */
+export async function unreadCounts(userId) {
+  const { rows } = await pool.query(
+    `SELECT mb.room, c.last_seq - mb.read_seq AS unread
+       FROM memberships mb JOIN conversations c ON c.name = mb.room
+      WHERE mb.user_id = $1 ORDER BY mb.room`,
+    [userId],
+  );
+  return rows.map((r) => ({ room: r.room, unread: Number(r.unread) }));
+}
+
+/** Cumulative receipt: GREATEST keeps the marker monotonic when receipts arrive out of order. */
+export async function markRead(userId, room, upTo) {
+  const r = await pool.query(
+    `UPDATE memberships mb SET read_seq = GREATEST(mb.read_seq, $3), delivered_seq = GREATEST(mb.delivered_seq, $3)
+       FROM conversations c
+      WHERE mb.room = $2 AND mb.user_id = $1 AND c.name = mb.room AND $3 <= c.last_seq
+      RETURNING mb.read_seq`,
+    [userId, room, upTo],
+  );
+  if (r.rowCount === 0) throw new ChatError('bad_request', 'upTo is above the last seq or not a member');
+  return Number(r.rows[0].read_seq);
+}
+
+/**
+ * Alternative sequence source: a Redis counter. Seed it from the database once (SET ... NX), then INCR.
+ * Faster than a row lock, but values burnt by failed transactions leave gaps and a lost Redis needs a reseed.
+ */
+export async function nextSeqFromRedis(redis, room) {
+  const key = 'seq:' + room;
+  const seeded = await redis.set(key, '0', { NX: true });
+  if (seeded === 'OK') {
+    const { rows } = await pool.query('SELECT last_seq FROM conversations WHERE name = $1', [room]);
+    await redis.set(key, String(rows[0]?.last_seq ?? 0), { XX: true });
+  }
+  return redis.incr(key);
+}
+
+export function redisClient() {
+  return createClient({ url: process.env.REDIS_URL ?? 'redis://127.0.0.1:47001' });
+}
+----
+
+Source: https://node-postgres.com/features/transactions[node-postgres: Transactions]
+
+Why it is written this way:
+
+* *Reserve first.* `+INSERT ... ON CONFLICT DO NOTHING+` on `acks` is the dedupe gate. When two copies of the same
+  envelope arrive together, the second insert blocks on the first one's uncommitted unique-index entry; once the first
+  transaction commits, the second inserts nothing and returns the stored ack. This is how unique-index insertion behaves
+  under the default Read Committed isolation level, so no explicit lock and no `SERIALIZABLE` retry loop is needed. The
+  demo below fires twenty copies in parallel and gets exactly one new message.
+* *Everything else happens in the same transaction*, so a failure after the reservation (not a member, unknown parent,
+  constraint violation) rolls the reservation back too, and a later retry starts from scratch.
+* *The sequence number is taken late*, after all validation, to keep the row lock on the conversation as short as
+  possible. The `UPDATE` serialises writers of one room only; two busy rooms never wait for each other.
+* *Read the stored ack with the same client.* Asking the pool for a second connection while the first one is still held
+  deadlocks when every connection of the pool is a waiting duplicate; the demo fires twenty duplicates at a pool of ten,
+  which is exactly the situation that exposes the mistake.
+* *`conflict` for a stolen id.* The unique key on `messages.id` fires when a different user reuses an existing message
+  id (PostgreSQL error code `23505`), and the function maps it to the protocol's `conflict`.
+
+== Ordering and sequence numbers
+
+Order within a room is defined by `seq`, never by arrival time or by `ts`. There are three realistic ways to allocate it.
+
+[cols="1,3,3", options="header"]
+|===
+| Strategy | Strengths | Costs
+
+| A counter column in the room row (used above)
+| Gapless, transactional (a rollback gives the number back), no extra moving part, recoverable from the data.
+| Writers of one room serialise on a row lock until commit; a very hot room is limited by commit latency.
+
+| A Redis `INCR` per room
+| Very fast, no row lock, works when messages are stored in a system without transactions.
+| A failed or retried write burns a number and leaves a gap, a lost or failed-over Redis can hand out numbers again
+until it is reseeded from the database, and the counter and the message are two writes that can disagree.
+
+| One owner per room (consistent hashing or an actor per room)
+| A single writer can assign numbers in memory and batch writes; the cheapest per message.
+| Needs routing, ownership hand-over and fencing when an owner dies; far more code than the other two.
+|===
+
+The Redis variant, when you need it, must seed itself from the database and be treated as a hint: the stored `last_seq`
+remains authoritative, and clients tolerate gaps (they already must, because a history page returns messages only while
+edits and reactions consume numbers too). This is the function from `store.mjs`, which the demo calls twice and which
+returns 53 and 54 after 52 messages:
+
+[source,javascript]
+----
+export async function nextSeqFromRedis(redis, room) {
+  const key = 'seq:' + room;
+  const seeded = await redis.set(key, '0', { NX: true });
+  if (seeded === 'OK') {
+    const { rows } = await pool.query('SELECT last_seq FROM conversations WHERE name = $1', [room]);
+    await redis.set(key, String(rows[0]?.last_seq ?? 0), { XX: true });
+  }
+  return redis.incr(key);
+}
+----
+
+Source: https://redis.io/docs/latest/commands/incr/[Redis documentation: INCR]
+
+Even this snippet has a window: a second caller can `INCR` between the seeding `SET NX` and the corrective `SET XX`.
+A production version seeds inside a Lua script or a `MULTI` block (see
+xref:database/redis/pipelining-transactions-and-scripting.adoc[Redis pipelining, transactions and scripting]). That is
+the strongest argument for the counter column: its correctness does not depend on the order in which two processes
+happen to run.
+
+Clients treat `seq` as the only ordering key. An optimistic local echo is shown in a "sending" state at the bottom and
+moves into place when the ack delivers its `seq`. A jump in live `seq` values (the client holds 41 and receives 44) is a
+gap, and the client fills it with a `history` request or a `join` with `since`.
+
+== Fan-out
+
+Fan-out answers one question: *which gateways must hear about this event?* The answer is every gateway with at least one
+local member of the room. Three mechanisms are common.
+
+* *Redis publish and subscribe* is the simplest and the one used here. It has at-most-once delivery: a subscriber that
+  is disconnected misses events, and nothing is stored. That is acceptable because the database holds the truth and
+  clients catch up by `seq`.
+* *Redis Streams* (or Kafka) keep a log. A gateway that restarts reads from its last position instead of missing events.
+  The Socket.IO Redis Streams adapter is the packaged form (see
+  xref:web/webrtc-websockets/socket-io.adoc[Socket.IO (Node.js)]), and it is what enables connection state recovery.
+* *PostgreSQL `LISTEN` and `NOTIFY`* removes Redis from the picture and delivers notifications only when the
+  transaction commits, which fixes the publish-after-commit window. Payloads are limited to under 8000 bytes, so the
+  notification carries a `(room, seq)` pointer and the gateway reads the row.
+
+A gateway subscribes once, with a pattern, rather than once per room, and filters on its local membership map. The
+function below (also in `store.mjs`) is the whole gateway side; `deliver` is where Socket.IO's `+io.to(room).emit(...)+`
+goes.
+
+[source,javascript]
+----
+export async function startFanout(sub, deliver) {
+  await sub.pSubscribe('cb:room:*', (raw, channel) => {
+    const room = channel.slice('cb:room:'.length);
+    deliver(room, JSON.parse(raw));
+  });
+}
+----
+
+Source: https://redis.io/docs/latest/develop/pubsub/[Redis documentation: Pub/sub]
+
+Typing indicators and presence changes take the same route but are never stored and are allowed to be lost.
+
+== Receipts, unread counts and multi-device sync
+
+A user's devices are independent connections of one account. The model keeps them consistent with three rules:
+
+* *Server-side markers are per user, not per device.* `read_seq` lives on the membership row, so a freshly connected
+  device (or a new login) learns the unread count of every room from the server instead of guessing from its own cache.
+  Live propagation of "I read this on my phone" to the same user's other devices is not part of Chatterbox v1, whose
+  receipts go to the other members only; an echo of the user's own receipts to their other sockets is the natural
+  extension.
+* *Markers only move forward.* `GREATEST(old, new)` makes a late or duplicated receipt harmless, and a receipt above the
+  room's `last_seq` is rejected with `bad_request`.
+* *The unread count is derived*, `last_seq - read_seq`, one subtraction per room, with no counter to maintain. The count
+  includes edits and reactions because they consume sequence numbers. If the badge must count messages only, keep a
+  second per-room counter, or count with a query bounded by a sensible cap (for example "99+").
+
+Each device also keeps its own `lastSeq` per room and its own session. After a reconnect the client sends `hello` with
+`resume`, and the server replays everything above each `lastSeq` (see
+xref:web/webrtc-websockets/connection-lifecycle-heartbeats-and-reconnection.adoc[Connection Lifecycle, Heartbeats and Reconnection]).
+Drafts and mute settings, by contrast, are per-user data that a settings endpoint stores, not chat events.
+
+== History and catch-up
+
+History is a keyset (cursor) pagination over `seq`: `pass:c[WHERE seq < $before ORDER BY seq DESC LIMIT n + 1]`, where the extra
+row tells the server whether `hasMore` is true. It stays fast on a room with millions of rows because the primary key
+`(room, seq)` is the sort order, and it is stable while new messages arrive, which `OFFSET` pagination is not
+(see xref:database/pagination-strategies.adoc[Pagination Strategies]). Catch-up after an outage uses the same index in the
+other direction: `+WHERE seq > $since ORDER BY seq+`. The full treatment of history, retention, offline push and
+moderation is on xref:web/webrtc-websockets/history-offline-delivery-and-moderation.adoc[History, Offline Delivery and Moderation].
+
+== Attachments and push
+
+Attachment bytes never travel through the WebSocket. The client asks an HTTP endpoint for a pre-signed upload URL, uploads
+the file to object storage directly, and sends a `message` whose `attachments` array holds the resulting `https` URL, the
+name, the MIME type and the size. The server validates the URL against its own bucket and the size against a limit, and
+hands out pre-signed download URLs that expire. For members with no live connection the push worker sends a Web Push
+message (RFC 8030, with VAPID identification as in RFC 8292) that wakes a service worker; when the text is private the
+notification should carry a room name and a `seq`, not the message text.
+
+== Choosing the protocol: custom, XMPP or hosted
+
+[cols="1,3,3", options="header"]
+|===
+| Option | Choose it when | Cost
+
+| Custom WebSocket protocol (Chatterbox)
+| The chat is part of a product, you control both clients, you need product-specific features and want one stack for
+the rest of the application.
+| You own presence, history, receipts, moderation and every edge case this section describes.
+
+| XMPP (Prosody, ejabberd; see xref:web/webrtc-websockets/xmpp-fundamentals.adoc[XMPP Fundamentals])
+| You want an open, federated standard with mature extensions: MUC rooms (XEP-0045), archive and catch-up (XEP-0313),
+receipts (XEP-0184), chat markers (XEP-0333) and carbons (XEP-0280), plus existing clients such as Converse.js.
+| Protocol weight (XML stanzas), an extension zoo to select from, and less freedom to bend semantics.
+
+| A hosted chat service
+| Time to market matters more than control, and message volume, compliance and data location fit the provider.
+| Recurring cost, vendor lock-in, and a data model you cannot change.
+|===
+
+The decision is also about people: a custom protocol is cheapest to start and most expensive to operate, XMPP shifts
+cost into learning the standard, and a hosted service shifts it into a contract. The comparison across all stacks is on
+xref:web/webrtc-websockets/comparison-and-decision-guide.adoc[Comparison & Decision Guide].
+
+== Running the storage example
+
+The files above form a small project. `compose.yaml` starts PostgreSQL (which applies `schema.sql` on first boot) and Redis
+on loopback ports, and `demo.mjs` drives the chat service the way a gateway would: persist and fan-out through two
+subscribers, retry, twenty concurrent duplicates, fifty concurrent distinct messages, error cases, history, unread counts
+and the Redis counter. Put `schema.sql` in a `sql` folder next to `compose.yaml`.
+
+[source,yaml]
+----
+name: g6-chat-architecture
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: g6-chat-architecture-postgres
+    environment:
+      POSTGRES_USER: chatterbox
+      POSTGRES_PASSWORD: change-me
+      POSTGRES_DB: chatterbox
+    ports:
+      - "127.0.0.1:47000:5432"
+    volumes:
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatterbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:8.8.3-alpine
+    container_name: g6-chat-architecture-redis
+    ports:
+      - "127.0.0.1:47001:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+----
+
+Source: https://hub.docker.com/_/postgres[Docker Official Image: postgres]
+
+[source,json]
+----
+{ "name": "chatterbox-storage-demo", "version": "1.0.0", "private": true, "type": "module",
+  "dependencies": { "pg": "8.23.1", "redis": "6.3.0" } }
+----
+
+[source,javascript]
+----
+import assert from 'node:assert/strict';
+import { pool, persistMessage, publishMessage, startFanout, history, unreadCounts, markRead, nextSeqFromRedis, redisClient, ChatError } from './store.mjs';
+
+const env = (id, room, text, extra = {}) => ({ v: 1, type: 'message', id, room, ts: 0, payload: { text, replyTo: null, attachments: [], ...extra } });
+const ULID = (n) => 'MSG' + String(n).padStart(23, '0');
+
+await pool.query("INSERT INTO users (id, name) VALUES ('u_ana','Ana'),('u_ben','Ben'),('u_eve','Eve') ON CONFLICT DO NOTHING");
+await pool.query("INSERT INTO conversations (name, kind) VALUES ('general','public') ON CONFLICT DO NOTHING");
+await pool.query("INSERT INTO memberships (room, user_id) VALUES ('general','u_ana'),('general','u_ben') ON CONFLICT DO NOTHING");
+
+// 1. persist + fan-out through Redis with two "gateways"
+const pub = redisClient(), subA = redisClient(), subB = redisClient();
+await Promise.all([pub.connect(), subA.connect(), subB.connect()]);
+const gotA = [], gotB = [];
+await startFanout(subA, (room, e) => gotA.push({ room, ...e }));
+await startFanout(subB, (room, e) => gotB.push({ room, ...e }));
+const ack1 = await persistMessage('u_ana', env(ULID(1), 'general', 'Hello, Chatterbox'));
+assert.deepEqual(ack1, { ok: true, seq: 1, dup: false, result: {} });
+await publishMessage(pub, env(ULID(1), 'general', 'Hello, Chatterbox'), ack1.seq, { userId: 'u_ana', name: 'Ana' });
+await new Promise((r) => setTimeout(r, 200));
+assert.equal(gotA.length, 1); assert.equal(gotB.length, 1); assert.equal(gotA[0].payload.seq, 1); assert.equal(gotB[0].room, 'general');
+console.log('1 persist+fanout ok', ack1);
+
+// 2. retry with the same id -> dup:true, same seq, no new row
+const ack2 = await persistMessage('u_ana', env(ULID(1), 'general', 'Hello, Chatterbox'));
+assert.deepEqual(ack2, { ok: true, seq: 1, dup: true, result: {} });
+console.log('2 retry ok', ack2);
+
+// 3. 20 concurrent identical retries -> exactly one new row
+const same = await Promise.all(Array.from({ length: 20 }, () => persistMessage('u_ana', env(ULID(2), 'general', 'racing'))));
+assert.equal(same.filter((a) => !a.dup).length, 1);
+assert.ok(same.every((a) => a.seq === 2));
+console.log('3 concurrent duplicates ok: 1 new, 19 dup, seq', same[0].seq);
+
+// 4. 50 concurrent distinct messages -> gapless seq 3..52
+const many = await Promise.all(Array.from({ length: 50 }, (_, i) => persistMessage(i % 2 ? 'u_ana' : 'u_ben', env(ULID(100 + i), 'general', 'm' + i))));
+const seqs = many.map((a) => a.seq).sort((a, b) => a - b);
+assert.deepEqual(seqs, Array.from({ length: 50 }, (_, i) => i + 3));
+console.log('4 concurrent distinct ok:', seqs[0], '..', seqs.at(-1));
+
+// 5. errors
+const expect = async (p, code) => { try { await p; } catch (e) { assert.ok(e instanceof ChatError, String(e)); assert.equal(e.code, code); return; } assert.fail('no error ' + code); };
+await expect(persistMessage('u_eve', env(ULID(900), 'general', 'let me in')), 'forbidden');
+await expect(persistMessage('u_ben', env(ULID(1), 'general', 'stolen id')), 'conflict');
+await expect(persistMessage('u_ana', env(ULID(901), 'general', 'x', { replyTo: 'nope' })), 'not_found');
+await expect(persistMessage('u_ana', env(ULID(902), 'nowhere', 'x')), 'forbidden');
+const lost = await pool.query("SELECT count(*)::int AS n FROM acks WHERE id IN ($1,$2,$3)", [ULID(900), ULID(901), ULID(902)]);
+assert.equal(lost.rows[0].n, 0); // failed transactions leave no ack behind
+const last = await pool.query("SELECT last_seq FROM conversations WHERE name='general'");
+assert.equal(Number(last.rows[0].last_seq), 52);
+console.log('5 errors ok; failed attempts burnt no seq, last_seq =', last.rows[0].last_seq);
+
+// 6. history, unread, receipts
+const h1 = await history('general', null, 20);
+assert.equal(h1.messages.length, 20); assert.equal(h1.hasMore, true); assert.equal(h1.messages.at(-1).seq, '52');
+const h2 = await history('general', h1.next, 20);
+assert.equal(h2.messages.at(-1).seq, String(h1.next - 1));
+console.log('6a history ok next=', h1.next, 'then', h2.next);
+console.log('6b unread', await unreadCounts('u_ben'));
+assert.equal(await markRead('u_ben', 'general', 40), 40);
+assert.equal(await markRead('u_ben', 'general', 10), 40); // older receipt cannot move marker back
+console.log('6c unread after read 40', await unreadCounts('u_ben'));
+await expect(markRead('u_ben', 'general', 999), 'bad_request');
+
+// 7. redis counter
+const r = redisClient(); await r.connect();
+const a = await nextSeqFromRedis(r, 'general'); const b = await nextSeqFromRedis(r, 'general');
+assert.equal(a, 53); assert.equal(b, 54);
+console.log('7 redis seq ok', a, b);
+
+await Promise.all([subA.quit(), subB.quit(), pub.quit(), r.quit()]); await pool.end();
+console.log('ALL OK');
+----
+
+Source: https://www.postgresql.org/docs/18/sql-insert.html[PostgreSQL documentation: INSERT, ON CONFLICT clause]
+
+Run it with Node.js 24 or later:
+
+[source,bash]
+----
+docker compose up -d --wait
+npm install
+node demo.mjs
+docker compose down -v
+----
+
+The expected output shows the guarantees at work: nineteen duplicates answered from the stored ack, fifty parallel
+writers receiving the gapless range 3 to 52, and rejected attempts burning no sequence number.
+
+[source,text]
+----
+1 persist+fanout ok { ok: true, seq: 1, dup: false, result: {} }
+2 retry ok { ok: true, seq: 1, dup: true, result: {} }
+3 concurrent duplicates ok: 1 new, 19 dup, seq 2
+4 concurrent distinct ok: 3 .. 52
+5 errors ok; failed attempts burnt no seq, last_seq = 52
+6a history ok next= 33 then 13
+6b unread [ { room: 'general', unread: 52 } ]
+6c unread after read 40 [ { room: 'general', unread: 12 } ]
+7 redis seq ok 53 54
+ALL OK
+----
+
+Run the demo against a fresh database (`docker compose down -v` first), because it asserts exact sequence numbers.
+
+== Security considerations
+
+* *Authorise in the chat service, not in the gateway.* Membership, authorship and DM access are checked inside the
+  transaction, so that a bug in a gateway cannot post into a room. The handshake rules (Origin allow-list, one-time
+  ticket) are on xref:web/webrtc-websockets/authentication-and-authorization.adoc[Authentication and Authorization] and
+  xref:web/webrtc-websockets/security.adoc[Security].
+* *Never trust a client-supplied `ts`, `from` or `seq`.* The server sets all three on every outbound envelope.
+* *Treat message text as data.* Render it as text, never as HTML. Link previews and attachment URLs are the usual
+  server-side request forgery and cross-site scripting entry points.
+* *Redis is not a secure bus by default.* Anyone who can publish on `+cb:room:*+` can inject messages, so Redis needs a
+  password, TLS where it crosses a network, and a network policy. Fan-out messages are unauthenticated: only gateways and
+  the chat service may hold the credentials.
+* *Rate-limit before deduplicating.* A flood of duplicate ids still costs a database round trip.
+* *End-to-end encryption changes the architecture.* The server then stores ciphertext and cannot search, preview or
+  moderate; see xref:web/webrtc-websockets/end-to-end-encryption.adoc[End-to-End Encryption] and
+  xref:web/webrtc-websockets/omemo-encryption.adoc[OMEMO Encryption].
+
+== Common errors and pitfalls
+
+* *Assigning `seq` in the gateway from memory.* Two gateways accept messages for the same room and both hand out 42.
+  Allocate it in the database (or one owner), never per process.
+* *Using `ts` to order messages.* Two events in the same millisecond, or devices with skewed clocks, reorder the
+  conversation. Order by `seq`.
+* *Acking before the commit.* A crash after the ack loses a message the client believes was stored. Ack after `COMMIT`.
+* *Publishing inside the transaction.* Subscribers may query the database before the commit is visible, or see an event
+  for a transaction that later rolls back. Publish after the commit, or use `NOTIFY` or an outbox.
+* *Holding one pooled connection while asking for another.* Under load every connection waits for a second one and the
+  service stalls with no error. Do the whole transaction on one client and release it in `finally`.
+* *Remembering errors as acks.* A transient `internal` error would then replay as a failure for 24 hours. Remember only
+  successes.
+* *Looping over members in the accepting gateway.* Sending to each socket from the gateway that accepted the message does
+  not scale past one node; fan out through the shared layer and deliver locally.
+* *Counting unread with `+COUNT(*)+` on every page load.* Use the marker subtraction.
+* *Treating Redis pub/sub as reliable.* It is not. Clients must be able to catch up by `seq` without the bus.
+
+== Version and specification notes
+
+* PostgreSQL 18 is the baseline (18.6 on 2026-10-24). `+INSERT ... ON CONFLICT+` has been available since 9.5 and
+  everything else on this page uses long-stable SQL.
+* Redis 8.8.3 was used. Pub/sub, `INCR`, `SET` with `NX` and `XX`, and Streams are the long-standing commands.
+* In node-redis 6, the listener passed to `subscribe` and `pSubscribe` receives the message first and the channel second.
+* UUIDv7 is standardised in RFC 9562, which obsoletes RFC 4122. ULID is a community specification.
+* Web Push is RFC 8030 with VAPID in RFC 8292.
+* XEP-0313 (Message Archive Management), XEP-0184 (Message Delivery Receipts), XEP-0333 (Chat Markers) and XEP-0280
+  (Message Carbons) are the XMPP counterparts of history, delivered receipts, read markers and multi-device sync.
+
+== Related pages
+
+* xref:web/webrtc-websockets/message-design-and-serialization.adoc[Message Design and Serialization]: the Chatterbox frames, ack, error and close-code tables that this architecture implements.
+* xref:web/webrtc-websockets/presence-typing-and-receipts.adoc[Presence, Typing and Receipts], xref:web/webrtc-websockets/history-offline-delivery-and-moderation.adoc[History, Offline Delivery and Moderation] and xref:web/webrtc-websockets/building-a-chat-app.adoc[Building a Chat App]: the next pages of the chat path.
+* xref:web/webrtc-websockets/socket-io.adoc[Socket.IO (Node.js)] and xref:web/webrtc-websockets/scaling-websockets.adoc[Scaling WebSockets]: the reference server and the scaling options for the fan-out layer.
+* xref:backend/messaging/delivery-guarantees.adoc[Messaging delivery guarantees]: background for at-least-once semantics.
+* xref:web/webrtc-websockets/xmpp-chat-features.adoc[XMPP Chat Features] and xref:web/webrtc-websockets/converse-js.adoc[Converse.js]: the same features on XMPP.
+
+== References
+
+* https://www.postgresql.org/docs/18/sql-insert.html[PostgreSQL: INSERT (ON CONFLICT)]
+* https://www.postgresql.org/docs/18/ddl-constraints.html[PostgreSQL: Constraints]
+* https://www.postgresql.org/docs/18/transaction-iso.html[PostgreSQL: Transaction isolation]
+* https://www.postgresql.org/docs/18/explicit-locking.html[PostgreSQL: Explicit locking]
+* https://www.postgresql.org/docs/18/sql-notify.html[PostgreSQL: NOTIFY]
+* https://node-postgres.com/features/transactions[node-postgres: Transactions]
+* https://node-postgres.com/apis/pool[node-postgres: Pool]
+* https://redis.io/docs/latest/develop/pubsub/[Redis: Pub/sub]
+* https://redis.io/docs/latest/develop/data-types/streams/[Redis: Streams]
+* https://redis.io/docs/latest/commands/incr/[Redis: INCR]
+* https://socket.io/docs/v4/redis-adapter/[Socket.IO: Redis adapter]
+* https://socket.io/docs/v4/delivery-guarantees/[Socket.IO: Delivery guarantees]
+* https://www.rfc-editor.org/rfc/rfc9562[RFC 9562: Universally Unique IDentifiers (UUIDs)]
+* https://www.rfc-editor.org/rfc/rfc8030[RFC 8030: Generic Event Delivery Using HTTP Push]
+* https://www.rfc-editor.org/rfc/rfc8292[RFC 8292: VAPID for Web Push]
+* https://developer.mozilla.org/en-US/docs/Web/API/Push_API[MDN: Push API]
+* https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html[Amazon S3: Sharing objects with presigned URLs]
+* https://xmpp.org/extensions/xep-0045.html[XEP-0045: Multi-User Chat]
+* https://xmpp.org/extensions/xep-0313.html[XEP-0313: Message Archive Management]
+* https://xmpp.org/extensions/xep-0184.html[XEP-0184: Message Delivery Receipts]
+* https://xmpp.org/extensions/xep-0333.html[XEP-0333: Chat Markers]
+* https://xmpp.org/extensions/xep-0280.html[XEP-0280: Message Carbons]

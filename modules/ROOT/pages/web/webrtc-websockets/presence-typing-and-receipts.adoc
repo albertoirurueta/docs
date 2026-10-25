@@ -1,0 +1,495 @@
+= Presence, Typing and Receipts
+:description: Build the three ephemeral signals of a chat application on the Chatterbox protocol: presence with heartbeats, Redis TTL keys and a grace period, multi-device aggregation and last seen, typing indicators with throttling and expiry, cumulative delivered and read receipts, unread counts and the privacy settings each feature needs, with TypeScript code run against Redis 8.8.
+:keywords: presence, heartbeat, Redis, TTL, key expiry, last seen, multi-device, typing indicator, throttling, delivered receipt, read receipt, unread count, privacy, XEP-0085, XEP-0184, XEP-0333, ioredis, Chatterbox
+
+include::partial$webrtc-websockets-disclaimer.adoc[]
+
+Presence, typing indicators and receipts are the signals that make a chat feel alive. They are *ephemeral* (a stale value is worse than none), *chatty* (they outnumber messages by an order of magnitude) and *private* (they tell people when you are around). This page implements the three on the Chatterbox protocol of xref:web/webrtc-websockets/message-design-and-serialization.adoc[Message Design and Serialization], with Redis as the shared state of a server cluster.
+
+It was written against Redis 8.8.3 (the commands used exist since Redis 6.2), `ioredis` 6.0.0, `ws` 8.22.0 and Node.js 24.21, which runs TypeScript files directly. The XMPP counterparts are XEP-0085 (chat states, version 2.1, Final), XEP-0184 (delivery receipts, 1.4.0, Draft), XEP-0333 (displayed markers, 1.0.0, Draft) and XEP-0319 (last user interaction in presence, 1.0.2, Stable). Everything was checked on 2026-10-24, and every listing was run against a Redis container, including two server nodes sharing it.
+
+*Who uses what.* Chatterbox (chat) uses all three. Huddle (videoconference) uses presence for the lobby and the participant list, and typing for its in-call chat, but media state ("muted", "speaking") belongs to the SFU or the data channel, see xref:web/webrtc-websockets/videoconference-architecture.adoc[Videoconference Architecture]. Pixel Arena (game) needs only connected and disconnected, which its tick loop already knows. Where the signals sit in the whole system is described in xref:web/webrtc-websockets/chat-architecture.adoc[Chat Architecture].
+
+== What the protocol fixes
+
+* `presence` (client to server): `+{ "status": "online" or "away" }+`. It is also the *application heartbeat*, re-sent every `heartbeatMs` (20000), and the server acks it. Servers broadcast `+{ userId, name, status }+` with `online`, `away` or `offline` to room members only when the status changes. The user is `offline` 15 seconds after the last connection closes. A silent socket is closed with 4408 after `+2 x heartbeatMs+`.
+* `typing`: `+{ "state": "start" or "stop" }+`, fire-and-forget, at most one frame per 3 seconds from the client; the server relays it to the *other* members; receivers expire a `start` after 5 seconds.
+* `receipt`: `+{ "kind": "delivered" or "read", "upTo": seq }+`, fire-and-forget and cumulative, relayed to the other members as `+{ userId, kind, upTo }+`. An `upTo` beyond the room's last `seq` is `bad_request`.
+
+== Presence: heartbeats, TTL keys and a grace period
+
+A connection is the unit that can fail; a user is the unit people care about. So the server keeps one record per connection and derives the user's status from them.
+
+[mermaid]
+....
+stateDiagram-v2
+  [*] --> offline
+  offline --> online: first heartbeat
+  online --> away: every device away
+  away --> online: any device online
+  online --> grace: last device gone
+  away --> grace: last device gone
+  grace --> online: heartbeat within 15 s
+  grace --> offline: 15 s elapsed
+....
+
+Each connection owns a Redis key with a TTL of `+2 x heartbeatMs+` plus a little slack, refreshed by every heartbeat. If the socket dies without a close frame (a phone leaving coverage, a killed process), the key simply expires, which is about the moment the server would have closed it with 4408. A clean close deletes the key at once. In both cases the user is declared offline only after the *grace period*, so a page reload or a tunnel does not flicker the whole room.
+
+[cols="2,3,3",options="header"]
+|===
+|Key |Type and TTL |Purpose
+|`+pres:{u}:c:<connId>+` |string, PX = TTL |one per connection, value `online` or `away`
+|`+pres:{u}:conns+` |set, 10 min |connection ids to look up (pruned lazily)
+|`+pres:{u}:pub+` |string |last published status, so only changes are broadcast
+|`+pres:{u}:seen+` |string |time of the last frame, for last seen
+|`pres:due` |sorted set |users to re-check, scored by the time to do so
+|===
+
+The `+{u}+` is a hash tag, so all keys of a user map to the same Redis Cluster slot (see xref:database/redis/replication-sentinel-and-cluster.adoc[Replication, Sentinel and Cluster]). Aggregation is: `online` if any device is online, `away` if all live devices are away, `offline` when there is none. The sorted set `pres:due` answers "who might have expired?" without scanning: every heartbeat pushes the user's score to `now + ttl + grace` with `ZADD GT`, a clean close sets it to `now + grace`, and a sweeper on every node takes what is due.
+
+[source,typescript]
+----
+import type { Redis } from "ioredis";
+
+export type Status = "online" | "away" | "offline";
+export interface PresenceEvent { userId: string; status: Status; lastSeen?: number; room?: string }
+
+export class PresenceStore {
+  readonly redis: Redis;
+  readonly heartbeatMs: number;
+  readonly graceMs: number;
+  readonly ttlMs: number;
+
+  constructor(redis: Redis, opts: { heartbeatMs?: number; graceMs?: number } = {}) {
+    this.redis = redis;
+    this.heartbeatMs = opts.heartbeatMs ?? 20_000;
+    this.graceMs = opts.graceMs ?? 15_000;
+    this.ttlMs = 2 * this.heartbeatMs + 2_000; // the server closes a silent socket after 2 x heartbeatMs
+  }
+
+  // {user} is a hash tag: every key of one user lives in the same Redis Cluster slot.
+  private key(userId: string, part: string): string { return `pres:{${userId}}:${part}`; }
+
+  /** Called for hello, for every presence envelope (the heartbeat) and for any other frame. */
+  async beat(userId: string, connId: string, status: "online" | "away"): Promise<void> {
+    const now = Date.now();
+    await this.redis.pipeline()
+      .set(this.key(userId, `c:${connId}`), status, "PX", this.ttlMs)
+      .sadd(this.key(userId, "conns"), connId)
+      .pexpire(this.key(userId, "conns"), 600_000)
+      .set(this.key(userId, "seen"), now)
+      .zadd("pres:due", "GT", now + this.ttlMs + this.graceMs, userId)
+      .exec();
+    await this.announce(userId);
+  }
+
+  /** The aggregate over all devices: online if any is online, away if all are away, else offline. */
+  async aggregate(userId: string): Promise<Status> {
+    const ids = await this.redis.smembers(this.key(userId, "conns"));
+    if (ids.length === 0) return "offline";
+    const values = await this.redis.mget(ids.map((id) => this.key(userId, `c:${id}`)));
+    const dead = ids.filter((_, i) => values[i] === null);
+    if (dead.length > 0) await this.redis.srem(this.key(userId, "conns"), ...dead); // lazy clean-up
+    const live = values.filter((v) => v !== null);
+    return live.length === 0 ? "offline" : live.includes("online") ? "online" : "away";
+  }
+
+  /** Publishes online or away when the published status changes. Offline is announced only by sweep(). */
+  private async announce(userId: string): Promise<void> {
+    const status = await this.aggregate(userId);
+    if (status === "offline") return;
+    const previous = await this.redis.set(this.key(userId, "pub"), status, "GET");
+    if (previous !== status) await this.publish({ userId, status });
+  }
+
+  async close(userId: string, connId: string): Promise<void> {
+    await this.redis.pipeline().del(this.key(userId, `c:${connId}`)).srem(this.key(userId, "conns"), connId).exec();
+    if ((await this.aggregate(userId)) === "offline") {
+      await this.redis.zadd("pres:due", Date.now() + this.graceMs, userId); // re-check after the grace period
+    } else {
+      await this.announce(userId);
+    }
+  }
+
+  /** Run every second on every node. Handles clean closes (after the grace) and silent drops (after TTL + grace). */
+  async sweep(): Promise<void> {
+    const due = await this.redis.zrangebyscore("pres:due", "-inf", Date.now(), "LIMIT", 0, 100);
+    for (const userId of due) {
+      if ((await this.redis.zrem("pres:due", userId)) === 0) continue; // another node took it
+      if ((await this.aggregate(userId)) !== "offline") continue;       // came back during the grace period
+      const previous = await this.redis.set(this.key(userId, "pub"), "offline", "GET");
+      if (previous !== null && previous !== "offline") {
+        const seen = await this.redis.get(this.key(userId, "seen"));
+        await this.publish({ userId, status: "offline", lastSeen: seen ? Number(seen) : undefined });
+      }
+    }
+  }
+
+  /** Used by join: tell one room about the user's current status. */
+  async announceTo(userId: string, room: string): Promise<void> {
+    const status = (await this.published([userId]))[userId];
+    await this.publish({ userId, status, room });
+  }
+
+  async published(userIds: string[]): Promise<Record<string, Status>> {
+    const values = userIds.length ? await this.redis.mget(userIds.map((u) => this.key(u, "pub"))) : [];
+    return Object.fromEntries(userIds.map((u, i) => [u, (values[i] as Status | null) ?? "offline"]));
+  }
+
+  private async publish(event: PresenceEvent): Promise<void> {
+    await this.redis.publish("presence", JSON.stringify(event));
+  }
+}
+----
+
+Source: https://redis.io/docs/latest/commands/set/[Redis SET (PX, NX, GET)], https://redis.io/docs/latest/commands/zadd/[Redis ZADD (GT)]
+
+`announce` publishes only when `+SET ... GET+` shows that the stored status differs from the new one, and that command is atomic, so two nodes racing publish once. The same call makes the sweeper idempotent, which is why a double sweep is harmless. This script plays Alice with two devices, Bob who goes silent, and Carol who reconnects inside the grace period, with short timings:
+
+[source,typescript]
+----
+import { Redis } from "ioredis";
+import { PresenceStore } from "./presence.ts";
+
+const redis = new Redis(process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
+const sub = new Redis(process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
+const store = new PresenceStore(redis, { heartbeatMs: 1000, graceMs: 1500 }); // short values for the demo
+const t0 = Date.now();
+const log = (text: string) => console.log(`${String(Date.now() - t0).padStart(5)} ms  ${text}`);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+await redis.flushdb();
+await sub.subscribe("presence");
+sub.on("message", (_channel, raw) => log(`event ${raw}`));
+const sweeper = setInterval(() => void store.sweep(), 250);
+
+log("laptop: online");        await store.beat("alice", "laptop", "online");
+log("phone: away");           await store.beat("alice", "phone", "away");        // no event, aggregate stays online
+log("laptop: away");          await store.beat("alice", "laptop", "away");       // all devices away -> away
+log("phone: online");         await store.beat("alice", "phone", "online");      // online again
+log("laptop closes");         await store.close("alice", "laptop");              // no event, the phone is still there
+log("phone closes");          await store.close("alice", "phone");               // offline only after the grace period
+await sleep(2200);
+log("bob: one beat, then silence"); await store.beat("bob", "tab", "online");
+await sleep(4500);
+log("carol: closes, reconnects within the grace");
+await store.beat("carol", "tab", "online"); await store.close("carol", "tab"); await sleep(500);
+await store.beat("carol", "tab2", "online"); await sleep(2500);
+log(`published: ${JSON.stringify(await store.published(["alice", "bob", "carol"]))}`);
+clearInterval(sweeper); redis.disconnect(); sub.disconnect();
+----
+
+Source: https://redis.io/docs/latest/develop/pubsub/[Redis Pub/Sub]
+
+[source,text]
+----
+    7 ms  laptop: online
+   11 ms  event {"userId":"alice","status":"online"}
+   11 ms  phone: away
+   12 ms  laptop: away
+   14 ms  phone: online
+   14 ms  event {"userId":"alice","status":"away"}
+   15 ms  laptop closes
+   15 ms  event {"userId":"alice","status":"online"}
+   17 ms  phone closes
+ 1772 ms  event {"userId":"alice","status":"offline","lastSeen":1792879942898}
+ 2218 ms  bob: one beat, then silence
+ 2233 ms  event {"userId":"bob","status":"online"}
+ 6733 ms  carol: closes, reconnects within the grace
+ 6741 ms  event {"userId":"carol","status":"online"}
+ 7799 ms  event {"userId":"bob","status":"offline","lastSeen":1792879945102}
+ 9757 ms  published: {"alice":"offline","bob":"offline","carol":"online"}
+----
+
+Alice's phone going away does nothing while her laptop is online, and closing the laptop does nothing while the phone remains. Offline arrives 1.7 s after the last close (grace 1.5 s). Bob, who never closed, goes offline after the key TTL (4 s) plus the grace. Carol, who came back in time, never goes offline. The same keys through `redis-cli`: `GET` returns the previous value, `NX` refuses the second typing key, and `ZADD GT` refuses to move a score backwards (here the score already held a later time):
+
+[source,text]
+----
+> SET pres:{alice}:c:laptop online PX 42000
+OK
+> SET pres:{alice}:pub online GET
+(nil)
+> SET pres:{alice}:pub away GET
+"online"
+> SET typing:{general}:bob 1 PX 2500 NX
+OK
+> SET typing:{general}:bob 1 PX 2500 NX
+(nil)
+> ZADD pres:due GT 1792879600000 alice
+(integer) 0
+----
+
+Source: https://redis.io/docs/latest/commands/pexpire/[Redis PEXPIRE and key expiry], https://redis.io/docs/latest/commands/ttl/[Redis TTL]
+
+=== Design decisions and pitfalls
+
+* *Why not keyspace notifications?* Redis can publish an `expired` event, but it is delivered over Pub/Sub, which is fire-and-forget: a subscriber that is disconnected, or a node that restarts, misses events forever, and the notification is emitted when Redis actually removes the key, which can lag the TTL. Expiry notifications are off by default. The `pres:due` sorted set is durable and each pass is idempotent. See https://redis.io/docs/latest/develop/pubsub/keyspace-notifications/[Redis keyspace notifications].
+* *Heartbeat versus load balancer.* The 20 s heartbeat is shorter than the 60 s idle timeout of an AWS ALB, which keeps the connection open as a side effect, see xref:web/webrtc-websockets/connection-lifecycle-heartbeats-and-reconnection.adoc[Connection Lifecycle, Heartbeats and Reconnection].
+* *Cost.* A heartbeat in this listing is four round trips: one pipelined write of five commands, then `smembers`, `mget` and `+set ... get+`. With 100,000 connections that is 5,000 heartbeats and about 20,000 round trips per second, which one Redis handles. To cut it to one round trip, call `announce` only when the connection's own status changed, and let `close` and the sweeper handle the rest.
+* *Clock skew.* Scores use the application clock, so keep nodes on NTP. A skew of a second only moves the offline announcement by a second.
+* *Never trust the client for status.* A client can send `online` forever; the server derives `away` from its own signals if you want (no input for ten minutes). The page visibility event is the client's best signal: send `away` when the document is hidden, as noted in xref:web/webrtc-websockets/connection-lifecycle-heartbeats-and-reconnection.adoc[Connection Lifecycle, Heartbeats and Reconnection].
+* *Large rooms.* Broadcasting every change of every member to a 10,000-member room is a storm. Subscribe clients to presence only for the visible members and the people in their direct messages, and leave the rest to a count.
+
+=== Multi-device and last seen
+
+A user may have a laptop, a phone and a tab. The aggregate above is the rule most apps use. Two refinements belong in the product: a mobile device that is backgrounded sends `away`, so a desktop that is online keeps the user online; and push notifications should be sent while *no* device is online, which is the `offline` decision, not "this socket closed". Last seen is the time of the last frame from any device (`+pres:{u}:seen+`, resolution one heartbeat) and is shown only when the privacy setting allows it. XMPP expresses the same idea with idle time in XEP-0319. Source: https://xmpp.org/extensions/xep-0319.html[XEP-0319: Last User Interaction in Presence].
+
+== Typing indicators
+
+The sender throttles, the server rate limits independently, and the receiver expires. All three are needed: a client bug must not flood the room, and a lost `stop` must not leave "Bob is typing" on screen forever.
+
+[source,typescript]
+----
+export const SEND_EVERY_MS = 3_000; // protocol: at most one typing frame per 3 s
+export const IDLE_STOP_MS = 4_000;  // stop after this long without a keystroke
+export const EXPIRE_MS = 5_000;     // receivers drop a "start" after 5 s
+
+/** Sending side: call keystroke() on every input event, stopped() on send, blur or an empty field. */
+export class TypingSender {
+  private lastStart = -Infinity;
+  private idle: ReturnType<typeof setTimeout> | undefined;
+  private active = false;
+  readonly emit: (state: "start" | "stop") => void;
+
+  constructor(emit: (state: "start" | "stop") => void) { this.emit = emit; }
+
+  keystroke(): void {
+    const now = Date.now();
+    if (!this.active || now - this.lastStart >= SEND_EVERY_MS) {
+      this.emit("start");
+      this.lastStart = now;
+      this.active = true;
+    }
+    clearTimeout(this.idle);
+    this.idle = setTimeout(() => this.stopped(), IDLE_STOP_MS);
+  }
+
+  stopped(): void {
+    clearTimeout(this.idle);
+    if (this.active) this.emit("stop");
+    this.active = false;
+    this.lastStart = -Infinity;
+  }
+}
+
+/** Receiving side: one expiry timer per user, so a lost "stop" never leaves the indicator stuck. */
+export class TypingView {
+  private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  readonly onChange: (typingUserIds: string[]) => void;
+
+  constructor(onChange: (typingUserIds: string[]) => void) { this.onChange = onChange; }
+
+  apply(userId: string, state: "start" | "stop"): void {
+    clearTimeout(this.timers.get(userId));
+    if (state === "start") this.timers.set(userId, setTimeout(() => this.apply(userId, "stop"), EXPIRE_MS));
+    else this.timers.delete(userId);
+    this.onChange([...this.timers.keys()]);
+  }
+
+  /** Call when a message from that user arrives. */
+  messageFrom(userId: string): void { if (this.timers.has(userId)) this.apply(userId, "stop"); }
+}
+----
+
+Source: https://nodejs.org/docs/latest-v24.x/api/test.html#timers[Node.js test runner, mocking timers]
+
+Both classes were tested with `node --test` and mocked timers: twenty keystrokes in five seconds produce `start` at 0 s and 3 s only and a `stop` four seconds after the last keystroke, and a `start` shown for 4.999 s disappears at 5 s or when a message from that user arrives. In a browser, call `keystroke()` from the `input` event of the composer and `stopped()` on submit, on blur and when the field becomes empty. On the server, a typing `start` takes a key with `+SET ... PX 2500 NX+` (second example above): a client that sends more than one per 2.5 s is dropped silently, with no error frame, because typing is fire-and-forget. The message handler should delete that key, so the next message starts a fresh indicator.
+
+Typing is never stored, never goes in history and never needs a receipt. XEP-0085 has the same shape with `composing`, `paused` and `active`, but no expiry: receivers choose one. Source: https://xmpp.org/extensions/xep-0085.html[XEP-0085: Chat State Notifications].
+
+== Delivery and read receipts
+
+The ack of a `message` means only that the server stored it. *Delivered* means the recipient's client received it; *read* means the user saw it. Both are cumulative cursors per user and room, so a lost receipt is repaired by the next one, and the state is two small numbers per member instead of two flags per message. Cursors must be monotonic: networks reorder, and a late `read 42` after `read 43` must change nothing. A Lua script keeps check and write atomic, and also enforces the protocol rule that `upTo` cannot exceed the room's last `seq`.
+
+[source,typescript]
+----
+import type { Redis } from "ioredis";
+
+export type Kind = "delivered" | "read";
+export type Outcome = "advanced" | "stale" | "bad_request";
+
+// KEYS[1] = rcpt:{room} (hash), KEYS[2] = seq:{room} (the room's last seq)
+// ARGV = kind, upTo, userId. Returns 1 advanced, 0 stale, -1 beyond the last seq.
+const ADVANCE = `
+local last = tonumber(redis.call('GET', KEYS[2]) or '0')
+local upTo = tonumber(ARGV[2])
+if upTo > last then return -1 end
+local field = ARGV[3] .. ':' .. ARGV[1]
+local current = tonumber(redis.call('HGET', KEYS[1], field) or '0')
+if upTo <= current then return 0 end
+redis.call('HSET', KEYS[1], field, upTo)
+if ARGV[1] == 'read' then
+  local delivered = ARGV[3] .. ':delivered'
+  if upTo > tonumber(redis.call('HGET', KEYS[1], delivered) or '0') then
+    redis.call('HSET', KEYS[1], delivered, upTo)
+  end
+end
+return 1`;
+
+export class Receipts {
+  readonly redis: Redis;
+  constructor(redis: Redis) { this.redis = redis; }
+
+  /** Cursors only move forward, so a duplicate or reordered receipt changes nothing. */
+  async advance(room: string, userId: string, kind: Kind, upTo: number): Promise<Outcome> {
+    const code = Number(await this.redis.eval(ADVANCE, 2, `rcpt:{${room}}`, `seq:{${room}}`, kind, upTo, userId));
+    return code === 1 ? "advanced" : code === 0 ? "stale" : "bad_request";
+  }
+
+  /** Messages after the user's read cursor. msgs:{room} holds the seq of every message envelope (not edits or reactions). */
+  async unread(room: string, userId: string): Promise<number> {
+    const cursor = (await this.redis.hget(`rcpt:{${room}}`, `${userId}:read`)) ?? "0";
+    return this.redis.zcount(`msgs:{${room}}`, `(${cursor}`, "+inf");
+  }
+
+  /** Who has read message `seq`: the data behind a "seen by" list. */
+  async readers(room: string, seq: number): Promise<string[]> {
+    const all = await this.redis.hgetall(`rcpt:{${room}}`);
+    return Object.entries(all).filter(([f, v]) => f.endsWith(":read") && Number(v) >= seq).map(([f]) => f.slice(0, -5));
+  }
+}
+----
+
+Source: https://redis.io/docs/latest/commands/eval/[Redis EVAL (Lua scripting)], https://redis.io/docs/latest/commands/zcount/[Redis ZCOUNT]
+
+Running it for room `general` with 44 sequence numbers (messages 40, 41, 43, 44; 42 was an edit) and Bob reading to 43:
+
+[source,text]
+----
+delivered 41   advanced
+read 43        advanced
+read 42 (late) stale
+read 99        bad_request
+cursors        { 'bob:delivered': '43', 'bob:read': '43' }
+bob unread     1 | carol unread 4
+----
+
+* *When to send.* The client sends `delivered` when envelopes arrive (once per burst, with the highest `seq`) and `read` when the newest message is visible in a focused window, debounced to a second. Sending a receipt per message wastes the cumulative design.
+* *Only broadcast changes.* The server relays a receipt only when the cursor advanced, so a duplicate produces no traffic, as the next section's end-to-end run shows. A `read` also moves `delivered`.
+* *Unread counts* come from the stored cursor, not from the client, because the count is shown on devices that were offline. Count message envelopes (`+msgs:{room}+`), not `seq` values, because edits and reactions use `seq` too. Chatterbox v1 has no field that carries a count; a compatible extension adds an `unread` map to the `join` result, since receivers ignore unknown fields.
+* *Groups.* One read receipt per reader per message is O(members) traffic. Past a few dozen members, stop broadcasting `read` and show a "seen by" list on request from `readers()`, or send a count.
+* *Sender side.* The sender's UI marks a message as read by someone when any `read` cursor reaches its `seq`; for a DM that is the single other member. XEP-0184 (`received`) and XEP-0333 (`displayed`) map to `delivered` and `read`. Source: https://xmpp.org/extensions/xep-0333.html[XEP-0333: Displayed Markers].
+
+== Privacy settings
+
+Each signal reveals behaviour, so each needs a setting, and the check must run on the server for every recipient at delivery time.
+
+[cols="2,3,3",options="header"]
+|===
+|Setting |Effect |Rule
+|`presence` |who sees online and away; `nobody` is invisible mode |others get `offline`
+|`lastSeen` |who sees the time |hidden unless the viewer is allowed and also sees presence
+|`readReceipts` |on or off |*reciprocal*: off means you neither send nor see `read`
+|`typing` |on or off |off means your `start` is not relayed
+|===
+
+`delivered` is not configurable here, because acks of delivery are needed for reliability, but it can be dropped in large rooms. Reciprocity for `read` stops a user from watching others while hiding their own behaviour. Even with receipts off, the cursor is still stored: it drives the user's own unread counts. These functions are the whole policy; defaults are `presence: everyone`, `lastSeen: contacts` (people who share a direct message), `readReceipts: true`, `typing: true`.
+
+[source,typescript]
+----
+import type { Redis } from "ioredis";
+
+export interface Privacy {
+  presence: "everyone" | "contacts" | "nobody"; // who sees online/away; "nobody" is invisible mode
+  lastSeen: "everyone" | "contacts" | "nobody";
+  readReceipts: boolean;                         // reciprocal: off means you neither send nor see read receipts
+  typing: boolean;
+}
+export const DEFAULTS: Privacy = { presence: "everyone", lastSeen: "contacts", readReceipts: true, typing: true };
+
+export async function loadPrivacy(redis: Redis, userId: string): Promise<Privacy> {
+  const h = await redis.hgetall(`priv:{${userId}}`);
+  return {
+    presence: (h.presence as Privacy["presence"]) ?? DEFAULTS.presence,
+    lastSeen: (h.lastSeen as Privacy["lastSeen"]) ?? DEFAULTS.lastSeen,
+    readReceipts: (h.readReceipts ?? String(DEFAULTS.readReceipts)) === "true",
+    typing: (h.typing ?? String(DEFAULTS.typing)) === "true",
+  };
+}
+
+const allowed = (rule: Privacy["presence"], isContact: boolean) => rule === "everyone" || (rule === "contacts" && isContact);
+
+/** Applied for every recipient at delivery time, never trusted from the client. */
+export function visibleStatus(from: Privacy, isContact: boolean, status: string): string {
+  return allowed(from.presence, isContact) ? status : "offline";
+}
+export function visibleLastSeen(from: Privacy, isContact: boolean, lastSeen: number | undefined): number | undefined {
+  return allowed(from.lastSeen, isContact) && allowed(from.presence, isContact) ? lastSeen : undefined;
+}
+export function mayDeliver(kind: "typing" | "delivered" | "read", from: Privacy, to: Privacy): boolean {
+  if (kind === "typing") return from.typing;
+  if (kind === "read") return from.readReceipts && to.readReceipts;
+  return true;
+}
+----
+
+Source: https://www.rfc-editor.org/rfc/rfc6121#section-4[RFC 6121, section 4: Exchanging Presence Information]
+
+The relays apply it. Every node subscribes to the `fanout` and `presence` Redis channels and delivers to its own sockets, so users on different nodes see each other (the presence relay in `handlers.ts` is the same loop with `visibleStatus`). They plug into a Chatterbox server such as the one in xref:web/webrtc-websockets/socket-io.adoc[Socket.IO (Node.js)] or xref:web/webrtc-websockets/uwebsockets-js.adoc[uWebSockets.js] (the page that assembles the whole app is xref:web/webrtc-websockets/building-a-chat-app.adoc[Building a Chat App]):
+
+[source,typescript]
+----
+// Excerpt of class ChatNode in handlers.ts: the relays. Conn, ProtocolError and the imports come from the same file.
+  async onTyping(c: Conn, room: string, state: "start" | "stop"): Promise<void> {
+    if (!c.rooms.has(room)) return;                          // fire-and-forget: no error frame
+    if (state === "start") {
+      const first = await this.redis.set(`typing:{${room}}:${c.userId}`, "1", "PX", 2500, "NX");
+      if (first === null) return;                            // more than one start per 2.5 s: drop it
+    }
+    await this.fanout(room, "typing", { userId: c.userId, state }, c.userId);
+  }
+
+  async onReceipt(c: Conn, room: string, kind: Kind, upTo: number): Promise<void> {
+    if (!c.rooms.has(room)) return;
+    const outcome = await this.receipts.advance(room, c.userId, kind, upTo);
+    if (outcome === "bad_request") throw new ProtocolError("bad_request", "upTo is beyond the last seq of the room");
+    if (outcome === "advanced") await this.fanout(room, "receipt", { userId: c.userId, kind, upTo }, c.userId);
+  }
+
+  async fanout(room: string, type: string, payload: { userId: string; [k: string]: unknown }, except: string): Promise<void> {
+    await this.redis.publish("fanout", JSON.stringify({ room, type, payload, except }));
+  }
+
+  private async deliverFanout(m: { room: string; type: string; payload: { userId: string; kind?: Kind; state?: string }; except: string }) {
+    const sender = await loadPrivacy(this.redis, m.payload.userId);
+    for (const c of this.local.get(m.room) ?? []) {
+      if (c.userId === m.except) continue;
+      const kind = m.type === "typing" ? "typing" : (m.payload.kind as "delivered" | "read");
+      if (mayDeliver(kind, sender, await loadPrivacy(this.redis, c.userId))) c.send(m.type, m.room, m.payload);
+    }
+  }
+----
+
+Source: https://github.com/redis/ioredis[ioredis]
+
+To test it, two `ws` servers shared one Redis, Alice connected to the first and Bob to the second, and a Node `WebSocket` client for each ran the protocol. Observed: Bob's `join` ack listed Alice as online and Alice received Bob's presence; Bob's `delivered 1` and `read 1` reached Alice, a repeated `read 1` did not; `read 99` returned `error bad_request`; two `typing start` frames in a row delivered one, then `stop` was delivered; with Bob's `readReceipts` set to false his `read 2` was stored (cursor 2) but not delivered; Alice's `away` reached Bob, and 1.9 s after Alice closed (grace 1.5 s) Bob received `offline`, without a last-seen time because Alice and Bob are not contacts.
+
+== Common errors
+
+* Treating the socket as the user: each tab reconnect flips the user offline. Aggregate, and use the grace period.
+* Computing offline in the client from "no presence for N seconds". Clients cannot know the server's view.
+* Per-message receipts, non-monotonic cursors, or unread counts computed from `seq`.
+* Broadcasting hidden state: filtering in the UI rather than in the server leaks it in the frames.
+* Storing typing events or presence history. Presence history is personal data; if you keep it, state the retention and honour deletion requests.
+
+== Version notes
+
+The protocol-level pieces have not changed since Chatterbox v1. `+SET ... GET+` and `+ZADD ... GT+` need Redis 6.2 or Valkey 7.2 or later; Redis 8.x added more options to `SET` that are not used here. `ioredis` 6.0.0 exports the `Redis` class by name, and Node.js 24 strips TypeScript types, which is why the listings use only erasable syntax. See also xref:web/webrtc-websockets/history-offline-delivery-and-moderation.adoc[History, Offline Delivery and Moderation], xref:web/webrtc-websockets/scaling-websockets.adoc[Scaling WebSockets] and xref:web/webrtc-websockets/xmpp-chat-features.adoc[XMPP Chat Features].
+
+== References
+
+* https://redis.io/docs/latest/commands/set/[Redis SET]
+* https://redis.io/docs/latest/commands/zadd/[Redis ZADD]
+* https://redis.io/docs/latest/commands/eval/[Redis EVAL]
+* https://redis.io/docs/latest/commands/pexpire/[Redis PEXPIRE]
+* https://redis.io/docs/latest/develop/pubsub/[Redis Pub/Sub]
+* https://redis.io/docs/latest/develop/pubsub/keyspace-notifications/[Redis keyspace notifications]
+* https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/[Redis Cluster specification (hash tags)]
+* https://github.com/redis/ioredis[ioredis]
+* https://nodejs.org/docs/latest-v24.x/api/test.html[Node.js test runner]
+* https://developer.mozilla.org/en-US/docs/Web/API/Document/visibilitychange_event[MDN: visibilitychange event]
+* https://xmpp.org/extensions/xep-0085.html[XEP-0085: Chat State Notifications]
+* https://xmpp.org/extensions/xep-0184.html[XEP-0184: Message Delivery Receipts]
+* https://xmpp.org/extensions/xep-0333.html[XEP-0333: Displayed Markers]
+* https://xmpp.org/extensions/xep-0319.html[XEP-0319: Last User Interaction in Presence]
+* https://www.rfc-editor.org/rfc/rfc6121[RFC 6121: XMPP Instant Messaging and Presence]

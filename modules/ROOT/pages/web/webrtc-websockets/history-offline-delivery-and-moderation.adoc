@@ -1,0 +1,385 @@
+= History, Offline Delivery and Moderation
+:description: How a chat server stores and serves what people missed -- cursor-paginated history on a per-room sequence number, catch-up after a reconnect, Web Push with VAPID for users who are offline, edits, deletes and reactions kept as events, attachments through pre-signed URLs, moderation (rate limits, word filters, reports, bans, roles) and retention -- built for the Chatterbox scenario on PostgreSQL.
+:keywords: chat history, cursor pagination, keyset pagination, seq, catch-up, offline delivery, Web Push, VAPID, RFC 8030, RFC 8291, RFC 8292, service worker, pre-signed URL, presigned POST, moderation, rate limit, token bucket, word filter, ban, report, retention, PostgreSQL, Chatterbox
+
+include::partial$webrtc-websockets-disclaimer.adoc[]
+
+A chat that only shows live traffic is a toy. People open the app on a second device, lose the connection in a tunnel, close the tab and expect a notification, edit a typo, delete a message they regret and report one that is abusive. This page is the server side of all of that for Chatterbox, the chat scenario of this section: the storage model, the history and catch-up queries, the offline push path, attachments, moderation and retention. The wire protocol is the one defined on xref:web/webrtc-websockets/message-design-and-serialization.adoc[Message Design and Serialization]; the architecture around it is on xref:web/webrtc-websockets/chat-architecture.adoc[Chat Architecture].
+
+Baseline, checked on 2026-10-24: PostgreSQL 18.6, Node.js 24 with `pg` 8.23.1, `web-push` 3.6.7 (the last release of that library is from January 2024, and it still works with the current RFCs), the AWS SDK for JavaScript 3.1156.0 against SeaweedFS 4.48 as an S3-compatible store, and the Web Push specifications RFC 8030, RFC 8291 and RFC 8292. The history, catch-up, delete, retention and moderation code ran against a PostgreSQL container, the push code against a local HTTPS push service that decrypts the payload and verifies the VAPID signature, and the upload code against the object store; the blocks below are excerpts of those files. Chat, videoconference and game applications differ here: a chat needs all of it, a videoconference needs only the chat sidebar and a push to ring a user who is away, and a game needs none of the history.
+
+== One log, two views
+
+The protocol gives every room one strictly increasing `seq` shared by `message`, `edit` and `react`. Keep exactly that as the source of truth: an append-only `events` table keyed by `(room, seq)`. Reading it answers "what happened after the point I know" (catch-up). A second table, `messages`, is a projection with edits and deletes already applied, and answers "show me the page before this one" (history). Both are needed because the questions differ: a replay must contain the edit and the reaction as separate events, while a history page must not make the client fold them again.
+
+[source,sql]
+----
+CREATE TABLE rooms (
+  name text PRIMARY KEY CHECK (name ~ '^[a-z0-9-]{1,64}$'),
+  last_seq bigint NOT NULL DEFAULT 0,       -- one counter per room
+  floor_seq bigint NOT NULL DEFAULT 0,      -- everything at or below was purged
+  retention interval                        -- NULL keeps messages forever
+);
+CREATE TABLE messages (
+  room text NOT NULL REFERENCES rooms(name) ON DELETE CASCADE,
+  seq bigint NOT NULL, id text NOT NULL UNIQUE, user_id text NOT NULL,
+  body text NOT NULL, reply_to text, attachments jsonb NOT NULL DEFAULT '[]',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  edited_at timestamptz, deleted_at timestamptz, deleted_by text,
+  PRIMARY KEY (room, seq)
+);
+CREATE TABLE events (
+  room text NOT NULL REFERENCES rooms(name) ON DELETE CASCADE,
+  seq bigint NOT NULL, type text NOT NULL, id text NOT NULL, payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (room, seq)
+);
+----
+
+Source: https://www.postgresql.org/docs/18/ddl-constraints.html[PostgreSQL documentation: Constraints]
+
+`reactions` (one row per message, user and emoji), `acks` (the remembered ack per user and envelope id), `members`, `push_subscriptions`, `bans` and `reports` are plain tables in the same style. The primary key `(room, seq)` is also the history index: a page is a backward index scan that stops after `limit` rows, so the cost of page 400 equals the cost of page 1. Offset pagination (`OFFSET 20000`) has to walk and discard every skipped row and drifts when new messages arrive between two requests; a cursor is stable because `seq` never changes.
+
+=== Assigning seq without gaps in visibility
+
+Do not take `seq` from a PostgreSQL sequence. A sequence hands out numbers at call time, but rows become visible at commit time, so transaction A can hold 41, transaction B can take 42 and commit first, and a client that catches up in between sees 42 and believes it has everything up to 42. The fix used here is to lock the room row, which serialises writers of one room, and to increment `rooms.last_seq` inside the same transaction as the insert. Lock first, check idempotency second, so that a retry racing its original blocks instead of both inserting.
+
+[source,javascript]
+----
+async function appendEvent(userId, id, room, write) {
+  return tx(async (c) => {
+    const r = await c.query("SELECT last_seq FROM rooms WHERE name = $1 FOR UPDATE", [room]);
+    if (r.rowCount === 0) throw new ChatError("not_found", "no such room");
+    const prior = await c.query("SELECT ack FROM acks WHERE user_id = $1 AND id = $2", [userId, id]);
+    if (prior.rowCount) return { ...prior.rows[0].ack, dup: true };      // same ack, no new seq, no broadcast
+    const seq = Number(r.rows[0].last_seq) + 1;
+    const { type, payload } = await write(c, seq);                       // inserts into messages, reactions, ...
+    await c.query("UPDATE rooms SET last_seq = $2 WHERE name = $1", [room, seq]);
+    await c.query("INSERT INTO events (room, seq, type, id, payload) VALUES ($1, $2, $3, $4, $5)", [room, seq, type, id, payload]);
+    const ack = { ref: id, ok: true, seq, dup: false, result: {} };
+    await c.query("INSERT INTO acks (user_id, id, ack) VALUES ($1, $2, $3)", [userId, id, ack]);
+    return { ...ack, broadcast: { type, id, room, payload } };           // the caller fans this out after COMMIT
+  });
+}
+----
+
+Source: https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL documentation: The Locking Clause]
+
+Fan-out happens after the transaction commits, never inside it, otherwise a rollback leaves clients holding a message that does not exist. A test with 50 parallel sends into one room produced 50 distinct, gapless values. The cost is that one room is one writer at a time; at tens of messages per second per room that is not a limit, and a room that needs more should be split. The same function backs `message`, `edit`, `react` and the delete extension described below, each supplying only its `write` callback.
+
+== Cursor-based history
+
+The `history` request carries `before` (exclusive, `null` for the newest page) and `limit` (1 to 100). The reply is the page in ascending `seq`, `hasMore`, and `next`, the `seq` of the oldest message returned, to be sent back as the next `before`. The query fetches `limit + 1` rows: the extra row only proves that more exist.
+
+[source,javascript]
+----
+const HISTORY_SQL = `
+  SELECT m.*, (
+    SELECT jsonb_object_agg(emoji, users) FROM (
+      SELECT emoji, jsonb_agg(user_id ORDER BY user_id) AS users
+      FROM reactions r WHERE r.message_id = m.id GROUP BY emoji) x
+  ) AS reactions
+  FROM messages m
+  WHERE m.room = $1 AND m.deleted_at IS NULL AND ($2::bigint IS NULL OR m.seq < $2)
+  ORDER BY m.seq DESC
+  LIMIT $3`;
+
+export async function history(room, { before = null, limit = 50 }, maxBytes = 262144) {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new ChatError("bad_request", "limit must be 1..100");
+  const { rows } = await pool.query(HISTORY_SQL, [room, before, limit + 1]);
+  let more = rows.length > limit;
+  const keep = []; let bytes = 0;
+  for (const row of rows.slice(0, limit)) {              // newest first; stop when the byte budget is spent
+    bytes += Buffer.byteLength(JSON.stringify(toEnvelope(room)(row)));
+    if (bytes > maxBytes && keep.length > 0) { more = true; break; }
+    keep.push(row);
+  }
+  const messages = keep.reverse().map(toEnvelope(room));  // ascending seq, edits already applied
+  return { messages, hasMore: more, next: more ? messages[0].payload.seq : null };
+}
+----
+
+Source: https://www.postgresql.org/docs/18/queries-limit.html[PostgreSQL documentation: LIMIT and OFFSET]
+
+The protocol says a history page stays under 262144 bytes by returning fewer messages with `hasMore` true, and the loop above does that. Walking 120 messages in pages of 50 returned seq ranges 70 to 120, 20 to 69 and 1 to 19 with `next` 70, 20 and `null`; the ranges contain gaps (here one deleted message) because edits and reactions consume numbers too. `EXPLAIN` showed `Index Scan Backward using messages_pkey` with the cursor in the index condition.
+
+Two details are easy to miss. The protocol's history entries are message envelopes only, so a client that reloads from history would lose reactions; the example adds an optional `reactions` object to each message, which is legal because receivers ignore unknown fields, and clients that do not know it still work. The second detail is deleted messages: the query skips them, so a page may hold fewer than `limit` rows while `hasMore` stays accurate.
+
+=== The client half
+
+The browser keeps one log per room. It stores the highest `seq` it applied (`lastSeq`, the cursor for resume and for `join` with `since`) and the lowest message `seq` it holds (`oldestSeq`, the cursor for scrolling back), drops any `seq` it has already applied, and folds `edit`, `react` and `delete` into their targets.
+
+[source,javascript]
+----
+apply(env) {                                            // one method of the RoomLog class; byId is a Map
+  const p = env.payload;
+  if (env.room !== this.room || typeof p.seq !== "number" || this.#seen.has(p.seq)) return false;   // duplicate delivery
+  this.#seen.add(p.seq);
+  if (env.type === "message") {
+    this.byId.set(env.id, { id: env.id, seq: p.seq, from: p.from, text: p.text, edited: p.edited, reactions: p.reactions ?? {} });
+    this.oldestSeq = Math.min(this.oldestSeq ?? p.seq, p.seq);
+  } else if (env.type === "edit") { const m = this.byId.get(p.target); if (m) { m.text = p.text; m.edited = true; } }
+  else if (env.type === "delete") this.byId.delete(p.target);          // react is folded the same way
+  this.lastSeq = Math.max(this.lastSeq, p.seq);
+  return true;
+}
+// scrolling back: const r = await request("history", { before: this.oldestSeq, limit }); r.messages.forEach((e) => this.apply(e)); this.hasMoreOlder = r.hasMore;
+----
+
+Source: https://developer.mozilla.org/en-US/docs/Web/API/IntersectionObserver[MDN: IntersectionObserver (trigger loadOlder when the top sentinel scrolls into view)]
+
+== Catch-up after a reconnect
+
+The reconnect mechanics (backoff, `hello` with `resume`) are on xref:web/webrtc-websockets/connection-lifecycle-heartbeats-and-reconnection.adoc[Connection Lifecycle, Heartbeats and Reconnection]. This page owns the storage side. There are two paths and the server must support both:
+
+* *Resume.* If the session is younger than 120 seconds, the `hello` reply says `resumed: true` and the server replays events with a `seq` above the client's `lastSeq` for each room it lists.
+* *Cursor catch-up.* Otherwise the client sends `join` with `since` set to its `lastSeq`; the server runs the query below and sends the events as normal broadcasts after the ack.
+
+[source,javascript]
+----
+export async function eventsSince(room, since, limit = 500) {
+  const { rows } = await pool.query(
+    `SELECT seq, type, id, payload, created_at FROM events
+     WHERE room = $1 AND seq > $2 AND NOT (payload ? 'redacted') ORDER BY seq LIMIT $3`, [room, since, limit + 1]);
+  const more = rows.length > limit;                      // more: keep replaying from the last seq sent
+  const events = rows.slice(0, limit).map((e) => ({ v: 1, type: e.type, id: e.id, room, ts: e.created_at.getTime(), payload: e.payload }));
+  return { events, more };
+}
+----
+
+Source: https://www.postgresql.org/docs/18/functions-json.html[PostgreSQL documentation: JSON functions and operators]
+
+A test client held 30 messages with `lastSeq` 30, then an edit, a reaction, a delete and a new message happened while it was away. Applying `eventsSince(room, 30)` produced the edited text, the reaction and no deleted message, and applying the same replay a second time changed nothing, which is the overlap case between a replay and live traffic. Cap the replay: a client that has been away for a month should discard its local copy and load the newest page rather than receive 200,000 events. Compare `since` with `rooms.floor_seq` (see retention) and, if the cursor is older, answer the join with an additive `oldestSeq` field so the client knows to reload. Messages the client sent just before the drop are covered by the outbox, which retries with the same ids; the `acks` table makes that retry safe.
+
+== Edits, deletes and reactions as events
+
+Never update a message in place and forget it: the other devices only learn about the change if it is an event with its own `seq`. In Chatterbox v1:
+
+* `edit` is an event; the author only; `messages.body` and `edited_at` change and history shows the edited text with `edited: true`.
+* `react` is an event with `op` `add` or `remove`; a duplicate add is `conflict`, removing an absent reaction is `not_found`.
+* *Delete is not part of v1.* The twelve types have no `delete`. A server that wants it needs a compatible extension, shown here as a Chatterbox 1.1 proposal: a `delete` envelope `{ "target", "reason" }` from client to server, and `{ "target", "seq", "by", "moderated" }` to the room. Offer it only to clients that announced it in `hello` (the `client` string), because a v1 server answers an unknown type with `bad_request`. The XMPP equivalents are retraction and moderated retraction, described on xref:web/webrtc-websockets/xmpp-chat-features.adoc[XMPP Chat Features].
+
+A delete must be a tombstone, not a `DELETE FROM`: the row stays so that replies still resolve and the audit trail survives, but the text and the attachment list are wiped, and so is the copy in the event log. Otherwise catch-up would replay the original text to a client that has not yet seen the deletion.
+
+[source,javascript]
+----
+await c.query("UPDATE messages SET deleted_at = now(), deleted_by = $2, body = '', attachments = '[]' WHERE id = $1", [target, user.userId]);
+await c.query(
+  `UPDATE events SET payload = '{"redacted": true}'
+   WHERE room = $1 AND type IN ('message', 'edit') AND (id = $2 OR payload->>'target' = $2)`, [room, target]);
+----
+
+Source: https://www.postgresql.org/docs/18/functions-json.html#FUNCTIONS-JSON-PROCESSING[PostgreSQL documentation: JSON processing functions]
+
+The author may delete their own message; a user whose role in `members` is `moderator` or `owner` may delete anyone's, with `moderated: true` in the broadcast so the interface can say "removed by a moderator". Forwarded copies, push payloads that already left the server and screenshots cannot be recalled, so say "deleted for everyone in the room" and not "erased".
+
+== Offline delivery with Web Push
+
+When a user has no open connection, the chat can still wake the device through the browser vendor's push service. Three standards define it: RFC 8030 (the HTTP request an application server sends to the push service, with the `TTL`, `Urgency` and `Topic` headers), RFC 8291 (end-to-end encryption of the payload to the browser) and RFC 8292 (VAPID, the application server's signed identity). The browser side is the Push API and the Notifications API with a service worker. Chrome, Edge and Firefox support it on desktop and Android; Safari supports it on macOS and, on iOS and iPadOS 16.4 and later, only for web apps added to the Home Screen; Safari 18.4 adds Declarative Web Push, a JSON payload that the browser turns into a notification without running a service worker. Chrome and Edge reject `subscribe` unless `userVisibleOnly` is `true`: every push must end in a visible notification.
+
+The flow: the page asks permission from a click, subscribes with the VAPID public key, and sends the subscription (an endpoint plus the keys `p256dh` and `auth`) to the server over an ordinary authenticated HTTP request. The server stores it per user and device. When a message arrives for a member with no live connection, the server encrypts a small payload to each subscription and POSTs it to the endpoint with a VAPID `Authorization` header. The push service answers `201` once it has queued the message, and delivers when the browser is reachable.
+
+[source,javascript]
+----
+export async function enablePush(publicKey /* base64url VAPID public key */) {
+  if (!window.isSecureContext || !("serviceWorker" in navigator) || !("PushManager" in window)) return "unsupported";
+  const registration = await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+  if ((await Notification.requestPermission()) !== "granted") return "denied";
+  const subscription = (await registration.pushManager.getSubscription()) ?? await registration.pushManager.subscribe({
+    userVisibleOnly: true,
+    applicationServerKey: Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0)),
+  });
+  const res = await fetch("/api/push/subscriptions", {      // an HTTP call, not a Chatterbox envelope
+    method: "PUT", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(subscription),
+  });
+  return res.ok ? "enabled" : "failed";
+}
+----
+
+Source: https://developer.mozilla.org/en-US/docs/Web/API/PushManager/subscribe[MDN: PushManager.subscribe()]
+
+The service worker shows the notification and focuses the right room on click. It must not assume that the payload holds the text: Chatterbox sends only the room, the `seq` and the sender's name, and the worker shows a generic body, so that the message never passes through a third party and the design also holds when end-to-end encryption is added.
+
+[source,javascript]
+----
+self.addEventListener("push", (event) => {
+  const data = event.data ? event.data.json() : { room: "general", from: "Someone" };
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    if (windows.some((w) => w.visibilityState === "visible")) return;     // the user is already looking at the app
+    await self.registration.showNotification(`New message from ${data.from}`, {
+      body: "Open Chatterbox to read it", tag: `room-${data.room}`, renotify: true, data: { room: data.room, seq: data.seq },
+    });
+  })());
+});
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = new URL(`/rooms/${event.notification.data.room}`, self.location.origin).href;
+  event.waitUntil(self.clients.openWindow(url));
+});
+// pushsubscriptionchange: subscribe again with event.oldSubscription.options and PUT the new subscription
+----
+
+Source: https://developer.mozilla.org/en-US/docs/Web/API/ServiceWorkerGlobalScope/push_event[MDN: ServiceWorkerGlobalScope push event]
+
+The two halves above are syntax-checked only: a real push needs a vendor push service, a permission prompt and an HTTPS origin, none of which a headless test provides. The server half was run for real. Generate the key pair once with `npx web-push generate-vapid-keys --json`, keep the private key in a secret store and give the public key to the page; the values below are placeholders.
+
+[source,javascript]
+----
+import { createHash } from "node:crypto";
+import webpush from "web-push";
+
+webpush.setVapidDetails("mailto:ops@chat.example.test", process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY);
+const topicFor = (room) => createHash("sha256").update(room).digest("base64url").slice(0, 32);   // Topic: at most 32 URL-safe characters
+
+export async function notifyOffline(userIds, { room, seq, fromName }) {
+  const { rows } = await pool.query("SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ANY($1)", [userIds]);
+  const body = JSON.stringify({ kind: "message", room, seq, from: fromName });
+  let sent = 0, removed = 0;
+  await Promise.all(rows.map(async (r) => {
+    try {
+      await webpush.sendNotification({ endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } }, body,
+        { TTL: 4 * 60 * 60, urgency: "normal", topic: topicFor(room), timeout: 10_000 });
+      sent++;
+    } catch (err) {
+      if (err.statusCode === 404 || err.statusCode === 410) {       // the subscription is gone for good
+        await pool.query("DELETE FROM push_subscriptions WHERE endpoint = $1", [r.endpoint]); removed++;
+      } else console.warn("push failed", err.statusCode ?? err.code);   // 429 or 5xx: retry later with backoff
+    }
+  }));
+  return { sent, removed };
+}
+----
+
+Source: https://github.com/web-push-libs/web-push[web-push-libs/web-push: README and API reference]
+
+The test pointed one subscription at a local HTTPS server that implemented the push service side: it decrypted the body with the subscription's private key (RFC 8291, `aes128gcm`), received `TTL: 14400`, `Urgency: normal` and a 32-character `Topic`, and verified the ES256 signature of the VAPID token against the public key in the `k` parameter, with `aud` equal to the endpoint's origin, `sub` equal to the contact address and an `exp` less than 24 hours away. A second subscription whose endpoint answered `410` was deleted. Points to design around:
+
+* `TTL` is required; `0` means "deliver now or never". A chat message that is stale after hours should have a TTL of hours, and the client reconciles through history anyway.
+* `Topic` makes a new message replace the previous undelivered one for the same room, so a phone that was off for a day gets one wake-up per room, not 300.
+* A push service must accept at least 4096 bytes of body, which after the RFC 8291 header and padding leaves 3993 bytes of plaintext; send identifiers, not content.
+* The endpoint URL is a bearer capability: anyone holding it with valid VAPID credentials can push. Store it like a secret and delete it on `404` or `410`.
+* Send a push only when the user has no live connection to any node; with several nodes that is a presence lookup (see xref:web/webrtc-websockets/presence-typing-and-receipts.adoc[Presence, Typing and Receipts]). Respect mute settings, and do not push for typing, receipts or presence.
+
+The same pattern outside this section is shown on xref:web/nextjs/advanced-patterns.adoc[Next.js Advanced Patterns], on xref:web/vaadin/responsive-design-and-pwa.adoc[Vaadin Responsive Design and PWA] and, for the notification channels of a PHP backend, on xref:web/php-laravel/mail-and-notifications.adoc[Laravel Mail and Notifications]. For XMPP servers the equivalent is XEP-0357, covered on xref:web/webrtc-websockets/xmpp-chat-features.adoc[XMPP Chat Features].
+
+== Attachments through pre-signed URLs
+
+Chatterbox messages carry `attachments` of `{ url, name, mime, size }`. The bytes never travel over the WebSocket (frames are limited to 16384 bytes) nor through the chat server: the browser uploads straight to object storage with a one-time permission that the server signs. The server decides the key, the maximum size and the content type; the browser only gets a URL and form fields. A pre-signed POST is better than a pre-signed PUT here because its policy can enforce `content-length-range`, while a PUT URL cannot limit the size.
+
+[source,javascript]
+----
+export async function createUpload(user, room, { name, mime, size }) {
+  if (!ALLOWED.has(mime)) throw new ChatError("bad_request", "type not allowed");
+  if (!Number.isInteger(size) || size < 1 || size > MAX_BYTES) throw new ChatError("too_large", "file too large");
+  const key = `${room}/${user.userId}/${randomUUID()}/${safeName(name)}`;
+  const { url, fields } = await createPresignedPost(s3, {
+    Bucket, Key: key, Expires: 300,
+    Conditions: [["content-length-range", 1, size], ["eq", "$Content-Type", mime]],
+    Fields: { "Content-Type": mime },
+  });
+  return { upload: { url, fields }, attachment: { url: PUBLIC_BASE + encodeURI(key), name, mime, size } };
+}
+----
+
+Source: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html[Amazon S3 API Reference: POST policy conditions]
+
+The flow is: the client calls `POST /api/uploads` with the file's metadata, uploads with `FormData` (the `file` field last), then sends the `message` with the returned `attachment`. The attachment URL is a stable URL of the chat service, not the storage URL; when someone opens it, the server checks that the caller is a member of the room in the key and answers with a redirect to a 60-second pre-signed GET with `ResponseContentDisposition` set, so the file downloads instead of rendering in the origin. When the `message` arrives, `checkAttachments` takes each URL apart and rejects foreign hosts, keys outside `room/userId/`, and objects whose `HEAD` shows a different size or type, or that were never uploaded. Against the object store, an upload within limits returned 204, a 5000-byte body declared as 1000 bytes returned 400, a declared PNG sent as `text/html` returned 403, a tampered download signature returned 403, and an unfinished upload was rejected at message time with `not_found`.
+
+Source: https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html[Amazon S3 User Guide: Sharing objects with presigned URLs]
+
+Never trust the declared `mime`: the allow-list limits what is accepted, serve user files from a separate origin or with `Content-Disposition: attachment`, scan them if the product requires it, and generate thumbnails in a worker. The upload pipeline in general (queues, workers, status) is on xref:backend/media-optimization/upload-pipelines-queues-and-jobs.adoc[Upload Pipelines, Queues and Jobs]; Spring and Laravel storage details are on xref:backend/springboot/file-storage-and-object-stores.adoc[Spring Boot File Storage and Object Stores] and xref:web/php-laravel/file-storage-and-images.adoc[Laravel File Storage and Images]. XMPP does the same with HTTP File Upload, XEP-0363.
+
+== Moderation
+
+Moderation has layers, from cheap and automatic to human:
+
+. *Rate limits.* The protocol fixes a token bucket of 20 envelopes per second with a capacity of 40 per connection (tokens refill with elapsed time, capped at the capacity), `rate_limited` on excess and close 4429 after repeated excess. Add per-user and per-room limits for what a connection limit cannot see (many tabs, many accounts), and a room-level slow mode.
+. *Word filters.* Normalise before matching (compatibility decomposition, accents and zero-width characters removed, lower case) and match whole words only, otherwise innocent words that contain a listed one are blocked. A filter is a speed bump, not a wall.
+. *Reports.* Members report a message; the unique key `(message_id, reporter)` stops one person from filing a hundred reports, and the queue groups reports by message so moderators see the most reported first.
+. *Bans and roles.* Roles `owner`, `moderator` and `member` live in `members`. A ban has an optional expiry and is checked on `join` and again on every `message`, because a ban must work on sockets that are already open. A moderator cannot ban an owner or another moderator.
+
+[source,javascript]
+----
+export const normalise = (text) =>
+  text.normalize("NFKD").replace(/\p{M}+/gu, "").replace(/[​-‍⁠﻿]/g, "").toLowerCase();
+
+export function compileFilter(words) {
+  const alts = words.map((w) => normalise(w).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${alts})(?![\\p{L}\\p{N}])`, "u");
+  return (text) => re.test(normalise(text));
+}
+
+export async function assertNotBanned(room, userId) {
+  const { rowCount } = await pool.query(
+    "SELECT 1 FROM bans WHERE room = $1 AND user_id = $2 AND (until IS NULL OR until > now())", [room, userId]);
+  if (rowCount) throw new ChatError("forbidden", "you are banned from this room");
+}
+----
+
+Source: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/String/normalize[MDN: String.prototype.normalize()]
+
+With a fake clock the bucket let 40 envelopes through a burst of 45 and 10 more half a second later; the filter blocked full-width letters, a zero-width space inside the word and mixed case, and passed longer words that merely contain a listed word; two reporters of one message produced one queue row with `reporters` 2, a duplicate report from the same user was ignored, and a banned user's next message was refused with `forbidden`. A ban also removes the user from `members`, so even without the extra check the user cannot post. Moderation actions should be events too: log who did what and why, and emit the `delete` event with `moderated: true`. Send the offender a close with 4403 or an `error` with `forbidden` and a reason, not a silent drop.
+
+== Retention
+
+Keeping everything forever is a choice, and it has cost (storage, backups, breach impact) and legal weight (GDPR storage limitation and erasure requests). Decide per room: `rooms.retention` is an interval or `NULL`. A purge job deletes the oldest events and messages in small batches so that it does not hold long locks, and records the new floor so that catch-up can tell a client its cursor is older than the log.
+
+[source,sql]
+----
+-- one batch: run every few seconds until it deletes nothing
+WITH old AS (
+  SELECT seq FROM events
+  WHERE room = $1 AND created_at < now() - (SELECT retention FROM rooms WHERE name = $1)
+  ORDER BY seq LIMIT 1000
+), cut AS (SELECT max(seq) AS top FROM old)
+DELETE FROM events WHERE room = $1 AND seq <= (SELECT top FROM cut);
+-- in the same transaction: delete from messages with the same bound and raise rooms.floor_seq
+----
+
+Source: https://www.postgresql.org/docs/18/sql-delete.html[PostgreSQL documentation: DELETE]
+
+The tested job (`purgeBatch`) locks the room row, deletes events and messages up to the highest expired `seq` and raises `floor_seq`; 30 aged events went in three batches of ten, the oldest remaining message was seq 31, and reactions disappeared through `ON DELETE CASCADE`. For very large rooms, partition `events` by time so that retention becomes `DROP TABLE` of an old partition. Also expire the `acks` table after the 24-hour idempotency window plus margin, delete push subscriptions that answer `404` or `410`, and remove a departed user's uploads. A full erasure request touches the messages, the event log, the reactions, the stored objects and any backups.
+
+== Running it
+
+The tests used one Compose project with `postgres:18-alpine` (schema mounted into `docker-entrypoint-initdb.d`, port 47200 on the host) and `chrislusf/seaweedfs:4.48` started with `server -dir=/data -s3 -s3.config=/etc/seaweedfs/s3.json`, whose identity file holds a placeholder key pair (`example-access-key`, `change-me-example-secret`). Any S3-compatible service or AWS S3 works with the same SDK calls when `S3_ENDPOINT` is changed or removed. Source: https://github.com/seaweedfs/seaweedfs[SeaweedFS: README and S3 API documentation]
+
+== Common errors and pitfalls
+
+* *Using a database sequence for `seq`.* Commit order differs from number order, so catch-up skips messages. Lock the room row instead.
+* *Offset pagination.* It slows down with depth and repeats or skips rows when new messages arrive. Use `before`.
+* *Forgetting the log when deleting.* The deleted text lives on in replays unless the event is scrubbed.
+* *Putting message text in the push payload.* It crosses the vendor's push service and breaks end-to-end encryption plans.
+* *Trusting client-supplied attachment URLs.* Accept only keys the same user uploaded to the same room, and verify size and type with `HEAD`.
+* *Checking a ban only at join.* Open sockets keep posting.
+* *Substring word filters.* They block innocent words and are trivially bypassed with homoglyphs; normalise and match words.
+
+== Version and specification notes
+
+RFC 8030, RFC 8291 and RFC 8292 were all published in 2017 as Proposed Standards and are the current Web Push documents. The Push API is still a W3C Working Draft and Notifications is a WHATWG living standard. Safari's Web Push support arrived in 2022 (macOS) and 2023 (iOS and iPadOS 16.4), and Declarative Web Push in Safari 18.4 (2025). `web-push` 3.6.7 dates from 2024 and is the library used here; the Web Push protocol itself has not changed since. The pre-signed POST policy format is part of the long-stable S3 API. Chatterbox v1 has no delete, history or reaction summary beyond what is described on the protocol page; the `delete` envelope, the `reactions` field on history messages and the `oldestSeq` join field are additive proposals of this page.
+
+== Related pages
+
+xref:web/webrtc-websockets/building-a-chat-app.adoc[Building a Chat App] wires all of this into the end-to-end application; xref:web/webrtc-websockets/security.adoc[Security] and xref:web/webrtc-websockets/authentication-and-authorization.adoc[Authentication and Authorization] cover the access checks used above.
+
+== References
+
+* https://www.rfc-editor.org/rfc/rfc8030[RFC 8030: Generic Event Delivery Using HTTP Push]
+* https://www.rfc-editor.org/rfc/rfc8291[RFC 8291: Message Encryption for Web Push]
+* https://www.rfc-editor.org/rfc/rfc8292[RFC 8292: Voluntary Application Server Identification (VAPID) for Web Push]
+* https://www.w3.org/TR/push-api/[W3C: Push API]
+* https://notifications.spec.whatwg.org/[WHATWG: Notifications API]
+* https://developer.mozilla.org/en-US/docs/Web/API/Push_API[MDN: Push API]
+* https://webkit.org/blog/16535/meet-declarative-web-push/[WebKit blog: Meet Declarative Web Push]
+* https://developer.apple.com/documentation/usernotifications/sending-web-push-notifications-in-web-apps-and-browsers[Apple: Sending web push notifications in web apps and browsers]
+* https://github.com/web-push-libs/web-push[web-push library]
+* https://www.postgresql.org/docs/18/queries-limit.html[PostgreSQL 18: LIMIT and OFFSET]
+* https://www.postgresql.org/docs/18/sql-select.html#SQL-FOR-UPDATE-SHARE[PostgreSQL 18: The Locking Clause]
+* https://www.postgresql.org/docs/18/functions-sequence.html[PostgreSQL 18: Sequence manipulation functions]
+* https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html[Amazon S3: POST policy]
+* https://docs.aws.amazon.com/AmazonS3/latest/userguide/using-presigned-url.html[Amazon S3: Sharing objects with presigned URLs]
+* https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html[OWASP: File Upload Cheat Sheet]
+* https://gdpr-info.eu/art-17-gdpr/[GDPR Article 17: Right to erasure]
+* https://xmpp.org/extensions/xep-0313.html[XEP-0313: Message Archive Management]
+* https://xmpp.org/extensions/xep-0357.html[XEP-0357: Push Notifications]
