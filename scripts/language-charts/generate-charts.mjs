@@ -425,35 +425,55 @@ export function renderChart(def) {
  */
 export const CHART_DEFINITIONS = [...CHART_BUILDERS];
 
-/** Loads every CSV in the data directory into a { name: rows } map (name without extension). */
-export function loadData(dir = DATA_DIR) {
-  const names = ['languages', 'popularity-current', 'popularity-history', 'ecosystem', 'ecosystem-history', 'performance',
-    'energy', 'learning', 'learning-so', 'onboarding-checks', 'security', 'versatility', 'versatility-domains', 'jobs', 'sources'];
+/** Reads each `<name>.csv` of `dir` into a { name: rows } map. */
+export function readCsvFiles(names, dir) {
   return Object.fromEntries(names.map((n) => [n, readCsv(`${n}.csv`, dir)]));
 }
 
-/** Renders and writes all definitions to `outDir`; returns the written file paths. */
-export function generateCharts(definitions, data, outDir) {
+/** Loads every CSV in the data directory into a { name: rows } map (name without extension). */
+export function loadData(dir = DATA_DIR) {
+  return readCsvFiles(['languages', 'popularity-current', 'popularity-history', 'ecosystem', 'ecosystem-history',
+    'performance', 'energy', 'learning', 'learning-so', 'onboarding-checks', 'security', 'versatility',
+    'versatility-domains', 'jobs', 'sources'], dir);
+}
+
+/** Renders and writes all definitions to `outDir` as `<prefix><id>.svg`; returns the written file paths. */
+export function writeCharts(definitions, data, outDir, prefix) {
   mkdirSync(outDir, { recursive: true });
   return definitions.map((d) => {
     const def = typeof d === 'function' ? d(data) : d;
-    const file = join(outDir, `${FILE_PREFIX}${def.id}.svg`);
+    const file = join(outDir, `${prefix}${def.id}.svg`);
     writeFileSync(file, renderChart(def));
     return file;
   });
 }
 
-function main(argv) {
+/** Renders and writes all definitions to `outDir`; returns the written file paths. */
+export function generateCharts(definitions, data, outDir) {
+  return writeCharts(definitions, data, outDir, FILE_PREFIX);
+}
+
+/**
+ * Shared command line: parses `[--out <dir>]`, calls `generate(outDir)` (which returns the written files) and prints
+ * them. `script` is the script path shown in the usage message.
+ */
+export function runChartCli(argv, { script, defaultOutDir, generate }) {
   const i = argv.indexOf('--out');
   if (i >= 0 && (argv[i + 1] === undefined || argv[i + 1].startsWith('--'))) {
-    console.error('Usage: node scripts/language-charts/generate-charts.mjs [--out <dir>]');
+    console.error(`Usage: node ${script} [--out <dir>]`);
     process.exitCode = 2;
     return;
   }
-  const outDir = i >= 0 ? resolve(argv[i + 1]) : DEFAULT_OUT_DIR;
-  const files = generateCharts(CHART_DEFINITIONS, loadData(), outDir);
+  const outDir = i >= 0 ? resolve(argv[i + 1]) : defaultOutDir;
+  const files = generate(outDir);
   console.log(`Wrote ${files.length} chart(s) to ${outDir}`);
   files.forEach((f) => console.log(`  ${f}`));
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main(process.argv.slice(2));
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  runChartCli(process.argv.slice(2), {
+    script: 'scripts/language-charts/generate-charts.mjs',
+    defaultOutDir: DEFAULT_OUT_DIR,
+    generate: (outDir) => generateCharts(CHART_DEFINITIONS, loadData(), outDir),
+  });
+}

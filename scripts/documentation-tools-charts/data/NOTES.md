@@ -26,7 +26,7 @@ sources below, not copied from earlier notes. Missing values are the literal `n/
   `repository/contributors` (committer count, first page of up to 100; the total is 37).
 * npm: `downloads/point/last-week/{package}` and `downloads/range/{start}:{end}/{package}` (daily counts summed per
   month, in chunks under one year). Release dates from the registry document (`time`), stable versions only.
-* PyPI: `pypistats.org/api/packages/{package}/recent` (last week, with mirrors) and `/overall?mirrors=false`
+* PyPI: `pypistats.org/api/packages/{package}/overall?mirrors=false` (the daily series, summed by week; the "last 7 days" figure is the last complete week, 2026-10-19 to 2026-10-25)
   (daily, 180 days, summed per week). Release dates are the earliest upload time per version in the PyPI JSON API.
 * NuGet: the search API `totalDownloads` for the `docfx` package (cumulative only) and the flat container for the
   version list.
@@ -36,8 +36,8 @@ sources below, not copied from earlier notes. Missing values are the literal `n/
 ## Caveats
 
 * npm, PyPI and NuGet downloads are inflated differently by CI systems, mirrors and caches, so values are compared
-  within one ecosystem and never across them. The PyPI weekly series excludes mirrors; the single "last 7 days" PyPI
-  figure in `current.csv` includes them.
+  within one ecosystem and never across them. Both the PyPI weekly series and the single "last 7 days" PyPI
+  figure in `current.csv` exclude mirrors.
 * Antora is hosted on GitLab: its stars, forks and contributor definition (commit authors) are not comparable with
   GitHub's. Antora is also often run from Docker, which npm does not count.
 * The DocFX NuGet total is cumulative since 2016 and has no weekly counterpart, so DocFX is `n/a` in the weekly
