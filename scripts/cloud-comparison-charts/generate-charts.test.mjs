@@ -11,8 +11,8 @@ import {
   PROVIDERS, PROVIDER_COLORS, PROVIDER_IDS, providerId, providerIndex, providerName,
 } from './providers.mjs';
 import {
-  AXES, COMPUTED_AXES, EDITORIAL_AXES, computeScores, computedBasis, ecosystemInputs, latestInfrastructure,
-  latestSynergyQuarter, meanRatioScore, popularityInputs, relativeScore, sovereignOptions, architectureTotals,
+  AXES, COMPUTED_AXES, EDITORIAL_AXES, computeScores, computedBasis, ecosystemInputs, latestSynergyQuarter,
+  meanRatioScore, popularityInputs, publicFootprint, sovereignOptions, architectureTotals,
 } from './scores.mjs';
 import { FIT_LEVELS, fitFor, llmAvailability, recommendationRows, WORKLOADS } from './matrix.mjs';
 import {
@@ -213,7 +213,7 @@ test('score computation stays within 0-10 and is complete for every provider and
   assert.equal(scores['google-cloud'].popularity, 5.6);
   assert.deepEqual(PROVIDER_IDS.map((id) => scores[id].ecosystem_breadth), [10, 9.4, 8]);
   assert.deepEqual(PROVIDER_IDS.map((id) => scores[id].price_competitiveness), [9.8, 10, 8.4]);
-  assert.deepEqual(PROVIDER_IDS.map((id) => scores[id].regional_coverage), [8.8, 8.7, 8]);
+  assert.deepEqual(PROVIDER_IDS.map((id) => scores[id].regional_coverage), [8.1, 8.7, 8]);
 });
 
 test('radar-scores.csv matches the computed values, keeps the editorial rows and states a basis', () => {
@@ -231,13 +231,12 @@ test('radar-scores.csv matches the computed values, keeps the editorial rows and
   const basis = computedBasis(data);
   assert.match(basis.aws.price_competitiveness, /reference-totals/);
   assert.match(basis['google-cloud'].regional_coverage, /43 regions and 130 zones/);
+  assert.match(basis.aws.regional_coverage, /34 regions and 109 zones/);
+  const partial = { ...data, 'reference-totals': data['reference-totals'].filter((r) => !(r.architecture === 'static-site' && r.provider !== 'aws')) };
+  assert.match(computedBasis(partial).azure.price_competitiveness, /static-site n\/a USD/);
 });
 
 test('score helpers handle missing values without inventing zeros', () => {
-  assert.equal(relativeScore(5, 10), 5);
-  assert.equal(relativeScore(null, 10), null);
-  assert.equal(relativeScore(5, 0), null);
-  assert.equal(relativeScore(20, 10), 10);
   assert.equal(meanRatioScore([1, null, 0.5]), 7.5);
   assert.equal(meanRatioScore([null, null]), null);
   assert.equal(meanRatioScore([]), null);
@@ -247,12 +246,13 @@ test('score helpers handle missing values without inventing zeros', () => {
   assert.equal(ecosystemInputs(data).categories, 31);
   assert.deepEqual(ecosystemInputs(data).covered, { aws: 31, azure: 30, 'google-cloud': 24 });
   assert.deepEqual(sovereignOptions(data.sovereign), { aws: 3, azure: 2, 'google-cloud': 2 });
-  const infra = latestInfrastructure(data['regions-over-time']);
-  assert.deepEqual(infra.azure, { as_of: '2026-10-26', regions: 58, zones: 124 });
+  assert.deepEqual(publicFootprint(data.footprint), {
+    aws: { regions: 34, zones: 109 }, azure: { regions: 58, zones: 124 }, 'google-cloud': { regions: 43, zones: 130 },
+  });
   const totals = architectureTotals(data['reference-totals']);
   assert.equal(Math.round(totals['static-site'].aws * 100) / 100, 48.2);
   assert.deepEqual(Object.keys(totals).sort(), ['ai-service', 'microservices', 'simple-dynamic-site', 'static-site']);
-  const noData = { ...data, 'reference-totals': [], 'regions-over-time': [], tooling: [], 'market-share': [] };
+  const noData = { ...data, 'reference-totals': [], footprint: [], tooling: [], 'market-share': [] };
   assert.equal(computeScores({ ...noData, 'radar-scores': [] }).aws.price_competitiveness, null);
   assert.equal(computeScores({ ...noData, 'radar-scores': [] }).aws.regional_coverage, null);
 });
@@ -280,6 +280,10 @@ test('the recommendation matrix covers every workload and provider and matches r
   assert.equal(llm.azure.available, 12);
   const missing = recommendationRows({ ...data, 'reference-totals': [] }).filter((r) => r.workload_id === 'static-site');
   assert.ok(missing.every((r) => r.fit === 'n/a' && r.relative_index === 'n/a'));
+  assert.ok(rows.filter((r) => r.workload_id === 'onboarding').every((r) => /for ease of use$/.test(r.rationale)));
+  const zeroEditorial = { ...data, 'radar-scores': data['radar-scores'].map((r) => (r.axis === 'ease_of_use' ? { ...r, score: '0' } : r)) };
+  const zeroRows = recommendationRows(zeroEditorial).filter((r) => r.workload_id === 'onboarding');
+  assert.ok(zeroRows.every((r) => r.fit === 'n/a' && r.relative_index === 'n/a'));
 });
 
 test('pricing figures are indexed to the cheapest provider and keep the dollar price in the tooltip', () => {
@@ -335,4 +339,7 @@ test('renderers reject incomplete specs and addFooter grows the figure', () => {
   assert.ok(h(withFooter) > h(base));
   assertWellFormed(withFooter);
   assert.equal(toCsv(['a', 'b'], [{ a: 'x,y', b: 'q"r' }]), 'a,b\n"x,y","q""r"\n');
+  assert.equal(toCsv(['a'], [{ a: 'x\ry' }]), 'a\n"x\ry"\n');
+  const noEditorial = { ...data, 'radar-scores': data['radar-scores'].filter((r) => r.axis !== 'ai_offering') };
+  assert.throws(() => radarCsv(noEditorial), /no editorial row/);
 });

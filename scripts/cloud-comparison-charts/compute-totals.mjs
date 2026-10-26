@@ -8,64 +8,20 @@
 //                               and one total row per architecture and provider (line = TOTAL)
 //
 // A pricing_id in reference-architectures.csv is the provider-neutral key; the row of pricing.csv used for a
-// provider has the id "<provider>-<pricing_id>" (for example aws-vm-us-east). All totals use list prices for
+// provider has the id "<prefix>-<pricing_id>" (for example aws-vm-us-east, gcp-vm-us-east). All totals use list prices for
 // the US East region, with no free allowance, discount or tax. Run: node compute-totals.mjs
-import { readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { readCsv } from '../language-charts/generate-charts.mjs';
+import { toCsv } from './csv.mjs';
+import { PROVIDER_IDS } from './providers.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = join(here, 'data');
 
-export const PROVIDERS = ['aws', 'azure', 'gcp'];
-
-/** Parses CSV text with quoted fields into an array of objects keyed by the header row. */
-export function parseCsv(text) {
-  const rows = [];
-  let row = [];
-  let field = '';
-  let quoted = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (quoted) {
-      if (c === '"' && text[i + 1] === '"') {
-        field += '"';
-        i++;
-      } else if (c === '"') {
-        quoted = false;
-      } else {
-        field += c;
-      }
-    } else if (c === '"') {
-      quoted = true;
-    } else if (c === ',') {
-      row.push(field);
-      field = '';
-    } else if (c === '\n' || c === '\r') {
-      if (c === '\r' && text[i + 1] === '\n') i++;
-      row.push(field);
-      field = '';
-      if (row.length > 1 || row[0] !== '') rows.push(row);
-      row = [];
-    } else {
-      field += c;
-    }
-  }
-  if (field !== '' || row.length > 0) {
-    row.push(field);
-    rows.push(row);
-  }
-  const [header, ...body] = rows;
-  return body.map((r) => Object.fromEntries(header.map((h, i) => [h, r[i] ?? ''])));
-}
-
-function toCsv(columns, records) {
-  const esc = (v) => {
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  return [columns.join(','), ...records.map((r) => columns.map((c) => esc(r[c])).join(','))].join('\n') + '\n';
-}
+// pricing.csv ids start with the short provider prefix; reference-totals.csv uses the canonical provider id.
+const PRICING_PREFIX = { aws: 'aws', azure: 'azure', 'google-cloud': 'gcp' };
 
 /**
  * Computes line items and totals.
@@ -77,10 +33,10 @@ export function computeTotals(pricing, architectures) {
   const byId = new Map(pricing.map((p) => [p.id, p]));
   const lines = [];
   const sums = new Map();
-  for (const provider of PROVIDERS) {
+  for (const provider of PROVIDER_IDS) {
     for (const a of architectures) {
-      const price = byId.get(`${provider}-${a.pricing_id}`);
-      if (!price) throw new Error(`Missing pricing row ${provider}-${a.pricing_id}`);
+      const price = byId.get(`${PRICING_PREFIX[provider]}-${a.pricing_id}`);
+      if (!price) throw new Error(`Missing pricing row ${PRICING_PREFIX[provider]}-${a.pricing_id}`);
       if (price.unit !== a.unit) {
         throw new Error(`Unit mismatch for ${price.id}: pricing has "${price.unit}", architecture has "${a.unit}"`);
       }
@@ -114,8 +70,8 @@ export function computeTotals(pricing, architectures) {
 const money = (n) => (Math.round(n * 100) / 100).toFixed(2);
 
 function main() {
-  const pricing = parseCsv(readFileSync(join(dataDir, 'pricing.csv'), 'utf8'));
-  const architectures = parseCsv(readFileSync(join(dataDir, 'reference-architectures.csv'), 'utf8'));
+  const pricing = readCsv('pricing.csv', dataDir);
+  const architectures = readCsv('reference-architectures.csv', dataDir);
   const { lines, totals } = computeTotals(pricing, architectures);
   const records = lines.map((l) => ({ ...l, line_usd: money(l.line_usd) }));
   for (const t of totals) {
@@ -135,4 +91,4 @@ function main() {
   for (const t of totals) console.log(`${t.architecture}\t${t.provider}\t${money(t.total_usd)}`);
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();

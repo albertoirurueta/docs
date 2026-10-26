@@ -175,10 +175,12 @@ function otherSurveys(data) {
 
 // ---------------------------------------------------------------- regions
 
-const isAnnouncedAzureCount = (r) => providerId(r.provider) === 'azure' && toNumber(r.availability_zones) !== null;
+// The Azure row that has an AZ count is the regions-list count (58), not an announced "60+"/"70+" count; the regions
+// line keeps Azure on the announced basis, so this row is left out of it.
+const isAzureRegionsListRow = (r) => providerId(r.provider) === 'azure' && toNumber(r.availability_zones) !== null;
 
 function regions(data) {
-  const rows = data['regions-over-time'].filter((r) => !isAnnouncedAzureCount(r));
+  const rows = data['regions-over-time'].filter((r) => !isAzureRegionsListRow(r));
   return {
     type: 'line', id: 'regions', width: 860, yZero: true,
     title: 'Cloud regions over time',

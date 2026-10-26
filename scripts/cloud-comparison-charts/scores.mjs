@@ -30,12 +30,6 @@ function byProvider(entries) {
   return out;
 }
 
-/** value / best, scaled to 0-10; null when the value or the best is missing or not positive. */
-export function relativeScore(value, best) {
-  if (value === null || best === null || !(best > 0)) return null;
-  return round1(clamp((value / best) * 10));
-}
-
 /** Mean of the available ratios (missing ones are skipped, never zero), x 10 and rounded; null when none is available. */
 export function meanRatioScore(ratios) {
   const present = ratios.filter((r) => r !== null && Number.isFinite(r));
@@ -117,17 +111,6 @@ export function priceScores(data) {
   return Object.fromEntries(PROVIDER_IDS.map((id) => [id, meanRatioScore(ratios[id])]));
 }
 
-/** Latest regions-over-time row per provider that has both a region and an availability zone count. */
-export function latestInfrastructure(rows) {
-  const out = Object.fromEntries(PROVIDER_IDS.map((id) => [id, null]));
-  for (const id of PROVIDER_IDS) {
-    const r = rows.filter((x) => providerId(x.provider) === id && toNumber(x.regions) !== null && toNumber(x.availability_zones) !== null)
-      .sort((a, b) => a.as_of.localeCompare(b.as_of)).pop();
-    if (r) out[id] = { as_of: r.as_of, regions: toNumber(r.regions), zones: toNumber(r.availability_zones) };
-  }
-  return out;
-}
-
 /** Number of sovereign, government and China offerings (one per category) whose status says they are available. */
 export function sovereignOptions(rows) {
   const out = Object.fromEntries(PROVIDER_IDS.map((id) => [id, 0]));
@@ -139,14 +122,32 @@ export function sovereignOptions(rows) {
   return out;
 }
 
-/** Regional coverage: 10 x mean(regions / most regions, zones / most zones, sovereign categories / 3). */
+/**
+ * Generally available public regions and their availability zones per provider, from footprint.csv. Every provider is
+ * counted on the same basis: China, government and sovereign partitions are excluded (they are scored separately by
+ * sovereignOptions), as are announced or listed-but-not-available regions. A region without zones adds no zones.
+ */
+export function publicFootprint(rows) {
+  const out = Object.fromEntries(PROVIDER_IDS.map((id) => [id, null]));
+  for (const r of rows) {
+    const id = providerId(r.provider);
+    if (!id || r.partition !== 'public' || r.status !== 'available') continue;
+    out[id] ??= { regions: 0, zones: 0 };
+    out[id].regions += 1;
+    out[id].zones += toNumber(r.availability_zones) ?? 0;
+  }
+  return out;
+}
+
+/** Regional coverage: 10 x mean(public regions / most, public zones / most, sovereign categories / 3). */
 export function regionalScores(data) {
-  const infra = latestInfrastructure(data['regions-over-time']);
-  const maxR = Math.max(...PROVIDER_IDS.map((id) => infra[id]?.regions ?? 0));
-  const maxZ = Math.max(...PROVIDER_IDS.map((id) => infra[id]?.zones ?? 0));
+  const fp = publicFootprint(data.footprint);
+  const maxR = Math.max(0, ...PROVIDER_IDS.map((id) => fp[id]?.regions ?? 0));
+  const maxZ = Math.max(0, ...PROVIDER_IDS.map((id) => fp[id]?.zones ?? 0));
   const sov = sovereignOptions(data.sovereign);
-  return Object.fromEntries(PROVIDER_IDS.map((id) => [id, infra[id] ? meanRatioScore([
-    infra[id].regions / maxR, infra[id].zones / maxZ, sov[id] / SOVEREIGN_CATEGORIES.length]) : null]));
+  const ratio = (v, max) => (max > 0 ? v / max : null);
+  return Object.fromEntries(PROVIDER_IDS.map((id) => [id, fp[id] ? meanRatioScore([
+    ratio(fp[id].regions, maxR), ratio(fp[id].zones, maxZ), sov[id] / SOVEREIGN_CATEGORIES.length]) : null]));
 }
 
 /** Returns { providerId: { axisId: score } }: computed axes from the CSVs, editorial axes from radar-scores.csv. */
@@ -171,19 +172,19 @@ export function computeScores(data) {
 export function computedBasis(data) {
   const pop = popularityInputs(data);
   const eco = ecosystemInputs(data);
-  const infra = latestInfrastructure(data['regions-over-time']);
+  const fp = publicFootprint(data.footprint);
   const sov = sovereignOptions(data.sovereign);
   const totals = architectureTotals(data['reference-totals']);
   const maxShare = Math.max(...Object.values(pop.share));
   const maxUsage = Math.max(...Object.values(pop.usage));
-  const r2 = (v) => v.toFixed(2);
+  const r2 = (v) => (typeof v === 'number' ? v.toFixed(2) : 'n/a');
   const out = {};
   for (const id of PROVIDER_IDS) {
     out[id] = {
       popularity: `Computed: 10 x mean(share/max share, usage/max usage). market-share.csv Synergy ${pop.quarter} share ${pop.share[id]}% (max ${maxShare}); learning.csv so_usage_2026 ${pop.usage[id]}% (max ${maxUsage}). Share is infrastructure-services spend; usage is developer-survey only`,
       ecosystem_breadth: `Computed: mean of service coverage and SDK coverage x 10. service-mapping.csv: ${eco.covered[id]} of ${eco.categories} categories have a service; tooling.csv official_sdk_languages ${eco.sdk[id]} of ${eco.sdkMax} (max)`,
       price_competitiveness: `Computed: 10 x mean over the ${Object.keys(totals).length} reference architectures of (cheapest total / own total). reference-totals.csv monthly list-price totals (${Object.entries(totals).map(([a, t]) => `${a} ${r2(t[id])} USD`).join('; ')}). Excludes free tiers, discounts and support, which are not like for like`,
-      regional_coverage: `Computed: 10 x mean(regions/most regions, zones/most zones, sovereign categories/${SOVEREIGN_CATEGORIES.length}). regions-over-time.csv ${infra[id]?.as_of}: ${infra[id]?.regions} regions and ${infra[id]?.zones} zones; sovereign.csv: ${sov[id]} of China, government and sovereign offerings available. Region and zone definitions differ between providers`,
+      regional_coverage: `Computed: 10 x mean(public regions/most, public zones/most, sovereign categories/${SOVEREIGN_CATEGORIES.length}). footprint.csv generally available public regions: ${fp[id]?.regions ?? 'n/a'} regions and ${fp[id]?.zones ?? 'n/a'} zones (China, government and sovereign partitions excluded); sovereign.csv: ${sov[id]} of China, government and sovereign offerings available. Zone definitions differ between providers`,
     };
   }
   return out;

@@ -19,7 +19,7 @@ const ALIASES = new Map([
 
 /**
  * Canonical provider id for the spellings used by the CSVs: `aws`/`azure`/`google-cloud`, `google_cloud` (service-mapping
- * header), `gcp` (pricing.csv, reference-totals.csv), `AWS`/`Azure`/`Google Cloud` (footprint, regions, availability)
+ * header), `gcp` (pricing.csv), `AWS`/`Azure`/`Google Cloud` (footprint, regions, availability)
  * and `microsoft` (revenue.csv). Returns null for anything else.
  */
 export function providerId(raw) {

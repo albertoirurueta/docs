@@ -3,16 +3,15 @@
 // data/recommendations.csv from the other CSVs. Run it after changing any input CSV.
 // Usage: node scripts/cloud-comparison-charts/update-derived-data.mjs
 import { writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { resolve } from 'node:path';
 import { loadData, DATA_DIR } from './generate-charts.mjs';
 import { AXES, COMPUTED_AXES, computeScores, computedBasis } from './scores.mjs';
 import { recommendationRows } from './matrix.mjs';
 import { PROVIDER_IDS } from './providers.mjs';
+import { toCsv } from './csv.mjs';
 
-const esc = (v) => (/[",\n\r]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-export const toCsv = (header, rows) => `${[header, ...rows.map((r) => header.map((h) => r[h]))].map((r) => r.map(esc).join(',')).join('\n')}\n`;
+export { toCsv };
 
 /** Text of the new radar-scores.csv: computed rows regenerated, editorial rows kept. */
 export function radarCsv(data) {
@@ -23,9 +22,12 @@ export function radarCsv(data) {
   for (const [axis] of AXES) {
     for (const id of PROVIDER_IDS) {
       if (COMPUTED_AXES.includes(axis)) {
-        rows.push({ provider_id: id, axis, score: scores[id][axis].toFixed(1), basis: basis[id][axis] });
+        const score = scores[id][axis];
+        rows.push({ provider_id: id, axis, score: score === null ? 'n/a' : score.toFixed(1), basis: basis[id][axis] });
       } else {
-        rows.push(old.find((r) => r.provider_id === id && r.axis === axis));
+        const kept = old.find((r) => r.provider_id === id && r.axis === axis);
+        if (!kept) throw new Error(`radar-scores.csv has no editorial row for ${id} / ${axis}`);
+        rows.push(kept);
       }
     }
   }

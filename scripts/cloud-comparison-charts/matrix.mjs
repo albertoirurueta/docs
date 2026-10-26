@@ -3,7 +3,7 @@
 // a test keeps it in sync; regenerate with `node scripts/cloud-comparison-charts/update-derived-data.mjs`.
 import { toNumber } from '../language-charts/data-utils.mjs';
 import { PROVIDER_IDS, providerId, providerName } from './providers.mjs';
-import { architectureTotals, computeScores } from './scores.mjs';
+import { AXES, architectureTotals, computeScores } from './scores.mjs';
 
 export const FIT_LEVELS = [
   { id: 'best', label: 'Best fit', min: 0.95 },
@@ -44,13 +44,15 @@ const architectureWorkload = (arch, id, label) => ({
   },
 });
 
+const axisLabel = (axis) => (AXES.find(([a]) => a === axis)?.[1] ?? axis).toLowerCase();
+
 const axisWorkload = (axis, id, label, metric) => ({
   id, label, metric, higherIsBetter: true,
   value: (data) => {
     const s = computeScores(data);
-    const max = Math.max(...PROVIDER_IDS.map((p) => s[p][axis] ?? 0));
-    return Object.fromEntries(PROVIDER_IDS.map((p) => [p, s[p][axis] === null ? null
-      : { v: s[p][axis] / max, text: `radar score ${s[p][axis].toFixed(1)} of 10 for ${axis.replace('_', ' ')}` }]));
+    const max = Math.max(0, ...PROVIDER_IDS.map((p) => s[p][axis] ?? 0));
+    return Object.fromEntries(PROVIDER_IDS.map((p) => [p, s[p][axis] === null || !(max > 0) ? null
+      : { v: s[p][axis] / max, text: `radar score ${s[p][axis].toFixed(1)} of 10 for ${axisLabel(axis)}` }]));
   },
 });
 
