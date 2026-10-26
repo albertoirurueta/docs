@@ -1,7 +1,7 @@
 # Language charts
 
 Dependency-free Node (v18+, developed on v24) tooling that turns the CSV data behind the "Programming Languages
-Comparative" guide into SVG charts. No npm packages are needed beyond Node itself.
+Comparative" guide into SVG charts and AsciiDoc tables. No npm packages are needed beyond Node itself.
 
 ## Layout
 
@@ -12,6 +12,7 @@ Comparative" guide into SVG charts. No npm packages are needed beyond Node itsel
 | `chart-definitions.mjs` | The chart builders (`CHART_BUILDERS`): one `(data) => spec` per guide chart |
 | `scores.mjs` | 0-10 radar scores computed from the CSVs with the `data/NOTES.md` rubric |
 | `data-utils.mjs` | `isMissing` / `toNumber` shared by every module |
+| `generate-tables.mjs` | The guide's data tables and Bibliography as AsciiDoc partials (`TABLE_PARTIALS`) and the CLI |
 | `*.test.mjs` | `node --test` suites (renderers, builders, scores, every chart rendered from the real data) |
 
 ## Data format
@@ -42,7 +43,8 @@ Comparative" guide into SVG charts. No npm packages are needed beyond Node itsel
 
 All specs also need `id`, `title`, `desc`, and (except radar) `xLabel` and `yLabel` including units. Every SVG gets
 a `viewBox`, `<title>`, `<desc>`, a legend, a colour-blind-safe (Okabe-Ito) palette with distinct dash styles and
-markers, and light/dark colours through CSS variables and `@media (prefers-color-scheme: dark)`.
+markers, and one light palette through CSS variables. There is no `prefers-color-scheme` override: the site UI has no
+dark theme, so following the reader's OS setting would put dark panels on the white page.
 
 ## Adding a chart
 
@@ -74,10 +76,42 @@ Every SVG is `modules/ROOT/images/programming-languages-<id>.svg`. Suggested cap
 | `energy-vs-ease` | scatter | Energy score vs ease-of-learning score (rubric in `data/NOTES.md`) |
 | `radar-jvm`, `radar-c-family`, `radar-scripting`, `radar-scientific`, `radar-systems`, `radar-legacy` | radar | Nine-axis 0-10 radar per editorial group (a language may appear in two groups). Scores computed by `scores.mjs` from the sourced CSVs, 2026-10-26; gaps are n/a |
 
+## Generated tables
+
+`generate-tables.mjs` writes one partial per data table to
+`modules/ROOT/partials/programming-languages-comparative/<name>.adoc`, and the page includes each one with
+`include::partial$programming-languages-comparative/<name>.adoc[]`. Edit the CSVs or the generator, never the
+partials: they are overwritten on every run.
+
+| Partial | Page section | Content |
+|---|---|---|
+| `first-appearance` | Overview and timeline | First appearance, editorial group, documented (sorted by year, then name) |
+| `popularity-indices` | Popularity | TIOBE rating (rank), PYPL share, SO 2026 usage and admired |
+| `package-registries` | Ecosystem | Languages with a registry name: registry, count, unit, source |
+| `performance` | Performance | CPU and memory ratios, energy vs C, execution model |
+| `learning-curve` | Learning curve | Onboarding score, gzip source size, SO 2025 learning usage, type system |
+| `memory-safety` | Security and safety | Languages with a memory-safety classification (the caption counts the rest) |
+| `paradigms-purposes-platforms` | Versatility and platforms | Paradigms and purposes re-joined with `; `; platforms cells longer than `PLATFORM_JOIN_MIN_LENGTH` too |
+| `median-salary` | Job market | SO 2024 median salary, highest first |
+| `standards-cadence-licence` | Other metrics | Standard, release cadence, licence |
+| `radar-scores` | Radar comparisons | One column per axis returned by `computeScores` in `scores.mjs` |
+| `bibliography` | Bibliography | Source count and one table per `BIBLIOGRAPHY_GROUPS` subsection, with `[[src-<id>]]` anchors |
+
+Text cells are `+++...+++` passthroughs (so no AsciiDoc substitution applies), numbers are printed as written in
+the CSV, and missing values are `n/a`. A new `sources.csv` row goes into the first `BIBLIOGRAPHY_GROUPS` group whose
+rule matches (by id or by the files that cite it); a row no rule matches is listed under "Other sources" and the CLI
+prints a warning, so add a rule for it.
+
+The hand-written tables of the page (the metric list, the scoring rubric and the recommendations by purpose) are
+editorial and stay in the page.
+
 ## Regenerating and testing
 
 ```bash
+npm run charts && npm run tables    # write SVGs to modules/ROOT/images/ and table partials to modules/ROOT/partials/
 npm run charts                      # write SVGs to modules/ROOT/images/
+npm run tables                      # write the table partials only
+node scripts/language-charts/generate-tables.mjs --out /tmp/tables  # write elsewhere
 node scripts/language-charts/generate-charts.mjs --out /tmp/charts   # write elsewhere
 npm run test:charts                 # node --test "scripts/language-charts/*.test.mjs"
 ```

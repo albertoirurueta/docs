@@ -13,7 +13,8 @@ function assertWellFormed(svg) {
   assert.match(svg, /^<svg [^>]*viewBox="0 0 \d+ \d+"/);
   assert.match(svg, /<title[^>]*>[^<]+<\/title>/);
   assert.match(svg, /<desc[^>]*>[^<]+<\/desc>/);
-  assert.match(svg, /prefers-color-scheme: dark/);
+  assert.doesNotMatch(svg, /prefers-color-scheme/);
+  assert.doesNotMatch(svg, /currentColor/);
   assert.match(svg, /class="legend"/);
   assert.ok(svg.trimEnd().endsWith('</svg>'));
   assert.doesNotMatch(svg, /&(?!amp;|lt;|gt;|quot;|apos;)/);
@@ -149,4 +150,33 @@ test('real data files load and keep n/a as missing', () => {
     series: [{ name: 'Java', points: hist.map((r) => ({ x: r.year, y: r.value })) }],
   });
   assertWellFormed(svg);
+});
+
+test('square markers take their series colour from the class, not an inline style', () => {
+  const svg = renderLineChart({
+    id: 'sq', title: 'T', desc: 'D', xLabel: 'Year', yLabel: 'Value',
+    series: [{ name: 'A', points: [{ x: 1, y: 1 }, { x: 2, y: 2 }] }, { name: 'B', points: [{ x: 1, y: 2 }, { x: 2, y: 3 }] }],
+  });
+  const squares = [...svg.matchAll(/<rect class="m1"[^>]*>/g)].map((m) => m[0]);
+  assert.ok(squares.length > 0);
+  for (const s of squares) assert.doesNotMatch(s, /style=/);
+  assert.match(svg, /\.m1\{fill:var\(--s1\)/);
+});
+
+test('the CLI rejects --out without a directory', async () => {
+  const { spawnSync } = await import('node:child_process');
+  const r = spawnSync(process.execPath, [new URL('./generate-charts.mjs', import.meta.url).pathname, '--out'], { encoding: 'utf8' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /Usage:/);
+});
+
+test('legend columns are wide enough for the longest name', () => {
+  const long = 'C and C++ (combined entry)';
+  const svg = renderLineChart({
+    id: 'lg', title: 'T', desc: 'D', xLabel: 'X', yLabel: 'Y',
+    series: [{ name: long, points: [{ x: 1, y: 1 }] }, { name: 'B', points: [{ x: 1, y: 2 }] }],
+  });
+  const xs = [...svg.matchAll(/<text x="(\d+(?:\.\d+)?)" y="[\d.]+">([^<]+)<\/text>/g)].filter((m) => m[2] === long.replace(/&/g, '&amp;') || m[2] === 'B').map((m) => Number(m[1]));
+  assert.equal(xs.length, 2);
+  assert.ok(xs[1] - xs[0] >= long.length * 6.6, `${xs}`);
 });

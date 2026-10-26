@@ -80,13 +80,13 @@ Normalisation helpers: `lin(x) = 10 * (x - min) / (max - min)`; `loginv(x) = 10 
 | Axis | Inputs | Formula | Anchors |
 |---|---|---|---|
 | Popularity | TIOBE rating (`popularity-current.csv`), Stack Overflow usage | mean of `log` score of TIOBE rating and `lin` of SO usage; if only one exists use it and flag it | 10 = highest in set, 0 = lowest |
-| Ecosystem | registry packages, `actively_maintained`, standard exists | `log` score of packages (60%), plus 2 points for an active release in the last 12 months, plus 2 points for a formal standard; capped at 10; `n/a` if there is no registry count | 10 = largest registry with active releases and a standard |
+| Ecosystem | registry packages, `actively_maintained` | `log` score of packages (80%), plus 2 points for an active release in the last 12 months; `n/a` if there is no registry count. A formal standard is not scored: its absence is rarely verified, so a bonus for it penalised missing data | 10 = largest registry with active releases |
 | Performance | `cpu_time_vs_fastest` | `loginv` of the CPU ratio | 10 = fastest in the Benchmarks Game set, 0 = slowest |
 | Memory | `memory_vs_fastest` | `loginv` of the memory ratio | 10 = least memory, 0 = most |
 | Energy | `energy_normalized` | `loginv` of the energy ratio | 10 = C (1.00), 0 = worst in Pereira et al. |
 | Learning curve (ease) | onboarding score, verbosity, type system | mean of the onboarding score (already 0 to 10) and `loginv` of gzip bytes; type system is shown but not scored | 10 = all four official onboarding checks pass and the shortest sources |
 | Safety | `memory_safety` | `memory-safe` = 10, `memory-safe unless unsafe construct` = 8, `not memory safe` = 2; `n/a` otherwise | anchors fixed by the cited CISA, ONCD classification |
-| Versatility | `platforms`, `purposes` | `lin` of the number of distinct purposes listed in `versatility.csv` | 10 = most listed purposes |
+| Versatility | `versatility-domains.csv` | `10 * yes / 9` over the nine application domains (see "Versatility domains" below); `n/a` when fewer than 5 domains are known | 10 = all nine domains confirmed by a cited source |
 | Job market | Stack Overflow median salary, optional | `lin` of median salary (USD, 2024 survey) | optional axis, omitted when fewer than 10 languages have data |
 
 ### Onboarding score (used by the Learning axis)
@@ -105,3 +105,36 @@ be answered. `n/a` checks are excluded from the denominator, so a language is no
 
 Charts must be regenerated from these CSVs only. When a source publishes a new edition, replace the rows, update the
 `edition` and `retrieved` columns and the entry in `sources.csv`, and rerun the generator.
+
+## Versatility domains
+
+`versatility-domains.csv` replaces the old Versatility input (a count of Wikipedia lead phrases). It holds one row
+per language and domain (35 x 9 = 315 rows), all retrieved on 2026-10-26. The 9 domains are:
+
+| Slug | Domain |
+|---|---|
+| `web-frontend` | browser front-end (client-side web UI) |
+| `backend` | server-side and web back-end services |
+| `mobile` | mobile apps (Android, iOS) |
+| `desktop` | desktop GUI applications |
+| `embedded` | embedded systems, microcontrollers, firmware |
+| `systems` | operating systems, kernels, drivers, low-level systems programming |
+| `data-ai` | data analysis, data science, machine learning and AI |
+| `scientific-hpc` | scientific, numerical and high-performance computing |
+| `mainframe` | mainframes (IBM Z, z/OS, System/360 lineage) |
+
+Rules for `value`:
+
+- `yes` only when a source that was read says the language is used for, or officially targets, that domain: the
+  language's official docs, the official docs of a widely used framework or toolchain for the domain (for example
+  Flutter, .NET MAUI, React Native, the Android NDK, IBM z/OS SDKs), or the language's Wikipedia article.
+  WebAssembly or Emscripten alone does not count as `web-frontend`, unless the language's own docs present browser
+  front-end development as a supported use.
+- `no` when a source puts the domain outside the language's reach, or when it is clearly outside it by the
+  language's nature. The reasoning is stated in `note`, and the source is the language's Wikipedia article.
+- `n/a` when it could not be verified (source `n/a`). A `yes` is never guessed.
+
+Score: `versatility = 10 * yes / 9`, the share of all nine domains a cited source confirms. An `n/a` domain counts as
+not confirmed, so the score is a lower bound, and it is `null` when fewer than 5 of the 9 domains are known (yes or
+no). Excluding `n/a` from the denominator was rejected: a language with five verified domains, all `yes`, would score
+10 next to one with nine.

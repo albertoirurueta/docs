@@ -112,9 +112,9 @@ export function formatTick(v) {
   return String(roundTo(v, 2));
 }
 
-// Okabe-Ito palette (colour-blind safe); dark mode uses lighter variants of the same hues.
+// Okabe-Ito palette (colour-blind safe). The site UI has no dark theme, so the charts use one light palette instead
+// of following the reader's OS colour scheme, which would put dark panels on the white page.
 const LIGHT = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#E69F00', '#56B4E9', '#7A6A00', '#000000'];
-const DARK = ['#56B4E9', '#E69F00', '#44C9A0', '#E8A0CB', '#F0E442', '#7FB8F0', '#D9C84A', '#FFFFFF'];
 const DASHES = ['', '6 3', '2 2', '8 3 2 3', '4 4', '10 3', '1 3', '6 2 1 2'];
 const MARKERS = ['circle', 'square', 'triangle', 'diamond', 'cross', 'circle', 'square', 'triangle'];
 export const PALETTE_SIZE = LIGHT.length;
@@ -123,7 +123,6 @@ function styleBlock() {
   const vars = (p) => p.map((c, i) => `--s${i}:${c};`).join('');
   return `<style>
 :root{--bg:#ffffff;--fg:#1f2328;--muted:#59636e;--grid:#d1d9e0;--axis:#59636e;${vars(LIGHT)}}
-@media (prefers-color-scheme: dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--grid:#30363d;--axis:#9198a1;${vars(DARK)}}}
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:var(--fg);font-size:12px}
 .title{font-size:16px;font-weight:600}.muted{fill:var(--muted)}.axis-label{font-size:12px;fill:var(--muted)}
 .grid{stroke:var(--grid);stroke-width:1;fill:none}.axis{stroke:var(--axis);stroke-width:1;fill:none}
@@ -134,7 +133,7 @@ text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:var(-
 function markerShape(kind, x, y, cls, r = 4) {
   const c = `class="${cls}"`;
   switch (kind) {
-    case 'square': return `<rect ${c} x="${fmt(x - r)}" y="${fmt(y - r)}" width="${2 * r}" height="${2 * r}" style="fill:var(--bg-m,currentColor)"/>`;
+    case 'square': return `<rect ${c} x="${fmt(x - r)}" y="${fmt(y - r)}" width="${2 * r}" height="${2 * r}"/>`;
     case 'triangle': return `<path ${c} d="M${fmt(x)} ${fmt(y - r - 1)}L${fmt(x + r + 1)} ${fmt(y + r)}L${fmt(x - r - 1)} ${fmt(y + r)}Z"/>`;
     case 'diamond': return `<path ${c} d="M${fmt(x)} ${fmt(y - r - 1)}L${fmt(x + r + 1)} ${fmt(y)}L${fmt(x)} ${fmt(y + r + 1)}L${fmt(x - r - 1)} ${fmt(y)}Z"/>`;
     case 'cross': return `<path ${c} d="M${fmt(x - r)} ${fmt(y - r)}L${fmt(x + r)} ${fmt(y + r)}M${fmt(x + r)} ${fmt(y - r)}L${fmt(x - r)} ${fmt(y + r)}" style="fill:none;stroke-width:2"/>`;
@@ -156,7 +155,8 @@ function seriesCss(count) {
 }
 
 function legend(names, x, y, width, { lines = true } = {}) {
-  const itemW = 150;
+  // Column width fits the longest name (about 6.6px per character after the 30px swatch) so labels never overlap.
+  const itemW = Math.max(150, Math.ceil(Math.max(0, ...names.map((n) => String(n).length)) * 6.6) + 44);
   const perRow = Math.max(1, Math.floor(width / itemW));
   const parts = [];
   names.forEach((name, i) => {
@@ -428,7 +428,7 @@ export const CHART_DEFINITIONS = [...CHART_BUILDERS];
 /** Loads every CSV in the data directory into a { name: rows } map (name without extension). */
 export function loadData(dir = DATA_DIR) {
   const names = ['languages', 'popularity-current', 'popularity-history', 'ecosystem', 'ecosystem-history', 'performance',
-    'energy', 'learning', 'learning-so', 'onboarding-checks', 'security', 'versatility', 'jobs', 'sources'];
+    'energy', 'learning', 'learning-so', 'onboarding-checks', 'security', 'versatility', 'versatility-domains', 'jobs', 'sources'];
   return Object.fromEntries(names.map((n) => [n, readCsv(`${n}.csv`, dir)]));
 }
 
@@ -445,6 +445,11 @@ export function generateCharts(definitions, data, outDir) {
 
 function main(argv) {
   const i = argv.indexOf('--out');
+  if (i >= 0 && (argv[i + 1] === undefined || argv[i + 1].startsWith('--'))) {
+    console.error('Usage: node scripts/language-charts/generate-charts.mjs [--out <dir>]');
+    process.exitCode = 2;
+    return;
+  }
   const outDir = i >= 0 ? resolve(argv[i + 1]) : DEFAULT_OUT_DIR;
   const files = generateCharts(CHART_DEFINITIONS, loadData(), outDir);
   console.log(`Wrote ${files.length} chart(s) to ${outDir}`);

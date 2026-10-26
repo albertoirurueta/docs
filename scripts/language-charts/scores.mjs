@@ -1,6 +1,6 @@
 // Radar-chart scores (0 to 10 per axis), computed from the CSV data exactly as the rubric in data/NOTES.md says.
 // No score is typed by hand. A missing input gives null (a gap in the chart), never 0.
-import { isMissing, toNumber } from './data-utils.mjs';
+import { toNumber } from './data-utils.mjs';
 
 export const AXES = ['Popularity', 'Ecosystem', 'Performance', 'Memory', 'Energy', 'Learning (ease)', 'Safety', 'Versatility', 'Job market'];
 
@@ -51,11 +51,26 @@ function scoreMap(map, score) {
 
 const SAFETY = { 'memory-safe': 10, 'memory-safe unless unsafe construct': 8, 'not memory safe': 2 };
 
-/** Number of distinct purposes in a `;` separated list, or null when the list is missing. */
-export function countPurposes(value) {
-  if (isMissing(value)) return null;
-  const set = new Set(String(value).split(';').map((p) => p.trim().toLowerCase()).filter((p) => p !== '' && p !== 'n/a'));
-  return set.size > 0 ? set.size : null;
+/** The application domains checked for the Versatility axis (versatility-domains.csv). */
+export const DOMAINS = ['web-frontend', 'backend', 'mobile', 'desktop', 'embedded', 'systems', 'data-ai', 'scientific-hpc', 'mainframe'];
+
+/** Minimum number of domains with a known yes/no value for a Versatility score. */
+export const MIN_KNOWN_DOMAINS = 5;
+
+/**
+ * `10 * yes / 9`: the share of all nine domains that a cited source confirms, so an unverified (n/a) domain counts as
+ * not confirmed and the score is a lower bound. Null when fewer than MIN_KNOWN_DOMAINS domains are known (yes or no),
+ * so a language with too little data gets a gap rather than a low score.
+ */
+export function domainScore(rows, id) {
+  let yes = 0;
+  let known = 0;
+  for (const r of rows) {
+    if (r.language_id !== id || !DOMAINS.includes(r.domain)) continue;
+    const v = String(r.value).trim().toLowerCase();
+    if (v === 'yes') { yes++; known++; } else if (v === 'no') known++;
+  }
+  return known >= MIN_KNOWN_DOMAINS ? (10 * yes) / DOMAINS.length : null;
 }
 
 /**
@@ -75,17 +90,16 @@ export function computeScores(data) {
     return [id, parts.length ? parts.reduce((a, b) => a + b, 0) / parts.length : null];
   }));
 
-  // Ecosystem: 60% of the log score of registry packages, +2 for an actively maintained implementation, +2 for a
-  // formal standard, capped at 10. n/a without a registry count.
+  // Ecosystem: 80% of the log score of registry packages, +2 for an actively maintained implementation. n/a without a
+  // registry count. A formal standard is not scored: its absence is rarely verified, so it penalised missing data.
   const eco = data.ecosystem;
   const packages = scoreMap(numericMap(eco, (r) => r.metric === 'registry_packages'), logScore);
-  const flag = (metric, test) => new Map(eco.filter((r) => r.metric === metric).map((r) => [r.language_id, test(r.value)]));
-  const active = flag('actively_maintained', (v) => String(v).trim().toLowerCase() === 'yes');
-  const standard = flag('standardisation_body', (v) => !isMissing(v));
+  const active = new Map(eco.filter((r) => r.metric === 'actively_maintained')
+    .map((r) => [r.language_id, String(r.value).trim().toLowerCase() === 'yes']));
   const ecosystem = new Map(ids.map((id) => {
     const p = packages.get(id);
     if (!finite(p)) return [id, null];
-    return [id, Math.min(10, 0.6 * p + (active.get(id) ? 2 : 0) + (standard.get(id) ? 2 : 0))];
+    return [id, 0.8 * p + (active.get(id) ? 2 : 0)];
   }));
 
   const perf = data.performance;
@@ -106,9 +120,7 @@ export function computeScores(data) {
   const safety = new Map(data.security.filter((r) => r.metric === 'memory_safety')
     .map((r) => [r.language_id, SAFETY[String(r.value).trim().toLowerCase()] ?? null]));
 
-  const purposeCounts = new Map(data.versatility.filter((r) => r.metric === 'purposes')
-    .map((r) => [r.language_id, countPurposes(r.value)]).filter(([, n]) => n !== null));
-  const versatility = scoreMap(purposeCounts, linScore);
+  const versatility = new Map(ids.map((id) => [id, domainScore(data['versatility-domains'] ?? [], id)]));
 
   const jobs = scoreMap(numericMap(data.jobs, (r) => r.source === 'so-survey-2024' && r.metric === 'so-median-salary'), linScore);
 

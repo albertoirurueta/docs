@@ -9,7 +9,7 @@ import {
 import {
   firstYear, licenceFamily, purposeKind, sortItems, historySeries, registryLabel, growthPoints, RADAR_GROUPS,
 } from './chart-definitions.mjs';
-import { linScore, logScore, logInvScore, countPurposes, computeScores, AXES } from './scores.mjs';
+import { linScore, logScore, logInvScore, domainScore, computeScores, AXES, DOMAINS } from './scores.mjs';
 
 const near = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} != ${b}`);
 const data = loadData();
@@ -99,8 +99,10 @@ test('score helpers: lin, log and inverse log', () => {
   assert.equal(linScore(null, 0, 1), null);
   assert.equal(logScore(0, 1, 2), null);
   near(linScore(3, 3, 3), 10);
-  assert.equal(countPurposes('a; b ;A;'), 2);
-  assert.equal(countPurposes('n/a'), null);
+  const dom = (id, values) => values.map((value, i) => ({ language_id: id, domain: DOMAINS[i], value }));
+  near(domainScore(dom('a', ['yes', 'yes', 'no', 'no', 'yes', 'n/a']), 'a'), 10 * 3 / 9);
+  assert.equal(domainScore(dom('a', ['yes', 'yes', 'no', 'n/a', 'n/a']), 'a'), null, 'fewer than 5 known domains');
+  assert.equal(domainScore([{ language_id: 'a', domain: 'cooking', value: 'yes' }], 'a'), null, 'unknown domains ignored');
 });
 
 test('computeScores follows the rubric on a small fixture and keeps n/a as null', () => {
@@ -139,10 +141,11 @@ test('computeScores follows the rubric on a small fixture and keeps n/a as null'
       { language_id: 'b', metric: 'memory_safety', value: 'not memory safe' },
       { language_id: 'c', metric: 'memory_safety', value: 'n/a' },
     ],
-    versatility: [
-      { language_id: 'a', metric: 'purposes', value: 'x;y;z' },
-      { language_id: 'b', metric: 'purposes', value: 'x' },
-      { language_id: 'c', metric: 'purposes', value: 'n/a' },
+    versatility: [],
+    'versatility-domains': [
+      ...DOMAINS.map((domain) => ({ language_id: 'a', domain, value: 'yes' })),
+      ...DOMAINS.map((domain) => ({ language_id: 'b', domain, value: 'no' })),
+      ...DOMAINS.map((domain) => ({ language_id: 'c', domain, value: 'n/a' })),
     ],
     jobs: [{ language_id: 'a', source: 'so-survey-2024', metric: 'so-median-salary', value: '100' }],
   };
@@ -152,7 +155,7 @@ test('computeScores follows the rubric on a small fixture and keeps n/a as null'
   const b = scores.get('b');
   const c = scores.get('c');
   near(a[0], 10); near(b[0], 0);                     // popularity: mean of log(TIOBE) and lin(SO)
-  near(a[1], 0.6 * 10 + 2 + 2); near(b[1], 0);       // ecosystem: log packages, active, standard
+  near(a[1], 0.8 * 10 + 2); near(b[1], 0);           // ecosystem: log packages and active; no standard bonus
   near(a[2], 10); near(b[2], 0); assert.equal(c[2], null);
   near(a[3], 10); near(b[3], 10);                    // equal memory ratios: all best
   near(a[4], 10); near(b[4], 0); assert.equal(c[4], null);
