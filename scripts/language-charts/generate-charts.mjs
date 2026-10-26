@@ -212,7 +212,7 @@ function cartesianFrame({ plot, xScale, yScale, xTicks, yTicks, xLabel, yLabel, 
 // ---------------------------------------------------------------- line chart
 
 /**
- * Spec: {id,title,desc,xLabel,yLabel,series:[{name,points:[{x,y}]}], yZero?, width?, height?}
+ * Spec: {id,title,desc,xLabel,yLabel,series:[{name,points:[{x,y}]}], yZero?, xFormat?, width?, height?}
  * A point with y null/NaN/'n/a' is a gap: the line is broken there and nothing is drawn.
  */
 export function renderLineChart(spec) {
@@ -234,7 +234,7 @@ export function renderLineChart(spec) {
   const xScale = linearScale(xSc.min, xSc.max, plot.l, plot.r);
   const yScale = linearScale(ySc.min, ySc.max, plot.b, plot.t);
   let body = `<g transform="translate(0 44)">${lg.svg}</g>`;
-  body += cartesianFrame({ plot, xScale, yScale, xTicks: xSc.ticks, yTicks: ySc.ticks, xLabel: spec.xLabel, yLabel: spec.yLabel, xFormat: (v) => String(v) });
+  body += cartesianFrame({ plot, xScale, yScale, xTicks: xSc.ticks, yTicks: ySc.ticks, xLabel: spec.xLabel, yLabel: spec.yLabel, xFormat: spec.xFormat ?? ((v) => String(v)) });
   series.forEach((s, i) => {
     const segments = [];
     let cur = [];
