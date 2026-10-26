@@ -89,7 +89,7 @@ export function niceScale(values, { zero = false, maxTicks = 6 } = {}) {
   return { min: roundTo(min, 10), max: roundTo(max, 10), step, ticks };
 }
 
-function roundTo(v, digits) { return Number(v.toFixed(digits)); }
+export function roundTo(v, digits) { return Number(v.toFixed(digits)); }
 
 /** Linear mapping from a domain to a pixel range. */
 export function linearScale(d0, d1, r0, r1) {
@@ -104,7 +104,7 @@ export function escapeXml(s) {
     .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-const fmt = (n) => String(roundTo(n, 2));
+export const fmt = (n) => String(roundTo(n, 2));
 
 export function formatTick(v) {
   if (Math.abs(v) >= 1e6) return `${roundTo(v / 1e6, 2)}M`;
@@ -119,7 +119,7 @@ const DASHES = ['', '6 3', '2 2', '8 3 2 3', '4 4', '10 3', '1 3', '6 2 1 2'];
 const MARKERS = ['circle', 'square', 'triangle', 'diamond', 'cross', 'circle', 'square', 'triangle'];
 export const PALETTE_SIZE = LIGHT.length;
 
-function styleBlock() {
+export function styleBlock() {
   const vars = (p) => p.map((c, i) => `--s${i}:${c};`).join('');
   return `<style>
 :root{--bg:#ffffff;--fg:#1f2328;--muted:#59636e;--grid:#d1d9e0;--axis:#59636e;${vars(LIGHT)}}
@@ -130,7 +130,7 @@ text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:var(-
 </style>`;
 }
 
-function markerShape(kind, x, y, cls, r = 4) {
+export function markerShape(kind, x, y, cls, r = 4) {
   const c = `class="${cls}"`;
   switch (kind) {
     case 'square': return `<rect ${c} x="${fmt(x - r)}" y="${fmt(y - r)}" width="${2 * r}" height="${2 * r}"/>`;
@@ -142,7 +142,7 @@ function markerShape(kind, x, y, cls, r = 4) {
 }
 
 /** Per-series classes: stroke/fill colour from CSS variables. */
-function seriesCss(count) {
+export function seriesCss(count) {
   let css = '';
   for (let i = 0; i < count; i++) {
     const k = i % PALETTE_SIZE;
@@ -154,7 +154,7 @@ function seriesCss(count) {
   return `<style>${css}</style>`;
 }
 
-function legend(names, x, y, width, { lines = true } = {}) {
+export function legend(names, x, y, width, { lines = true } = {}) {
   // Column width fits the longest name (about 6.6px per character after the 30px swatch) so labels never overlap.
   const itemW = Math.max(150, Math.ceil(Math.max(0, ...names.map((n) => String(n).length)) * 6.6) + 44);
   const perRow = Math.max(1, Math.floor(width / itemW));
@@ -173,7 +173,7 @@ function legend(names, x, y, width, { lines = true } = {}) {
   return { svg: `<g class="legend">${parts.join('')}</g>`, height: rows * 20 };
 }
 
-function wrap({ width, height, title, desc, body, seriesCount, id }) {
+export function wrap({ width, height, title, desc, body, seriesCount, id }) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-labelledby="${id}-t ${id}-d">
 <title id="${id}-t">${escapeXml(title)}</title>
 <desc id="${id}-d">${escapeXml(desc)}</desc>
@@ -191,7 +191,7 @@ function requireFields(spec, fields) {
 }
 
 /** Axes, grid and axis labels for cartesian charts. */
-function cartesianFrame({ plot, xScale, yScale, xTicks, yTicks, xLabel, yLabel, xFormat = formatTick, yFormat = formatTick, height }) {
+export function cartesianFrame({ plot, xScale, yScale, xTicks, yTicks, xLabel, yLabel, xFormat = formatTick, yFormat = formatTick, height }) {
   const g = [];
   for (const t of yTicks) {
     const y = yScale(t);
