@@ -28,6 +28,11 @@ Re-probed on 2026-10-27, after full network access was granted:
   are marked "(unverified)" in `sources.csv`.
 * Consequences: GitHub stars come from deps.dev (a snapshot), contributor counts and stars over time are `n/a`, CVE ids
   come from OSV aliases, and long-term PyPI history is `n/a`.
+* Stars over time, alternatives checked on 2026-10-27: GH Archive on BigQuery (`githubarchive` dataset, `WatchEvent`
+  per repository and year) needs a Google Cloud project, which the authoring environment does not have; the public
+  ClickHouse `github_events` playground only holds events from 2023-01-13 to 2026-07-02, with uneven ingestion (71.3M
+  stars in 2023, 8.4M in 2025), so it cannot give a yearly history. The yearly history is left to a follow-up run with
+  BigQuery credentials or a GitHub token; the pages say so.
 
 The fetch scripts were run from a scratch directory and are not part of the repository. Each dataset section below
 names the endpoint and the method, so the data can be fetched again.
@@ -228,7 +233,7 @@ An axis without inputs for a framework is `n/a` (never zero) and the radar shows
 
 | Axis | Page | Kind | Rule |
 |---|---|---|---|
-| `popularity` | both | Computed | Mean of the available signals, each scaled to 0-1 and then × 10: Stack Overflow 2025 usage (all respondents) / largest value on the page; registry downloads on a log scale within one registry, `log10(x) / log10(max in that registry)` (npm 12 months, PyPI and Packagist 30 days, crates.io and Hex 90 days, NuGet and RubyGems totals); GitHub stars on the same log scale; HTTP Archive origins on the same log scale (web page) |
+| `popularity` | both | Computed | Mean of the available signals, each scaled to 0-1 and then × 10: Stack Overflow 2025 usage (all respondents) / largest value on the page; registry downloads on a log scale within one registry, `log10(x) / log10(max in that registry)` (npm 12 months, PyPI and Packagist 30 days, crates.io and Hex 90 days, NuGet and RubyGems totals), a framework with primary packages on several registries being scored in the registry with the most frameworks on the page (ties: npm, PyPI, Packagist, crates.io, Hex, NuGet, RubyGems), so Inertia is ranked on npm rather than against Livewire alone on Packagist; GitHub stars on the same log scale; HTTP Archive origins on the same log scale (web page) |
 | `growth` | both | Computed | Mean of the available signals; each signal is `g = ln(now / then)`, scaled min-max to 0-10 across the frameworks on the page that have it. Signals: Stack Overflow usage 2023 to 2025, npm downloads (12 months to 2026-06 against the 12 months before), Packagist average daily downloads (same windows), State of JS usage 2023 to 2025 |
 | `talent_jobs` | both | Computed | Mean of Stack Overflow 2025 professional usage / largest value and Hacker News 2025 mention share / largest value, × 10 |
 | `ease_of_use` | both | Editorial | Concepts to learn before the first endpoint or page, amount of configuration, conventions against configuration, quality of the official tutorial and documentation; supporting signals: Stack Overflow admired, State of JS retention |

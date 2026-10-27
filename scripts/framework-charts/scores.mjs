@@ -31,12 +31,19 @@ export function popularityInputs(data, ids) {
   const so = Object.fromEntries(ids.map((id) => [id, metricValue(data.popularity, id, 'so_usage_all', '2025')]));
   const soMax = maxOf(Object.values(so));
   for (const id of ids) out[id].so_usage = ratio(so[id], soMax);
+  // A framework with primary packages on several registries is scored in the registry with the most frameworks on the
+  // page (ties: REGISTRY_MEASURES order), the widest comparison available, never in whichever registry comes last.
+  const peers = {};
   for (const [file, period] of REGISTRY_MEASURES) {
     const vals = registryValues(data, file, period);
     const inPage = ids.filter((id) => vals[id] !== undefined);
     if (inPage.length < 2) continue; // a registry with one framework on the page says nothing relative
     const max = Math.max(...inPage.map((id) => vals[id]));
-    for (const id of inPage) out[id].downloads = logRatio(vals[id], max);
+    for (const id of inPage) {
+      if (peers[id] !== undefined && peers[id] >= inPage.length) continue;
+      peers[id] = inPage.length;
+      out[id].downloads = logRatio(vals[id], max);
+    }
   }
   const origins = Object.fromEntries(ids.map((id) => [id, metricValue(data.popularity, id, 'httparchive_origins_mobile')]));
   const oMax = maxOf(Object.values(origins));
@@ -95,11 +102,13 @@ export function talentScores(data, ids) {
   return Object.fromEntries(ids.map((id) => [id, round1(clamp10(mean([ratio(prof[id], pMax), ratio(hn[id], hMax)].map((v) => (v === null ? null : 10 * v)))))]));
 }
 
-/** Best TechEmpower round-23 fortunes result over a framework's variants. */
-export function fortunesRps(data, id) {
-  const vals = data['performance-techempower'].filter((r) => r.framework_id === id && r.round === '23' && r.test === 'fortunes').map((r) => num(r.rps)).filter((v) => v !== null);
+/** Best TechEmpower round-23 result of one test over a framework's variants; null when it has none. */
+export function bestRps(data, id, test) {
+  const vals = data['performance-techempower'].filter((r) => r.framework_id === id && r.round === '23' && r.test === test).map((r) => num(r.rps)).filter((v) => v !== null);
   return vals.length ? Math.max(...vals) : null;
 }
+/** Best TechEmpower round-23 fortunes result over a framework's variants. */
+export const fortunesRps = (data, id) => bestRps(data, id, 'fortunes');
 /** throughput = 10 x (1 - log10(best / rps) / 2), clamped. */
 export function throughputScores(data, ids) {
   const rps = Object.fromEntries(ids.map((id) => [id, fortunesRps(data, id)]));
@@ -136,8 +145,13 @@ export function editorialScores(data) {
   return out;
 }
 
-/** All radar scores: { backend|web|css: { fid: { axis: score|null } } }. */
+const SCORE_CACHE = new WeakMap();
+/** All radar scores: { backend|web|css: { fid: { axis: score|null } } }, computed once per data object. */
 export function computeScores(data) {
+  if (!SCORE_CACHE.has(data)) SCORE_CACHE.set(data, scoresOf(data));
+  return SCORE_CACHE.get(data);
+}
+function scoresOf(data) {
   const ed = editorialScores(data);
   const result = {};
   const backendIds = frameworksOf(data, 'backend').map((f) => f.id);

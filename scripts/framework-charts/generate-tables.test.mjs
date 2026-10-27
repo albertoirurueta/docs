@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadData } from './generate-charts.mjs';
 import { frameworksOf } from './frameworks.mjs';
-import { TABLE_PARTIALS, bibliography, citedSources, comparisonTable, generateTables, nameCell, scopeTable } from './generate-tables.mjs';
+import { TABLE_PARTIALS, bibliography, citedSources, comparisonTable, generateTables, nameCell, otherMetricsTable, scopeTable } from './generate-tables.mjs';
 
 const data = loadData();
 
@@ -70,4 +70,22 @@ test('table generation is deterministic and writes every partial', () => {
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });
   }
+});
+
+test('advisory totals never count n/a years as zero', () => {
+  const [a, b] = frameworksOf(data, 'backend').map((f) => f.id);
+  const adv = (id, period, value) => ({ framework_id: id, metric: 'advisories', period, value });
+  const t = otherMetricsTable({ ...data, security: [adv(a, '2021', '2'), adv(a, '2022', 'n/a'), adv(b, '2021', 'n/a')] }, 'backend');
+  const cellAfter = (id) => { const lines = t.split('\n'); const i = lines.findIndex((l) => l.includes(data.frameworks.find((f) => f.id === id).name)); return lines[i + 1]; };
+  assert.equal(cellAfter(a), '|2 (partial)');
+  assert.equal(cellAfter(b), '|n/a');
+});
+
+test('a site_xref of n/a is not reported as on this site', () => {
+  const f = frameworksOf(data, 'backend').find((x) => x.site_xref);
+  const t = scopeTable({ ...data, frameworks: data.frameworks.map((x) => (x.id === f.id ? { ...x, site_xref: 'n/a' } : x)) }, 'backend');
+  const lines = t.split('\n');
+  const i = lines.findIndex((l) => l.includes(`[${f.name}]`));
+  assert.ok(i >= 0);
+  assert.equal(lines[i + 7], '|no');
 });

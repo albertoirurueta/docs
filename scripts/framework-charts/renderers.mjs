@@ -3,6 +3,7 @@
 // new type is a release timeline (first release, major versions and end-of-life dates per framework).
 import { escapeXml, fmt, linearScale, markerShape, renderChart, wrap } from '../language-charts/generate-charts.mjs';
 import { toNumber } from '../language-charts/data-utils.mjs';
+import { decimalYear } from './frameworks.mjs';
 import { addFooter, renderGrid, renderGroupedBarChart, renderPanelBars, wrapText } from '../cloud-comparison-charts/renderers.mjs';
 
 /**
@@ -20,6 +21,8 @@ export function renderTimeline(spec) {
   const top = 74;
   const plot = { l: 24 + labelW, r: width - 30, t: top, b: top + spec.rows.length * rowH };
   const x = linearScale(spec.from, spec.to, plot.l, plot.r);
+  // Active rows end at the snapshot date the legend names, not at the right edge of the axis.
+  const asOf = /^\d{4}-\d{2}-\d{2}$/.test(String(spec.asOf)) ? decimalYear(spec.asOf) : spec.to;
   let body = '';
   // legend
   body += `<g class="legend"><rect class="f0" x="70" y="40" width="24" height="8"/><text x="100" y="48">active (first release to ${escapeXml(String(spec.asOf ?? 'today'))})</text>`
@@ -38,7 +41,7 @@ export function renderTimeline(spec) {
     const s = toNumber(r.start);
     if (s === null) { body += `<text class="na" x="${plot.l + 6}" y="${cy + 4}">n/a</text>`; return; }
     const sx = x(Math.max(s, spec.from));
-    const e = toNumber(r.end) ?? spec.to;
+    const e = toNumber(r.end) ?? asOf;
     const ex = x(Math.min(e, spec.to));
     const tip = `<title>${escapeXml(`${r.label}: first release ${r.startLabel ?? s}${r.eolLabel ? `, end of life ${r.eolLabel}` : ''}`)}</title>`;
     body += r.legacy

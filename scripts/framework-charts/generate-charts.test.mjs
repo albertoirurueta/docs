@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { toNumber, isMissing } from '../language-charts/data-utils.mjs';
@@ -145,6 +145,17 @@ test('popularity uses only registries shared by two frameworks and ignores singl
   assert.equal(p.a.so_usage, null);
 });
 
+test('a framework on several registries is scored in the registry with the most frameworks on the page', () => {
+  const r = (id, v, period) => ({ framework_id: id, primary: 'yes', period, value: String(v) });
+  const d = fixture({
+    'downloads-npm': [r('a', 1e6, 'last-12-months'), r('b', 1e3, 'last-12-months'), r('c', 1e2, 'last-12-months')],
+    'downloads-packagist': [r('b', 99, 'last-30-days'), r('d', 100, 'last-30-days')],
+  });
+  const p = popularityInputs(d, ['a', 'b', 'c', 'd']);
+  assert.equal(p.b.downloads, 0.5, 'npm (3 frameworks) wins over Packagist (2), whatever the processing order');
+  assert.equal(p.d.downloads, 1);
+});
+
 test('growth is min-max scaled per signal and null without two values', () => {
   const h = (id, period, v) => ({ framework_id: id, metric: 'so_usage_all', period, value: String(v) });
   const g = growthScores(fixture({ 'popularity-history': [h('a', '2023', 10), h('a', '2025', 20), h('b', '2023', 10), h('b', '2025', 10), h('c', '2025', 5)] }), ['a', 'b', 'c']);
@@ -226,10 +237,28 @@ test('a chart whose data is entirely n/a is skipped and reported', () => {
   assert.ok(so.skip, 'so-usage should be skipped');
   const dir = mkdtempSync(join(tmpdir(), 'fw-skip-'));
   try {
+    const stale = join(dir, `${so.file}.svg`);
+    writeFileSync(stale, '<svg/>');
     const { written, skipped } = generateCharts([CHART_DEFINITIONS[1]], empty, dir);
     assert.equal(written.length, 0);
     assert.equal(skipped.length, 1);
+    assert.equal(existsSync(stale), false, 'the previous SVG of a skipped chart must be deleted');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('active timeline rows end at the snapshot date, not at the right edge of the axis', () => {
+  const t = (asOf) => renderTimeline({ id: 't', title: 'T', desc: 'D', xLabel: 'Year', from: 2000, to: 2027, asOf, rows: [{ label: 'A', start: 2010 }] });
+  const width = (svg) => Number(svg.match(/<rect class="f0" x="[^"]+" y="[^"]+" width="([^"]+)"/g).pop().match(/width="([^"]+)"/)[1]);
+  assert.ok(width(t('2020-01-01')) < width(t('2027-01-01')));
+  assert.equal(width(t('n/a')), width(t('2027-01-01')), 'an unknown snapshot falls back to the axis end');
+});
+
+test('the CSS stylesheet-size panel (lower is better) lists the smallest first and n/a last', () => {
+  const css = specs.find((s) => s.file?.endsWith('css-frameworks'));
+  const size = css.panels.find((p) => p.title.includes('lower is better')).items;
+  const known = size.filter((i) => i.value !== null).map((i) => i.value);
+  assert.deepEqual(known, [...known].sort((a, b) => a - b));
+  assert.ok(size.findIndex((i) => i.value === null) === -1 || size.slice(size.findIndex((i) => i.value === null)).every((i) => i.value === null));
 });
 
 test('every chart renders to a well-formed SVG with light and dark theme variables', () => {

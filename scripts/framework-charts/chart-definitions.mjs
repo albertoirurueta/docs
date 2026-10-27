@@ -7,7 +7,7 @@
 import {
   AXES, FILE_PREFIX, RADAR_GROUPS, axisLabel, decimalYear, frameworksOf, nameOf, num, snapshotOf, sourceIds,
 } from './frameworks.mjs';
-import { computeScores, fortunesRps, radarValues } from './scores.mjs';
+import { bestRps, computeScores, fortunesRps, radarValues } from './scores.mjs';
 
 const MAX_SERIES = 8;
 const fmtInt = (v) => Math.round(v).toLocaleString('en-US');
@@ -97,9 +97,9 @@ function soAdmiredDesired(page) {
     }, ids.map((id) => pop(data, id, 'so_admired')));
   };
 }
-function historyLine(page, file, metric, ids, { title, desc, yLabel, source, unitNote = '', fromYear }) {
+function historyLine(page, file, metric, ids, { title, desc, yLabel, unitNote = '' }) {
   return (data) => {
-    const rows = data['popularity-history'].filter((r) => r.metric === metric && ids.includes(r.framework_id) && (!fromYear || Number(r.period.slice(0, 4)) >= fromYear));
+    const rows = data['popularity-history'].filter((r) => r.metric === metric && ids.includes(r.framework_id));
     const present = ids.filter((id) => rows.some((r) => r.framework_id === id && num(r.value) !== null)).slice(0, MAX_SERIES);
     const series = present.map((id) => ({ name: nameOf(data, id), points: rows.filter((r) => r.framework_id === id).map((r) => ({ x: decimalYear(r.period), y: num(r.value) })).sort((a, b) => a.x - b.x) }));
     return spec(page, file, {
@@ -243,7 +243,7 @@ function tfbTests(page, ids) {
   return (data) => {
     const rows = data['performance-techempower'].filter((r) => r.round === '23' && ids.includes(r.framework_id));
     const TESTS = [['json', 'JSON serialization'], ['single_query', 'Single query'], ['multiple_queries', 'Multiple queries (20 per request)'], ['fortunes', 'Fortunes'], ['plaintext', 'Plaintext (pipelined)']];
-    const panels = TESTS.map(([t, title]) => ({ title, items: ids.map((id) => { const v = rows.filter((r) => r.framework_id === id && r.test === t).map((r) => num(r.rps)).filter((x) => x !== null); return { label: nameOf(data, id), index: 0, value: v.length ? Math.max(...v) / 1000 : null }; }).sort((a, b) => (b.value ?? -1) - (a.value ?? -1)) }));
+    const panels = TESTS.map(([t, title]) => ({ title, items: ids.map((id) => { const v = bestRps(data, id, t); return { label: nameOf(data, id), index: 0, value: v === null ? null : v / 1000 }; }).sort((a, b) => (b.value ?? -1) - (a.value ?? -1)) }));
     return spec(page, 'techempower-tests', {
       type: 'panelbars', width: 860, title: 'TechEmpower round 23 by test type (thousands of responses per second, best variant)',
       desc: 'Each test has its own axis because plaintext and JSON results are orders of magnitude higher than database tests.',
@@ -334,13 +334,15 @@ function cssFrameworks(page) {
     const dl = data['downloads-npm'].filter((r) => r.primary === 'yes' && r.period === 'last-12-months' && ids.includes(r.framework_id));
     const size = data['performance-web'].filter((r) => r.metric === 'css_min_gzip_kb' && ids.includes(r.framework_id));
     const or = data.popularity.filter((r) => r.metric === 'httparchive_origins_mobile' && ids.includes(r.framework_id));
-    const items = (rows, f) => rows.map((r) => ({ label: nameOf(data, r.framework_id), index: 0, value: f(num(r.value)) })).sort((a, b) => (b.value ?? -1) - (a.value ?? -1));
+    // Higher-is-better panels list the largest value first; lower-is-better panels (stylesheet size) the smallest, n/a last.
+    const items = (rows, f, lowerIsBetter = false) => rows.map((r) => ({ label: nameOf(data, r.framework_id), index: 0, value: f(num(r.value)) }))
+      .sort((a, b) => (lowerIsBetter ? (a.value ?? Infinity) - (b.value ?? Infinity) : (b.value ?? -1) - (a.value ?? -1)));
     const rows = [...dl, ...size, ...or];
     return spec(page, 'css-frameworks', {
       type: 'panelbars', width: 860, title: 'CSS frameworks: downloads, usage on websites and stylesheet size',
       desc: 'npm downloads in the 12 months to 2026-06, origins detected by HTTP Archive (2026-09) and the size of the distributed stylesheet. Tailwind CSS generates its stylesheet per project, so its size is n/a.',
       xLabel: 'See each panel', legendNames: ['Value'], valueFormat: (v) => String(Math.round(v * 10) / 10),
-      panels: [{ title: 'npm downloads, 12 months to 2026-06 (millions)', items: items(dl, (v) => (v === null ? null : v / 1e6)) }, { title: 'Origins in the HTTP Archive mobile crawl (thousands)', items: items(or, (v) => (v === null ? null : v / 1000)) }, { title: 'Distributed stylesheet, min+gzip (kB, lower is better)', items: items(size, (v) => v) }],
+      panels: [{ title: 'npm downloads, 12 months to 2026-06 (millions)', items: items(dl, (v) => (v === null ? null : v / 1e6)) }, { title: 'Origins in the HTTP Archive mobile crawl (thousands)', items: items(or, (v) => (v === null ? null : v / 1000)) }, { title: 'Distributed stylesheet, min+gzip (kB, lower is better)', items: items(size, (v) => v, true) }],
       footer: footer(data, rows),
     }, rows.map((r) => num(r.value)));
   };

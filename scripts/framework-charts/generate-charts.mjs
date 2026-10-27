@@ -3,9 +3,9 @@
 // It reuses the CSV loading, renderers and command line of scripts/language-charts/generate-charts.mjs (and the extra
 // renderers of scripts/cloud-comparison-charts through ./renderers.mjs) and writes
 // backend-frameworks-comparison-<id>.svg and web-frameworks-comparison-<id>.svg. A chart whose data is entirely n/a
-// is skipped and reported instead of being drawn empty.
+// is skipped and reported instead of being drawn empty, and its previously generated SVG is deleted.
 // Usage: node scripts/framework-charts/generate-charts.mjs [--out <dir>]
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readCsvFiles, runChartCli } from '../language-charts/generate-charts.mjs';
@@ -36,8 +36,10 @@ export function generateCharts(definitions, data, outDir) {
   const skipped = [];
   for (const d of definitions) {
     const spec = typeof d === 'function' ? d(data) : d;
-    if (spec.skip) { skipped.push(`${spec.file}: ${spec.skip}`); continue; }
     const file = join(outDir, `${spec.file}.svg`);
+    // A skipped chart's previous SVG is deleted so outdated figures are never published; the page's image:: macro then
+    // fails the Antora build until it is removed.
+    if (spec.skip) { rmSync(file, { force: true }); skipped.push(`${spec.file}: ${spec.skip}`); continue; }
     writeFileSync(file, renderFrameworkChart(spec));
     written.push(file);
   }
@@ -50,7 +52,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     defaultOutDir: DEFAULT_OUT_DIR,
     generate: (outDir) => {
       const { written, skipped } = generateCharts(CHART_DEFINITIONS, loadData(), outDir);
-      for (const s of skipped) console.log(`Skipped (no data): ${s}`);
+      for (const s of skipped) console.log(`Skipped (no data, previous SVG removed): ${s}`);
       return written;
     },
   });
