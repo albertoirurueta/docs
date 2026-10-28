@@ -19,6 +19,24 @@ export function decimalYear(iso) {
   return Number(y) + (Number(m) - 1) / 12 + (Number(d) - 1) / 365;
 }
 
+/**
+ * Decimal years of the first day of every month from the month containing `from` to the first month start on or after
+ * `to` (both decimal years), so the ticks sit on real month starts and enclose the data.
+ */
+export function monthStartTicks(from, to) {
+  let year = Math.floor(from + 1e-9);
+  let month = Math.min(12, Math.floor((from - year) * 12 + 1e-6) + 1);
+  const ticks = [];
+  for (;;) {
+    const t = decimalYear(`${year}-${String(month).padStart(2, '0')}-01`);
+    ticks.push(t);
+    if (t >= to - 1e-9) break;
+    month += 1;
+    if (month > 12) { month = 1; year += 1; }
+  }
+  return ticks;
+}
+
 /** Label of a decimal year as YYYY-MM. */
 export function yearMonthLabel(v) {
   const year = Math.floor(v + 1e-9);
@@ -58,8 +76,14 @@ export function slotLegend(entries, x, y, width, { lines = true } = {}) {
 
 /**
  * Spec: {id,title,desc,xLabel,yLabel,series:[{name,slot,variant?,points:[{x,y}]}], xFormat?, yFormat?, yInclude?:[number],
- * yZero?, vlines?:[{x,label}], width?, height?}. A point with y null/NaN/'n/a' breaks the line (a gap).
+ * yZero?, vlines?:[{x,label}], xTicks?:'months', width?, height?}. A point with y null/NaN/'n/a' breaks the line (a gap).
+ * `xTicks: 'months'` puts the x ticks on the first day of each month (decimal years) instead of evenly spaced values.
  */
+function monthScale(xs) {
+  const ticks = monthStartTicks(Math.min(...xs), Math.max(...xs));
+  return { min: ticks[0], max: ticks.at(-1), ticks };
+}
+
 export function renderSlotLine(spec) {
   requireFields(spec, ['id', 'title', 'desc', 'xLabel', 'yLabel', 'series']);
   const width = spec.width ?? 860;
@@ -70,7 +94,7 @@ export function renderSlotLine(spec) {
   const plot = { l: 76, r: width - 24, t: top, b: height - 56 };
   const xs = series.flatMap((s) => s.points.map((p) => p.x));
   const ys = series.flatMap((s) => s.points.map((p) => p.y)).concat(spec.yInclude ?? []);
-  const xSc = niceScale(xs, { maxTicks: 8 });
+  const xSc = spec.xTicks === 'months' ? monthScale(xs) : niceScale(xs, { maxTicks: 8 });
   const ySc = niceScale(ys, { zero: spec.yZero ?? true });
   const xScale = linearScale(xSc.min, xSc.max, plot.l, plot.r);
   const yScale = linearScale(ySc.min, ySc.max, plot.b, plot.t);

@@ -5,10 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { toNumber } from '../language-charts/data-utils.mjs';
 import { loadData, generateCharts, CHART_DEFINITIONS, FILE_PREFIX, DATA_FILES } from './generate-charts.mjs';
-import { renderEcommerceChart, decimalYear, yearMonthLabel } from './renderers.mjs';
-import { quarterYear } from './chart-definitions.mjs';
+import { renderEcommerceChart, decimalYear, yearMonthLabel, monthStartTicks } from './renderers.mjs';
+import { quarterYear, tagYearSum } from './chart-definitions.mjs';
 import {
   AXES, COMPUTED_AXES, PLATFORMS, PLATFORM_SLOT, computeScores, logScore, latestValue, performanceScore, ecosystemScore,
+  totalQuestions,
 } from './scores.mjs';
 
 const data = loadData();
@@ -140,6 +141,32 @@ test('decimalYear, yearMonthLabel and quarterYear round trip', () => {
   for (const m of ['2025-01', '2025-06', '2026-12']) assert.equal(yearMonthLabel(decimalYear(m)), m);
   assert.equal(quarterYear('2026-Q3'), 2026.5);
   assert.equal(quarterYear('bad'), null);
+});
+
+test('month ticks sit on the first day of each month and the wporg chart labels every month once', () => {
+  const ticks = monthStartTicks(decimalYear('2026-05-04'), decimalYear('2026-10-26'));
+  assert.deepEqual(ticks.map(yearMonthLabel), ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10', '2026-11']);
+  ticks.forEach((t, i) => assert.equal(t, decimalYear(`2026-${String(i + 5).padStart(2, '0')}-01`)));
+  assert.deepEqual(monthStartTicks(decimalYear('2025-12-15'), decimalYear('2026-01-01')).map(yearMonthLabel), ['2025-12', '2026-01']);
+  const svg = renderEcommerceChart(specs['wporg-downloads']);
+  const labels = [...svg.matchAll(/>(\d{4}-\d{2})</g)].map((m) => m[1]);
+  assert.deepEqual(labels, ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10', '2026-11']);
+});
+
+test('Stack Overflow yearly sums are null (n/a) when a tag has no value for the year, never zero', () => {
+  const row = (item, date, value) => ({ platform: 'magento', metric: 'stackexchange_questions_year', item: `stackoverflow: tag ${item}`, date, value });
+  const rows = [row('magento', '2020', '10'), row('magento2', '2020', '5'), row('magento', '2021', '7'), row('magento2', '2021', 'n/a')];
+  assert.equal(tagYearSum(rows, 'magento', ['magento', 'magento2'], '2020'), 15);
+  assert.equal(tagYearSum(rows, 'magento', ['magento', 'magento2'], '2021'), null);
+  assert.equal(tagYearSum(rows, 'magento', ['magento', 'magento2'], '2022'), null);
+  for (const s of specs['stackoverflow-year'].series) for (const pt of s.points) assert.ok(pt.y === null || pt.y > 0, `${s.name} ${pt.x}`);
+});
+
+test('question totals count only Stack Overflow tag rows, not dedicated Stack Exchange sites', () => {
+  const tot = (item, value) => ({ platform: 'magento', metric: 'stackexchange_questions_total', item, date: '2026-10-27', value });
+  assert.equal(totalQuestions([tot('stackoverflow: tag magento', '100'), tot('stackoverflow: tag magento2', '20'), tot('magento.stackexchange: all questions', '5000')], 'magento'), 120);
+  assert.equal(totalQuestions([tot('magento.stackexchange: all questions', '5000')], 'magento'), null);
+  assert.equal(totalQuestions(data.popularity, 'magento'), 37173 + 4962);
 });
 
 test('every chart definition renders a well-formed SVG with legend, title, desc, caption and axis labels', () => {

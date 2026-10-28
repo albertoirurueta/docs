@@ -64,5 +64,5 @@ the evidence on the page; they are not a benchmark and moving a score by one poi
 | Low cost | hand | 10 = lowest total cost of entry; 8-9 free software, moderate infrastructure; 5-6 subscription plus fees; 3-4 heavy infrastructure or quote-based licence; 1-2 enterprise pricing |
 | Customisation flexibility | hand | how much of the stack can be changed: 9-10 open code with deep extension points; 7-8 open code; 5-6 constrained by the platform (checkout, data model) |
 | Scalability | hand | 9-10 managed elastic infrastructure; 7-8 designed for large catalogues, needs tuning; 5-6 depends on self-chosen hosting and caching |
-| Ecosystem | computed | mean of three log-scaled measures: live stores (10,000 = 0, 10,000,000 = 10), Stack Exchange questions of the platform's tags (1,000 = 0, 1,000,000 = 10), GitHub stars of the main repositories (100 = 0, 100,000 = 10) |
+| Ecosystem | computed | mean of three log-scaled measures: live stores (10,000 = 0, 10,000,000 = 10), Stack Overflow questions of the platform's tags (1,000 = 0, 1,000,000 = 10; dedicated Stack Exchange sites such as magento.stackexchange.com are context only and not counted), GitHub stars of the main repositories (100 = 0, 100,000 = 10) |
 | Headless readiness | hand | 9-10 documented storefront API and framework; 7-8 full APIs, no official storefront framework; 5-6 data APIs only |

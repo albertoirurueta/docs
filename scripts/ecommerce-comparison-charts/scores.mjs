@@ -46,19 +46,27 @@ export function latestValue(rows, platform, metric, item) {
  * desktop median Lighthouse performance scores (0-1 times 10), all from the latest month of the HTTP Archive.
  */
 export function performanceScore(rows, platform) {
+  const scaled = (metric, factor) => {
+    const v = latestValue(rows, platform, metric);
+    return v === null ? null : v * factor;
+  };
   const parts = [
-    latestValue(rows, platform, 'cwv_pass_mobile') !== null ? latestValue(rows, platform, 'cwv_pass_mobile') / 10 : null,
-    latestValue(rows, platform, 'cwv_pass_desktop') !== null ? latestValue(rows, platform, 'cwv_pass_desktop') / 10 : null,
-    latestValue(rows, platform, 'lighthouse_performance_mobile') !== null ? latestValue(rows, platform, 'lighthouse_performance_mobile') * 10 : null,
-    latestValue(rows, platform, 'lighthouse_performance_desktop') !== null ? latestValue(rows, platform, 'lighthouse_performance_desktop') * 10 : null,
+    scaled('cwv_pass_mobile', 1 / 10),
+    scaled('cwv_pass_desktop', 1 / 10),
+    scaled('lighthouse_performance_mobile', 10),
+    scaled('lighthouse_performance_desktop', 10),
   ];
   const m = mean(parts);
   return m === null ? null : round1(clamp(m));
 }
 
-/** Total Stack Overflow / Stack Exchange questions of the platform's tags (the `total` rows of popularity.csv). */
+/**
+ * Total Stack Overflow questions of the platform's tags (the `stackoverflow: tag` `total` rows of popularity.csv).
+ * Dedicated Stack Exchange sites (magento.stackexchange.com) are context only: not every platform has one, so they are
+ * not counted.
+ */
 export function totalQuestions(rows, platform) {
-  const t = rows.filter((r) => r.platform === platform && r.metric === 'stackexchange_questions_total' && toNumber(r.value) !== null);
+  const t = rows.filter((r) => r.platform === platform && r.metric === 'stackexchange_questions_total' && /^stackoverflow: tag /.test(r.item) && toNumber(r.value) !== null);
   return t.length ? t.reduce((a, r) => a + toNumber(r.value), 0) : null;
 }
 
@@ -70,7 +78,7 @@ export function totalStars(rows, platform) {
 
 /**
  * Ecosystem: mean of three log-scaled measures. Live stores (Store Leads, latest quarter): 10,000 = 0, 10,000,000 = 10.
- * Stack Exchange questions of the platform's tags: 1,000 = 0, 1,000,000 = 10. GitHub stars of the main repositories:
+ * Stack Overflow questions of the platform's tags: 1,000 = 0, 1,000,000 = 10. GitHub stars of the main repositories:
  * 100 = 0, 100,000 = 10.
  */
 export function ecosystemScore(rows, platform) {

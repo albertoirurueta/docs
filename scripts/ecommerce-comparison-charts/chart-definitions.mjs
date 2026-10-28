@@ -96,7 +96,7 @@ function adoption(data, dev) {
 const liveStores = (data) => ({
   type: 'slotline', id: 'live-stores', width: 900,
   title: 'Live stores per quarter',
-  desc: `Active (live) stores detected by Store Leads at the end of each quarter, 2019-Q1 to 2026-Q4 to date. WooCommerce and Shopify have millions of stores; PrestaShop peaked near 220,000 in 2022-Q3 and Magento near 164,000 in 2022-Q4 and both have declined since. The last point of each series is the current quarter to date.`,
+  desc: `Active (live) stores detected by Store Leads per quarter, each point placed at the start of its quarter, 2019-Q1 to 2026-Q4 to date. WooCommerce and Shopify have millions of stores; PrestaShop peaked near 220,000 in 2022-Q3 and Magento near 164,000 in 2022-Q4 and both have declined since. The last point of each series is the current quarter to date.`,
   xLabel: 'Quarter (year)', yLabel: 'Active stores detected (count)',
   series: PLATFORMS.map((p) => ({ name: SHORT[p], slot: PLATFORM_SLOT[p], points: pick(data.popularity, { platform: p, metric: 'storeleads_live_stores' }).map((r) => ({ x: quarterYear(r.date), y: toNumber(r.value) })) })),
   footer: footer('Store Leads reports (storeleads.app/reports)', 'popularity', 'Detected stores, not official counts.'),
@@ -135,6 +135,12 @@ const w3History = (data) => ({
   footer: footer('W3Techs historical yearly trends (w3techs.com/technologies/history_overview/content_management/all/y)', 'popularity'),
 });
 
+/** Sum of the yearly Stack Overflow questions of the tags; null (n/a) when any tag has no value for the year. */
+export function tagYearSum(rows, platform, tags, year) {
+  const values = tags.map((t) => toNumber(pick(rows, { platform, metric: 'stackexchange_questions_year', item: `stackoverflow: tag ${t}`, date: year })[0]?.value));
+  return values.some((v) => v === null) ? null : values.reduce((a, v) => a + v, 0);
+}
+
 function soYear(data) {
   const years = [];
   for (let y = 2014; y <= 2025; y++) years.push(String(y));
@@ -146,7 +152,7 @@ function soYear(data) {
     xLabel: 'Year asked', yLabel: 'Questions asked (count)',
     series: PLATFORMS.map((p) => ({
       name: p === 'magento' ? 'Magento (magento + magento2 tags)' : `${SHORT[p]} (tag ${tags[p][0]})`, slot: PLATFORM_SLOT[p],
-      points: years.map((y) => ({ x: Number(y), y: tags[p].reduce((a, t) => a + (toNumber(pick(data.popularity, { platform: p, metric: 'stackexchange_questions_year', item: `stackoverflow: tag ${t}`, date: y })[0]?.value) ?? 0), 0) })),
+      points: years.map((y) => ({ x: Number(y), y: tagYearSum(data.popularity, p, tags[p], y) })),
     })),
     footer: footer('Stack Exchange API (api.stackexchange.com)', 'popularity', 'Questions tagged with both magento and magento2 count twice.'),
   };
@@ -189,7 +195,7 @@ const wporgDownloads = (data) => ({
   type: 'slotline', id: 'wporg-downloads', width: 860,
   title: 'WooCommerce downloads per week on WordPress.org',
   desc: 'Weekly downloads of the WooCommerce plugin from WordPress.org for the complete Monday-to-Sunday weeks of the last 180 days (the API returns no longer window), from early May to late October 2026. Downloads include automatic updates of existing installs, so peaks follow release days. Active installs are only published as the rounded band 7,000,000+.',
-  xLabel: 'Week start (year-month)', yLabel: 'Downloads per week (WordPress.org)', xFormat: yearMonthLabel,
+  xLabel: 'Week start (year-month, ticks on the 1st of each month)', yLabel: 'Downloads per week (WordPress.org)', xFormat: yearMonthLabel, xTicks: 'months',
   series: [{ name: 'WooCommerce', slot: PLATFORM_SLOT.woocommerce, points: pick(data.popularity, { platform: 'woocommerce', metric: 'wporg_downloads_week' }).map((r) => ({ x: decimalYear(r.date), y: toNumber(r.value) })) }],
   footer: footer('WordPress.org plugin stats API (api.wordpress.org/stats/plugin/1.0/downloads.php)', 'popularity', 'Only about 180 days are available.'),
 });
