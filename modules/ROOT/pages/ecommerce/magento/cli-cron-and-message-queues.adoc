@@ -1,0 +1,893 @@
+= CLI, Cron and Message Queues
+:description: Custom bin/magento commands, cron jobs and groups with crontab.xml and cron_groups.xml, and the message queue framework (topics, publishers, consumers, the db, RabbitMQ and ActiveMQ Artemis connections), tested on Magento Open Source 2.4.9 as shipped by Mage-OS 3.6.0.
+:keywords: Magento, Adobe Commerce, bin/magento, Symfony Console, CommandListInterface, crontab.xml, cron_groups.xml, cron:run, cron_schedule, message queue, communication.xml, queue_topology.xml, queue_publisher.xml, queue_consumer.xml, queue:consumers:start, consumers_runner, RabbitMQ, ActiveMQ Artemis, MySQL queue
+
+include::partial$ecommerce-disclaimer.adoc[]
+
+This page was written against Magento 2.4.9 (generally available 2026-05-12) and checked on 2026-10-27. Everything that was run was run on
+Mage-OS 3.6.0, the community distribution built on the Magento Open Source 2.4.9 code base (PHP 8.5.12, MariaDB 11.8.9, Valkey 9.1.3,
+OpenSearch 3.9.0); the reference documentation quoted is Adobe's for Adobe Commerce and Magento Open Source 2.4.9. The three mechanisms
+described here apply to Magento Open Source, to Adobe Commerce on-premises and to Adobe Commerce on cloud infrastructure alike. They do
+not apply to Adobe Commerce as a Cloud Service (ACCS), which is versionless and has no PHP modules: work that would be a cron job or a
+queue consumer there is built out of process, with App Builder and Adobe I/O Events (see the page on editions and ecosystem,
+xref:ecommerce/magento/editions-and-ecosystem.adoc[Editions and Ecosystem]).
+
+Magento runs a lot of work outside the web request. A shopper who places an order triggers a request that must finish in a second or two,
+and everything that can wait (confirmation e-mails, stock reservations, catalog image resizing, index updates, exports) is handed to the
+background. Three mechanisms carry that background work, and they build on one another:
+
+* the *command line*, `bin/magento`, a Symfony Console application that every module can extend, is how an operator or a script starts
+  something by hand;
+* *cron* is the scheduler that starts jobs by the clock; Magento ships one system cron entry that calls `bin/magento cron:run` every
+  minute and decides itself which jobs are due;
+* the *message queue framework* decouples a producer from the code that does the work: the producer publishes a message to a named topic,
+  and a *consumer* picks it up later, usually in another process that cron started.
+
+The page follows the Pocket Coffee shop (see the running example): a console command that queues a roast batch for a SKU, a consumer that
+roasts it, and a cron job that reports how many batches are waiting. The module used throughout is `PocketCoffee_RoastQueue`. It
+follows the xref:ecommerce/magento/module-anatomy.adoc[module anatomy] page (registration, `module.xml`, the `app/code` layout) and
+the xref:ecommerce/magento/dependency-injection.adoc[dependency injection] page (`di.xml`, preferences, factories), which it assumes, and it precedes
+xref:ecommerce/magento/caching-indexing-and-performance.adoc[Caching, Indexing and Performance], where the indexers that cron keeps up to date are covered.
+
+== How the three pieces fit together
+
+The Mermaid diagram shows the path of one roast request through the module.
+
+[mermaid]
+....
+flowchart LR
+    subgraph producer["Producer"]
+        CLI["bin/magento pocketcoffee:roast:schedule"]
+        CODE["Any class that injects PublisherInterface"]
+    end
+    CLI --> PUB["PublisherInterface::publish(topic, message)"]
+    CODE --> PUB
+    PUB --> TOPO["communication.xml and queue_publisher.xml: topic, exchange, connection"]
+    TOPO --> EX["Exchange magento (db, amqp or stomp) and its binding"]
+    EX --> Q["Queue pocketcoffee.roast.queue"]
+    Q --> CONS["queue_consumer.xml: consumer pocketcoffee.roast.consumer"]
+    CRON["System crontab: * * * * * bin/magento cron:run"] --> RUNNER["Group consumers: consumers_runner"]
+    RUNNER -->|"spawns bin/magento queue:consumers:start"| CONS
+    CONS --> H["Handler RoastConsumer::process"]
+    H -->|"exception"| ERR["Message status error"]
+    H -->|"returns"| DONE["Message status complete"]
+    CRON --> G["Group pocketcoffee: RoastReport::execute"]
+    G --> Q
+....
+
+Three things to keep in mind from the picture:
+
+* publishing and consuming are separate processes. A message survives in the queue until a consumer takes it, so a stopped consumer
+  makes the queue grow but never loses work;
+* *cron is the glue*: it starts the consumers (job `consumers_runner`) as well as ordinary jobs, which is why a store with a broken
+  crontab shows stale indexes, unsent e-mails and growing queues all at once;
+* the same XML vocabulary is read by every broker. Switching from the built-in MySQL queue to RabbitMQ or ActiveMQ Artemis changes
+  `env.php` and the connection names, not the publisher or the consumer.
+
+== Custom CLI commands
+
+`bin/magento` is a Symfony Console application (Symfony 7.4 components in 2.4.9). Adobe's naming guideline for a command is
+`group:[subject:]action`, joined with colons, with arguments and options named by one word or by dashed words; a one-letter shortcut is for frequently
+used options only, and the name should contain a unique vendor segment to avoid collisions with other extensions. The Pocket Coffee command is
+`pocketcoffee:roast:schedule`: vendor `pocketcoffee`, subject `roast`, action `schedule`.
+
+Source: https://developer.adobe.com/commerce/php/development/cli-commands/naming-guidelines[Adobe Commerce developer docs: Command naming guidelines]
+
+=== The command class
+
+A command lives in `Console/Command` of the module and extends `Symfony\Component\Console\Command\Command`. `configure()` sets the name, the
+description, the arguments and the options; `execute()` does the work and returns an integer exit code (`+Command::SUCCESS+`, which is 0, or
+`+Command::FAILURE+`). Dependencies come through the constructor like any other object created by the ObjectManager, and the constructor takes an
+optional `$name` and passes it to the parent, because the name can also be set from `di.xml`.
+
+[source,php]
+----
+<?php
+declare(strict_types=1);
+
+namespace PocketCoffee\RoastQueue\Console\Command;
+
+use Magento\Framework\MessageQueue\PublisherInterface;
+use PocketCoffee\RoastQueue\Api\Data\RoastRequestInterfaceFactory;
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+
+class RoastScheduleCommand extends Command
+{
+    public const TOPIC = 'pocketcoffee.roast.requested';
+    private const ARG_SKU = 'sku';
+    private const OPT_QTY = 'qty';
+    private const OPT_ORDER = 'order';
+
+    public function __construct(
+        private readonly PublisherInterface $publisher,
+        private readonly RoastRequestInterfaceFactory $requestFactory,
+        ?string $name = null
+    ) {
+        parent::__construct($name);
+    }
+
+    protected function configure(): void
+    {
+        $this->setName('pocketcoffee:roast:schedule')
+            ->setDescription('Queues a roast batch for a SKU')
+            ->addArgument(self::ARG_SKU, InputArgument::REQUIRED, 'Product SKU, for example PC-ETH-WHL-250')
+            ->addOption(self::OPT_QTY, 'b', InputOption::VALUE_REQUIRED, 'Number of bags', '1')
+            ->addOption(self::OPT_ORDER, null, InputOption::VALUE_REQUIRED, 'Order number that triggered the batch');
+    }
+
+    protected function execute(InputInterface $input, OutputInterface $output): int
+    {
+        $request = $this->requestFactory->create();
+        $request->setSku((string)$input->getArgument(self::ARG_SKU))
+            ->setQty((int)$input->getOption(self::OPT_QTY))
+            ->setOrderNumber($input->getOption(self::OPT_ORDER));
+        $this->publisher->publish(self::TOPIC, $request);
+        $output->writeln(sprintf('<info>Queued %d x %s</info>', $request->getQty(), $request->getSku()));
+        return Command::SUCCESS;
+    }
+}
+----
+
+Source: https://developer.adobe.com/commerce/php/development/cli-commands/custom[Adobe Commerce developer docs: Create a custom CLI command]
+
+The methods and constants used, and what they do:
+
+[cols="2,5",options="header"]
+|===
+| Element | Behaviour
+
+| `setName()`
+| The command name typed after `bin/magento`. A command without a name fails with Symfony's "cannot have an empty name" error. The name may also be given from `di.xml` through the constructor argument `name`.
+
+| `setDescription()`
+| The line shown by `bin/magento list`.
+
+| `addArgument(name, mode, description, default)`
+| Positional input. `+InputArgument::REQUIRED+`, `OPTIONAL` and `IS_ARRAY` are the modes. Adobe advises few arguments and options for the rest.
+
+| `addOption(name, shortcut, mode, description, default)`
+| Named input. Modes are `VALUE_NONE` (a flag), `VALUE_REQUIRED`, `VALUE_OPTIONAL` and `VALUE_IS_ARRAY`. The shortcut is one character or null.
+
+| `execute()` return value
+| Returned as the process exit status. Return `+Command::FAILURE+` (or a non-zero integer) so that scripts and CI can react to an error.
+
+| Output tags
+| `<info>`, `<comment>`, `<question>` and `<error>` style the text; verbosity-dependent output is written with `+$output->writeln($text, OutputInterface::VERBOSITY_VERBOSE)+`.
+|===
+
+=== Registering the command
+
+Magento does not discover commands by scanning `Console/Command`. A command exists once it is an item of the `commands` argument of
+`Magento\Framework\Console\CommandListInterface` (whose preference is `Magento\Framework\Console\CommandList`), declared in `etc/di.xml`.
+The item name is only a unique key; the value is the class name, created through the ObjectManager with its dependencies.
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:ObjectManager/etc/config.xsd">
+    <preference for="PocketCoffee\RoastQueue\Api\Data\RoastRequestInterface"
+                type="PocketCoffee\RoastQueue\Model\RoastRequest"/>
+    <type name="Magento\Framework\Console\CommandListInterface">
+        <arguments>
+            <argument name="commands" xsi:type="array">
+                <item name="pocketcoffee_roast_schedule" xsi:type="object">PocketCoffee\RoastQueue\Console\Command\RoastScheduleCommand</item>
+            </argument>
+        </arguments>
+    </type>
+</config>
+----
+
+Source: https://developer.adobe.com/commerce/php/development/cli-commands/custom[Adobe Commerce developer docs: Create a custom CLI command]
+
+What happened when this module was installed on the test store, in the order the commands were run:
+
+[source,bash]
+----
+M='docker exec -u www-data -w /var/www/html ec-magento php bin/magento'
+$M module:enable PocketCoffee_RoastQueue       # "To make sure that the enabled modules are properly registered, run 'setup:upgrade'."
+$M setup:upgrade                               # Upgrade completed successfully.
+$M cache:flush
+$M pocketcoffee:roast:schedule PC-ETH-WHL-250 --qty=2 --order=000000042
+# Queued 2 x PC-ETH-WHL-250
+$M pocketcoffee:roast:schedule PC-COL-ESP-1000 -b 1
+# Queued 1 x PC-COL-ESP-1000
+----
+
+Source: https://developer.adobe.com/commerce/php/development/cli-commands/custom[Adobe Commerce developer docs: Create a custom CLI command]
+
+The first version of the command declared the quantity option with the shortcut `-q`. Every `bin/magento` command inherits the global option `-q, --quiet`, so Symfony stopped with
+`An option with shortcut "q" already exists.` on every invocation of `--help` and `bin/magento list` would have shown the same fault for this command.
+The reserved shortcuts of the application are `-h`, `-q`, `-V`, `-n` and `-v`; the example uses `-b` (for bags). In 2.4.9 the application also defines `--silent`.
+
+Things that commonly go wrong:
+
+* *The command is missing from `bin/magento list`*. The module is disabled, the item is not registered in `di.xml`, the class has a PHP error,
+  or the `di.xml` is cached: `bin/magento cache:clean config` (or `cache:flush`) and, in production mode, `bin/magento setup:di:compile`, which
+  Adobe's guide also tells you to run after registering a command.
+* *A constructor dependency on something that needs a web area*. The CLI runs without a design area, so session, layout or customer
+  objects that assume `frontend` or `adminhtml` fail. Use `+Magento\Framework\App\State::emulateAreaCode()+` around the call that needs an area,
+  or better, depend on a service contract that does not. Do not call `setAreaCode()` in the middle of a command that may be invoked
+  from code which already set one: it throws when the area is already set.
+* *A heavy constructor*. Magento resolves commands through a Symfony command loader, but listing and help still create command objects,
+  so keep constructors cheap. Constructor arguments that are expensive to build belong behind a factory or a proxy (see the dependency
+  injection page).
+* *Exit codes*. A command that catches an exception, prints it and returns 0 reports success to the shell; return `+Command::FAILURE+`.
+
+Related commands that every operator meets: `bin/magento list` (172 entries on the test store), `bin/magento help <command>`,
+`bin/magento --version` (printing `Mage-OS CLI 3.6.0 (based on Magento 2.4.9)` on Mage-OS; Adobe prints `Magento CLI` and the version),
+`bin/magento maintenance:enable|disable|status` and `bin/magento module:status`.
+
+== Cron
+
+=== How Magento uses cron
+
+Magento does not run a daemon. The operating system's cron runs a single command every minute and Magento does the scheduling:
+
+[source,bash]
+----
+bin/magento cron:install          # writes the Magento block into the crontab of the file system owner
+bin/magento cron:install --force  # rewrites an existing block
+bin/magento cron:remove           # removes the block
+crontab -l
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/configure-cron-jobs[Adobe Commerce docs: Configure and run cron]
+
+`cron:install` adds this entry between `+#~ MAGENTO START+` and `+#~ MAGENTO END+` comments:
+
+[source,text]
+----
+* * * * * /usr/bin/php /var/www/html/bin/magento cron:run 2>&1 | grep -v "Ran jobs by schedule" >> /var/www/html/var/log/magento.cron.log
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/configure-cron-jobs[Adobe Commerce docs: Configure and run cron]
+
+Each `cron:run` does the same three things for every cron group (or for the one given by `--group`): it *generates* rows in the table `cron_schedule`
+for the jobs of the group that will be due in the next minutes, it *runs* the rows whose `scheduled_at` has come and whose status is `pending`, and it *cleans* old rows.
+Because the real work is done by rows in the table, a job that did not run is visible as a row: the status column holds `pending`, `running`, `success`, `missed` (the run
+window `schedule_lifetime` passed before it started) or `error` (the job threw; the message is stored in the `messages` column).
+
+The `cron:run` options are `--group=<name>` (only that group), `--exclude-group=<name>` (repeatable, everything except those) and `--bootstrap=<param>` to add or override bootstrap parameters.
+The crontab must belong to the file system owner of the installation, not to root, and in a multi-node deployment it must run on exactly one node.
+
+Logging: `var/log/cron.log` has the lifecycle of every job; failed jobs with the status `error` or `missed` also go to `var/log/support_report.log`, a job in error is logged as critical in `var/log/exception.log`, and in
+developer mode missed jobs are written to `var/log/debug.log`.
+
+The system crontab itself could not be tested here: no crontab was installed in the containerised store and `cron:install` was deliberately not run. Instead the scheduler was exercised by calling
+`+bin/magento cron:run --group=...+` by hand, which is the same code path that the crontab calls, as the rest of this section shows.
+
+=== Defining a job: crontab.xml
+
+A job is declared in `etc/crontab.xml`. The element tree is `config / group (id) / job (name, instance, method) / schedule | config_path`.
+
+[cols="2,5",options="header"]
+|===
+| Node or attribute | Meaning
+
+| `+<group id="...">+`
+| The cron group the jobs belong to. Group ids are not unique per module; many modules add jobs to `default`, `index` and so on. A group is run with `cron:run --group=<id>`. Ids may use lower-case letters, digits and underscores only.
+
+| `+<job name="...">+`
+| A name unique across the whole installation. It becomes the `job_code` of the rows in `cron_schedule`. Prefix it with the vendor name.
+
+| `instance` and `method`
+| The class (created through the ObjectManager) and the public method to call, usually `execute`. The method takes no arguments.
+
+| `<schedule>`
+| A five-field cron expression. Omit the node when the schedule comes from configuration.
+
+| `<config_path>`
+| The path of a configuration value that holds the cron expression. The convention (and what was tested) is `crontab/<group>/jobs/<job_name>/schedule/cron_expr`, so that a default can be given in `config.xml` and the Admin or `bin/magento config:set` can change it per installation.
+|===
+
+The module declares one job that reads its schedule from configuration:
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Cron:etc/crontab.xsd">
+    <group id="pocketcoffee">
+        <job name="pocketcoffee_roast_report"
+             instance="PocketCoffee\RoastQueue\Cron\RoastReport"
+             method="execute">
+            <config_path>crontab/pocketcoffee/jobs/pocketcoffee_roast_report/schedule/cron_expr</config_path>
+        </job>
+    </group>
+</config>
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron-reference[Adobe Commerce docs: crontab.xml and cron_groups.xml reference]
+
+with its default in `etc/config.xml`, which is where the cron expression lives:
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Store:etc/config.xsd">
+    <default>
+        <crontab>
+            <pocketcoffee>
+                <jobs>
+                    <pocketcoffee_roast_report>
+                        <schedule>
+                            <cron_expr>* * * * *</cron_expr>
+                        </schedule>
+                    </pocketcoffee_roast_report>
+                </jobs>
+            </pocketcoffee>
+        </crontab>
+    </default>
+</config>
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron[Adobe Commerce docs: Configure custom cron jobs and cron groups]
+
+and the class that the job runs, a plain object with injected dependencies:
+
+[source,php]
+----
+<?php
+declare(strict_types=1);
+
+namespace PocketCoffee\RoastQueue\Cron;
+
+use Magento\Framework\App\ResourceConnection;
+use Psr\Log\LoggerInterface;
+
+class RoastReport
+{
+    public function __construct(
+        private readonly ResourceConnection $resource,
+        private readonly LoggerInterface $logger
+    ) {
+    }
+
+    public function execute(): void
+    {
+        $connection = $this->resource->getConnection();
+        $select = $connection->select()
+            ->from(['s' => $this->resource->getTableName('queue_message_status')], ['n' => 'COUNT(*)'])
+            ->join(['q' => $this->resource->getTableName('queue')], 'q.id = s.queue_id', [])
+            ->where('q.name = ?', 'pocketcoffee.roast.queue')
+            ->where('s.status = ?', 2); // 2 = new, see Magento\MysqlMq\Model\QueueManagement
+        $this->logger->info('PocketCoffee_RoastQueue: pending roast requests', [
+            'pending' => (int)$connection->fetchOne($select),
+        ]);
+    }
+}
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron-reference[Adobe Commerce docs: crontab.xml and cron_groups.xml reference]
+
+To write a plain schedule directly, replace `<config_path>` by `pass:c[<schedule>0 3 * * *</schedule>]` (daily at 03:00). A job cannot be switched off by a flag: to disable a job declared
+by another module, redeclare it in your module with a schedule that never matches, for example `+0 0 30 2 *+` (the thirtieth of February).
+The cron expression syntax is the standard five fields (minute, hour, day of month, month, day of week); the
+xref:backend/scheduling/cron-expressions.adoc[cron expressions] page on this site explains them.
+
+=== Defining a group: cron_groups.xml
+
+A group is created simply by using a new id in `crontab.xml`, but its timing parameters come from `etc/cron_groups.xml`. Without that file the group takes the values of `default`.
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:module:Magento_Cron:etc/cron_groups.xsd">
+    <group id="pocketcoffee">
+        <schedule_generate_every>5</schedule_generate_every>
+        <schedule_ahead_for>10</schedule_ahead_for>
+        <schedule_lifetime>10</schedule_lifetime>
+        <history_cleanup_every>10</history_cleanup_every>
+        <history_success_lifetime>60</history_success_lifetime>
+        <history_failure_lifetime>600</history_failure_lifetime>
+        <use_separate_process>0</use_separate_process>
+    </group>
+</config>
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron-reference[Adobe Commerce docs: crontab.xml and cron_groups.xml reference]
+
+[cols="3,5,2",options="header"]
+|===
+| Option | Meaning (all in minutes except the last) | `default` group on 2.4.9
+
+| `schedule_generate_every`
+| How often `cron:run` writes new rows to `cron_schedule` for the group.
+| 15
+
+| `schedule_ahead_for`
+| How far ahead rows are written. With `+* * * * *+` and 10 the table holds up to ten pending rows.
+| 20
+
+| `schedule_lifetime`
+| The window in which a pending job must start; after it the row becomes `missed`.
+| 15
+
+| `history_cleanup_every`
+| How often finished rows are cleaned.
+| 10
+
+| `history_success_lifetime`
+| How long rows of successful jobs are kept.
+| 60
+
+| `history_failure_lifetime`
+| How long rows of failed and missed jobs are kept.
+| 4320
+
+| `use_separate_process`
+| `1` runs the group's jobs in their own PHP process (the `consumers` group sets it to 1), `0` runs them inside the process of `cron:run`.
+| 0
+|===
+
+The same options appear in the Admin under Stores > Configuration > Advanced > System, in the section Cron configuration options for group, one per group, and are stored in `core_config_data` under `system/cron/<group>/<option>`. Values set there override `cron_groups.xml`.
+
+=== What happened when it ran
+
+The sequence below was executed on the test store (the clock is that of the container, UTC):
+
+[source,bash]
+----
+$M pocketcoffee:roast:schedule PC-ETH-WHL-250 --qty=1       # one message waiting in the queue
+$M cron:run --group=pocketcoffee                            # 16:53:21
+# table cron_schedule afterwards:
+#   pocketcoffee_roast_report  success  scheduled 16:53:00  executed 16:53:21  finished 16:53:21
+#   pocketcoffee_roast_report  pending  scheduled 16:54:00 ... 17:02:00      (nine more rows, schedule_ahead_for = 10)
+sleep 62
+$M cron:run --group=pocketcoffee                            # 16:54:23: the 16:54:00 row ran
+grep 'pending roast' var/log/system.log
+# main.INFO: PocketCoffee_RoastQueue: pending roast requests {"pending":1}
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/configure-cron-jobs[Adobe Commerce docs: Configure and run cron]
+
+Two details worth knowing: the first `cron:run` of a group generates the rows and runs the one that is already due in the same invocation, and a row is executed up to a minute after its `scheduled_at`
+(here 21 and 23 seconds), because the crontab only ticks once a minute. The job class is built by the ObjectManager from `di.xml`, so a constructor error appears as a row with status `error` and the message in the `messages` column.
+
+The other cron groups that matter on a typical store are `default` (most core jobs, such as sending queued e-mails and cleaning), `index` (`indexer_reindex_all_invalid`, `indexer_update_all_views`,
+`indexer_clean_all_changelogs`; see the caching and indexing page), `consumers` (the queue runner, below) and the groups of Adobe Commerce modules.
+
+== The message queue framework
+
+=== Concepts
+
+The message queue framework (MQF) lets a module publish messages to a named *topic* and defines the *consumers* that handle them asynchronously. The framework supports three transports:
+
+[cols="2,3,3",options="header"]
+|===
+| Connection name | Broker | Notes
+
+| `db`
+| The MySQL adapter: tables `queue`, `queue_message`, `queue_message_status` (plus `queue_lock`), with cron jobs making sure consumers run
+| No extra software, the default when `env.php` configures no other broker. Adobe does not recommend running several consumers on a MySQL queue.
+
+| `amqp`
+| RabbitMQ (AMQP 0.9.1), the primary broker. Only topic exchanges are used
+| The 2.4.9 system requirements list RabbitMQ 4.3.
+
+| `stomp`
+| Apache ActiveMQ Artemis over STOMP, introduced in 2.4.5; destinations use ANYCAST (one consumer gets each message)
+| The 2.4.9 system requirements list Artemis 2; the release notes call Artemis the long-term replacement for RabbitMQ.
+|===
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/message-queue-framework[Adobe Commerce docs: Message queue framework]
+
+The vocabulary is that of AMQP: a *publisher* sends a message to an *exchange*; the exchange routes it by the *topic* (a routing key of dot-separated words such as `customer.created`; `+*+` replaces one word and `#` zero or more) through a *binding* to one or more *queues*; a *consumer* reads one queue. The `db` and `stomp` connections emulate the model. In `db` mode a message is a row, a queue is a row of `queue`, and the status of each delivery is a row of `queue_message_status`.
+
+=== The four XML files
+
+Four files per module describe a topic from the producer to the handler. Their schema URNs are `urn:magento:framework:Communication/etc/communication.xsd` and `+urn:magento:framework-message-queue:etc/{topology,publisher,consumer}.xsd+`. In the test module all four validated with `xmllint --schema` against the XSDs in `+vendor/mage-os/framework*+`.
+
+*communication.xml* declares the topics and what is sent on them:
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework:Communication/etc/communication.xsd">
+    <topic name="pocketcoffee.roast.requested"
+           request="PocketCoffee\RoastQueue\Api\Data\RoastRequestInterface">
+        <handler name="pocketcoffeeRoastHandler"
+                 type="PocketCoffee\RoastQueue\Model\RoastConsumer"
+                 method="process"/>
+    </topic>
+</config>
+----
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/configuration[Adobe Commerce developer docs: Configure message queues]
+
+[cols="2,5",options="header"]
+|===
+| Node or attribute | Meaning
+
+| `topic name`
+| The topic, dot separated. Unique across the installation.
+
+| `topic request`
+| The class or interface of the message: a data interface with typed getters and setters, a scalar type such as `string`, or an array type such as `string[]`. The framework serialises and deserialises the message with the same machinery as the web API service layer, so the interface needs docblock or native types on its methods. The same `schema` attribute can instead name a service method (`+Vendor\Module\Api\Service::method+`) whose parameter list becomes the message.
+
+| `topic response`
+| The type of the answer for a *synchronous* (RPC) topic, together with `is_synchronous`. Omit both for ordinary fire-and-forget topics.
+
+| `topic schema`
+| An alternative to `request`/`response`: a service contract method that defines both.
+
+| `handler name`, `type`, `method`
+| A handler of the topic: class and method. A topic may have several handlers, each with a unique name, and a handler can be turned off with `disabled="true"` from another module.
+|===
+
+*queue_topology.xml* declares exchanges and bindings. Every core module uses an exchange named `magento`; the file below sets the connection explicitly on the exchange, which is how a module stays on `db` while the installation default is `amqp`:
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework-message-queue:etc/topology.xsd">
+    <exchange name="magento" connection="db">
+        <binding id="pocketcoffeeRoastBinding"
+                 topic="pocketcoffee.roast.requested"
+                 destinationType="queue"
+                 destination="pocketcoffee.roast.queue"/>
+    </exchange>
+</config>
+----
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/configuration[Adobe Commerce developer docs: Configure message queues]
+
+`exchange` accepts `name`, `type` (`topic`, the only value), `connection`, `durable`, `autoDelete`, `internal` and an `arguments` child (broker-specific). `binding` takes `id`, `topic` (a routing key; wildcards allowed on AMQP), `destinationType` (`queue`), `destination` (the queue name) and `disabled`. For the `db` connection the rows of the table `queue` are created by `setup:upgrade` (the recurring setup script of `Magento_MysqlMq` reads the configured queues), and for AMQP and STOMP the queues are declared in the broker at the same point, so run `bin/magento setup:upgrade` after adding or renaming a queue.
+
+*queue_publisher.xml* says which topics can be published and to which connection and exchange:
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework-message-queue:etc/publisher.xsd">
+    <publisher topic="pocketcoffee.roast.requested">
+        <connection name="db" exchange="magento"/>
+    </publisher>
+</config>
+----
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/configuration[Adobe Commerce developer docs: Configure message queues]
+
+`publisher` takes `topic` (required), `queue` (a shortcut that implies a direct queue; the examples in core use it as `+<publisher topic="..." queue="..."/>+`) and `disabled`. Its `connection` children take `name`, `exchange` and `disabled`. A publisher may list several connections; the message goes to all enabled ones.
+
+*queue_consumer.xml* declares the consumers:
+
+[source,xml]
+----
+<?xml version="1.0"?>
+<config xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="urn:magento:framework-message-queue:etc/consumer.xsd">
+    <consumer name="pocketcoffee.roast.consumer"
+              queue="pocketcoffee.roast.queue"
+              connection="db"
+              handler="PocketCoffee\RoastQueue\Model\RoastConsumer::process"
+              maxMessages="500"/>
+</config>
+----
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/configuration[Adobe Commerce developer docs: Configure message queues]
+
+[cols="2,5",options="header"]
+|===
+| Attribute | Meaning
+
+| `name`
+| The consumer name used with `queue:consumers:start` and in `env.php` (required, unique).
+
+| `queue`
+| The queue read.
+
+| `handler`
+| `+Class::method+`, the code called for each message. It receives the message (here a `RoastRequestInterface`). Instead of `handler` a consumer may name a `consumerInstance` class implementing `ConsumerInterface` for full control (batch consumers do this).
+
+| `consumerInstance`
+| The consumer class. The default is `Magento\Framework\MessageQueue\Consumer`; the core batch consumer is `Magento\Framework\MessageQueue\BatchConsumer`.
+
+| `connection`
+| `db`, `amqp` or `stomp`; defaults to the installation's default connection.
+
+| `maxMessages`
+| Messages processed before the process exits and cron restarts it. Overridden by `cron_consumers_runner/max_messages` and the command's `--max-messages`.
+
+| `maxIdleTime`, `sleep`, `onlySpawnWhenMessageAvailable`
+| Idle timeout (seconds) after which a consumer that waits for messages ends, the pause between polls, and whether the runner starts the consumer only when the queue has a message.
+|===
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/[Adobe Commerce developer docs: Message queues]
+
+=== The default connection
+
+When a file does not name a connection, `Magento\Framework\MessageQueue\DefaultValueProvider` picks one: `queue/default_connection` of `env.php` if set, otherwise `stomp` if `queue/stomp` is configured, otherwise `amqp` if `queue/amqp` is configured, otherwise `db`. The test store configures none of them, so every queue above is `db`. If
+`default_connection` is `amqp` but a module's XML files name `db` explicitly, that module still uses MySQL.
+
+[source,php]
+----
+// app/etc/env.php - fragments only; credentials come from the environment and are placeholders here
+'queue' => [
+    'default_connection' => 'amqp',
+    'amqp' => [
+        'host' => 'rabbitmq.example.test',
+        'port' => '5672',
+        'user' => 'magento',
+        'password' => '<your-rabbitmq-password>',
+        'virtualhost' => '/',
+        'ssl' => false,
+    ],
+    'consumers_wait_for_messages' => 1,
+],
+'cron_consumers_runner' => [
+    'cron_run' => true,
+    'max_messages' => 10000,
+    'consumers' => [],
+    'multiple_processes' => ['pocketcoffee.roast.consumer' => 2],
+],
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/files/config-reference-envphp[Adobe Commerce docs: env.php reference]
+
+The `bin/magento setup:config:set` options for the same values are `--amqp-host`, `--amqp-port`, `--amqp-user`, `--amqp-password` and `--amqp-virtualhost`, and the installer accepts the same names. For ActiveMQ Artemis the node is `queue/stomp` (host, port, user, password, ssl) and `default_connection` is `stomp`. Neither RabbitMQ nor ActiveMQ Artemis is installed on the test store, so these fragments are taken from the documentation and were not run.
+
+=== Publishing and handling
+
+A producer needs only the topic and a message that matches the topic's request type. The data interface of the example and its model:
+
+[source,php]
+----
+<?php
+declare(strict_types=1);
+
+namespace PocketCoffee\RoastQueue\Api\Data;
+
+/**
+ * @api
+ */
+interface RoastRequestInterface
+{
+    /** @return string */
+    public function getSku(): string;
+    /** @param string $sku @return $this */
+    public function setSku(string $sku): static;
+    /** @return int */
+    public function getQty(): int;
+    /** @param int $qty @return $this */
+    public function setQty(int $qty): static;
+    /** @return string|null */
+    public function getOrderNumber(): ?string;
+    /** @param string|null $orderNumber @return $this */
+    public function setOrderNumber(?string $orderNumber): static;
+}
+----
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/[Adobe Commerce developer docs: Message queues]
+
+(The docblocks are shortened here; the module has the usual multi-line ones.) The model `PocketCoffee\RoastQueue\Model\RoastRequest` implements it with private properties and returns `$this` from the setters, and `di.xml` has the preference shown earlier. The handler:
+
+[source,php]
+----
+<?php
+declare(strict_types=1);
+
+namespace PocketCoffee\RoastQueue\Model;
+
+use PocketCoffee\RoastQueue\Api\Data\RoastRequestInterface;
+use Psr\Log\LoggerInterface;
+
+class RoastConsumer
+{
+    public function __construct(private readonly LoggerInterface $logger)
+    {
+    }
+
+    public function process(RoastRequestInterface $request): void
+    {
+        if ($request->getQty() < 1) {
+            throw new \InvalidArgumentException('Quantity must be at least 1');
+        }
+        $this->logger->info('PocketCoffee_RoastQueue: roasting batch', [
+            'sku' => $request->getSku(),
+            'qty' => $request->getQty(),
+            'order' => $request->getOrderNumber(),
+        ]);
+    }
+}
+----
+
+Source: https://developer.adobe.com/commerce/php/development/components/message-queues/[Adobe Commerce developer docs: Message queues]
+
+In code, any class publishes with `+Magento\Framework\MessageQueue\PublisherInterface::publish(string $topicName, $data)+`; the command at the top of the page does exactly that. For many messages at once, `+Magento\Framework\MessageQueue\BulkPublisherInterface::publish($topicName, array $data)+` sends them in one go; the asynchronous and bulk web API endpoints, the bulk operations and the `async.operations.all` consumer are built on it (see the REST and GraphQL page, xref:ecommerce/magento/rest-and-graphql-apis.adoc[REST and GraphQL APIs]). Publishing happens during the web request, so a failure to reach the broker (RabbitMQ down) makes the request itself fail; with the `db` connection the publish is a row insert in the same database.
+
+=== Running a consumer and what a failure does
+
+The consumer is started by name. The options were read from `bin/magento queue:consumers:start --help`:
+
+[cols="2,5",options="header"]
+|===
+| Command or option | Behaviour
+
+| `queue:consumers:list`
+| Lists the names of all consumers (24 on the test store including `pocketcoffee.roast.consumer`).
+
+| `queue:consumers:start <consumer>`
+| Runs the consumer in the foreground until `--max-messages` is reached, or, if the queue is empty, until no message is left (when `consumers_wait_for_messages` is 0) or forever (when it is 1).
+
+| `--max-messages=N`
+| Messages to process before the process terminates. Without it the consumer processes everything queued.
+
+| `--batch-size=N`
+| Messages per batch; for batch consumers only.
+
+| `--area-code=<area>`
+| The area in which the handler runs; default `global`.
+
+| `--single-thread`
+| Prevents two copies of the same consumer from running at once (replaces the deprecated `--pid-file-path`).
+
+| `--multi-process=N`
+| Number of processes for one consumer.
+
+| `queue:consumers:restart`
+| Signals running consumers to restart (after a deployment, so that they load the new code).
+
+| `queue:config:status`
+| Checks that the queues defined in configuration exist in the queue system ("Queue config files are up to date.").
+|===
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/manage-message-queues[Adobe Commerce docs: Manage message queues]
+
+The run on the test store published three messages (two good ones and one with `--qty=0`) and then consumed them:
+
+[source,bash]
+----
+$M pocketcoffee:roast:schedule PC-ETH-WHL-250 --qty=2 --order=000000042
+$M pocketcoffee:roast:schedule PC-COL-ESP-1000 -b 1
+$M pocketcoffee:roast:schedule PC-BRA-FIL-250 --qty=0
+# queue_message.body of the first row, in JSON:
+#   {"sku":"PC-ETH-WHL-250","qty":2,"order_number":"000000042"}
+$M queue:consumers:start pocketcoffee.roast.consumer --max-messages=3
+# var/log/system.log:
+#   main.INFO: PocketCoffee_RoastQueue: roasting batch {"sku":"PC-ETH-WHL-250","qty":2,"order":"000000042"}
+#   main.INFO: PocketCoffee_RoastQueue: roasting batch {"sku":"PC-COL-ESP-1000","qty":1,"order":null}
+# queue_message_status afterwards: message 1 status 4, message 2 status 4, message 3 status 6
+----
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/manage-message-queues[Adobe Commerce docs: Manage message queues]
+
+The message body is stored as JSON in the property names of the data interface (`order_number` for `getOrderNumber`), which is how the message looks to any other consumer, including a non-PHP one on RabbitMQ.
+
+The meaning of the status column of `queue_message_status` comes from the constants of `Magento\MysqlMq\Model\QueueManagement`:
+
+[cols="1,3,5",options="header"]
+|===
+| Value | Constant | Meaning
+
+| 2 | `MESSAGE_STATUS_NEW` | Published, waiting. The cron job above counts these.
+| 3 | `MESSAGE_STATUS_IN_PROGRESS` | Taken by a consumer.
+| 4 | `MESSAGE_STATUS_COMPLETE` | The handler returned.
+| 5 | `MESSAGE_STATUS_RETRY_REQUIRED` | Failed; will be retried (the number of trials is in `number_of_trials`).
+| 6 | `MESSAGE_STATUS_ERROR` | Failed for good. The third message above, whose handler threw `InvalidArgumentException`, ended here.
+| 7 | `MESSAGE_STATUS_TO_BE_DELETED` | Marked for the cleanup job `mysqlmq_clean_messages` (runs twice a day).
+|===
+
+On AMQP a failed message is not recorded in a status table: the broker holds it, and the framework either rejects it (it is dead-lettered or dropped, depending on the queue arguments) or requeues it; that behaviour was not tested here because no broker is installed. What is common to all connections is that a handler that throws does not stop the consumer, and that handlers must be idempotent: a message can be delivered more than once after a crash.
+
+=== Who starts the consumers: consumers_runner
+
+In production nobody types `queue:consumers:start`. The cron group `consumers` contains one job, `consumers_runner` (`+* * * * *+`, `use_separate_process` 1, failure history 600 minutes), whose class `Magento\MessageQueue\Model\Cron\ConsumersRunner` starts each configured consumer in a background process unless one is already running. The runner is configured by the node `cron_consumers_runner` of `env.php`:
+
+[cols="2,5",options="header"]
+|===
+| Key | Behaviour
+
+| `cron_run`
+| `true` (default) lets the runner start consumers; set it to `false` when consumers are managed by Supervisor or systemd instead.
+
+| `max_messages`
+| Messages per consumer process before it ends and cron starts a new one (default 10000; 0 never ends, which Adobe discourages).
+
+| `consumers`
+| The consumer names to run. An empty array runs all of them.
+
+| `multiple_processes`
+| Map of consumer name to number of processes (2.4.4 and later).
+|===
+
+The node `queue/consumers_wait_for_messages` decides what a consumer does when the queue empties before `max_messages`: `1` (the installed value, and Adobe's recommendation for busy stores) keeps waiting for messages; `0` ends the process, which saves resources on small stores and avoids long-running processes that block cron. The runner could not be exercised on the test store: running it would start a background process for every consumer in the installation (24 here) and leave them waiting, so the consumers were started by hand and the runner's behaviour is taken from the documentation and the source of `ConsumersRunner`.
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/manage-message-queues[Adobe Commerce docs: Manage message queues]
+
+On Adobe Commerce on cloud infrastructure the same settings are controlled from the `.magento.env.yaml` variables `CRON_CONSUMERS_RUNNER` and `CONSUMERS_WAIT_FOR_MAX_MESSAGES`, not by editing `env.php`.
+
+=== The consumers that ship with the product
+
+The table lists consumers that the test store defines, with their purpose, to show how much of the platform depends on the queue.
+
+[cols="3,5",options="header"]
+|===
+| Consumer | Purpose
+
+| `async.operations.all`
+| Processes the individual tasks of a bulk operation (asynchronous and bulk web API calls, mass price or attribute changes when the Admin is set to run bulk operations asynchronously).
+
+| `product_action_attribute.update`, `product_action_attribute.website.update`
+| Writes mass attribute updates made in the Admin.
+
+| `media.storage.catalog.image.resize`, `media.gallery.synchronization`, `media.gallery.renditions.update`, `media.content.synchronization`
+| Catalog image resizing and Media Gallery work.
+
+| `inventory.reservations.update`, `inventory.reservations.cleanup`, `inventory.source.items.cleanup`, `inventory.mass.update`, `inventory.indexer.sourceItem`, `inventory.indexer.stock`, `inventory.reservations.updateSalabilityStatus`
+| Inventory Management: stock reservations, cleanups and the asynchronous stock indexer. `inventory.reservations.updateSalabilityStatus` should always be running when Inventory Management is used.
+
+| `exportProcessor`, `codegeneratorProcessor`, `saveConfigProcessor`, `catalog_website_attribute_value_sync`, `catalog_product_generate_urls`, `product_alert`, `sales.rule.update.coupon.usage`, `sales.rule.quote.trigger.recollect`, `pbTemplateImport`
+| Large exports, coupon batch generation, asynchronous configuration save, website-scope attribute sync, URL rewrite generation, product alerts, single-use coupon accounting, recollecting active carts after a price rule change, Page Builder template import.
+|===
+
+Source: https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/consumers[Adobe Commerce docs: Message queue consumers]
+
+Adobe Commerce adds consumers for B2B (purchase orders, shared catalogs, negotiable quotes) and for the I/O Events publisher (`commerce.eventing.event.publish`); Open Source, and so the test store, has none of them.
+
+== Troubleshooting
+
+[cols="3,5",options="header"]
+|===
+| Symptom | Likely cause and check
+
+| Queue grows, nothing is consumed
+| No consumer process. Check `ps` for `queue:consumers:start`, the status of the `consumers_runner` row in `cron_schedule`, and `cron_consumers_runner/cron_run` in `env.php`. With the `db` connection also check that `queue` has the row for your queue: `bin/magento queue:config:status`.
+
+| `cron_schedule` has only `pending` or `missed` rows
+| The system crontab is not running, runs as the wrong user, or is slower than `schedule_lifetime`. `crontab -l` as the file system owner; `var/log/cron.log`.
+
+| A consumer exits at once
+| Empty queue with `consumers_wait_for_messages` 0, or `maxMessages` reached. Not an error.
+
+| A handler change has no effect
+| Long-running consumers keep the old code. `bin/magento queue:consumers:restart` after deployment.
+
+| Message ends in status 6
+| The handler threw. The exception is in `var/log/exception.log`; fix the cause and republish, rows in error are not retried by themselves.
+
+| Two copies of one job run at once
+| The job is slower than its schedule and the group does not use a lock. Make the job re-entrant or use the lock provider (`lock` node of `env.php`).
+
+| Custom command missing or failing with a shortcut error
+| See the section on commands: registration in `di.xml`, `cache:clean config`, no reserved shortcuts.
+|===
+
+== What could not be run
+
+The module's PHP files passed `php -l` and `vendor/bin/phpcs --standard=Magento2 --severity=6` (no errors; one warning each for the long `xsi:noNamespaceSchemaLocation` line of `di.xml`), and all XML files validated against Magento's XSDs with `xmllint --schema`.
+
+
+* RabbitMQ and ActiveMQ Artemis: no broker is installed on the test store, so the `amqp` and `stomp` connections, their `env.php` nodes and their failure semantics are documented but not executed. The `db` connection was run end to end.
+* The system crontab and the `consumers_runner` job (see above). `cron:install`, `cron:remove` and the `consumers` group were not run; the `pocketcoffee` group was run through `cron:run --group`.
+* Adobe Commerce on cloud infrastructure and ACCS (cloud variables, no PHP modules on ACCS). Adobe Commerce-only consumers (B2B, Events).
+* Production mode: the commands were run in developer mode, where `setup:di:compile` is not needed to see a new command.
+
+== References
+
+* https://developer.adobe.com/commerce/php/development/cli-commands/[Adobe Commerce developer docs: CLI commands]
+* https://developer.adobe.com/commerce/php/development/cli-commands/custom[Adobe Commerce developer docs: Create a custom CLI command]
+* https://developer.adobe.com/commerce/php/development/cli-commands/naming-guidelines[Adobe Commerce developer docs: Command naming guidelines]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/cli/configure-cron-jobs[Adobe Commerce docs: Configure and run cron]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron[Adobe Commerce docs: Configure custom cron jobs and cron groups]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/crons/custom-cron-reference[Adobe Commerce docs: crontab.xml and cron_groups.xml reference]
+* https://developer.adobe.com/commerce/php/development/components/message-queues/[Adobe Commerce developer docs: Message queues]
+* https://developer.adobe.com/commerce/php/development/components/message-queues/configuration[Adobe Commerce developer docs: Configure message queues]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/message-queue-framework[Adobe Commerce docs: Message queue framework]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/manage-message-queues[Adobe Commerce docs: Manage message queues]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/message-queues/consumers[Adobe Commerce docs: Message queue consumers]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/configuration-guide/files/config-reference-envphp[Adobe Commerce docs: env.php reference]
+* https://experienceleague.adobe.com/en/docs/commerce-operations/installation-guide/system-requirements[Adobe Commerce docs: System requirements]
+* xref:ecommerce/magento/caching-indexing-and-performance.adoc[Caching, Indexing and Performance] (the index cron group)
+* xref:backend/scheduling/cron-expressions.adoc[Cron expressions on this site]
+* xref:backend/messaging/delivery-guarantees.adoc[Delivery guarantees on this site]
