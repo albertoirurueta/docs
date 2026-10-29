@@ -1,0 +1,894 @@
+= Managed Database: RDS and Aurora
+:description: Running the WordPress database on Amazon RDS or Aurora instead of next to the web server: choosing MariaDB, MySQL or Aurora MySQL, an OpenTofu instance and parameter group, Multi-AZ, TLS from wp-config.php with a verified CA, an application user and a migration user, connection math against PHP-FPM, RDS Proxy and pinning, read replicas with LudicrousDB and a failover test.
+:keywords: WordPress, Amazon RDS, Aurora MySQL, MariaDB 11.8, MySQL 8.4, parameter group, Multi-AZ, failover, RDS Proxy, pinning, MYSQL_CLIENT_FLAGS, TLS, global-bundle.pem, LudicrousDB, HyperDB, read replica, max_connections, pm.max_children, OpenTofu, wp-config.php, DB_HOST
+
+include::partial$cms-wordpress-disclaimer.adoc[]
+
+This page was written against WordPress 7.1.3 (released 2026-10-06; 7.1.4, the security release of 2026-10-28, is the
+version to run), PHP 8.4, MariaDB 11.8, MySQL 8.4, Amazon RDS, Aurora MySQL 3 and 8.4, OpenTofu 1.12 with the AWS
+provider 6.x and LudicrousDB 5.3.1, and checked on 2026-10-29. The running example is the Lumen Press production site on
+the EKS cluster `lumenpress-prod` in `eu-west-1`, account `123456789012`. Listings were validated with
+`tofu init -backend=false` and `tofu validate`, `php -l` and `shellcheck`; nothing was created in an AWS account, so the
+instance classes, sizes and timings below are starting points to measure, not results.
+
+This is the database tier of the xref:cms/wordpress/cloud-reference-architecture.adoc[Cloud Reference Architecture]. It
+assumes the VPC and subnets from xref:cloud/aws/vpc-networking.adoc[VPC Networking] and does not re-explain how RDS works;
+xref:cloud/aws/rds.adoc[Amazon RDS] and xref:cloud/aws/aurora.adoc[Amazon Aurora] cover that. What follows is what is
+specific to WordPress: what the application asks of the database, which engine and version to pick, the exact
+parameters, how `wp-config.php` connects over TLS, which database users the pods and the release job need, how many
+connections a fleet of PHP-FPM workers can open, and how to prove that a failover does not take the site down. The
+detail that used to sit in xref:cms/wordpress/scaling-and-high-availability.adoc[Scaling and High Availability] under
+"The database: replicas and failover" lives here; that page keeps a summary.
+
+== What WordPress asks of the database
+
+WordPress is an unusually easy client for a managed database, with a few habits worth knowing before sizing anything.
+
+* *One non-persistent connection per request.* `wpdb` connects when PHP loads WordPress and closes when the request ends.
+  There is no application-side connection pool. The number of connections is therefore the number of PHP-FPM workers that
+  are busy at that moment, plus WP-CLI processes, the cron scheduler and monitoring.
+* *Plain SQL.* Core uses no stored procedures, triggers or vendor extensions, so MariaDB, MySQL and Aurora MySQL all work
+  (see xref:cms/wordpress/requirements-and-hosting.adoc[Requirements and Hosting] for the supported versions). Core does
+  not use prepared statements on the wire either, which matters for RDS Proxy later.
+* *DDL at runtime.* `dbDelta()` runs `CREATE TABLE` and `ALTER TABLE` when core or a plugin upgrades its schema, and some
+  plugins do it on `init` without a version check. A database user restricted to data statements breaks those plugins;
+  the section on users shows the split that makes this safe.
+* *One writer.* Standard `wpdb` sends every query to a single host. Read replicas need a drop-in (see below).
+* *`utf8mb4`.* Tables are created with `utf8mb4`, so the server character set should match. The tables are described in
+  xref:cms/wordpress/database-schema.adoc[Database Schema].
+
+== Choosing the engine
+
+[cols="1,2,2,2",options=header]
+|===
+| | RDS for MariaDB | RDS for MySQL | Aurora MySQL
+| Versions to use for WordPress | 11.8 (standard support until June 2028), 11.4 (until May 2029) or the newer 12.3 (released 2026-08-07, standard support until June 2029). 10.11 (until February 2028) and 10.6 (until 2026-12-31) are for existing sites | 8.4, the LTS: RDS standard support until 2029-07-31. 8.0 left standard support on 2026-07-31 and now runs only under paid RDS Extended Support | Aurora MySQL 3, compatible with MySQL 8.0, and Aurora MySQL 8.4 (generally available since 2026-05-21, engine version format `8.4.mysql_aurora.8.4.7`)
+| Storage | EBS volume sized in advance, with storage autoscaling | The same | A shared cluster volume that grows by itself
+| High availability | Multi-AZ instance (synchronous standby, not readable) | Multi-AZ instance, or Multi-AZ DB cluster with two readable standbys | Writer plus reader instances; a reader is promoted on failure
+| Read scaling | Up to 15 read replicas per source, asynchronous | The same | Up to 15 readers on the same storage, so little lag; one reader endpoint
+| Fit for WordPress | Closest to what the project tests against (MariaDB 11.8 is on its hosting handbook list) | Closest to the MySQL the handbook names (8.4) | Worth it for faster failover and read scaling; verify each plugin on the Aurora version
+| What to remember | `require_secure_transport` is on by default from 11.8.3, so a client that does not use TLS cannot connect | The 8.0 line is in paid extended support; new databases start on 8.4 | Aurora MySQL 3 still defaults to `mysql_native_password` and cannot change the default plugin
+|===
+
+The recommendation for Lumen Press is *RDS for MariaDB 11.8 with Multi-AZ*, because it is the engine WordPress's own
+tooling and the staging cluster in xref:cms/wordpress/scaling-and-high-availability.adoc[Scaling and High Availability] already
+use, and because it is the simplest thing that has no single point of failure. Move to Aurora when one of three things
+becomes true: the primary is busy and reads can be moved to readers with little lag, failover must be faster than a
+Multi-AZ DNS flip, or the database grows past what is comfortable to resize. RDS for MySQL 8.4 is the choice when a
+plugin documents MySQL only. An engine move later is a dump and restore (see
+xref:cms/wordpress/migrating-from-a-single-server.adoc[Migrating from a Single Server]), so decide it once.
+
+The WordPress hosting handbook lists MySQL 8.4 and MariaDB 11.8, 11.4 and 10.11 as the tested LTS lines and names Amazon RDS and Aurora as services that are not tested regularly but known to work well. Pick a
+version from that list that your cloud still supports for years, and run the same version in staging.
+
+Version notes for the other clouds are in xref:cms/wordpress/other-clouds-and-alternatives.adoc[Google Cloud, Azure and Alternatives]. One fact
+matters here: Azure Database for MariaDB was retired on 2025-09-19, so a MariaDB-based design does not move to Azure
+as it is; the Azure equivalent is Azure Database for MySQL Flexible Server.
+
+== The instance with OpenTofu
+
+The listing creates a subnet group in the private data subnets, a security group that admits only the EKS nodes, a
+parameter group, a Multi-AZ MariaDB 11.8 instance with the master password held in Secrets Manager, and one read
+replica. xref:cms/wordpress/eks-infrastructure-with-opentofu.adoc[EKS Infrastructure with OpenTofu] shows the same
+resources wired into the full stack and its state backend; the basics of OpenTofu are in
+xref:cloud/aws/infrastructure-as-code.adoc[Infrastructure as Code].
+
+[source,hcl]
+----
+terraform {
+  required_version = ">= 1.8"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+variable "private_subnet_ids" {
+  description = "Private data subnets in at least two Availability Zones."
+  type        = list(string)
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "node_security_group_id" {
+  description = "Security group of the EKS nodes (or of the pods when security groups for pods are used)."
+  type        = string
+}
+
+variable "db_instance_class" {
+  type    = string
+  default = "db.m7g.large"
+}
+
+resource "aws_db_subnet_group" "lumenpress" {
+  name       = "lumenpress-prod"
+  subnet_ids = var.private_subnet_ids
+}
+
+resource "aws_security_group" "db" {
+  name        = "lumenpress-prod-db"
+  description = "MariaDB access from the WordPress pods only"
+  vpc_id      = var.vpc_id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "db_from_nodes" {
+  security_group_id            = aws_security_group.db.id
+  referenced_security_group_id = var.node_security_group_id
+  ip_protocol                  = "tcp"
+  from_port                    = 3306
+  to_port                      = 3306
+  description                  = "MariaDB from EKS nodes"
+}
+
+resource "aws_db_parameter_group" "lumenpress" {
+  name        = "lumenpress-mariadb11-8"
+  family      = "mariadb11.8"
+  description = "Lumen Press WordPress: utf8mb4, TLS required, slow query log"
+
+  parameter {
+    name  = "character_set_server"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_client"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_connection"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "character_set_results"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "max_allowed_packet"
+    value = "67108864"
+  }
+
+  parameter {
+    name  = "slow_query_log"
+    value = "1"
+  }
+
+  parameter {
+    name  = "long_query_time"
+    value = "1"
+  }
+
+  parameter {
+    name  = "log_output"
+    value = "FILE"
+  }
+
+  parameter {
+    name  = "require_secure_transport"
+    value = "1"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_db_instance" "lumenpress" {
+  identifier = "lumenpress-prod"
+
+  engine         = "mariadb"
+  engine_version = "11.8"
+  instance_class = var.db_instance_class
+
+  allocated_storage     = 100
+  max_allocated_storage = 400
+  storage_type          = "gp3"
+  storage_encrypted     = true
+
+  db_name  = "lumenpress"
+  username = "admin_lumenpress"
+
+  # RDS creates the master password in Secrets Manager and rotates it.
+  manage_master_user_password = true
+
+  multi_az               = true
+  db_subnet_group_name   = aws_db_subnet_group.lumenpress.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+  publicly_accessible    = false
+  parameter_group_name   = aws_db_parameter_group.lumenpress.name
+  ca_cert_identifier     = "rds-ca-rsa2048-g1"
+
+  backup_retention_period         = 14
+  backup_window                   = "02:00-03:00"
+  maintenance_window              = "sun:03:30-sun:04:30"
+  auto_minor_version_upgrade      = true
+  copy_tags_to_snapshot           = true
+  deletion_protection             = true
+  skip_final_snapshot             = false
+  final_snapshot_identifier       = "lumenpress-prod-final"
+  enabled_cloudwatch_logs_exports = ["error", "slowquery"]
+
+  database_insights_mode = "standard"
+}
+
+resource "aws_db_instance" "lumenpress_replica" {
+  identifier                 = "lumenpress-prod-replica-1"
+  replicate_source_db        = aws_db_instance.lumenpress.identifier
+  instance_class             = var.db_instance_class
+  parameter_group_name       = aws_db_parameter_group.lumenpress.name
+  vpc_security_group_ids     = [aws_security_group.db.id]
+  publicly_accessible        = false
+  auto_minor_version_upgrade = true
+  ca_cert_identifier         = "rds-ca-rsa2048-g1"
+}
+
+output "endpoint" {
+  value = aws_db_instance.lumenpress.address
+}
+----
+Source: https://search.opentofu.org/provider/hashicorp/aws/latest/docs/resources/db_instance[OpenTofu registry: aws_db_instance]
+
+The arguments that deserve a reason:
+
+* `manage_master_user_password = true` makes RDS create the master credentials in Secrets Manager and rotate them. The
+  password never appears in the OpenTofu state or in a variable. Nothing in WordPress uses the master user; it creates
+  the two application users below and is then used only for administration. See
+  xref:cloud/aws/secrets-manager-and-kms.adoc[Secrets Manager and KMS].
+* `multi_az = true` places a synchronous standby in a second zone. The standby cannot serve reads. The next section covers
+  what a failover looks like to WordPress.
+* `storage_type = "gp3"` with `max_allocated_storage` lets the volume grow without an outage up to a ceiling you choose, so a
+  runaway `wp_options` or log table does not stop the site, while the ceiling still caps surprises.
+* `ca_cert_identifier = "rds-ca-rsa2048-g1"` is the default certificate authority; setting it makes the choice visible,
+  and it is the one the TLS section trusts.
+* `deletion_protection = true` and a named final snapshot make a mistaken `tofu destroy` stop instead of deleting the
+  site's only copy of its content. `backup_retention_period` sets automated backups, point-in-time recovery included;
+  restoring is covered in xref:cms/wordpress/backups-and-disaster-recovery.adoc[Backups and Disaster Recovery].
+* `enabled_cloudwatch_logs_exports` ships the error and slow query logs to CloudWatch Logs, where the pods' own logs
+  already go. `database_insights_mode = "standard"` is the CloudWatch Database Insights mode that is on by default;
+  AWS is replacing the Performance Insights console experience with Database Insights, so use it for load by wait and
+  statement. Execution plans and on-demand analysis belong to the Advanced mode.
+* `publicly_accessible = false` and a security group that references the node security group instead of a CIDR range keep
+  the database reachable only from the pods. With EKS Auto Mode or the VPC CNI, the source is the node (or pod) security
+  group; see xref:cloud/aws/eks-clusters.adoc[EKS Clusters].
+* The replica inherits the engine and the parameter group. It is optional: leave it out until reads are a problem.
+
+== The parameter group
+
+RDS does not let you edit `my.cnf`. Settings live in a *parameter group* of the right family, `mariadb11.8` here and
+`mysql8.4` for MySQL 8.4. Parameters are either dynamic, applied at once, or static, applied at the next reboot; the
+provider's `apply_method` is `immediate` for the first kind and `pending-reboot` for the second. A parameter group is
+attached to the instance, so a new one, as the `create_before_destroy` lifecycle above, must be created before the
+instance can switch to it, and a switch can need a reboot.
+
+The Lumen Press group changes only what WordPress and operations need:
+
+[cols="2,2,3",options=header]
+|===
+| Parameter | Value | Why
+| `character_set_server`, `character_set_client`, `character_set_connection`, `character_set_results` | `utf8mb4` | Matches `DB_CHARSET`. WordPress also sets the connection character set itself, but a server default avoids surprises for WP-CLI, migrations and ad hoc sessions. RDS Proxy tracks these variables, so they do not cause pinning
+| `max_allowed_packet` | `67108864` | 64 MiB. Imports, large `post_content` and serialized options exceed the 16 MiB default; WordPress reports "MySQL server has gone away" when a packet is rejected
+| `slow_query_log`, `long_query_time`, `log_output` | `1`, `1`, `FILE` | Writes the slow query log to a file that RDS exports to CloudWatch Logs. One second is a coarse start; lower it when the log is quiet
+| `require_secure_transport` | `1` | Refuses unencrypted connections. It is the default from MariaDB 11.8.3 on RDS; setting it keeps MariaDB 10.11 and 11.4, and MySQL, equal
+|===
+
+Parameters that are *not* changed, deliberately:
+
+* `max_connections` has an RDS default derived from the instance memory: `+LEAST({DBInstanceClassMemory/25165760},12000)+`
+  for MariaDB 10.5 and later, and `+{DBInstanceClassMemory/12582880}+` for MySQL. The first is "about the memory in
+  megabytes divided by 25"; the instance's real value is lower because the formula starts from memory net of what RDS
+  reserves. Read it with `+SHOW GLOBAL VARIABLES LIKE 'max_connections'+` instead of calculating it, and design the pod
+  fleet to stay under it (next sections). Raising it trades memory for connections; a connection proxy is the better fix.
+* `innodb_buffer_pool_size` keeps the RDS default, a fraction of instance memory. Tune it only after the working set is
+  known; the object cache removes most read pressure first.
+* `sql_mode` stays at the engine default. `wpdb` sets its own `sql_mode` at connect time (it removes modes WordPress
+  cannot work with, such as `ONLY_FULL_GROUP_BY` and strict modes for old plugins), so a custom server value rarely helps.
+* `time_zone` stays UTC. WordPress stores GMT dates alongside local ones and does its own conversions.
+
+Change a parameter in the OpenTofu file, run `tofu plan` and read whether the provider reports a pending reboot before
+applying. A reboot of a Multi-AZ instance fails over, which is a short outage; do it in a maintenance window or through
+a planned failover, and, if RDS Proxy is in use, remember that a parameter group change is reflected in the proxy only
+after an instance reboot.
+
+== Multi-AZ and what WordPress sees during a failover
+
+In a Multi-AZ instance deployment RDS keeps a synchronous standby in another zone. On a failure of the primary, of its
+zone or of its storage, and during planned maintenance, RDS promotes the standby and moves the instance endpoint's DNS
+record to it. AWS documents a failover time of typically one to two minutes for this deployment type. The standby is not
+readable.
+
+For WordPress the effect is a window of failed requests, and then recovery with no action:
+
+. Existing connections drop. A request in the middle of a query gets an error and `wpdb` reports it; a half-saved
+  post is rolled back by InnoDB, since each statement is atomic.
+. New requests cannot connect for the length of the window. WordPress shows "Error establishing a database connection"
+  with a 500 response unless a `wp-content/db-error.php` drop-in replaces the page; use one that returns `503` and
+  `Retry-After`, so the CDN can serve stale pages and visitors do not see a stack trace. Pages served entirely from
+  the CDN or a full-page cache keep working during the window.
+. PHP does not cache the database address. Each request resolves the endpoint again through the system resolver, so
+  the next connection after the DNS change reaches the new primary. This is unlike a JVM, which can hold a resolved
+  address for a long time. The only caching to watch is a sidecar or node-local DNS cache with a long TTL; keep it at
+  the RDS record's short TTL.
+. Pods stay healthy as processes. If the readiness probe touches the database, the pods leave the load balancer
+  during the window and return after it, which hides the errors from visitors at the cost of a harder outage; whether that
+  is better than errors on dynamic pages depends on how much of the traffic the CDN absorbs. A probe that checks only
+  PHP-FPM keeps the pods in service and lets the CDN and `db-error.php` handle the window. The Helm page chooses a probe
+  (xref:cms/wordpress/deploying-on-eks-with-helm.adoc[Deploying on EKS with Helm]).
+. Writes by the cron scheduler, `wp-cli` jobs and the release Job fail and are retried by the next run or by Kubernetes.
+
+The test that proves it is a forced failover on staging, while a probe hits a URL that needs the database. The script
+below requests `/wp-json/` once a second, forces a failover with the call from the CLI reference and prints every
+response that was not `200`, together with the RDS events:
+
+[source,bash]
+----
+#!/usr/bin/env bash
+# Forces a Multi-AZ failover of the instance named below while measuring what a visitor sees.
+# Run against staging first. Needs the AWS CLI configured for the right account and region.
+set -euo pipefail
+
+instance=lumenpress-staging
+url=https://staging.lumenpress.example/wp-json/
+log=$(mktemp)
+
+# Probe once a second for the whole test; /wp-json/ needs the database, so it fails when the database is away.
+( while true; do
+    curl -s -o /dev/null --max-time 5 -w '%{time_starttransfer} %{http_code}\n' "$url" | sed "s/^/$(date +%T) /" >> "$log" || true
+    sleep 1
+  done ) &
+probe=$!
+trap 'kill "$probe" 2>/dev/null || true' EXIT
+
+sleep 20
+echo "Forcing failover of $instance at $(date +%T)"
+aws rds reboot-db-instance --db-instance-identifier "$instance" --force-failover --output text --query 'DBInstance.DBInstanceStatus'
+
+aws rds wait db-instance-available --db-instance-identifier "$instance"
+echo "Instance available again at $(date +%T)"
+sleep 20
+
+echo "Events during the test:"
+aws rds describe-events --source-type db-instance --source-identifier "$instance" --duration 30 \
+  --query 'Events[].[Date,Message]' --output text
+
+echo "Probe results other than HTTP 200:"
+grep -v ' 200$' "$log" || echo "none"
+----
+Source: https://docs.aws.amazon.com/cli/latest/reference/rds/reboot-db-instance.html[AWS CLI: aws rds reboot-db-instance]
+
+Read the result as the real availability of the tier. A window longer than the documented one, or errors that continue
+after RDS reports the instance available, usually point at a node-local DNS cache, a connection timeout in a plugin, or a
+probe that keeps the pods out of service. For Aurora, the cluster endpoint fails over to a promoted reader and
+the same script applies with `aws rds failover-db-cluster --db-cluster-identifier <cluster>` in place of the reboot.
+Repeat the test after any change to the network path, such as adding RDS Proxy.
+
+== TLS from wp-config.php
+
+RDS for MariaDB 11.8 on RDS refuses unencrypted connections by default, and the parameter group above makes that explicit.
+WordPress has one switch for TLS, and it is thin: `wpdb::db_connect()` passes the value of the constant
+`MYSQL_CLIENT_FLAGS` to `mysqli_real_connect()` and calls nothing else, so core has no setting for a CA file. The
+consequences are worth stating plainly:
+
+* `+define( 'MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL );+` *encrypts* the connection. With no CA configured, PHP's `mysqlnd`
+  driver does not verify the server's certificate, so the connection is protected from eavesdropping but not from
+  someone who answers for the database's address. Inside a private subnet that is a small residual risk, and many
+  sites stop here.
+* To *verify* the certificate, the client must call `mysqli_ssl_set()` with a CA file before connecting. Core never does.
+  A `db.php` drop-in with a `wpdb` subclass can; the one below reads the CA path from a `DB_SSL_CA` constant. It
+  copies the connection steps of `wpdb::db_connect()`, so compare it with that method whenever WordPress is upgraded.
+* The CA file is the RDS bundle. AWS publishes one for every commercial Region at
+  `https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`; it holds the roots `rds-ca-rsa2048-g1`,
+  `rds-ca-rsa4096-g1` and `rds-ca-ecc384-g1`. Register only roots, not intermediates, so that RDS can rotate server
+  certificates without a client change. Download it in the image build, not at pod start.
+* Connect to the name in the certificate: the instance endpoint as RDS reports it. A friendly CNAME in front of it makes
+  host-name verification fail, which is also why RDS Proxy cannot be used with custom DNS and host-name validation.
+* RDS Proxy presents certificates from AWS Certificate Manager. Applications that connect through the proxy trust the
+  Amazon roots already in the system bundle and need no RDS download; point `DB_SSL_CA` at the system bundle instead.
+* LudicrousDB replaces `$wpdb` with its own class. It honours `MYSQL_CLIENT_FLAGS` but has no CA option, so with replicas
+  the connection is encrypted but not verified. Choose between verification and replicas, or add the CA call to a
+  LudicrousDB subclass.
+
+The database section of `wp-config.php` for the tiered site follows. Values arrive as environment variables from the
+secret store; xref:cms/wordpress/wp-config-reference.adoc[wp-config.php Reference] lists the constants.
+
+[source,php]
+----
+<?php
+/**
+ * wp-config.php fragment: the database section for the tiered Lumen Press site on RDS.
+ * Values come from environment variables that Kubernetes fills from Secrets Manager.
+ */
+define( 'DB_NAME', getenv( 'WORDPRESS_DB_NAME' ) ?: 'lumenpress' );
+define( 'DB_USER', getenv( 'WORDPRESS_DB_USER' ) ?: 'wp_app' );
+define( 'DB_PASSWORD', getenv( 'WORDPRESS_DB_PASSWORD' ) );
+define( 'DB_HOST', getenv( 'WORDPRESS_DB_HOST' ) );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+
+// Encrypt the connection. Core passes these flags to mysqli_real_connect() and nothing else.
+define( 'MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL );
+
+// Verify the server certificate. Read by the db.php drop-in shown on this page, not by core.
+define( 'DB_SSL_CA', '/etc/ssl/certs/rds-global-bundle.pem' );
+----
+Source: https://developer.wordpress.org/advanced-administration/wordpress/wp-config/[Advanced Administration Handbook: Editing wp-config.php]
+
+The drop-in is `wp-content/db.php`. WordPress loads it instead of the default `wpdb` when it exists. It was tested
+against MariaDB 11.8 with a certificate from a private CA: a connection with the right CA succeeded over TLS 1.3, and a
+connection with a CA that did not sign the server certificate failed with the standard connection error.
+
+[source,php]
+----
+<?php
+/**
+ * Drop-in wp-content/db.php: a wpdb that verifies the database server certificate.
+ *
+ * Core calls mysqli_real_connect() with MYSQL_CLIENT_FLAGS and never mysqli_ssl_set(), so a CA bundle
+ * cannot be passed through wp-config.php. This subclass supplies the CA from the DB_SSL_CA constant.
+ * Keep it in step with wpdb::db_connect() when WordPress changes it.
+ */
+class Lumen_Verified_TLS_Wpdb extends wpdb {
+
+	public function db_connect( $allow_bail = true ) {
+		$this->is_mysql = true;
+		mysqli_report( MYSQLI_REPORT_OFF );
+
+		$dbh       = mysqli_init();
+		$host      = $this->dbhost;
+		$port      = null;
+		$socket    = null;
+		$host_data = $this->parse_db_host( $this->dbhost );
+		if ( $host_data ) {
+			list( $host, $port, $socket ) = $host_data;
+		}
+
+		if ( defined( 'DB_SSL_CA' ) ) {
+			mysqli_ssl_set( $dbh, null, null, DB_SSL_CA, null, null );
+		}
+		$flags = defined( 'MYSQL_CLIENT_FLAGS' ) ? MYSQL_CLIENT_FLAGS : 0;
+
+		// phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+		@mysqli_real_connect( $dbh, $host, $this->dbuser, $this->dbpassword, null, $port, $socket, $flags );
+
+		if ( $dbh->connect_errno ) {
+			$this->dbh = null;
+			if ( $allow_bail ) {
+				$this->bail( '<h1>Error establishing a database connection</h1>', 'db_connect_fail' );
+			}
+			return false;
+		}
+
+		$this->dbh = $dbh;
+		if ( ! $this->has_connected ) {
+			$this->init_charset();
+		}
+		$this->has_connected = true;
+		$this->set_charset( $this->dbh );
+		$this->ready = true;
+		$this->set_sql_mode();
+		$this->select( $this->dbname, $this->dbh );
+
+		return true;
+	}
+}
+
+$wpdb = new Lumen_Verified_TLS_Wpdb( DB_USER, DB_PASSWORD, DB_NAME, DB_HOST );
+----
+Source: https://www.php.net/manual/en/mysqli.ssl-set.php[PHP manual: mysqli::ssl_set]
+
+The image build adds both the bundle and the drop-in. The base is the official image; the tag
+`wordpress:7.1.4-php8.4-fpm` existed on Docker Hub on the check date, and the build of your own image should confirm
+that with `docker pull` before relying on it.
+
+[source,dockerfile]
+----
+# Fragment of the Lumen Press image: trust the RDS certificate authorities and ship the verifying db.php.
+FROM wordpress:php8.4-fpm
+
+ADD --chmod=0644 https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem /etc/ssl/certs/rds-global-bundle.pem
+
+COPY --chown=root:root --chmod=0644 db.php /usr/src/wordpress/wp-content/db.php
+----
+Source: https://docs.docker.com/reference/dockerfile/#add[Dockerfile reference: ADD]
+
+To prove that TLS is really in use, run `+SHOW SESSION STATUS LIKE 'Ssl_cipher'+` through `wp db query` on a pod; an
+empty value means the session is not encrypted. See xref:cms/wordpress/wp-cli.adoc[WP-CLI].
+
+== Users and grants
+
+Three kinds of database accounts exist, and only two belong to WordPress.
+
+* The *master user*, created with the instance. It has broad rights, its password is held and rotated by Secrets
+  Manager, and nothing in the cluster mounts it.
+* `wp_app`, used by every web pod and by the cron scheduler. It needs to read and write rows only.
+* `wp_migrate`, used by the pre-upgrade Job `lumenpress-migrate` (`wp core update-db`, plugin schema upgrades, imports).
+  It also needs DDL.
+
+The statements run once as the master user, over TLS, from a temporary pod inside the cluster:
+
+[source,sql]
+----
+-- Run once as the RDS master user, over TLS.
+CREATE USER 'wp_app'@'%' IDENTIFIED BY '<generate-and-store-in-secrets-manager>' REQUIRE SSL;
+GRANT SELECT, INSERT, UPDATE, DELETE ON `lumenpress`.* TO 'wp_app'@'%';
+
+CREATE USER 'wp_migrate'@'%' IDENTIFIED BY '<generate-and-store-in-secrets-manager>' REQUIRE SSL;
+GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES, CREATE TEMPORARY TABLES, LOCK TABLES
+  ON `lumenpress`.* TO 'wp_migrate'@'%';
+
+SHOW GRANTS FOR 'wp_app'@'%';
+SHOW GRANTS FOR 'wp_migrate'@'%';
+----
+Source: https://mariadb.com/kb/en/grant/[MariaDB documentation: GRANT]
+
+The grants were run on MariaDB 11.8. Notes:
+
+* `REQUIRE SSL` on each account means a client that skips TLS is refused even if the server parameter is weakened.
+* The split makes a compromised web pod unable to drop or alter tables, which is the damage a remote-code-execution
+  bug in a plugin would otherwise cause. It also means schema changes happen only in the release Job, as intended.
+* The cost: a plugin that creates tables from `init` without the release Job fails with "command denied" on the web pods.
+  Find these in staging by enabling plugins one by one with the app user. For the few that cannot be fixed, either run
+  their upgrade routine in the release Job (a WP-CLI command, or loading `wp-admin/includes/upgrade.php` and calling
+  the plugin's installer) or, as a last resort, give `wp_app` the extra privileges and say so in the runbook.
+* Never grant `FILE`, `SUPER` or `PROCESS` to application users, and never `GRANT OPTION`. `GRANT ALL` on `+*.*+` is
+  not available on RDS anyway.
+* WordPress needs no privilege on other schemas. Keep one database per site, and create a second schema and second pair of
+  users for a second site, even though a multisite network uses one.
+* Passwords are generated outside the page and stored in Secrets Manager (`lumenpress/prod/wordpress`, key
+  `DB_PASSWORD`, plus the migrate user's password under its own key or secret that only the Job can read). The statements
+  show placeholders only.
+
+Rotating a user's password is a two-step change: update the secret, then restart the pods so they read it again, or
+use the master-user rotation that RDS provides for the master secret only. Applications that use their own users need
+a rotation function of their own; see xref:cloud/aws/secrets-manager-and-kms.adoc[Secrets Manager and KMS].
+
+== Connection math
+
+Every busy PHP-FPM worker holds one connection. The maximum number of connections the fleet can open is therefore
+bounded by the pool settings, and a pool that can outgrow `max_connections` turns a traffic spike into "Too many
+connections" errors that the autoscaler cannot fix, since adding pods adds connections.
+
+The worst-case total is:
+
+`pass:c[pods x pm.max_children + cron and jobs + monitoring + operators + headroom <= max_connections]`
+
+For Lumen Press, with a MariaDB instance whose `max_connections` reads about 300 on the chosen class:
+
+[cols="2,1,3",options=header]
+|===
+| Term | Connections | Basis
+| Web pods at the HPA maximum: 10 pods with `pm.max_children = 16` | 160 | A pod never serves more than 16 concurrent PHP requests, so it never holds more than 16 connections
+| Scheduler CronJob (`wp cron event run --due-now`) | 4 | One pod, a handful of events at once
+| Release Job and one-off WP-CLI pods | 8 | The migrate Job plus an operator running `wp` commands
+| Monitoring exporters and a read-only dashboard user | 6 | Prometheus exporters poll over one connection each
+| Replication and RDS internals | 5 | `rdsadmin`, replicas, the proxy's own user if present
+| *Total* | *183* | About 60 percent of 300, leaving room for a rolling update to run old and new pods side by side
+|===
+
+The rolling update is the term people forget: with `maxSurge` above zero, old and new pods coexist, so the figure should
+hold with the surge pods added. A static pool is the easiest to reason about because the number is fixed:
+
+[source,ini]
+----
+[www]
+user = www-data
+group = www-data
+listen = 127.0.0.1:9000
+
+; Static pool: the number of PHP workers, and so of database connections, per pod never changes.
+pm = static
+pm.max_children = 16
+pm.max_requests = 500
+
+; Fail a stuck request instead of holding a worker and a database connection for ever.
+request_terminate_timeout = 60s
+----
+Source: https://www.php.net/manual/en/install.fpm.configuration.php[PHP manual: FPM configuration]
+
+`pm = static` with `pm.max_children = 16` keeps a pod's connections constant at the cost of memory for 16 workers even
+when idle; `pm = dynamic` saves memory but lets the number swing. Size `max_children` from pod memory (the memory of a
+worker is whatever `ps` shows for php-fpm children under load, plus OPcache shared once per pod), then size the pod count
+from the connection budget, not the reverse. `request_terminate_timeout` stops a hung request from holding a worker and
+a connection for ever.
+
+Measure rather than assume:
+
+[source,sql]
+----
+SHOW GLOBAL VARIABLES LIKE 'max_connections';
+SHOW GLOBAL STATUS LIKE 'Max_used_connections';
+SHOW GLOBAL STATUS LIKE 'Threads_connected';
+SHOW GLOBAL STATUS LIKE 'Aborted_connects';
+SHOW GLOBAL STATUS LIKE 'Connection_errors_max_connections';
+----
+Source: https://mariadb.com/kb/en/server-status-variables/[MariaDB documentation: Server Status Variables]
+
+`Max_used_connections` after a load test is the figure to compare with the budget, and in CloudWatch the metric
+`DatabaseConnections` shows the same over time. `Connection_errors_max_connections` above zero is the error you are
+budgeting against. Load testing the cluster, including the connection figure, is covered in
+xref:cms/wordpress/releases-upgrades-and-autoscaling-on-kubernetes.adoc[Releases, Upgrades and Autoscaling on Kubernetes].
+
+Three levers lower the connections without a proxy: fewer busy workers per page through a persistent object cache (the
+queries disappear; see xref:cms/wordpress/object-cache-sessions-and-cron-in-a-cluster.adoc[Object Cache, Sessions and Cron in a Cluster]),
+an edge cache so that anonymous traffic never reaches PHP, and a smaller `max_children` with more pods. Do not turn on
+persistent connections (`p:` host prefix, or LudicrousDB's `persistent` property): with WordPress they keep an idle
+connection per worker for ever, which is the opposite of what the budget needs.
+
+== RDS Proxy and pinning
+
+RDS Proxy keeps a pool of long-lived connections to the database and lets many short client connections share them. It
+suits WordPress when the connection budget is hard to meet: bursts from autoscaling, failover storms in which every pod
+reconnects at once, or a small instance class that has low `max_connections`. It also shortens failover for clients, since
+the proxy bypasses DNS caches and holds client connections while the database changes. RDS Proxy sits in the same VPC
+and is attached to the writer only; it cannot be attached to a read replica.
+
+*Pinning* is the cost. The proxy multiplexes a client's connections only between transactions; when a session depends on
+state, the proxy pins the client to one database connection until the client disconnects, and that connection cannot be
+shared, so heavy pinning gives no pooling at all. AWS lists what pins a MariaDB or MySQL session: explicit table locks
+(`LOCK TABLES`, `FLUSH TABLES WITH READ LOCK`), `GET_LOCK` named locks, temporary tables, prepared statements, executable
+comments, setting user or system variables with some exceptions, statements larger than 16 KB, and a few functions such
+as `ROW_COUNT()` and `FOUND_ROWS()`. The variables the proxy tracks without pinning include `+character_set_*+`,
+`+collation_*+`, `sql_mode`, `time_zone`, `autocommit`, `NAMES`, `wait_timeout` and the transaction isolation variables.
+
+What follows for WordPress:
+
+* The `SET NAMES` and `SET SESSION sql_mode` that `wpdb` runs on connect are in the tracked list, so they do not pin.
+* Core does not use prepared statements or `LOCK TABLES` in normal requests. A plugin that does, or that calls
+  `GET_LOCK`, pins the session of that request only, since the connection ends with the request.
+* A post with more than 16 KB of content, serialized options and many imports are single statements over 16 KB. Their
+  sessions pin too, briefly. The editor saves and imports are rare compared with page views.
+* Queries that read `FOUND_ROWS()` after `SQL_CALC_FOUND_ROWS` may pin. Whether a given plugin's queries do is something
+  to measure rather than predict.
+
+The measurement is the CloudWatch metric `DatabaseConnectionsCurrentlySessionPinned` next to `DatabaseConnections`
+for the proxy; if most client connections are pinned, the proxy adds a hop without adding capacity. The proxy's session
+pinning filters and its initialization query let you exempt `SET` statements or move session setup to the proxy.
+
+Other limits that matter on this stack: a proxy for MariaDB listens on port 3306; it does not support the MariaDB
+compressed protocol or `auth_ed25519`, and it does not support TLS 1.3 for MariaDB, so clients negotiate TLS 1.2;
+and it cannot be used with an instance whose `read_only` parameter is `1`. Each proxy needs the database credentials
+as Secrets Manager secrets, one per database user. A parameter group change reaches the proxy only after an instance
+reboot. Pods connect to the proxy endpoint instead of the instance endpoint and trust the system CA bundle. In short,
+start without a proxy, watch `Max_used_connections` and the failover test, and add one when the numbers say so.
+
+== Read replicas and LudicrousDB
+
+A read replica is an asynchronous copy for reads, and standard `wpdb` cannot use one. Before adding it, rule out the
+cheaper fixes: a persistent object cache and a full-page cache serve most reads without PHP. Replicas are not a high
+availability mechanism; a promotion is manual and can lose the replication lag. Multi-AZ gives availability; replicas
+give read capacity.
+
+HyperDB is Automattic's `db.php` drop-in that splits reads and writes; its WordPress.org page showed version 1.9, last
+updated October 2022 and tested up to WordPress 6.0 on the check date. LudicrousDB, its community fork, was at
+5.3.1 (2026-09-23), requires PHP 7.4 and WordPress 6.4 and is tested up to 7.1. Both are third-party software. The three
+installation steps are unchanged from xref:cms/wordpress/scaling-and-high-availability.adoc[Scaling and High Availability]: put
+the plugin in `wp-content/mu-plugins/ludicrousdb/`, copy `drop-ins/db.php` to `wp-content/db.php`, and write
+`db-config.php` next to `wp-config.php`. For RDS the configuration reads the writer from `DB_HOST` and the replica
+(or the Aurora reader endpoint) from the environment:
+
+[source,php]
+----
+<?php
+/**
+ * LudicrousDB configuration for Lumen Press on RDS or Aurora: the writer takes every write, the reader
+ * endpoint (an RDS read replica or the Aurora reader endpoint) takes the reads.
+ * Lives next to wp-config.php. Host names come from the environment, never from the file.
+ */
+
+// Writer: every write, and reads when the reader is unreachable.
+$wpdb->add_database(
+	array(
+		'host'          => DB_HOST,
+		'user'          => DB_USER,
+		'password'      => DB_PASSWORD,
+		'name'          => DB_NAME,
+		'write'         => 1,
+		'read'          => 2, // Fallback for reads.
+		'dataset'       => 'global',
+		'timeout'       => 0.5,
+		'lag_threshold' => null,
+	)
+);
+
+// Reader: reads only. A lag threshold makes LudicrousDB skip a replica that has fallen behind.
+$wpdb->add_database(
+	array(
+		'host'          => getenv( 'LUMEN_DB_READER_HOST' ),
+		'user'          => DB_USER,
+		'password'      => DB_PASSWORD,
+		'name'          => DB_NAME,
+		'write'         => 0,
+		'read'          => 1,
+		'dataset'       => 'global',
+		'timeout'       => 0.5,
+		'lag_threshold' => 5,
+	)
+);
+----
+Source: https://github.com/stuttter/ludicrousdb[LudicrousDB on GitHub (stuttter/ludicrousdb)]
+
+How it behaves:
+
+* Reads go to the lowest `read` number, writes to the host with `write` set. After a write in the same request, reads in
+  that request stay on the writer, so a user sees their own change; the next request, after a redirect, may read a
+  replica that is behind.
+* If the replica is unreachable, reads fall back to the writer (`+'read' => 2+`) after the connection `timeout`. Keep it
+  short, as set above, or every request pays it.
+* `lag_threshold` makes LudicrousDB skip a replica whose lag, read through a callback you register, is above the
+  threshold. Without a callback it has nothing to compare, so also alarm on the CloudWatch `ReplicaLag` metric.
+* In Aurora, use the cluster's *reader endpoint*, which spreads connections over the readers and drops a failed one.
+  With RDS read replicas, name one replica, or put several behind Route 53 weighted records.
+* The drop-in and the CA-verifying drop-in of the TLS section are mutually exclusive: both are `wp-content/db.php`.
+* Cron events, `wp-admin` saves and WooCommerce checkouts need current data. Keep their reads on the writer or avoid
+  replicas for the sites that mostly write; see the WooCommerce cloud pages for the specifics.
+
+== Aurora
+
+Aurora separates compute from a shared storage volume that is copied across three zones. A cluster has a *writer*
+instance and up to 15 *readers* that read the same storage, so replica lag is typically milliseconds rather than the
+seconds of binlog replication. Failover promotes a reader (the one with the best promotion tier) and is faster than a
+Multi-AZ DNS flip because no data is copied; the cluster endpoint is a DNS name with a short TTL that moves to the new
+writer. For WordPress:
+
+* `DB_HOST` is the *cluster endpoint*, which always points at the writer. The *reader endpoint* is for LudicrousDB.
+* Parameters live in two groups: a cluster parameter group (character sets, `require_secure_transport`, binlog format) and
+  an instance parameter group (per-instance settings), with the families `aurora-mysql8.0` for Aurora MySQL 3 and the one
+  that matches an Aurora MySQL 8.4 engine version (read it from `aws rds describe-db-engine-versions`).
+* Aurora MySQL 3 is compatible with MySQL 8.0.23 and later; Aurora MySQL 8.4 is MySQL 8.4 compatible. WordPress's tested
+  line is MySQL 8.4, so test plugins on the engine you choose.
+* Direct inserts into `mysql.user` are not allowed in Aurora MySQL 3. Use `CREATE USER` and `GRANT`, as above; the
+  `rds_superuser_role` stands in for `SUPER`.
+* Multi-source replication and the `default_authentication_plugin` change are not available in Aurora MySQL 3.
+
+The cluster in OpenTofu, with two instances in different zones and the engine version as a variable so that it is chosen
+from the live list rather than copied from a page:
+
+[source,hcl]
+----
+terraform {
+  required_version = ">= 1.8"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "eu-west-1"
+}
+
+variable "aurora_engine_version" {
+  description = "List the choices with: aws rds describe-db-engine-versions --engine aurora-mysql"
+  type        = string
+}
+
+variable "aurora_parameter_group_family" {
+  description = "Parameter group family that matches the engine version."
+  type        = string
+  default     = "aurora-mysql8.0"
+}
+
+variable "db_subnet_group_name" {
+  type = string
+}
+
+variable "db_security_group_id" {
+  type = string
+}
+
+resource "aws_rds_cluster_parameter_group" "lumenpress" {
+  name   = "lumenpress-aurora-cluster"
+  family = var.aurora_parameter_group_family
+
+  parameter {
+    name  = "character_set_server"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "require_secure_transport"
+    value = "ON"
+  }
+}
+
+resource "aws_rds_cluster" "lumenpress" {
+  cluster_identifier = "lumenpress-prod"
+  engine             = "aurora-mysql"
+  engine_version     = var.aurora_engine_version
+  database_name      = "lumenpress"
+  master_username    = "admin_lumenpress"
+
+  manage_master_user_password = true
+
+  db_subnet_group_name            = var.db_subnet_group_name
+  vpc_security_group_ids          = [var.db_security_group_id]
+  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.lumenpress.name
+
+  storage_encrypted               = true
+  backup_retention_period         = 14
+  deletion_protection             = true
+  copy_tags_to_snapshot           = true
+  skip_final_snapshot             = false
+  final_snapshot_identifier       = "lumenpress-prod-final"
+  enabled_cloudwatch_logs_exports = ["error", "slowquery"]
+}
+
+resource "aws_rds_cluster_instance" "lumenpress" {
+  count = 2
+
+  identifier         = "lumenpress-prod-${count.index + 1}"
+  cluster_identifier = aws_rds_cluster.lumenpress.id
+  engine             = aws_rds_cluster.lumenpress.engine
+  engine_version     = aws_rds_cluster.lumenpress.engine_version
+  instance_class     = "db.r7g.large"
+}
+
+output "writer_endpoint" {
+  value = aws_rds_cluster.lumenpress.endpoint
+}
+
+output "reader_endpoint" {
+  value = aws_rds_cluster.lumenpress.reader_endpoint
+}
+----
+Source: https://search.opentofu.org/provider/hashicorp/aws/latest/docs/resources/rds_cluster[OpenTofu registry: aws_rds_cluster]
+
+The `db.r7g.large` class is an example; pick the class from the working set and the connection budget, and check that it
+is offered for the engine in the Region.
+
+== Pitfalls
+
+* *Unsized connections.* Autoscaling web pods against a fixed `max_connections` is the commonest way for a healthy
+  database to refuse the site. Do the budget before the first load test.
+* *Skipping the CA.* A connection that is encrypted but unverified looks secure in a status query. Decide on purpose,
+  and write the decision in the runbook.
+* *A runtime user that cannot run DDL.* The first plugin that creates a table on `init` fails with a database error
+  and a half-installed feature. Test every plugin on staging with the real grants.
+* *Forgetting the reboot.* A static parameter, or a proxy attached to the instance, is not in effect until a reboot, and a Multi-AZ reboot is a failover.
+* *Probing the database from the readiness probe.* A failover then removes every pod from the load balancer at once.
+* *Replicas for write-heavy pages.* Replication lag turns "I just saved" into stale pages. Keep these reads on the writer.
+* *Changing the engine family late.* Moving from MariaDB to MySQL, or to Aurora, is a dump and restore, not a setting.
+* *Leaving MySQL 8.0 where it is.* Standard support ended on 2026-07-31, and the instance is now in paid extended support
+  until 2029-07-31; upgrade with a snapshot restored to a test instance first.
+
+== Where older material is outdated
+
+* Older WordPress guides name MySQL 5.7 or MariaDB 10.3. Both are long out of support, and RDS offers neither for new
+  databases.
+* Guides that put `+define( 'MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL );+` in `wp-config.php` and call the result "SSL with
+  certificate checking" are wrong about the checking part: core never verifies the certificate.
+* Posts about Performance Insights describe a console experience that AWS is replacing with CloudWatch Database Insights.
+* Bitnami MariaDB and MySQL images and charts are no longer a safe default for the database tier: the public images moved
+  to a legacy repository without updates in August 2025. Use the managed service, or build your own image.
+* Azure Database for MariaDB no longer exists (retired 2025-09-19).
+
+== References
+
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html[Amazon RDS User Guide]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_WorkingWithParamGroups.html[Parameter groups for Amazon RDS]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_Limits.html[Quotas and constraints for Amazon RDS (maximum connections)]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html[Multi-AZ DB instance deployments]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html[Using SSL/TLS to encrypt a connection to a DB instance or cluster]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy.html[Amazon RDS Proxy]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/rds-proxy-pinning.html[Avoiding pinning an RDS Proxy]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_ReadRepl.html[Working with DB instance read replicas]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/USER_DatabaseInsights.html[CloudWatch Database Insights for RDS]
+* https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/CHAP_AuroraOverview.html[Amazon Aurora User Guide]
+* https://developer.wordpress.org/advanced-administration/wordpress/wp-config/[Advanced Administration Handbook: Editing wp-config.php]
+* https://make.wordpress.org/hosting/handbook/server-environment/[Hosting Handbook: Server Environment]
+* https://www.php.net/manual/en/mysqli.ssl-set.php[PHP manual: mysqli::ssl_set]
+* https://www.php.net/manual/en/install.fpm.configuration.php[PHP manual: FPM configuration]
+* https://search.opentofu.org/provider/hashicorp/aws/latest/docs/resources/db_instance[OpenTofu registry: aws_db_instance]
