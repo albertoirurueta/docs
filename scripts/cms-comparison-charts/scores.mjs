@@ -5,6 +5,20 @@
 // and is drawn as a gap, never as zero.
 import { toNumber } from '../language-charts/data-utils.mjs';
 
+/** Snapshot (retrieval) date of the data; the year ranges of the charts and scores are derived from it. */
+export const SNAPSHOT = '2026-10-29';
+export const SNAPSHOT_YEAR = Number(SNAPSHOT.slice(0, 4));
+/** Last complete calendar year before the snapshot. */
+export const LAST_COMPLETE_YEAR = SNAPSHOT_YEAR - 1;
+
+/**
+ * GitHub repositories that are read-only mirrors of another host (WordPress Subversion, Drupal and TYPO3 GitLab). Their
+ * stars and contributors understate the community, so they are left out of the ecosystem score.
+ */
+export const MIRROR_REPOS = ['WordPress/WordPress', 'drupal/drupal', 'TYPO3/typo3'];
+/** Secondary repositories of a CMS that already has a main one in the data; charts show one repository per CMS. */
+export const SECONDARY_REPOS = ['WordPress/wordpress-develop'];
+
 /** The CMSs compared, grouped as on the page. Shopify is market-share context only and has no scores. */
 export const GROUPS = [
   { id: 'traditional', title: 'Traditional open-source (self-hosted)', short: 'Traditional open-source', slot: 0, members: ['wordpress', 'drupal', 'joomla', 'typo3', 'craft-cms'] },
@@ -36,7 +50,7 @@ export const CMS_GROUP = Object.fromEntries(GROUPS.flatMap((g) => g.members.map(
 export const AXES = [
   ['popularity', 'Popularity'],
   ['growth', 'Growth'],
-  ['talent', 'Talent pool / jobs'],
+  ['talent', 'Talent pool (Stack Overflow)'],
   ['ease_editors', 'Ease of use (editors)'],
   ['ease_developers', 'Ease of use (developers)'],
   ['ecosystem', 'Ecosystem and maturity'],
@@ -70,23 +84,38 @@ export function logScore(value, lo, hi) {
 const numeric = (r) => toNumber(r.value) !== null;
 const byDate = (a, b) => String(a.date).localeCompare(String(b.date));
 
-/** Rows of the platform and metric (optional item prefix filter) that carry a number, oldest first. */
+/** Rows whose fields match the filter: each value is an exact string or a RegExp tested against the field. */
+export function pickRows(rows, filter) {
+  return rows.filter((r) => Object.entries(filter).every(([k, v]) => (v instanceof RegExp ? v.test(r[k]) : r[k] === v)));
+}
+
+/** Rows matching the filter that carry a number, oldest first. */
+export function numericRowsWhere(rows, filter) {
+  return pickRows(rows, filter).filter(numeric).sort(byDate);
+}
+
+/** Latest numeric row matching the filter, or null. */
+export function latestRowWhere(rows, filter) {
+  const m = numericRowsWhere(rows, filter);
+  return m.length ? m.at(-1) : null;
+}
+
+const platformFilter = (platform, metric, itemFilter) => ({ platform, metric, ...(itemFilter ? { item: itemFilter } : {}) });
+
+/** Rows of the platform and metric (optional item RegExp filter) that carry a number, oldest first. */
 export function numericRows(rows, platform, metric, itemFilter) {
-  return rows
-    .filter((r) => r.platform === platform && r.metric === metric && numeric(r) && (!itemFilter || itemFilter.test(r.item)))
-    .sort(byDate);
+  return numericRowsWhere(rows, platformFilter(platform, metric, itemFilter));
 }
 
 /** Value of the row with the largest date for the platform and metric; null when none. */
 export function latestValue(rows, platform, metric, itemFilter) {
-  const m = numericRows(rows, platform, metric, itemFilter);
-  return m.length ? toNumber(m.at(-1).value) : null;
+  const r = latestRow(rows, platform, metric, itemFilter);
+  return r ? toNumber(r.value) : null;
 }
 
 /** Latest numeric row of the platform and metric, or null. */
 export function latestRow(rows, platform, metric, itemFilter) {
-  const m = numericRows(rows, platform, metric, itemFilter);
-  return m.length ? m.at(-1) : null;
+  return latestRowWhere(rows, platformFilter(platform, metric, itemFilter));
 }
 
 /** Popularity: mean of the log-scaled W3Techs share of all sites (0.01% = 0, 50% = 10) and HTTP Archive mobile origins (100 = 0, 5,000,000 = 10). */
@@ -109,7 +138,7 @@ export function growthScore(rows, platform) {
 }
 
 /** Questions asked on Stack Overflow with the CMS tag in the last two complete years; null when either year is missing. */
-export function recentQuestions(rows, platform, years = ['2024', '2025']) {
+export function recentQuestions(rows, platform, years = [String(LAST_COMPLETE_YEAR - 1), String(LAST_COMPLETE_YEAR)]) {
   const vals = years.map((y) => {
     const r = rows.find((x) => x.platform === platform && x.metric === 'stackexchange_questions_year' && /^stackoverflow:/.test(x.item) && x.date === y);
     return r ? toNumber(r.value) : null;
@@ -122,9 +151,12 @@ export function talentScore(rows, platform) {
   return logScore(recentQuestions(rows, platform), 10, 1e4);
 }
 
-/** GitHub stars of the CMS repositories, excluding mirrors and develop repositories; null when it has none. */
+/** True for the one repository per CMS that the charts show (secondary repositories are left out). */
+export const isMainRepo = (item) => Boolean(item) && !SECONDARY_REPOS.includes(item);
+
+/** GitHub stars of the CMS repositories, excluding mirrors and secondary repositories; null when it has none. */
 export function totalStars(rows, platform) {
-  const t = rows.filter((r) => r.platform === platform && r.metric === 'github_stars' && !/develop/.test(r.item) && numeric(r));
+  const t = rows.filter((r) => r.platform === platform && r.metric === 'github_stars' && isMainRepo(r.item) && !MIRROR_REPOS.includes(r.item) && numeric(r));
   return t.length ? t.reduce((a, r) => a + toNumber(r.value), 0) : null;
 }
 
@@ -153,8 +185,15 @@ export function performanceScore(rows, platform) {
   return m === null ? null : round1(clamp(m));
 }
 
-/** Returns { cms: { axisKey: score | null } } from the CSV data map. */
+const scoreCache = new WeakMap();
+
+/** Returns { cms: { axisKey: score | null } } from the CSV data map, computed once per data object. */
 export function computeScores(data) {
+  if (!scoreCache.has(data)) scoreCache.set(data, buildScores(data));
+  return scoreCache.get(data);
+}
+
+function buildScores(data) {
   const out = {};
   for (const p of CMS) out[p] = Object.fromEntries(AXES.map(([k]) => [k, null]));
   for (const r of data['radar-scores']) {

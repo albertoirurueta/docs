@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { toNumber } from '../language-charts/data-utils.mjs';
 import { loadData, generateCharts, CHART_DEFINITIONS, FILE_PREFIX, DATA_FILES, DATA_DIR } from './generate-charts.mjs';
+import { tcoComponents } from './chart-definitions.mjs';
 import { renderCmsChart, decimalYear } from './renderers.mjs';
 import {
-  AXES, CMS, CMS_GROUP, CMS_NAMES, CMS_SLOT, COMPUTED_AXES, EDITORIAL_AXES, GROUPS, computeScores, growthScore, latestValue, leaderOf, logScore,
+  AXES, CMS, CMS_GROUP, CMS_NAMES, CMS_SLOT, COMPUTED_AXES, EDITORIAL_AXES, GROUPS, LAST_COMPLETE_YEAR, MIRROR_REPOS, SNAPSHOT, SNAPSHOT_YEAR,
+  computeScores, ecosystemScore, growthScore, latestValue, leaderOf, logScore, totalStars,
 } from './scores.mjs';
 
 const data = loadData();
@@ -119,8 +121,9 @@ test('n/a is never plotted as zero: missing rows become gaps or n/a labels', () 
     for (const it of spec.items ?? []) check(it.value, `${it.label} value`);
   }
   for (const id of hasZero) {
-    // Zeros are real: zero counts (CVEs, advisories, job mentions), free software, or a computed score clamped at 0.
-    assert.match(id, /^(cves|advisories|hn-job|cost-entry|stackoverflow-questions|radar|scatter)/, `${id} plots a zero`);
+    // Zeros are real: zero counts (CVEs, advisories, job mentions), free software, a scenario with no paid extensions,
+    // or a computed score clamped at 0.
+    assert.match(id, /^(cves|advisories|hn-job|cost-entry|tco|stackoverflow-questions|radar|scatter)/, `${id} plots a zero`);
   }
   assert.ok(data.security.some((r) => r.metric === 'nvd_cves_year' && r.value === '0'));
 });
@@ -295,4 +298,45 @@ test('the committed images match the generator output', { skip: !existsSync(new 
     assert.ok(existsSync(file), `${id} is not generated into modules/ROOT/images`);
     assert.equal(readFileSync(file, 'utf8'), renderCmsChart(spec), `${id} is stale: run npm run charts:cms-comparison`);
   }
+});
+
+test('year ranges follow the snapshot date', () => {
+  assert.equal(SNAPSHOT_YEAR, Number(SNAPSHOT.slice(0, 4)));
+  const cves = specs['cves-core-traditional'];
+  assert.equal(Math.max(...cves.series[0].points.map((p) => p.x)), SNAPSHOT_YEAR);
+  assert.match(cves.xLabel, new RegExp(SNAPSHOT));
+  assert.equal(Math.max(...specs['stackoverflow-questions-traditional'].series[0].points.map((p) => p.x)), LAST_COMPLETE_YEAR);
+});
+
+test('the ecosystem score leaves out mirror repositories and the GitHub charts show one repository per CMS', () => {
+  const rows = [
+    { platform: 'x', metric: 'github_stars', item: MIRROR_REPOS[0], date: SNAPSHOT, value: '50000' },
+    { platform: 'x', metric: 'github_stars', item: 'x/main', date: SNAPSHOT, value: '1000' },
+  ];
+  assert.equal(totalStars(rows, 'x'), 1000);
+  for (const p of ['wordpress', 'drupal', 'typo3']) assert.equal(totalStars(data.popularity, p), null, p);
+  assert.equal(ecosystemScore(data.popularity, 'wordpress'), logScore(latestValue(data.popularity, 'wordpress', 'stackexchange_questions_total'), 1e2, 3e5));
+  for (const id of ['github-stars', 'github-contributors']) {
+    const labels = specs[id].items.map((i) => i.label);
+    assert.ok(!labels.includes('WordPress/wordpress-develop'), id);
+    assert.equal(labels.filter((l) => l.startsWith('WordPress/')).length, 1, id);
+  }
+});
+
+test('an unknown support-window phase is an error, not standard support', () => {
+  const build = CHART_DEFINITIONS.find((b) => b(data).id === 'support-windows-gantt');
+  const bad = { ...data, 'support-windows': [{ ...data['support-windows'][0], phase: 'lts' }] };
+  assert.throws(() => build(bad), /unknown phase "lts"/);
+});
+
+test('the 3-year TCO adds labour, extensions and converted hosting, and a missing rate gives no total', () => {
+  const rows = tcoComponents(data);
+  assert.equal(rows.length, 4);
+  for (const r of rows) {
+    assert.ok(r.labour > 0 && r.hosting > 0 && r.extensions >= 0, r.item);
+    assert.ok(Math.abs(r.total - (r.labour + r.extensions + r.hosting)) < 1e-6, r.item);
+  }
+  assert.equal(rows[0].labour, 2 * 60 * 36);
+  const noRate = { ...data, cost: data.cost.filter((r) => r.metric !== 'ecb_reference_rate_usd_per_eur') };
+  for (const r of tcoComponents(noRate)) { assert.equal(r.hosting, null); assert.equal(r.total, null); }
 });

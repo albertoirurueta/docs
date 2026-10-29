@@ -4,12 +4,12 @@
 // position and say so in the legend. Missing (n/a) values are never plotted as zero: they are gaps or "n/a" labels.
 import { toNumber } from '../language-charts/data-utils.mjs';
 import {
-  AXES, CMS, CMS_GROUP, CMS_NAMES, CMS_SLOT, GROUPS, computeScores, leaderOf, numericRows,
+  AXES, CMS, CMS_GROUP, CMS_NAMES, CMS_SLOT, COMPUTED_AXES, GROUPS, LAST_COMPLETE_YEAR, SNAPSHOT, SNAPSHOT_YEAR,
+  computeScores, isMainRepo, latestRowWhere, leaderOf, numericRows, pickRows,
 } from './scores.mjs';
 import { decimalYear, yearMonthLabel } from './renderers.mjs';
 
-export { decimalYear, yearMonthLabel };
-export const SNAPSHOT = '2026-10-29';
+export { decimalYear, yearMonthLabel, SNAPSHOT };
 const roundTo = (v, d) => Number(v.toFixed(d));
 const pct = (v) => `${roundTo(v, 1)}%`;
 const pct0 = (v) => `${Math.round(v)}%`;
@@ -18,15 +18,21 @@ const SHORT = { ...CMS_NAMES, aem: 'AEM', 'craft-cms': 'Craft CMS', shopify: 'Sh
 const GROUP_BY_ID = Object.fromEntries(GROUPS.map((g) => [g.id, g]));
 const CONTEXT_SLOT = 4;
 
-const pick = (rows, f) => rows.filter((r) => Object.entries(f).every(([k, v]) => (v instanceof RegExp ? v.test(r[k]) : r[k] === v)));
+const pick = pickRows;
 const latest = (rows, f) => {
-  const m = pick(rows, f).filter((r) => toNumber(r.value) !== null).sort((a, b) => String(a.date).localeCompare(String(b.date)));
-  return m.length ? toNumber(m.at(-1).value) : null;
+  const r = latestRowWhere(rows, f);
+  return r ? toNumber(r.value) : null;
 };
-const latestDate = (rows, f) => {
-  const m = pick(rows, f).filter((r) => toNumber(r.value) !== null).sort((a, b) => String(a.date).localeCompare(String(b.date)));
-  return m.length ? m.at(-1).date : 'n/a';
+const latestDate = (rows, f) => latestRowWhere(rows, f)?.date ?? 'n/a';
+/** "A, B and C" (or "A and B", "A"). */
+const listOf = (xs) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs.at(-1)}`);
+/** Sentence naming the CMSs of `ids` for which `value(id)` is null, or '' when every one has a value. */
+const naSentence = (ids, value, what = 'no series') => {
+  const na = ids.filter((id) => value(id) === null).map((id) => SHORT[id]);
+  if (!na.length) return '';
+  return ` ${listOf(na)} ${na.length === 1 ? 'has' : 'have'} ${what} (n/a).`;
 };
+const YTD = `${SNAPSHOT_YEAR} year to date`;
 const footer = (sources, file, extra = '') => `Source: ${sources}; retrieved ${SNAPSHOT}. ${extra}${extra ? ' ' : ''}Raw data: scripts/cms-comparison-charts/data/${file}.csv. See the Bibliography for the sources.`;
 const groupLegend = (ids = GROUPS.map((g) => g.id), withContext = false) => [
   ...ids.map((id) => ({ name: GROUP_BY_ID[id].short, slot: GROUP_BY_ID[id].slot })),
@@ -53,7 +59,7 @@ const w3History = (data) => {
   return {
     type: 'slotline', id: 'w3techs-history', width: 900,
     title: 'W3Techs share of all websites per year',
-    desc: `Share of all websites using each CMS on 1 January of each year from 2015 and on ${SNAPSHOT} according to W3Techs, for WordPress, Wix, Squarespace, Shopify (market-share context only), Joomla, Drupal and Webflow. WordPress rose to about 43% and has been flat since 2022, Wix and Squarespace keep growing, Joomla and Drupal decline. W3Techs publishes yearly history only for systems above 1% of all sites (Webflow from 2019), so the other CMSs have no series (n/a). Colours are assigned by position in this figure.`,
+    desc: `Share of all websites using each CMS on 1 January of each year from 2015 and on ${SNAPSHOT} according to W3Techs, for WordPress, Wix, Squarespace, Shopify (market-share context only), Joomla, Drupal and Webflow. W3Techs publishes yearly history only for systems above 1% of all sites (Webflow from 2019), so the other CMSs have no series (n/a). Colours are assigned by position in this figure.`,
     xLabel: `Year (1 January; last point ${SNAPSHOT})`, yLabel: 'Share of all websites (%)', yFormat: (v) => `${v}%`,
     series: ids.map((id, i) => ({ name: SHORT[id], slot: i, points: datedPoints(data.popularity, id, 'w3techs_share_all_sites_yearly') })),
     footer: footer('W3Techs historical yearly trends (w3techs.com/technologies/history_overview/content_management/all/y)', 'popularity'),
@@ -65,7 +71,7 @@ const w3Now = (data) => {
   return {
     type: 'groupedbar', id: 'w3techs-share-now', width: 1200,
     title: 'W3Techs market share now',
-    desc: `Share of all websites and share of websites with a known CMS for each CMS on ${SNAPSHOT} (W3Techs), ordered by share of all websites. WordPress holds about two fifths of all websites and three fifths of the sites with a known CMS. W3Techs does not report the CMSs shown as n/a, mostly headless and enterprise products that do not leave a visible fingerprint.`,
+    desc: `Share of all websites and share of websites with a known CMS for each CMS on ${SNAPSHOT} (W3Techs), ordered by share of all websites. ${SHORT[ids[0]]} has the largest share: ${pct(latest(data.popularity, { platform: ids[0], metric: 'w3techs_share_all_sites' }))} of all websites and ${pct(latest(data.popularity, { platform: ids[0], metric: 'w3techs_share_known_cms' }))} of the websites with a known CMS.${naSentence(ids, (id) => latest(data.popularity, { platform: id, metric: 'w3techs_share_all_sites' }), 'no W3Techs share')} Products that leave no visible fingerprint, mostly headless and enterprise ones, are not reported by W3Techs.`,
     xLabel: 'CMS (ordered by share of all websites)', yLabel: 'Share (%)', categories: ids.map((id) => SHORT[id]), valueFormat: pct,
     series: [['w3techs_share_all_sites', 'Share of all websites'], ['w3techs_share_known_cms', 'Share of websites with a known CMS']]
       .map(([metric, name]) => ({ name, values: ids.map((id) => latest(data.popularity, { platform: id, metric })) })),
@@ -83,7 +89,7 @@ const originsMobile = (group) => (data) => ({
 });
 
 const githubBars = (data, metric, id, title, unit, extra) => {
-  const rows = data.popularity.filter((r) => r.metric === metric && CMS.includes(r.platform) && toNumber(r.value) !== null && r.item)
+  const rows = data.popularity.filter((r) => r.metric === metric && CMS.includes(r.platform) && toNumber(r.value) !== null && isMainRepo(r.item))
     .sort((a, b) => toNumber(b.value) - toNumber(a.value));
   return {
     type: 'slotbars', id, width: 900,
@@ -110,8 +116,8 @@ const npmDownloads = (data) => {
   return {
     type: 'slotline', id: 'npm-downloads', width: 900,
     title: 'npm downloads per year',
-    desc: 'Yearly npm downloads of @strapi/strapi, payload, sanity, contentful and ghost, 2020 to 2026 year to date. Payload and Sanity downloads grow fastest; Strapi is flat. Counts include CI and mirror traffic and compare only npm packages with each other: PHP, Python and .NET CMSs ship through other registries. Colours are assigned by position in this figure.',
-    xLabel: 'Year (2026 is year to date)', yLabel: 'Downloads per year (npm, includes CI)',
+    desc: `Yearly npm downloads of @strapi/strapi, payload, sanity, contentful and ghost, 2020 to ${YTD}. Counts include CI and mirror traffic and compare only npm packages with each other: PHP, Python and .NET CMSs ship through other registries. Colours are assigned by position in this figure.`,
+    xLabel: `Year (${SNAPSHOT_YEAR} is year to date)`, yLabel: 'Downloads per year (npm, includes CI)',
     series: defs.map(([id, pkg], i) => {
       const rows = pick(data.popularity, { platform: id, metric: 'npm_downloads_year', item: pkg }).filter((r) => /^\d{4}$/.test(r.date) && toNumber(r.value) !== null).sort((x, y) => x.date.localeCompare(y.date));
       while (rows.length && toNumber(rows[0].value) === 0) rows.shift(); // years before the package was published
@@ -124,9 +130,9 @@ const npmDownloads = (data) => {
 const soQuestions = (group) => (data) => ({
   type: 'slotline', id: `stackoverflow-questions-${group.id}`, width: 900,
   title: `Stack Overflow questions per year (${group.short.toLowerCase()})`,
-  desc: `Questions asked each year on Stack Overflow with the tag of ${names(group.members)}, 2018 to 2025. Every tag falls steeply from 2023, mirroring the decline of the whole site, so the trend says little about the popularity of a CMS. The partial year 2026 is omitted.`,
+  desc: `Questions asked each year on Stack Overflow with the tag of ${names(group.members)}, 2018 to ${LAST_COMPLETE_YEAR}. The number of questions asked on the whole site has fallen since 2023, so a falling line says little about the popularity of a CMS. The partial year ${SNAPSHOT_YEAR} is omitted.`,
   xLabel: 'Year asked', yLabel: 'Questions asked (count)',
-  series: groupSeries(group, (id) => range(2018, 2025).map((y) => ({ x: Number(y), y: toNumber(pick(data.popularity, { platform: id, metric: 'stackexchange_questions_year', item: /^stackoverflow:/, date: y })[0]?.value) }))),
+  series: groupSeries(group, (id) => range(2018, LAST_COMPLETE_YEAR).map((y) => ({ x: Number(y), y: toNumber(pick(data.popularity, { platform: id, metric: 'stackexchange_questions_year', item: /^stackoverflow:/, date: y })[0]?.value) }))),
   footer: footer('Stack Exchange API (api.stackexchange.com)', 'popularity', 'A CMS with no tag series is not shown.'),
 });
 
@@ -137,15 +143,15 @@ const soUsage = (data) => {
   return {
     type: 'slotline', id: 'stackoverflow-usage', width: 860,
     title: 'Stack Overflow survey usage per year',
-    desc: 'Share of respondents to the Stack Overflow Developer Survey who did extensive development work with WordPress, Drupal and Strapi in the past year, 2023 to 2026. Only these CMSs are listed under web frameworks and technologies; Strapi appears in 2024 only (n/a elsewhere). WordPress stays near 13% and Drupal near 2%. Colours are assigned by position in this figure.',
+    desc: `Share of respondents to the Stack Overflow Developer Survey who did extensive development work with WordPress, Drupal and Strapi in the past year, 2023 to ${SNAPSHOT_YEAR}. Only these CMSs are listed under web frameworks and technologies; a year in which a CMS is not listed is a gap (n/a). Colours are assigned by position in this figure.`,
     xLabel: 'Survey year', yLabel: 'Respondents (%)', yFormat: (v) => `${v}%`,
     series: ids.map((id, i) => ({ name: SHORT[id], slot: i, points: pick(data.talent, { platform: id, metric: 'so_usage_all' }).filter((r) => toNumber(r.value) !== null).map((r) => ({ x: Number(r.date), y: toNumber(r.value) })) })),
-    footer: footer('Stack Overflow Developer Survey 2023 to 2026 (survey.stackoverflow.co)', 'talent'),
+    footer: footer(`Stack Overflow Developer Survey 2023 to ${SNAPSHOT_YEAR} (survey.stackoverflow.co)`, 'talent'),
   };
 };
 
 const hnShare = (data) => {
-  const years = range(2018, 2025);
+  const years = range(2018, LAST_COMPLETE_YEAR);
   const ranked = CMS.map((id) => ({ id, vals: years.map((y) => toNumber(pick(data.talent, { platform: id, metric: 'hn_whoishiring_mention_share', date: y })[0]?.value)) }))
     .filter((c) => c.vals.some((v) => v !== null && v > 0))
     .sort((a, b) => Math.max(...b.vals.filter((v) => v !== null)) - Math.max(...a.vals.filter((v) => v !== null)))
@@ -153,7 +159,7 @@ const hnShare = (data) => {
   return {
     type: 'slotline', id: 'hn-job-share', width: 900,
     title: 'Hacker News job mentions per year',
-    desc: `Share of the postings in the monthly "Who is hiring?" threads on Hacker News that mention each CMS, per year 2018 to 2025, for the CMSs with at least one mention (${names(ranked.map((c) => c.id))}). It is a demand proxy biased to startups and mentions stay below about half a percent of postings for every CMS, with WordPress highest but noisy from year to year. Colours are assigned by position in this figure.`,
+    desc: `Share of the postings in the monthly "Who is hiring?" threads on Hacker News that mention each CMS, per year 2018 to ${LAST_COMPLETE_YEAR}, for the CMSs with at least one mention (${names(ranked.map((c) => c.id))}). It is a demand proxy biased to startups; the highest yearly share is ${pct(Math.max(...ranked.flatMap((c) => c.vals.filter((v) => v !== null))))} of postings. Colours are assigned by position in this figure.`,
     xLabel: 'Year', yLabel: 'Postings mentioning the CMS (%)', yFormat: (v) => `${v}%`,
     series: ranked.map((c, i) => ({ name: SHORT[c.id], slot: i, points: years.map((y, j) => ({ x: Number(y), y: c.vals[j] })) })),
     footer: footer('Hacker News search API (hn.algolia.com)', 'talent', 'Mentions are matched by name and also match unrelated uses.'),
@@ -172,10 +178,19 @@ const cwvSeries = (group, dev) => (data) => ({
   footer: footer('HTTP Archive Tech Report (cdn.httparchive.org/v1/cwv)', 'performance', 'Survivor bias may flatter small populations.'),
 });
 
+/** "A (81%) and B (80%) lead on mobile; C, D and E have the lowest pass rates." from the latest mobile pass rates. */
+const cwvRanking = (data) => {
+  const ranked = CMS.map((id) => ({ id, v: latest(data.performance, { platform: id, metric: 'cwv_pass_mobile' }) }))
+    .filter((c) => c.v !== null).sort((a, b) => b.v - a.v);
+  if (ranked.length < 5) return '';
+  const fmt = (c) => `${SHORT[c.id]} (${pct0(c.v)})`;
+  return `${listOf(ranked.slice(0, 2).map(fmt))} lead on mobile; ${listOf(ranked.slice(-3).map(fmt))} have the lowest pass rates.`;
+};
+
 const cwvNow = (data) => ({
   type: 'groupedbar', id: 'cwv-now', width: 1200,
   title: 'Core Web Vitals pass rate now',
-  desc: `Share of origins passing all Core Web Vitals in ${latestDate(data.performance, { platform: 'wordpress', metric: 'cwv_pass_mobile' })}, mobile and desktop, for the sixteen CMSs (HTTP Archive Tech Report). Wix and TYPO3 lead on mobile at about 80%, Umbraco and Ghost follow, WordPress is below half, and Contentful, Strapi and AEM trail with fewer than two fifths of origins. Payload has no HTTP Archive series (n/a).`,
+  desc: `Share of origins passing all Core Web Vitals in ${latestDate(data.performance, { platform: 'wordpress', metric: 'cwv_pass_mobile' })}, mobile and desktop, for the sixteen CMSs (HTTP Archive Tech Report). ${cwvRanking(data)}${naSentence(CMS, (id) => latest(data.performance, { platform: id, metric: 'cwv_pass_mobile' }), 'no HTTP Archive series')}`,
   xLabel: 'CMS', yLabel: 'Origins passing Core Web Vitals (%)', categories: CMS.map((id) => SHORT[id]), valueFormat: pct0,
   series: ['mobile', 'desktop'].map((d) => ({ name: d === 'mobile' ? 'Mobile' : 'Desktop', values: CMS.map((id) => latest(data.performance, { platform: id, metric: `cwv_pass_${d}` })) })),
   footer: footer('HTTP Archive Tech Report (cdn.httparchive.org/v1/cwv)', 'performance', 'Origin-level field data.'),
@@ -184,7 +199,7 @@ const cwvNow = (data) => ({
 const lighthouseNow = (data) => ({
   type: 'groupedbar', id: 'lighthouse-now', width: 1200,
   title: 'Median Lighthouse performance score now',
-  desc: `Median Lighthouse performance score (0 to 100) of the origins detected for each CMS in ${latestDate(data.performance, { platform: 'wordpress', metric: 'lighthouse_performance_mobile' })}, mobile and desktop (HTTP Archive Tech Report). Lab scores come from a throttled test profile and are lower than real-user experience on fast devices. Payload has no series (n/a).`,
+  desc: `Median Lighthouse performance score (0 to 100) of the origins detected for each CMS in ${latestDate(data.performance, { platform: 'wordpress', metric: 'lighthouse_performance_mobile' })}, mobile and desktop (HTTP Archive Tech Report). Lab scores come from a throttled test profile and are lower than real-user experience on fast devices.${naSentence(CMS, (id) => latest(data.performance, { platform: id, metric: 'lighthouse_performance_mobile' }))}`,
   xLabel: 'CMS', yLabel: 'Median Lighthouse performance score (0-100)', categories: CMS.map((id) => SHORT[id]), valueFormat: (v) => String(Math.round(v)),
   series: ['mobile', 'desktop'].map((d) => ({ name: d === 'mobile' ? 'Mobile' : 'Desktop', values: CMS.map((id) => { const v = latest(data.performance, { platform: id, metric: `lighthouse_performance_${d}` }); return v === null ? null : roundTo(v * 100, 1); }) })),
   footer: footer('HTTP Archive Tech Report (cdn.httparchive.org/v1/lighthouse)', 'performance', 'Lab data, median over origins.'),
@@ -195,7 +210,7 @@ const vitalsNow = (dev) => (data) => {
   return {
     type: 'groupedbar', id: `vitals-${dev}`, width: 1300,
     title: `Good LCP, INP and CLS, ${dev}`,
-    desc: `Share of ${dev} origins with a good Largest Contentful Paint, Interaction to Next Paint and Cumulative Layout Shift for the sixteen CMSs in ${latestDate(data.performance, { platform: 'wordpress', metric: `cwv_good_lcp_${dev}` })} (HTTP Archive Tech Report). LCP separates the CMSs most; INP and CLS are good for most origins of most CMSs, except for Contentful, Strapi, Sanity and AEM. Payload has no series (n/a).`,
+    desc: `Share of ${dev} origins with a good Largest Contentful Paint, Interaction to Next Paint and Cumulative Layout Shift for the sixteen CMSs in ${latestDate(data.performance, { platform: 'wordpress', metric: `cwv_good_lcp_${dev}` })} (HTTP Archive Tech Report).${naSentence(CMS, (id) => latest(data.performance, { platform: id, metric: `cwv_good_lcp_${dev}` }))}`,
     xLabel: 'CMS', yLabel: `Origins with a good value, ${dev} (%)`, categories: CMS.map((id) => SHORT[id]), valueFormat: pct0,
     series: cats.map(([k, name]) => ({ name, values: CMS.map((id) => latest(data.performance, { platform: id, metric: `cwv_good_${k}_${dev}` })) })),
     footer: footer('HTTP Archive Tech Report (cdn.httparchive.org/v1/cwv)', 'performance'),
@@ -217,10 +232,10 @@ const lighthouseHistory = (data) => {
 // ---------------------------------------------------------------- security
 
 function cveSeries(data, id, title, desc, defs, footerExtra, metric = 'nvd_cves_year', yLabel = 'CVEs published (NVD, count)', src = 'NVD CVE API 2.0 (services.nvd.nist.gov)', first = 2015) {
-  const years = range(first, 2026);
+  const years = range(first, SNAPSHOT_YEAR);
   return {
     type: 'slotline', id, width: 900, title, desc,
-    xLabel: 'Year published (2026 to 2026-10-29)', yLabel,
+    xLabel: `Year published (${SNAPSHOT_YEAR} to ${SNAPSHOT})`, yLabel,
     series: defs.map(([p, item, name, slot, variant]) => ({
       name, slot: slot ?? CMS_SLOT[p], variant: variant ?? 0,
       points: years.map((y) => ({ x: Number(y), y: toNumber(pick(data.security, { platform: p, metric, item, date: y })[0]?.value) })),
@@ -230,27 +245,27 @@ function cveSeries(data, id, title, desc, defs, footerExtra, metric = 'nvd_cves_
 }
 
 const cvesCoreTraditional = (d) => cveSeries(d, 'cves-core-traditional', 'CVEs per year, core of the traditional CMSs',
-  'CVEs published per year in the NVD for the core of WordPress, Drupal, Joomla, TYPO3 and Craft CMS (CPE-matched), 2015 to 2026 year to date. WordPress core stays low because plugin and theme CVEs are filed under other vendors; TYPO3 rose in 2025. CVE counts measure disclosure, not real risk, and NVD CPE tagging can lag.',
+  `CVEs published per year in the NVD for the core of WordPress, Drupal, Joomla, TYPO3 and Craft CMS (CPE-matched), 2015 to ${YTD}. WordPress plugin and theme CVEs are filed under other vendors, so they are not in the WordPress core series. CVE counts measure disclosure, not real risk, and NVD CPE tagging can lag.`,
   [['wordpress', 'core:wordpress_cpe', 'WordPress core'], ['drupal', 'core:drupal_cpe', 'Drupal core'], ['joomla', 'core:joomla_cpe', 'Joomla core'], ['typo3', 'core:typo3_cpe', 'TYPO3 core'], ['craft-cms', 'core:craft_cms_cpe', 'Craft CMS core']],
   'CVE counts measure disclosure, not real risk.');
 
 const cvesCoreOther = (d) => cveSeries(d, 'cves-core-other', 'CVEs per year, core of the other self-hosted CMSs',
-  'CVEs published per year in the NVD for AEM, Umbraco, Strapi, Payload and Ghost (CPE-matched), 2015 to 2026 year to date. AEM counts are an order of magnitude higher because Adobe files every AEM and add-on component under one product. Hosted products (Webflow, Wix, Squarespace, Contentful, Sanity) fix their platform without CVEs and have no series; they are not comparable. Wagtail is only found by keyword and appears in the ecosystem chart.',
+  `CVEs published per year in the NVD for AEM, Umbraco, Strapi, Payload and Ghost (CPE-matched), 2015 to ${YTD}. Adobe files every AEM and add-on component under one product, which inflates the AEM count. Hosted products (Webflow, Wix, Squarespace, Contentful, Sanity) fix their platform without CVEs and have no series; they are not comparable. Wagtail is only found by keyword and appears in the ecosystem chart.`,
   [['aem', 'core:aem_cpe', 'AEM'], ['umbraco', 'core:umbraco_cpe', 'Umbraco'], ['strapi', 'core:strapi_cpe', 'Strapi'], ['payload', 'core:payload_cpe', 'Payload'], ['ghost', 'core:ghost_cpe', 'Ghost']].map(([p, i, n], k) => [p, i, n, k]),
   'CVE counts measure disclosure, not real risk. Colours are assigned by position in this figure.');
 
 const cvesEcosystem = (d) => cveSeries(d, 'cves-ecosystem', 'CVEs per year, ecosystem and keyword search',
-  'CVEs published per year in the NVD that mention WordPress (plugins and themes, by keyword), Drupal (vendor CPE), Joomla, TYPO3 (extensions) and Wagtail (by keyword), 2015 to 2026 year to date. The WordPress keyword series reaches thousands a year, driven by CNAs issuing CVEs for plugins in bulk, and dwarfs the other CMSs. Keyword searches also match unrelated mentions.',
+  `CVEs published per year in the NVD that mention WordPress (plugins and themes, by keyword), Drupal (vendor CPE), Joomla, TYPO3 (extensions) and Wagtail (by keyword), 2015 to ${YTD}. CNAs that issue CVEs for WordPress plugins in bulk drive the WordPress keyword series. Keyword searches also match unrelated mentions.`,
   [['wordpress', 'ecosystem:wordpress_keyword', 'WordPress keyword (plugins and themes)', 0], ['drupal', 'ecosystem:drupal_vendor_cpe', 'Drupal vendor CPE (contrib)', 1], ['joomla', 'ecosystem:joomla_keyword', 'Joomla keyword (extensions)', 2], ['typo3', 'ecosystem:typo3_keyword', 'TYPO3 keyword (extensions)', 3], ['wagtail', 'ecosystem:wagtail_keyword', 'Wagtail keyword', 4]],
   'Keyword searches also match unrelated mentions. Colours are assigned by position in this figure.');
 
 const advisoriesTraditional = (d) => cveSeries(d, 'advisories-traditional', 'Security advisories per year, traditional CMSs',
-  'Security advisories published per year by the Drupal security team (core), the Joomla Security Centre (core), the TYPO3 core advisories and GitHub global advisories for Craft CMS, 2015 to 2026 year to date. Each project counts differently (one advisory can bundle several CVEs), so levels are not comparable between lines. Craft CMS jumps in 2026 year to date.',
+  `Security advisories published per year by the Drupal security team (core), the Joomla Security Centre (core), the TYPO3 core advisories and GitHub global advisories for Craft CMS, 2015 to ${YTD}. Each project counts differently (one advisory can bundle several CVEs), so levels are not comparable between lines.`,
   [['drupal', 'core:drupal_sa_core', 'Drupal core (SA)'], ['joomla', 'core:joomla_security_centre', 'Joomla core (Security Centre)'], ['typo3', 'core:typo3_core_sa', 'TYPO3 core (SA)'], ['craft-cms', 'core:ghsa_global_composer_craftcms_cms', 'Craft CMS (GitHub advisories)']],
   'Counting methods differ between projects.', 'advisories_year', 'Advisories published (count)', 'Drupal, Joomla and TYPO3 security advisories, GitHub advisory database');
 
 const advisoriesOther = (d) => cveSeries(d, 'advisories-other', 'Security advisories per year, other open-source CMSs',
-  'GitHub global advisories per year for the Strapi, Payload, Ghost, Wagtail and Umbraco packages (npm, pip and NuGet), 2015 to 2026 year to date. Counts are low until 2025, and Ghost jumps in 2026 year to date; young projects such as Payload and Strapi publish few advisories, which reflects both quality and disclosure habits. Colours are assigned by position in this figure.',
+  `GitHub global advisories per year for the Strapi, Payload, Ghost, Wagtail and Umbraco packages (npm, pip and NuGet), 2015 to ${YTD}. The number of advisories a project publishes reflects both its quality and its disclosure habits. Colours are assigned by position in this figure.`,
   [['strapi', 'core:ghsa_global_npm_strapi', 'Strapi', 0], ['payload', 'core:ghsa_global_npm_payload', 'Payload', 1], ['ghost', 'core:ghsa_global_npm_ghost', 'Ghost', 2], ['wagtail', 'core:ghsa_global_pip_wagtail', 'Wagtail', 3], ['umbraco', 'core:ghsa_global_nuget_umbraco_cms', 'Umbraco', 4]],
   'Counting methods differ between ecosystems.', 'advisories_year', 'Advisories published (count)', 'GitHub advisory database');
 
@@ -318,7 +333,57 @@ const costHosting = (data) => {
       name: prov,
       values: cats.map(([prefix]) => latest(data.cost, { platform: 'all', metric: 'hosting_cost_monthly_usd', item: new RegExp(`^${prefix}.* - ${prov}$`) })),
     })),
-    footer: footer('provider price lists, as compiled in cloud/comparing-cloud-providers.adoc (2026-10-26)', 'cost', 'Prices in USD; the sourced euro rate for total-cost scenarios is not available, so total cost of ownership is not charted.'),
+    footer: footer('provider price lists, as compiled in cloud/comparing-cloud-providers.adoc (2026-10-26)', 'cost', 'Prices in USD; the total cost of ownership chart converts them to euros at the ECB reference rate.'),
+  };
+};
+
+/** The TCO scenarios of cost.csv, in page order, with the hosting profiles (prefixes of the hosting_cost rows) each one needs. */
+const TCO_SCENARIOS = [
+  ['small brochure site', 'Small brochure site', ['Static website']],
+  ['blog or publication', 'Blog or publication', ['Simple dynamic site']],
+  ['multilingual corporate site with 5 editors', 'Multilingual corporate site', ['Simple dynamic site']],
+  ['headless multi-channel with separate front end', 'Headless multi-channel', ['Simple dynamic site', 'Static website']],
+];
+const HOSTING_PROVIDERS = ['AWS', 'Azure', 'Google Cloud'];
+
+/**
+ * 3-year cost in EUR of each TCO scenario for a self-hosted free-software CMS: labour (maintenance hours x hourly rate),
+ * paid extensions and hosting (mean of the three providers, converted from USD at the ECB reference rate). A component
+ * whose input is n/a is null, and so is the total.
+ */
+export function tcoComponents(data) {
+  const usdPerEur = latest(data.cost, { platform: 'all', metric: 'ecb_reference_rate_usd_per_eur' });
+  const hostingUsd = (prefix) => {
+    const vals = HOSTING_PROVIDERS.map((prov) => latest(data.cost, { platform: 'all', metric: 'hosting_cost_monthly_usd', item: new RegExp(`^${prefix}.* - ${prov}$`) }));
+    return vals.some((v) => v === null) ? null : vals.reduce((a, b) => a + b, 0) / vals.length;
+  };
+  return TCO_SCENARIOS.map(([item, label, profiles]) => {
+    const a = (metric) => latest(data.cost, { platform: 'all', metric: `tco_assumption_${metric}`, item });
+    const years = a('years');
+    const months = years === null ? null : years * 12;
+    const labour = [a('maintenance_hours_per_month'), a('hourly_rate_eur'), months].some((v) => v === null) ? null
+      : a('maintenance_hours_per_month') * a('hourly_rate_eur') * months;
+    const extensions = [a('paid_extensions_eur_per_year'), years].some((v) => v === null) ? null : a('paid_extensions_eur_per_year') * years;
+    const monthlyUsd = profiles.map(hostingUsd);
+    const hosting = usdPerEur === null || months === null || monthlyUsd.some((v) => v === null) ? null
+      : (monthlyUsd.reduce((x, y) => x + y, 0) * months) / usdPerEur;
+    const total = [labour, extensions, hosting].some((v) => v === null) ? null : labour + extensions + hosting;
+    return { item, label, labour, extensions, hosting, total };
+  });
+}
+
+const tcoSelfHosted = (data) => {
+  const rows = tcoComponents(data);
+  const rate = latestRowWhere(data.cost, { platform: 'all', metric: 'ecb_reference_rate_usd_per_eur' });
+  const rateText = rate ? `USD ${rate.value} per EUR, the ECB reference rate of ${rate.date}` : 'an exchange rate that is n/a';
+  return {
+    type: 'groupedbar', id: 'tco-self-hosted', width: 1200,
+    title: '3-year total cost of ownership, self-hosted',
+    desc: `Total cost of ownership over three years, in euros, of the four scenarios for a self-hosted free-software CMS: labour (maintenance hours at the editorial hourly rate), paid extensions, hosting (mean of AWS, Azure and Google Cloud, converted at ${rateText}) and their total.${rows.every((r) => r.labour !== null && r.labour >= Math.max(r.extensions ?? 0, r.hosting ?? 0)) ? ' Labour is the largest component in every scenario.' : ''}${rows.some((r) => r.total === null) ? ' A scenario with a missing input has no total (n/a).' : ''} Hosted builders and SaaS CMSs replace the hosting and most of the maintenance with their plan price.`,
+    xLabel: 'Scenario', yLabel: 'Cost over 3 years (EUR, k = thousand)', categories: rows.map((r) => r.label), valueFormat: (v) => (v >= 1000 ? `${roundTo(v / 1000, 1)}k` : int(v)),
+    series: [['labour', 'Labour'], ['extensions', 'Paid extensions'], ['hosting', 'Hosting (mean of three providers)'], ['total', 'Total']]
+      .map(([k, name]) => ({ name, values: rows.map((r) => r[k]) })),
+    footer: footer(`editorial assumptions in cost.csv, hosting from cloud/comparing-cloud-providers.adoc, ${rateText}`, 'cost', 'Labour and extensions are editorial assumptions, not measurements.'),
   };
 };
 
@@ -345,7 +410,9 @@ function ganttGroups(data) {
         const next = all.filter((x) => x.line === r.line && x.start > r.start).map((x) => x.start).sort()[0];
         end = next ?? 'open';
       }
-      row.segments.push({ start: r.start, end, phase: PHASE_KEY[r.phase] ?? 'main' });
+      const phase = PHASE_KEY[r.phase];
+      if (!phase) throw new Error(`support-windows.csv: unknown phase "${r.phase}" for ${id} ${r.line}`);
+      row.segments.push({ start: r.start, end, phase });
     }
     return { title: `${SHORT[id]} release lines`, legend: SHORT[id], slot: index, rows };
   });
@@ -384,7 +451,7 @@ const radarMainstream = (d) => {
 };
 
 const axisLabel = (key) => AXES.find(([k]) => k === key)[1];
-const isComputed = (key) => ['popularity', 'growth', 'talent', 'ecosystem', 'performance'].includes(key);
+const isComputed = (key) => COMPUTED_AXES.includes(key);
 
 function scatter(id, xAxis, yAxis, title, desc) {
   return (data) => {
@@ -414,12 +481,12 @@ export const CHART_BUILDERS = [
   ...GROUPS.flatMap((g) => [cwvSeries(g, 'mobile'), cwvSeries(g, 'desktop')]),
   cwvNow, lighthouseNow, vitalsNow('mobile'), vitalsNow('desktop'), lighthouseHistory,
   cvesCoreTraditional, cvesCoreOther, cvesEcosystem, advisoriesTraditional, advisoriesOther, patchstackShare,
-  costEntryPlans, costHosting, ganttSupport,
+  costEntryPlans, costHosting, tcoSelfHosted, ganttSupport,
   ...GROUPS.map((g) => groupRadar(g)), radarDocumented, radarMainstream,
   scatter('scatter-popularity-growth', 'popularity', 'growth', 'Popularity against growth',
     'Computed popularity (x: log-scaled W3Techs share and HTTP Archive origins) against computed growth (y: change in HTTP Archive mobile origins over three years, 5 = unchanged, 10 = doubled), coloured by group. Upper right: established and rising; lower right: established and shrinking; upper left: small and rising. Popularity counts visible fingerprints (W3Techs and HTTP Archive), so headless CMSs such as Strapi and Payload that leave few fingerprints are underestimated; their GitHub and npm figures are in the community charts. A CMS with no HTTP Archive series is not plotted.'),
   scatter('scatter-performance-ease', 'ease_developers', 'performance', 'Performance against ease of use for developers',
     'Editorial ease of use for developers (x) against computed performance (y: Core Web Vitals pass rate and Lighthouse score from the HTTP Archive), coloured by group. A CMS with no performance series is not plotted.'),
   scatter('scatter-cost-features', 'cost', 'features', 'Cost against features',
-    'Editorial low-cost score (x: higher means cheaper) against the feature-matrix score (y), coloured by group. Contentful and AEM have no cost score (n/a) and are not plotted.'),
+    'Editorial low-cost score (x: higher means cheaper) against the feature-matrix score (y), coloured by group. A CMS with no cost score (n/a) is not plotted.'),
 ];

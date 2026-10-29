@@ -85,8 +85,8 @@ evidence) and `source` ids. A CMS whose inputs are missing gets no score (`null`
 |---|---|---|
 | Popularity | computed | mean of the available log scores of the W3Techs share of all sites (0.01% = 0, 50% = 10) and HTTP Archive mobile origins (100 = 0, 5,000,000 = 10), latest values. It counts visible fingerprints, so headless CMSs are underestimated; Payload has neither input (null) |
 | Growth | computed | ratio of the latest HTTP Archive mobile origins to the same month three years earlier: `5 + 5 * log2(ratio)` clamped to 0-10 (unchanged = 5, doubled = 10, halved = 0); null without both months |
-| Talent pool / jobs | computed | log score of the Stack Overflow questions asked with the CMS tag in the last two complete years, 2024 and 2025 (10 = 0, 10,000 = 10). Job-posting mentions are too sparse to score |
-| Ecosystem and maturity | computed | mean of the available log scores of the GitHub stars of the main repositories (1,000 = 0, 100,000 = 10; mirrors and `develop` repositories excluded) and the total Stack Overflow questions of the tag (100 = 0, 300,000 = 10); hosted CMSs have no repository, so only the second input counts |
+| Talent pool (Stack Overflow) | computed | log score of the Stack Overflow questions asked with the CMS tag in the last two complete years before the snapshot (`LAST_COMPLETE_YEAR - 1` and `LAST_COMPLETE_YEAR`, now 2024 and 2025; 10 = 0, 10,000 = 10). It measures developer activity only; the job-market rows of `talent.csv` cover too few CMSs to score |
+| Ecosystem and maturity | computed | mean of the available log scores of the GitHub stars of the main repositories (1,000 = 0, 100,000 = 10; the `MIRROR_REPOS` of WordPress, Drupal and TYPO3 and the secondary `wordpress-develop` repository excluded, so those three use the Stack Overflow part only) and the total Stack Overflow questions of the tag (100 = 0, 300,000 = 10); hosted CMSs have no repository, so only the second input counts |
 | Performance | computed | mean of the mobile and desktop Core Web Vitals pass rates divided by 10 and of the mobile and desktop median Lighthouse performance scores times 10 (latest HTTP Archive month); null when one input is missing (Payload) |
 | Ease of use (editors) | editorial | can editors write, preview, schedule and approve without a developer; the visual building, draft preview, scheduling and workflow rows of `features.csv` are quoted in the basis |
 | Ease of use (developers) | editorial | concepts to learn before a first custom template or content type, local setup, API and docs; the content modelling, config-as-code and REST rows of `features.csv` are quoted |
@@ -97,8 +97,14 @@ evidence) and `source` ids. A CMS whose inputs are missing gets no score (`null`
 | Portability (low lock-in) | editorial | licence, data format, export and ability to change host; the `export_lockin` row of `features.csv` is quoted |
 
 Scores summarise the evidence on the page; they are not a benchmark and one point is within the uncertainty of the method.
-The total cost of ownership is not scored or charted: its inputs (`tco_assumption_*`) are in EUR, the hosting costs and most
-prices are in USD, and `tco_assumption_usd_to_eur` is `n/a` because no dated, sourced rate was recorded.
+The total cost of ownership is not scored, but it is charted (`tco-self-hosted`) for a self-hosted free-software CMS: labour
+(`tco_assumption_maintenance_hours_per_month` x `tco_assumption_hourly_rate_eur` x 12 x `tco_assumption_years`), paid
+extensions and hosting (the mean of the three providers' `hosting_cost_monthly_usd`, converted with
+`ecb_reference_rate_usd_per_eur`, the ECB reference rate of 2026-10-28, source `ecb-exr`). Plan prices stay in the currency the
+vendor publishes and are not converted.
+
+Every year range of the charts and of the talent score is derived from `SNAPSHOT` in `scores.mjs` (`SNAPSHOT_YEAR`,
+`LAST_COMPLETE_YEAR`), so a refresh only changes that constant and the data.
 
 ## Chart conventions
 
