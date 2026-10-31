@@ -1,0 +1,235 @@
+= Mixed Precision with torch.amp
+:description: Automatic mixed precision in PyTorch 2.15: torch.autocast on CUDA, CPU and XPU, float16 versus bfloat16, GradScaler, which operations run in which precision, clipping and accumulation with scaling, checkpointing the scaler, custom autograd functions, TF32 settings via fp32_precision, and migration from torch.cuda.amp.
+:keywords: PyTorch, torch.amp, autocast, GradScaler, mixed precision, float16, bfloat16, fp16, bf16, TF32, fp32_precision, set_float32_matmul_precision, loss scaling, custom_fwd, torch.cuda.amp
+
+include::partial$ml-pytorch-disclaimer.adoc[]
+
+Mixed precision runs the numerically safe, compute-heavy parts of a network (matrix multiplications and convolutions) in 16-bit floating point and keeps the sensitive parts (reductions, softmax, losses, normalisation) in 32-bit. On modern accelerators this cuts memory use and raises throughput without changing the model code much. PyTorch automates the choice per operation with `torch.autocast` and, for float16, protects small gradients from underflow with `torch.amp.GradScaler`. The number formats themselves, why bfloat16 needs no loss scaling, and the memory arithmetic are explained in xref:ml/hardware-and-mixed-precision.adoc[Hardware, Memory & Mixed Precision]; this page is the PyTorch API.
+
+Facts were checked on 2026-10-30 against the PyTorch 2.15 `torch.amp` reference and the CUDA notes, for Python 3.13. The snippets follow the documented API and were not executed during preparation (PyTorch was not installed in the authoring environment), so measure speed and memory on your own hardware.
+
+== autocast
+
+`torch.autocast(device_type, dtype=None, enabled=True, cache_enabled=None)` is a context manager and decorator that makes eligible operations run in a lower precision. `device_type` can be `"cuda"`, `"cpu"`, `"xpu"`, and a few others listed in the reference (`"mtia"`, `"maia"`, `"hpu"`); `torch.amp.autocast_mode.is_autocast_available(device_type)` checks support. When `dtype` is `None` it defaults to `torch.float16` on CUDA and `torch.bfloat16` on CPU. `enabled=False` is useful to switch the mechanism off by configuration, and a nested `enabled=False` region forces a sub-computation back to explicit precision.
+
+Rules from the reference:
+
+* Wrap only the forward pass and the loss computation. Call `backward()` outside the context; backward operations run in the same dtype autocast chose for the corresponding forward operation.
+* Do not call `.half()` or `.bfloat16()` on the model or the inputs. Parameters stay in float32 (the master copy), and autocast casts them on the fly; a weight cache (`cache_enabled`) avoids recasting them repeatedly inside the region.
+* Operations with an explicit `dtype=` argument, `out=` calls and in-place variants are not eligible for casting.
+
+=== Which operations run in which precision
+
+The reference groups operations into lists. For CUDA (summarised):
+
+[cols="2,5",options="header"]
+|===
+|Policy |Examples
+
+|Cast to float16 |Matrix and convolution operations: `mm`, `matmul`, `bmm`, `addmm`, `linear`, `conv1d/2d/3d`, transposed convolutions, RNN cells.
+|Cast to float32 |Numerically sensitive operations: `softmax`, `log_softmax`, `layer_norm`, `group_norm`, `sum`-like reductions, `nll_loss`, `cross_entropy`, `exp`, `log`, `pow`, `norm`.
+|Promote to the widest input type |Multi-input operations such as `addcmul`, `cross`, `dot`, `index_put`, `scatter_add`: they run in float16 only if all inputs are float16.
+|Unlisted |Assumed stable in lower precision; run in whatever type their inputs have.
+|===
+
+Source: https://docs.pytorch.org/docs/2.15/amp.html
+
+On the CPU the lower precision is bfloat16 (convolutions, matmul family, `linear`, `scaled_dot_product_attention`), losses, FFTs and linear-algebra decompositions stay in float32, and float16 on CPU uses the same lists as bfloat16. XPU support is marked experimental with a smaller list. One practical rule: `binary_cross_entropy` and `BCELoss` raise an error under autocast because they are unsafe in lower precision; use `binary_cross_entropy_with_logits` or `BCEWithLogitsLoss` (see xref:ml/pytorch/loss-functions.adoc[Loss Functions]).
+
+== float16 versus bfloat16
+
+[cols="1,2,2",options="header"]
+|===
+| |float16 |bfloat16
+
+|Exponent range |Narrow (small gradients underflow, large activations overflow) |Same as float32
+|Mantissa precision |Higher than bfloat16 |Lower
+|Needs `GradScaler` |Yes |No
+|Autocast default on |CUDA |CPU
+|===
+
+Source: https://docs.pytorch.org/docs/2.15/amp.html
+
+On GPUs that support bfloat16 natively (NVIDIA Ampere and newer, recent AMD and Intel accelerators) it is generally the simpler choice because it removes loss scaling and most overflow problems. The reference warns that a model pretrained in bfloat16 may have values that overflow float16's range, in which case the scale factor can fall below 1; check for NaNs when switching a checkpoint to float16.
+
+== The float16 training loop with GradScaler
+
+Float16 gradients with small magnitudes flush to zero. Loss scaling multiplies the loss by a large factor before `backward()` so the gradients stay representable, then divides the gradients again before the optimizer step. `torch.amp.GradScaler(device, init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000, enabled=True)` does this and adapts the factor: if a step produces infs or NaNs the optimizer step is skipped and the scale is halved; after `growth_interval` clean steps the scale doubles.
+
+[source,python]
+----
+import torch
+from torch import nn
+
+device = "cuda"
+model = nn.Sequential(nn.Linear(512, 1024), nn.ReLU(), nn.Linear(1024, 10)).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
+scaler = torch.amp.GradScaler("cuda")
+
+for step in range(100):
+    x = torch.randn(64, 512, device=device)
+    y = torch.randint(0, 10, (64,), device=device)
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        logits = model(x)
+        loss = criterion(logits, y)
+
+    scaler.scale(loss).backward()   # backward outside autocast
+    scaler.step(optimizer)          # unscales, skips the step on inf/NaN
+    scaler.update()                 # adjusts the scale factor
+----
+
+Source: https://docs.pytorch.org/docs/2.15/notes/amp_examples.html
+
+Because `scaler.step` may skip an optimizer step, call a learning-rate scheduler's `step()` normally, but expect the warning about the order if the first iteration is skipped; this is harmless.
+
+=== Gradient clipping with scaling
+
+The gradients in `.grad` are scaled until you unscale them, so clipping a scaled gradient clips at the wrong threshold. Call `scaler.unscale_(optimizer)` before clipping:
+
+[source,python]
+----
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)                                  # gradients now in real units
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+scaler.step(optimizer)                                      # does not unscale twice
+scaler.update()
+----
+
+Source: https://docs.pytorch.org/docs/2.15/notes/amp_examples.html
+
+=== Gradient accumulation with scaling
+
+Scale and backward each micro-batch's loss (divided by the number of accumulation steps), but call `scaler.step` and `scaler.update` only once per effective batch. Unscale before inspecting or modifying gradients, exactly as above. See the plain loop in xref:ml/pytorch/training-loop.adoc[The Training Loop & Evaluation].
+
+=== bfloat16: no scaler
+
+[source,python]
+----
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = torch.nn.Linear(512, 10).to(device)
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+x = torch.randn(64, 512, device=device)
+y = torch.randint(0, 10, (64,), device=device)
+
+optimizer.zero_grad(set_to_none=True)
+with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    loss = torch.nn.functional.cross_entropy(model(x), y)
+loss.backward()
+optimizer.step()
+----
+
+Source: https://docs.pytorch.org/docs/2.15/amp.html
+
+The reference notes that gradient scaling is not needed for CPU bfloat16, which uses only `torch.autocast`. `torch.amp.GradScaler("cpu")` also exists for CPU float16 experiments.
+
+=== Checkpointing the scaler
+
+The scaler carries state (the current scale and growth tracker). For exact resumption save `scaler.state_dict()` next to the optimizer state and restore it with `+scaler.load_state_dict(...)+`, as in xref:ml/pytorch/saving-and-loading.adoc[Saving & Loading Models].
+
+== Autocast for inference
+
+Autocast also speeds up inference. Combine it with `torch.inference_mode()` and no scaler:
+
+[source,python]
+----
+model.eval()
+with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    out = model(x)
+----
+
+Source: https://docs.pytorch.org/docs/2.15/amp.html
+
+For deployment-oriented reduction of precision, such as int8 and float8, see xref:ml/pytorch/quantization-and-sparsity.adoc[Quantization, Sparsity & Pruning with torchao] and xref:ml/model-compression.adoc[Model Compression].
+
+== Custom autograd functions
+
+A `torch.autograd.Function` runs inside autocast like any other code, which can make its dtype behaviour hard to reason about. The decorators live in `torch.amp`: `+torch.amp.custom_fwd(fwd=None, *, device_type, cast_inputs=None)+` and `+torch.amp.custom_bwd(bwd=None, *, device_type)+`. `custom_fwd` can cast floating-point inputs to a target dtype and run the forward with autocast disabled (it has no effect outside an autocast region); `custom_bwd` makes the backward run with the same autocast state as the forward. See xref:ml/pytorch/custom-autograd-functions.adoc[Custom autograd Functions].
+
+[source,python]
+----
+import torch
+
+
+class StableExp(torch.autograd.Function):
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
+    def forward(ctx, x):
+        out = torch.exp(x)
+        ctx.save_for_backward(out)
+        return out
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx, grad):
+        (out,) = ctx.saved_tensors
+        return grad * out
+----
+
+Source: https://docs.pytorch.org/docs/2.15/amp.html
+
+== TF32 and float32 matmul precision
+
+Separate from autocast, NVIDIA Ampere and newer GPUs can run float32 matrix multiplications on tensor cores with TensorFloat-32 (TF32), which keeps float32 range with a 10-bit mantissa. In PyTorch 2.9 and later the precision is controlled by the `fp32_precision` settings: `torch.backends.fp32_precision` for everything, and more specific ones such as `torch.backends.cuda.matmul.fp32_precision`, `torch.backends.cudnn.fp32_precision`, `torch.backends.cudnn.conv.fp32_precision` and `torch.backends.cudnn.rnn.fp32_precision`. Valid values are `"ieee"` (full float32 internally) and `"tf32"`; for CUDA matmuls `"bfx9"` is also accepted on CUDA 12.9+ builds, only on compute capability 10.0 and 10.3 GPUs, and other GPUs fall back to native float32. The CUDA notes warn not to mix the new and old settings.
+
+The older flags are `torch.backends.cuda.matmul.allow_tf32` (default `False` since 1.12), `torch.backends.cudnn.allow_tf32` (default `True`), and `torch.set_float32_matmul_precision("highest" | "high" | "medium")`, which sets matmul precision more broadly. The notes mark the `allow_tf32` flags as slated for deprecation, so prefer the new names in new code.
+
+[source,python]
+----
+import torch
+
+# PyTorch 2.9 and later: allow TF32 for CUDA matmuls and cuDNN convolutions.
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
+
+# Older, still widely seen equivalent for matmuls:
+# torch.set_float32_matmul_precision("high")
+----
+
+Source: https://docs.pytorch.org/docs/2.15/notes/cuda.html
+
+TF32 trades some accuracy for speed; for numerically delicate scientific code keep `"ieee"`. Hardware background is in xref:ml/hardware-and-mixed-precision.adoc[Hardware, Memory & Mixed Precision] and device selection in xref:ml/pytorch/devices-and-accelerators.adoc[Devices & Accelerators].
+
+== Combining with torch.compile
+
+`torch.compile` composes with autocast, and compiled models usually gain more from mixed precision because Inductor fuses the casts. The 2.15 reference points out one detail: the config `+torch._functorch.config.backward_pass_autocast+` defaults to `"same_as_forward"`; if backward runs outside autocast, as recommended for AMP training, set it to `"off"` for the compiled region. See xref:ml/pytorch/torch-compile.adoc[torch.compile].
+
+== Migration from torch.cuda.amp
+
+Older tutorials use device-specific names. They are deprecated, with these replacements:
+
+[cols="2,2",options="header"]
+|===
+|Deprecated |Use instead
+
+|`+torch.cuda.amp.autocast(...)+` |`+torch.amp.autocast("cuda", ...)+`
+|`+torch.cpu.amp.autocast(...)+` |`+torch.amp.autocast("cpu", ...)+`
+|`+torch.cuda.amp.GradScaler(...)+` |`+torch.amp.GradScaler("cuda", ...)+`
+|`+torch.cpu.amp.GradScaler(...)+` |`+torch.amp.GradScaler("cpu", ...)+`
+|`torch.cuda.amp.custom_fwd/custom_bwd` |`torch.amp.custom_fwd/custom_bwd` with `device_type="cuda"`
+|===
+
+Source: https://docs.pytorch.org/docs/2.15/amp.html
+
+The migration is mechanical. More renames are listed in xref:ml/pytorch/legacy-and-deprecated.adoc[Legacy APIs & Migration].
+
+== Debugging and pitfalls
+
+* NaN loss with float16: lower the learning rate, check the scale with `scaler.get_scale()` (a scale that keeps collapsing signals persistent infs), or switch to bfloat16.
+* Calling `backward()` inside the autocast block, or calling `.half()` on the model, defeats the master-weight design.
+* Clipping without `scaler.unscale_`.
+* Using `BCELoss` with a sigmoid output: switch to `BCEWithLogitsLoss`.
+* Expecting a speed-up on tiny models or on hardware without fast 16-bit paths; measure with the profiler (xref:ml/pytorch/profiling.adoc[Profiling with torch.profiler]) and see the memory side in xref:ml/pytorch/memory-management.adoc[GPU Memory & Activation Checkpointing].
+* Reductions that must stay exact (sums of many values, running statistics) belong in float32 outside autocast.
+* Sharded training with FSDP2 has its own mixed-precision policy (see xref:ml/pytorch/fsdp2.adoc[FSDP2 (fully_shard)]).
+
+== References
+
+* https://docs.pytorch.org/docs/2.15/amp.html[Automatic Mixed Precision package, torch.amp (PyTorch 2.15 documentation)]
+* https://docs.pytorch.org/docs/2.15/notes/amp_examples.html[Automatic Mixed Precision examples (PyTorch 2.15 notes)]
+* https://docs.pytorch.org/docs/2.15/notes/cuda.html[CUDA semantics, including TensorFloat-32 (PyTorch 2.15 notes)]
