@@ -50,7 +50,7 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   **Adding a new project to the picker means: an image in `modules/ROOT/images/`, a nav entry, and an `xref:`
   block in `index.adoc`** — in addition to the `content.sources` entry above.
 - **CI** (`.github/workflows/publish.yml` on a nightly cron, `.github/workflows/manual_publish.yml` on
-  `workflow_dispatch`) both run the same steps: install Antora + its three extensions, `npx antora
+  `workflow_dispatch`) both run the same steps: install Antora + its four extensions, `npx antora
   antora-playbook.yml`, then deploy `build/site` to the `gh-pages` branch via `crazy-max/ghaction-github-pages`.
   Because the remote content sources track release branches, a fresh build can pick up newly published releases
   from any of the dependent repos without any change in this repo.
