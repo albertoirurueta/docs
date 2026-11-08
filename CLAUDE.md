@@ -27,13 +27,17 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   entry is `url: .` (this repo's own local component, see below), and the rest are remote GitHub repos
   (`hermes`, `irurueta-units`, `irurueta-statistics`, `irurueta-sorting`, `irurueta-algebra`,
   `irurueta-numerical`, `irurueta-geometry`, `irurueta-geometry-io`, `irurueta-ar`, `irurueta-navigation`,
-  `irurueta-navigation-indoor`, `irurueta-navigation-inertial`, `irurueta-navigation-inertial-extra` and
-  `ai-catalog`), each pointed at a `start_path: docs` and a branch-glob pattern (e.g. `release_1.{4..99}*`) so only
-  tagged release branches of each dependent repo are pulled in. **Adding/removing a documented project means
+  `irurueta-navigation-indoor`, `irurueta-navigation-inertial`, `irurueta-navigation-inertial-extra`,
+  `ai-catalog` and `irurueta-auth-server`), each pointed at a `start_path: docs` and a branch-glob pattern (e.g. `release_1.{4..99}*`) so only
+  tagged release branches of each dependent repo are pulled in (`ai-catalog` and `irurueta-auth-server` track
+  `main`; `irurueta-auth-server` does so until its 1.0.0 release). **Adding/removing a documented project means
   editing this file's `content.sources` list**, not writing new pages here.
 - The playbook also wires up the UI (`ui-bundle.zip`, a custom Antora UI bundle used with `snapshot: true`) and
   Antora/Asciidoctor extensions: `@sntke/antora-mermaid-extension` (`[mermaid]` diagram blocks) and
-  `@djencks/asciidoctor-mathjax` (LaTeX via `\( \)` / `\[ \]`) are active. `@antora/lunr-extension` (site search) is
+  `@djencks/asciidoctor-mathjax` (LaTeX via `\( \)` / `\[ \]`) are active, and so is
+  `@antora/collector-extension`, which the site now depends on: the `irurueta-auth-server` example's
+  `docs/antora.yml` uses `ext.collector` to populate its `example$` family, and the pages' includes fail without
+  it. `@antora/lunr-extension` (site search) is
   currently commented out, so site search is disabled. Any doc content using diagrams or math depends on the
   active extensions staying configured here.
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
