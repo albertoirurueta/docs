@@ -1,0 +1,1133 @@
+= PostgreSQL Connector
+:description: How to use the Debezium PostgreSQL connector in a database migration, both when PostgreSQL is the legacy source and when the new PostgreSQL 18 bookshop database becomes the source of reverse replication -- logical decoding and wal_level=logical, pgoutput versus decoderbufs and the Debezium 3.7 output_plugin_libraries change, replication slots, failover slots on PostgreSQL 17 and later, publications and publication.autocreate.mode, REPLICA IDENTITY and TOAST, WAL disk growth and heartbeats, the least-privileged replication user, Amazon RDS, Aurora, Azure, Cloud SQL and CrunchyBridge, upgrades, monitoring and failure handling.
+:keywords: Debezium, PostgreSQL connector, PostgresConnector, logical decoding, wal_level, pgoutput, decoderbufs, output_plugin_libraries, replication slot, slot.name, slot.drop.on.stop, slot.failover, synchronized_standby_slots, publication, publication.name, publication.autocreate.mode, REPLICA IDENTITY, replica.identity.autoset.values, TOAST, unavailable.value.placeholder, WAL disk space, heartbeat.interval.ms, heartbeat.action.query, lsn.flush.mode, offset.mismatch.strategy, pg_replication_slots, Amazon RDS, Aurora, Azure Database for PostgreSQL, Cloud SQL, reverse replication, bookshop-pg-source, database migration
+
+include::partial$database-migration-disclaimer.adoc[]
+
+PostgreSQL appears twice in a migration that uses Debezium. Sometimes it *is* the legacy database: an old PostgreSQL
+server, often several major versions behind, with a schema that a new system is replacing. More often in this section
+it is the *new* database. In the Bookshop example, the Oracle `BOOKSHOP` schema is migrated to the PostgreSQL 18
+`bookshop` database, and after the write cut-over the roles reverse: the new application writes to PostgreSQL, and a
+Debezium PostgreSQL connector (`bookshop-pg-source`) captures those writes so that the legacy Oracle schema stays
+current for rollback and for the reports that still read it. That is *reverse replication*, and its runbook is on
+xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication].
+
+Both roles use the same connector and the same PostgreSQL machinery: logical decoding, a replication slot, a
+publication and the table's replica identity. This page explains each piece, why it matters for a migration, how to
+configure it, what goes wrong, and how to check it. It assumes you know what a change event looks like
+(xref:database/migration/change-event-structure.adoc[Anatomy of a Change Event]) and how Kafka Connect runs connectors
+(xref:backend/messaging/kafka-connect.adoc[Kafka Connect]).
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, Apache Kafka 4.3.1 (the Kafka version inside the
+`quay.io/debezium/connect:3.7.1.Final` image) and PostgreSQL 18.6 (`postgres:18`). Debezium 3.7 is tested against
+PostgreSQL 14, 15, 16, 17 and 18 with the `decoderbufs` and `pgoutput` plug-ins, according to the
+https://debezium.io/releases/3.7/[Debezium 3.7 release overview]. The reverse-replication setup on this page (the
+`postgres:18` server flags, the SQL that prepares the `bookshop` database, the `bookshop-pg-source` connector, an
+incremental snapshot started from the signal table, and the heartbeat) and a `decoderbufs` connector against
+`quay.io/debezium/example-postgres:3.7.1.Final` were run with Docker on 2026-11-09; the sample events below are
+trimmed copies of that run. The legacy-source configuration and the managed-cloud settings are derived from the
+official documentation and were not run.
+
+== The two roles of PostgreSQL in a migration
+
+[mermaid]
+....
+flowchart LR
+    subgraph roleA [Role 1: PostgreSQL is the legacy source]
+        LPG[(Legacy PostgreSQL)] -->|WAL, slot, publication| C1[Debezium PostgreSQL connector]
+        C1 --> K1[Kafka topics legacy-pg.*]
+        K1 --> NEW1[New database and services]
+    end
+    subgraph roleB [Role 2: PostgreSQL is the new database]
+        ORA[(Legacy Oracle BOOKSHOP)] -->|forward CDC| K2[Kafka topics legacy.BOOKSHOP.*]
+        K2 --> ACL[bookshop app, anti-corruption layer]
+        ACL --> PG[(PostgreSQL 18 bookshop)]
+        PG -->|slot bookshop_reverse, publication bookshop_reverse_pub| C2[bookshop-pg-source]
+        C2 --> K3[Kafka topics modern.public.*]
+        K3 --> RS[bookshop-oracle-reverse-sink]
+        RS --> ORA
+    end
+....
+
+The two roles differ in what you can change and when you start:
+
+[cols="1,2,2",options="header"]
+|===
+| Aspect | PostgreSQL as the legacy source | PostgreSQL as the new database (reverse replication)
+
+| Who owns the server
+| Often a team that is about to stop maintaining it. Changing `postgresql.conf` or restarting may need a change window.
+| You do. You can set `wal_level=logical` when you create the server, before any data arrives.
+
+| Initial snapshot
+| Needed: the new system must start from the full current data (`snapshot.mode=initial`, the default).
+| Usually not needed: Oracle already has the data, because it was the source until the cut-over. Start with
+  `snapshot.mode=no_data` from a slot created at the cut-over moment.
+
+| Tables to capture
+| The legacy tables that the new model needs.
+| Only the tables whose changes the legacy side must see (`book`, `customer`, `purchase_order`, ...), never the
+  `+legacy_*+` mirror tables that the forward pipeline writes.
+
+| Main risk
+| WAL growth on a server with little free disk, and old PostgreSQL versions without failover slots.
+| Change loops: changes that came *from* Oracle must not be sent *back* to Oracle.
+
+| Typical lifetime
+| Until the legacy system is switched off.
+| From the write cut-over until the point of no return, when the legacy database is decommissioned.
+|===
+
+== How the connector works
+
+PostgreSQL writes every change to its write-ahead log (WAL) before it changes the data files. With `wal_level=logical`,
+the WAL contains enough information to rebuild row changes. *Logical decoding* turns those WAL records into a stream of
+row changes, and an *output plug-in* formats them. A *replication slot* is a named, persistent cursor in the WAL: it
+remembers which position (the log sequence number, LSN) its consumer has confirmed, and it makes PostgreSQL keep every
+WAL segment after that position, even while the consumer is down.
+
+The Debezium connector opens a replication connection on its slot and receives the decoded changes of committed
+transactions, in commit order. Each event carries the LSN of the change, and Kafka Connect stores the last LSN it
+wrote as the connector's offset. After a restart, the connector asks the slot to stream from just after the stored
+LSN. Because the slot kept the WAL, nothing committed while the connector was down is lost.
+
+[mermaid]
+....
+sequenceDiagram
+    participant App as Application
+    participant PG as PostgreSQL
+    participant Slot as Replication slot
+    participant Dbz as Debezium connector
+    participant K as Kafka
+    App->>PG: COMMIT (INSERT, UPDATE, DELETE)
+    PG->>PG: write WAL records (wal_level=logical)
+    PG->>Slot: logical decoding with the output plug-in
+    Slot->>Dbz: decoded changes of the committed transaction
+    Dbz->>K: change events with lsn and txId
+    K-->>Dbz: write acknowledged, offset committed
+    Dbz->>Slot: confirm flushed LSN
+    Slot->>PG: WAL before confirmed_flush_lsn can be removed
+....
+
+Two details explain many problems later on this page:
+
+* The slot only advances when the connector confirms an LSN, and the connector only confirms LSNs of events it has
+  seen. If the captured tables are quiet while the rest of the database is busy, the slot does not move and the WAL
+  grows (see <<_wal_disk_growth_and_heartbeats>>).
+* The decoding stream carries the column values but not the primary-key definition. The connector reads that from
+  the JDBC metadata. If you change a primary key while the connector is streaming, there is a short window in which the
+  event key does not match the table. The official procedure is: put the application in read-only mode, let Debezium
+  process all remaining events, stop Debezium, change the primary key, put the application back in read/write mode and
+  restart Debezium. Plan this as part of any expand/contract change on a captured table (see
+  xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes]).
+
+The PostgreSQL connector always runs a single task (`tasks.max` is ignored), and it does not need a schema history
+topic: unlike the MySQL and Oracle connectors, it gets the table structure from the decoding stream and the database
+catalog.
+
+== Choosing the output plug-in: pgoutput or decoderbufs
+
+The connector supports two logical decoding output plug-ins, set with `plugin.name`:
+
+[cols="1,2,2",options="header"]
+|===
+| | `pgoutput` | `decoderbufs`
+
+| What it is
+| The plug-in that PostgreSQL's own logical replication uses. Built into PostgreSQL 10 and later.
+| A Debezium plug-in written in C that produces Protobuf messages.
+
+| Installation
+| None.
+| Compiled and installed on the database host, and loaded with `shared_preload_libraries`. The Debezium PostgreSQL
+  container images include it.
+
+| Managed services (RDS, Aurora, Cloud SQL, Azure)
+| Supported. The official documentation says you must set `plugin.name` to `pgoutput` on Cloud SQL and RDS.
+| Not available: you cannot install plug-ins on a managed server.
+
+| Table selection on the server
+| Uses a *publication*, which lists the tables whose changes PostgreSQL decodes.
+| No publication. The server decodes every table and the connector filters.
+
+| Connector default
+| No. You must set it explicitly.
+| Yes: `plugin.name` defaults to `decoderbufs`.
+|===
+
+For a migration, use `pgoutput`. It needs nothing installed, it works on every managed service, and the publication
+gives you a server-side list of the captured tables that a DBA can read. The connector default is still
+`decoderbufs`, so **always set `"plugin.name": "pgoutput"`** in the connector configuration. If you forget it on a
+server without the `decoderbufs` library, the connector fails when it tries to create the slot. The official
+documentation adds one more reason: if you use `time.precision.mode=structured` to keep `TIMESTAMP` values beyond the
+microsecond-since-epoch range, `plugin.name` must be `pgoutput`.
+
+=== The Debezium 3.7 container-image change: output_plugin_libraries
+
+The Debezium 3.7.0.Final release announcement describes a change that affects anyone still using `decoderbufs`. A
+recent PostgreSQL security update for PostgreSQL 15 and later added a setting, `output_plugin_libraries`, that limits
+which logical decoding output plug-ins may start. By default it allows only `pgoutput` and `test_decoding`, so an
+updated PostgreSQL server, including the public container images, rejects `decoderbufs`. The Debezium PostgreSQL
+container images now set this value to include `decoderbufs`. Any other server on which you still use `decoderbufs`
+must list it in `output_plugin_libraries` in its server configuration.
+
+The run for this page shows both sides. The stock `postgres:18` image (PostgreSQL 18.6) reports the restricted
+default, and the Debezium example image reports the extended value together with the preloaded library:
+
+.Checking the allowed output plug-ins
+[source,sql]
+----
+-- postgres:18 (PostgreSQL 18.6): returns 'pgoutput, test_decoding'
+-- quay.io/debezium/example-postgres:3.7.1.Final: returns 'pgoutput, test_decoding, decoderbufs'
+SHOW output_plugin_libraries;
+
+-- quay.io/debezium/example-postgres:3.7.1.Final: returns 'decoderbufs'
+SHOW shared_preload_libraries;
+----
+Reference: https://debezium.io/blog/2026/09/29/debezium-3-7-final-released/#postgresql_guc_logical_decoder_support[Debezium 3.7.0.Final release announcement -- PostgreSQL GUC logical decoder support]
+
+If a legacy server must keep `decoderbufs` (for example, because an existing pipeline depends on it), its
+configuration needs both the library and the permission:
+
+.postgresql.conf for a self-managed server that keeps decoderbufs
+[source,ini]
+----
+# MODULES
+shared_preload_libraries = 'decoderbufs'
+# Allow decoderbufs as an output plug-in (PostgreSQL 15+ servers with the security update)
+output_plugin_libraries = 'pgoutput, test_decoding, decoderbufs'
+
+# REPLICATION
+wal_level = logical
+max_wal_senders = 4
+max_replication_slots = 4
+----
+Reference: https://debezium.io/documentation/reference/stable/postgres-plugins.html#_setting_up_libraries_wal_and_replication_parameters[Debezium -- Logical decoding plug-ins: setting up libraries, WAL and replication parameters]
+
+The better fix during a migration is to move the connector to `pgoutput`. A slot is bound to one plug-in, so the
+switch means a new slot (and, for `pgoutput`, a publication). Follow the same steps as for a PostgreSQL upgrade
+(<<_upgrading_postgresql_during_a_migration>>): stop writes, let the connector drain the old slot, stop the
+connector, create the new `pgoutput` slot before writes resume, and restart the connector with `snapshot.mode=no_data`
+on the new slot.
+
+Plug-in behaviour is not identical. For example, `pgoutput` refreshes the connector's schema metadata more eagerly: a
+change to a column default triggers a refresh with `pgoutput`, while `decoderbufs` notices it only at the next
+structural change. Debezium tracks the known differences in a test class that the plug-in documentation links to.
+
+== Configuring the PostgreSQL server
+
+Logical decoding needs three server settings. `wal_level` can only change with a restart, so set it before the
+migration starts.
+
+.postgresql.conf settings for logical decoding with pgoutput
+[source,ini]
+----
+# REPLICATION
+wal_level = logical          # write enough WAL to decode row changes (restart required)
+max_wal_senders = 10         # concurrent replication connections (each connector uses one)
+max_replication_slots = 10   # each connector needs its own slot
+
+# Optional: lower the latency of change events when synchronous_commit is not 'on'
+#wal_writer_delay = 10ms
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-server-configuration[Debezium -- Configuring the PostgreSQL server]
+
+The official example uses `max_wal_senders=1` and `max_replication_slots=1`, which is the minimum for one connector.
+In a migration you usually need more: the forward pipeline may have a PostgreSQL connector on another database, the
+reverse connector needs one, and a standby or a backup tool may also use WAL senders. Count every consumer and add
+headroom.
+
+For the new PostgreSQL 18 database, set these flags when you create the container, so that the database is ready for
+reverse replication from day one:
+
+.compose.yaml service for the new bookshop database (PostgreSQL 18)
+[source,yaml]
+----
+services:
+  postgres:
+    image: postgres:18
+    command: ["postgres",
+              "-c", "wal_level=logical",
+              "-c", "max_wal_senders=10",
+              "-c", "max_replication_slots=10"]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: bookshop
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./pg-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#_configuring_replication_slot[Debezium -- Configuring replication slot]
+
+Check the result before you register any connector:
+
+.Verifying the logical decoding settings
+[source,sql]
+----
+SHOW wal_level;              -- must return 'logical'
+SHOW max_replication_slots;
+SHOW max_wal_senders;
+SELECT slot_name, plugin, slot_type, active FROM pg_replication_slots;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#setting-up-postgresql[Debezium -- Setting up PostgreSQL]
+
+The connector host must also be allowed to connect. On PostgreSQL 10 and later, a logical replication connection
+names a database, so a normal `pg_hba.conf` line for that database and user also covers replication; the stock
+`postgres` container image already accepts password connections from other hosts. On a self-managed server with a
+restrictive `pg_hba.conf`, add explicit lines. The official example uses `trust` for local connections only; use a
+password method such as `scram-sha-256` for anything that crosses the network:
+
+.pg_hba.conf entries for the connector user
+[source,text]
+----
+# TYPE  DATABASE        USER          ADDRESS          METHOD
+host    bookshop        dbz_reverse   10.20.0.0/16     scram-sha-256
+host    replication     dbz_reverse   10.20.0.0/16     scram-sha-256
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-host-replication-permissions[Debezium -- Configuring PostgreSQL to allow replication with the Debezium connector host]
+
+== The replication user
+
+By default, superusers have the `REPLICATION` and `LOGIN` attributes, but the official documentation recommends a
+dedicated user with only what it needs. For `pgoutput`, the connector user needs:
+
+* `LOGIN` and `REPLICATION`, to open the replication connection and create the slot.
+* `SELECT` on the captured tables, for the initial and incremental snapshots.
+* `CREATE` on the database, only if the connector creates the publication itself.
+* Ownership of the tables, only if the connector adds tables to a publication itself, because PostgreSQL requires the
+  table owner to do that.
+
+The last two points are why the official recommendation is to create the publication yourself, as a DBA, before the
+connector starts. Then the connector user needs neither `CREATE` nor ownership. This is the setup used for
+`bookshop-pg-source`, and it is the script that was run for this page:
+
+.pg-init.sql: preparing the new bookshop database for reverse replication
+[source,sql]
+----
+-- Tables of the new model that the legacy side must see (abridged to three of them)
+CREATE TABLE book (
+  id           bigint PRIMARY KEY,
+  isbn         text,
+  title        text,
+  price        numeric(12,2),
+  currency     char(3),
+  published_on date,
+  active       boolean,
+  supplier_id  bigint,
+  updated_at   timestamptz
+);
+CREATE TABLE customer (
+  id         uuid PRIMARY KEY,
+  legacy_id  bigint UNIQUE,
+  name       text,
+  email      text,
+  status     text,
+  created_at timestamptz
+);
+CREATE TABLE purchase_order (
+  id          uuid PRIMARY KEY,
+  legacy_id   bigint UNIQUE,
+  customer_id uuid REFERENCES customer (id),
+  placed_at   timestamptz,
+  status      text,
+  total       numeric(12,2)
+);
+
+-- Signal table (source signaling channel) and heartbeat table
+CREATE TABLE debezium_signal (id varchar(42) PRIMARY KEY, type varchar(32) NOT NULL, data varchar(2048) NULL);
+CREATE TABLE debezium_heartbeat (id int PRIMARY KEY, ts timestamptz NOT NULL);
+INSERT INTO debezium_heartbeat VALUES (1, now());
+
+-- Old values of every column in UPDATE and DELETE events (the reverse sink needs legacy_id)
+ALTER TABLE customer       REPLICA IDENTITY FULL;
+ALTER TABLE purchase_order REPLICA IDENTITY FULL;
+
+-- Least-privileged connector user
+CREATE ROLE dbz_reverse WITH LOGIN REPLICATION PASSWORD 'dbz_reverse_pw';
+GRANT CONNECT ON DATABASE bookshop TO dbz_reverse;
+GRANT USAGE ON SCHEMA public TO dbz_reverse;
+GRANT SELECT ON book, customer, purchase_order, debezium_signal, debezium_heartbeat TO dbz_reverse;
+GRANT INSERT, DELETE ON debezium_signal TO dbz_reverse;      -- watermark rows of incremental snapshots
+GRANT INSERT, UPDATE ON debezium_heartbeat TO dbz_reverse;
+
+-- Publication created by the DBA: only the tables that flow back to Oracle, plus signal and heartbeat tables
+CREATE PUBLICATION bookshop_reverse_pub
+  FOR TABLE public.book, public.customer, public.purchase_order,
+            public.debezium_signal, public.debezium_heartbeat;
+
+-- Slot created at the write cut-over, before the new application starts writing
+SELECT pg_create_logical_replication_slot('bookshop_reverse', 'pgoutput');
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-permissions[Debezium -- Setting up permissions]
+
+The `INSERT, UPDATE` grants on the signal and heartbeat tables are there because the connector itself writes to them:
+it writes watermark rows to the signal table during an incremental snapshot, and it runs `heartbeat.action.query`
+against the heartbeat table.
+
+If you prefer the connector to manage the publication with `publication.autocreate.mode=filtered`, the official
+documentation describes a shared-ownership setup: create a group role, grant it to the current table owner and to the
+replication user, transfer ownership of each captured table to the group, and give the user `CREATE` on the database.
+
+.Shared table ownership so that the connector can manage the publication
+[source,sql]
+----
+CREATE ROLE bookshop_replication_group;
+GRANT bookshop_replication_group TO bookshop_owner;   -- the current owner of the tables
+GRANT bookshop_replication_group TO dbz_reverse;      -- the Debezium user
+ALTER TABLE public.book           OWNER TO bookshop_replication_group;
+ALTER TABLE public.customer       OWNER TO bookshop_replication_group;
+ALTER TABLE public.purchase_order OWNER TO bookshop_replication_group;
+GRANT CREATE ON DATABASE bookshop TO dbz_reverse;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-replication-user-privileges[Debezium -- Setting privileges to enable Debezium to create PostgreSQL publications when you use pgoutput]
+
+Changing table ownership in a production schema is a bigger change than one `CREATE PUBLICATION` statement, which is
+another reason to let the DBA create the publication. See
+xref:database/migration/security-and-data-protection.adoc[Security & Data Protection] for storing the password outside
+the connector JSON.
+
+== Replication slots
+
+A replication slot is what makes PostgreSQL CDC reliable, and it is also the main operational risk. The slot keeps
+every WAL segment after its confirmed position until the connector confirms more. A connector that is stopped for a
+week therefore keeps a week of WAL on the database server's disk.
+
+[cols="1,1,3",options="header"]
+|===
+| Property | Default | What it means for a migration
+
+| `slot.name`
+| `debezium`
+| The slot this connector uses. Give every connector its own slot with a descriptive name (`bookshop_reverse`).
+  Slot names may contain only lower-case letters, numbers and underscores.
+
+| `slot.drop.on.stop`
+| `false`
+| Drops the slot when the connector stops gracefully. Only for tests and development: in production, dropping the
+  slot discards the position, and changes made while the connector is stopped are lost.
+
+| `slot.failover`
+| `false`
+| Creates a failover-enabled slot on PostgreSQL 17 and later, so that the slot survives a promotion of a standby.
+
+| `slot.max.retries` / `slot.retry.delay.ms`
+| `6` / `10000`
+| How often and how long the connector retries when the slot is busy, for example while an old task still holds it.
+
+| `offset.mismatch.strategy`
+| `no_validation`
+| What to do at start-up when the stored offset and the slot's `confirmed_flush_lsn` disagree (Technology Preview
+  in the Red Hat build). `trust_offset` fails when the offset is behind the slot, which turns a silent gap into an
+  error.
+|===
+
+=== One slot per connector
+
+Never let two connectors share a slot. A slot delivers each change once, so two consumers on one slot split the
+changes between them, and each of them misses events. PostgreSQL gives no warning. The official documentation calls
+this silent data loss. If you run a forward connector on a legacy PostgreSQL database and later a second connector on
+the same database (for example, to capture a new set of tables), each needs its own `slot.name`, and with `pgoutput`
+its own `publication.name`.
+
+=== When to create the slot
+
+The connector creates its slot automatically on the first start if the user has the `REPLICATION` privilege. For a
+migration, creating it yourself gives you control over the *moment* from which changes are retained:
+
+* For the legacy source, the connector's initial snapshot handles consistency for you. It reads the tables in a
+  transaction that is consistent with the slot position, so automatic creation is fine.
+* For reverse replication, create `bookshop_reverse` *at the write cut-over*, after the forward pipeline has drained
+  and before the new application starts accepting writes. Every write after that moment is retained in the WAL, even
+  if `bookshop-pg-source` is registered minutes later. With `snapshot.mode=no_data` and no stored offset, the
+  connector streams from the point at which the slot was created.
+
+.Creating the reverse-replication slot manually
+[source,sql]
+----
+SELECT pg_create_logical_replication_slot('bookshop_reverse', 'pgoutput');
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-create-a-replication-slot-manually[Debezium -- Create a replication slot manually]
+
+=== Failover slots on PostgreSQL 17 and later
+
+Before PostgreSQL 17, a logical slot lived only on the primary. After a failover, the new primary had no slot, and the
+connector could not resume without risking a gap; the official recovery procedure ends with a new snapshot. PostgreSQL
+16 allows slots on standbys, but you must synchronise them by hand. PostgreSQL 17 introduced failover slots, which the
+primary synchronises to the standbys.
+
+To use them, set `slot.failover=true` in the connector, and list the standby's *physical* slot in
+`synchronized_standby_slots` on the primary:
+
+.postgresql.conf on the primary (PostgreSQL 17 and later)
+[source,ini]
+----
+synchronized_standby_slots = 'standby1_slot'
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#enabling-postgresql-failover-slots[Debezium -- Enable failover slots for the PostgreSQL connector]
+
+.Checking that the slot is failover-enabled
+[source,sql]
+----
+SELECT slot_name, failover, synced
+FROM pg_replication_slots
+WHERE slot_name = 'bookshop_reverse';
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#enabling-postgresql-failover-slots[Debezium -- Enable failover slots for the PostgreSQL connector]
+
+The `bookshop` database runs PostgreSQL 18, so the reverse connector can use failover slots if the database has a
+standby. If you create the slot manually, create it with failover enabled (the fifth argument of
+`pg_create_logical_replication_slot` in PostgreSQL 17 and later), because `slot.failover` only affects slots that the
+connector creates. Some managed services (the official documentation names Amazon RDS and Cloud SQL) replicate the
+whole disk to the standby, so the slot survives a failover without this setting.
+
+== Publications
+
+With `pgoutput`, PostgreSQL decodes only the tables in the publication named by `publication.name` (default
+`dbz_publication`). `publication.autocreate.mode` decides who creates and maintains it:
+
+[cols="1,3,2",options="header"]
+|===
+| Value | Behaviour | Use it when
+
+| `all_tables` (default)
+| If the publication does not exist, the connector runs `CREATE PUBLICATION <name> FOR ALL TABLES`. This needs
+  superuser rights.
+| Rarely in a migration. The server decodes every table, including tables you never capture.
+
+| `filtered`
+| The connector creates the publication for the tables that match `schema.include.list`, `schema.exclude.list`,
+  `table.include.list` and `table.exclude.list`, and on every start it runs `+ALTER PUBLICATION <name> SET TABLE ...+`
+  to match the current filters.
+| The connector user owns the tables (shared ownership), and you want the include list to be the single place that
+  defines the captured tables.
+
+| `disabled`
+| The connector never creates or changes the publication. If it does not exist, the connector stops with an error.
+| A DBA owns the publication. This is the mode used for `bookshop-pg-source`.
+
+| `no_tables`
+| The connector creates a publication without tables.
+| You capture only logical decoding messages written with `pg_logical_emit_message`.
+|===
+
+Two practical consequences:
+
+* With `disabled`, the publication and the connector's include list can drift apart. The connector applies its own
+  filters on top of the publication, so a table that is in `table.include.list` but not in the publication produces
+  no events, silently. Keep both in the same change and check them with the query below.
+* `skipped.operations` defaults to `t` (truncate). With `all_tables` or `filtered`, the connector writes the skipped
+  operations into the publication's `publish` option, for example `+WITH (publish = 'insert,update,delete')+`, so that
+  PostgreSQL does not decode them at all. With `disabled`, you set that option yourself.
+
+.Inspecting the publication
+[source,sql]
+----
+SELECT pubname, puballtables, pubinsert, pubupdate, pubdelete, pubtruncate
+FROM pg_publication WHERE pubname = 'bookshop_reverse_pub';
+
+SELECT schemaname, tablename
+FROM pg_publication_tables WHERE pubname = 'bookshop_reverse_pub'
+ORDER BY 1, 2;
+
+-- Adding a table later (publication.autocreate.mode=disabled)
+ALTER PUBLICATION bookshop_reverse_pub ADD TABLE public.order_line;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-publication-autocreate-mode[Debezium -- publication.autocreate.mode]
+
+Put the signal table and the heartbeat table in the publication too. The connector reads signals and its own
+heartbeat writes from the replication stream, and the official documentation states explicitly that a heartbeat table
+must be added to a publication that is not `FOR ALL TABLES`. You do not need to add the signal table to
+`table.include.list`.
+
+== REPLICA IDENTITY: what an UPDATE or DELETE event contains
+
+`REPLICA IDENTITY` is a per-table PostgreSQL setting that decides which *old* values the WAL keeps for an `UPDATE` or
+`DELETE`. It therefore decides what the `before` field of a Debezium event contains:
+
+[cols="1,3",options="header"]
+|===
+| Setting | Content of the event
+
+| `DEFAULT`
+| Old values of the primary-key columns only. A table without a primary key produces only create events: updates and
+  deletes are not emitted.
+
+| `FULL`
+| Old values of every column. Needed when a consumer needs the previous state of non-key columns.
+
+| `INDEX index_name`
+| Old values of the columns in the given unique index. The index must be unique, not partial, not deferrable, and on
+  `NOT NULL` columns only.
+
+| `NOTHING`
+| No old values at all.
+|===
+
+For a migration, the setting matters in three cases:
+
+* *Deletes that the target must find by another key.* In reverse replication, `purchase_order` is keyed by a `uuid`
+  in PostgreSQL but by `ORDER_ID` (the `legacy_id` column) in Oracle. With `DEFAULT`, a delete event's `before` has
+  only `id`, and the reverse sink cannot find the Oracle row. With `FULL`, `before.legacy_id` is there. That is why the
+  script above sets `customer` and `purchase_order` to `FULL`.
+* *Tables without a primary key.* Legacy schemas often have them. With `DEFAULT`, their updates and deletes are
+  missing from the stream. Add a primary key, or set `FULL`.
+* *Custom message keys.* If `message.key.columns` uses columns outside the primary key, the official documentation
+  says to set `FULL`; otherwise delete events do not produce the expected tombstones.
+
+`FULL` costs WAL volume, because every update writes the whole old row. Use it on the tables that need it, not on
+every table. You can set it in SQL, or let the connector set it at start-up with `replica.identity.autoset.values`
+(the connector user then needs the rights to `ALTER` the table):
+
+.Setting the replica identity in SQL or from the connector
+[source,sql]
+----
+ALTER TABLE public.purchase_order REPLICA IDENTITY FULL;
+
+-- Check the current setting: d = default, f = full, i = index, n = nothing
+SELECT relname, relreplident FROM pg_class
+WHERE relname IN ('book', 'customer', 'purchase_order');
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-replica-identity[Debezium -- Replica identity]
+
+.replica.identity.autoset.values in the connector configuration
+[source,json]
+----
+{
+  "replica.identity.autoset.values": "public.customer:FULL,public.purchase_order:FULL"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-replica-autoset-type[Debezium -- replica.identity.autoset.values]
+
+The connector logs the replica identity of every captured table when it starts. The run for this page logged lines
+such as `+REPLICA IDENTITY for 'public.purchase_order' is 'FULL'+` and, for `book`, a note that UPDATE and DELETE events
+contain previous values only for the primary-key columns. Check those lines after every deployment.
+
+=== TOAST columns
+
+PostgreSQL stores values larger than about 8 KB out of line (TOAST). An `UPDATE` that does not change a TOASTed column
+does not write that column's value to the WAL, unless the column is part of the replica identity. With `DEFAULT`, the
+connector cannot read the missing value safely, so it puts the placeholder `+__debezium_unavailable_value+` (the
+default of `unavailable.value.placeholder`) in the event. A consumer that writes this event to the new database must
+not overwrite the real value with the placeholder. The options are `REPLICA IDENTITY FULL` on that table, a sink or
+consumer that skips placeholder values, or the reselect-columns post processor, described on
+xref:database/migration/custom-converters-and-post-processors.adoc[Custom Converters & Post Processors].
+
+== WAL disk growth and heartbeats
+
+The most common production incident with this connector is a database disk that fills up with WAL. The official
+documentation lists three causes:
+
+. *Normal batch reclamation.* `confirmed_flush_lsn` moves forward and `restart_lsn` lags a little. PostgreSQL removes
+  WAL in batches. No action needed.
+. *Busy database, quiet captured tables.* The connector reads WAL but rarely emits events for its tables, so it rarely
+  gets a chance to confirm a newer LSN. In a migration this is typical: the reverse connector captures a few tables of
+  a database that also holds busy mirror tables written by the forward pipeline.
+. *Several databases on one server.* WAL is shared by all databases on a server, but a slot belongs to one database.
+  If the captured database is quiet and another database is busy, the slot never advances. Amazon RDS has the same
+  effect on an idle instance, because it writes to its own system tables about every five minutes.
+
+The fix for causes 2 and 3 is to give the connector events to confirm:
+
+* `heartbeat.interval.ms` makes the connector emit a heartbeat record (to `+__debezium-heartbeat.<topic.prefix>+` by
+  default) at that interval. This lets it commit an offset and confirm the latest LSN it has received, even when no
+  captured table changed.
+* `heartbeat.action.query` additionally runs a statement on the source database at every heartbeat. Pointing it at a
+  small heartbeat table in the captured database creates real WAL traffic in that database, which solves cause 3. The
+  heartbeat table must be in the publication.
+
+.Heartbeat settings of bookshop-pg-source
+[source,json]
+----
+{
+  "heartbeat.interval.ms": "10000",
+  "heartbeat.action.query": "UPDATE public.debezium_heartbeat SET ts = now() WHERE id = 1"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-wal-disk-space[Debezium -- WAL disk space consumption]
+
+In the run for this page, the heartbeat table's `ts` column moved every ten seconds and the distance between the
+current WAL position and the slot's `confirmed_flush_lsn` fell from 403 kB (the WAL written while the database was
+initialised) to about 15 kB once heartbeats had run.
+
+`lsn.flush.mode` (which replaces the deprecated `flush.lsn.source`) controls who confirms LSNs:
+
+* `connector` (default): the connector confirms the LSN of each processed event.
+* `manual`: something outside the connector confirms LSNs. If nothing does, WAL accumulates.
+* `connector_and_driver` (Technology Preview in the Red Hat build): the PostgreSQL JDBC driver's keep-alive can also
+  confirm the server's current LSN when the connector has nothing pending, which helps on low-traffic databases. The
+  slot can then move ahead of the stored offset, so the official documentation recommends
+  `offset.mismatch.strategy` set to `trust_slot` or `trust_greater_lsn` with this mode.
+
+Heartbeats prevent the slow growth. They do not protect against a connector that is stopped or failing. For that, add
+a PostgreSQL-side limit and an alert:
+
+.Monitoring retained WAL per slot
+[source,sql]
+----
+SELECT slot_name,
+       active,
+       wal_status,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))         AS retained_wal,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed
+FROM pg_replication_slots
+WHERE slot_type = 'logical';
+----
+Reference: https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots]
+
+`max_slot_wal_keep_size` (a PostgreSQL setting, see
+https://www.postgresql.org/docs/current/runtime-config-replication.html[PostgreSQL -- Replication settings]) caps how
+much WAL a slot may retain. It protects the database, but when a slot passes the limit PostgreSQL invalidates it
+(`wal_status = 'lost'`), and the connector can no longer resume from its offset. That is a deliberate trade: the
+legacy or new database stays up, and you repair the pipeline with a new slot and a snapshot. Decide the limit with the
+team that runs the database, and alert well before it is reached.
+
+== Role 1: PostgreSQL as the legacy source
+
+When the legacy system runs on PostgreSQL, the connector configuration looks like this. The example captures a legacy
+`sales` schema of a `crm` database, with the prefix `legacy-pg`, so the topics are `legacy-pg.sales.customers`,
+`legacy-pg.sales.invoices` and so on (topic names are `topicPrefix.schemaName.tableName`).
+
+.legacy-pg-source.json: PostgreSQL as the legacy source
+[source,json]
+----
+{
+  "name": "legacy-pg-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "legacy-pg.internal",
+    "database.port": "5432",
+    "database.user": "dbz_legacy",
+    "database.password": "${file:/opt/kafka/secrets/legacy-pg.properties:password}",
+    "database.dbname": "crm",
+    "database.sslmode": "require",
+    "topic.prefix": "legacy-pg",
+    "plugin.name": "pgoutput",
+    "slot.name": "crm_migration",
+    "publication.name": "crm_migration_pub",
+    "publication.autocreate.mode": "disabled",
+    "schema.include.list": "sales",
+    "table.include.list": "sales.customers,sales.invoices,sales.invoice_lines",
+    "snapshot.mode": "initial",
+    "decimal.handling.mode": "string",
+    "replica.identity.autoset.values": "sales.invoice_lines:FULL",
+    "heartbeat.interval.ms": "10000",
+    "heartbeat.action.query": "INSERT INTO sales.debezium_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts",
+    "signal.data.collection": "sales.debezium_signal",
+    "provide.transaction.metadata": "true"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-connector-properties[Debezium -- PostgreSQL connector properties]
+
+Notes on the choices:
+
+* The password comes from a Kafka Connect config provider, not from the JSON (see
+  xref:database/migration/security-and-data-protection.adoc[Security & Data Protection]).
+* `decimal.handling.mode=string` makes `numeric` columns readable strings instead of the binary `Decimal` encoding;
+  the trade-offs are on xref:database/migration/data-types-and-precision.adoc[Data Types & Precision].
+* `provide.transaction.metadata=true` adds transaction boundaries, which consumers that rebuild aggregates (an invoice
+  with its lines) can use to apply one source transaction at a time.
+* The `crm_migration_pub` publication, created by a DBA, must contain the three captured tables, the heartbeat table
+  and the signal table.
+* `replica.identity.autoset.values` needs a connector user that may alter `sales.invoice_lines`; if it may not, set
+  the replica identity in SQL instead and remove the property.
+
+The initial snapshot (`snapshot.mode=initial`) reads the current data of every captured table and then streams from
+the slot. PostgreSQL's snapshot modes are summarised here; the details and the choice between them are on
+xref:database/migration/initial-snapshots.adoc[Initial Snapshots]:
+
+[cols="1,3",options="header"]
+|===
+| `snapshot.mode` | Behaviour
+
+| `initial` (default) | Snapshot only when no offset is stored, then stream.
+| `always` | Snapshot at every start, then stream.
+| `initial_only` | Snapshot, then stop without streaming.
+| `no_data` | Never snapshot. Stream from the stored offset, or, with none, from the moment the slot was created.
+| `when_needed` | Snapshot when there is no offset, or when the stored offset is no longer available on the server.
+| `configuration_based` | Controlled by the `+snapshot.mode.configuration.based.*+` properties.
+| `custom` | A `Snapshotter` implementation named by `snapshot.mode.custom.name`.
+|===
+
+For very large legacy tables, start with `snapshot.mode=no_data` and fill the history with an incremental snapshot
+that runs alongside streaming (see
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots]).
+
+== Role 2: PostgreSQL as the source of reverse replication
+
+After the write cut-over, the new `bookshop` application writes to PostgreSQL, and `bookshop-pg-source` turns those
+writes into events for `bookshop-oracle-reverse-sink`, which applies them to the legacy `BOOKSHOP` schema. The
+connector below is the configuration that was run for this page.
+
+.bookshop-pg-source.json: the reverse-replication source
+[source,json]
+----
+{
+  "name": "bookshop-pg-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "dbz_reverse",
+    "database.password": "dbz_reverse_pw",
+    "database.dbname": "bookshop",
+    "topic.prefix": "modern",
+    "plugin.name": "pgoutput",
+    "slot.name": "bookshop_reverse",
+    "publication.name": "bookshop_reverse_pub",
+    "publication.autocreate.mode": "disabled",
+    "table.include.list": "public.book,public.customer,public.purchase_order",
+    "snapshot.mode": "no_data",
+    "decimal.handling.mode": "string",
+    "time.precision.mode": "adaptive_time_microseconds",
+    "skipped.operations": "t",
+    "heartbeat.interval.ms": "10000",
+    "heartbeat.action.query": "UPDATE public.debezium_heartbeat SET ts = now() WHERE id = 1",
+    "signal.data.collection": "public.debezium_signal",
+    "signal.enabled.channels": "source",
+    "notification.enabled.channels": "log",
+    "tombstones.on.delete": "true"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-example-configuration[Debezium -- PostgreSQL connector configuration example]
+
+This is the minimal capture configuration, used here to show the connector settings themselves. The configuration
+actually registered for the Bookshop cut-over is different. It captures the catalogue first (`book`, `book_author`,
+`author`) and adds tables to the include list and the publication as each capability reaches the write cut-over. It
+uses `slot.stream.params=origin=none`, `tombstones.on.delete=false` and a Filter SMT for loop prevention, and it
+is created in the `STOPPED` state. See
+xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication]. In every deployment,
+replace the literal password with a config provider reference.
+
+.Registering the connector and checking its state
+[source,shell]
+----
+curl -s -X POST -H 'Content-Type: application/json' \
+     --data @bookshop-pg-source.json http://localhost:8083/connectors
+
+curl -s http://localhost:8083/connectors/bookshop-pg-source/status
+# {"name":"bookshop-pg-source","connector":{"state":"RUNNING",...},
+#  "tasks":[{"id":0,"state":"RUNNING",...}],"type":"source"}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-adding-connector-configuration[Debezium -- Adding connector configuration]
+
+With `snapshot.mode=no_data`, the connector logged that no snapshot would run, found the existing slot, and started
+streaming from the position at which the slot was created. An insert, an update and a delete on `purchase_order`
+produced these events on `modern.public.purchase_order` (payload only, trimmed):
+
+.Change events emitted by bookshop-pg-source (REPLICA IDENTITY FULL)
+[source,json]
+----
+{ "op": "c", "before": null,
+  "after":  { "id": "0b9d4c3e-7a61-4f2b-8c5d-3e2f1a9b7c02", "legacy_id": null,
+              "customer_id": "6f1c2b8e-1d3a-4c55-9a0e-2b7f5d9c1a01",
+              "placed_at": "2026-11-09T08:54:31.047296Z", "status": "NEW", "total": "19.90" },
+  "source": { "connector": "postgresql", "db": "bookshop", "schema": "public",
+              "table": "purchase_order", "txId": 783, "lsn": 29519560, "snapshot": "false" } }
+
+{ "op": "u",
+  "before": { "id": "0b9d4c3e-7a61-4f2b-8c5d-3e2f1a9b7c02", "legacy_id": null, "status": "NEW", "total": "19.90", ... },
+  "after":  { "id": "0b9d4c3e-7a61-4f2b-8c5d-3e2f1a9b7c02", "legacy_id": null, "status": "PAID", "total": "19.90", ... },
+  "source": { ..., "txId": 784, "lsn": 29520104 } }
+
+{ "op": "d",
+  "before": { "id": "0b9d4c3e-7a61-4f2b-8c5d-3e2f1a9b7c02", "legacy_id": null, "status": "PAID", ... },
+  "after":  null,
+  "source": { ..., "txId": 785, "lsn": 29520328 } }
+
+null
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-events[Debezium -- PostgreSQL data change events]
+
+What to notice:
+
+* The full `before` image in the update and delete events comes from `REPLICA IDENTITY FULL`.
+* `legacy_id` is `null`: this order was created in the new system and has no Oracle `ORDER_ID` yet. The reverse path
+  must allocate one (from an Oracle sequence) and record it in `legacy_id`. That logic belongs to the reverse
+  translator, as described on xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication].
+* `total` is the string `"19.90"` because of `decimal.handling.mode=string`. `book.published_on` (a `date`) arrived
+  as `6665`, the number of days since 1970-01-01; the reverse sink must convert it back.
+* The `null` line is the tombstone that follows a delete (`tombstones.on.delete=true`), which lets a compacted topic
+  remove the key.
+* `source.lsn` and `source.txId` identify the change. A consumer can store them in `processed_change.source_position`
+  to discard duplicates after a restart (see
+  xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]).
+
+=== Preventing loops
+
+During the overlap, the forward pipeline still writes to PostgreSQL. If the reverse connector captured those writes,
+it would send Oracle's own changes back to Oracle, which would capture them again: a loop. The PostgreSQL side gives
+you three tools, and the cut-over page combines them:
+
+* *Leave the forward pipeline's own tables out.* The `+legacy_*+` mirror tables written by `bookshop-pg-mirror-sink`
+  are not in `bookshop_reverse_pub`, so PostgreSQL never decodes them for this slot.
+* *Mark the origin of each write.* The rows that the `bookshop-legacy-sync` consumer writes carry an origin marker
+  (a `changed_by` column), and the reverse pipeline drops events whose marker says they came from Oracle, for example
+  with the Debezium Filter SMT
+  (https://debezium.io/documentation/reference/stable/transformations/filtering.html#example-basic-filter-configuration-example[Debezium -- Message filtering]).
+* *Use separate database users per direction*, so that the marker can be checked and audited.
+
+The `slot.stream.params` option `origin=any` (or `origin=none`) of `pgoutput` filters by replication origin. It only
+helps when the forward writes arrive through PostgreSQL's native logical replication, which sets an origin; writes made
+by a Kafka Connect sink or a Spring application are ordinary local writes and carry no origin.
+
+=== Signals and incremental snapshots on the new database
+
+With the signal table in the publication, you can start an incremental snapshot by inserting a row. This is useful
+when the reverse sink needs a table re-sent, for example after a repair on the Oracle side.
+
+.Starting an incremental snapshot of public.customer
+[source,sql]
+----
+INSERT INTO public.debezium_signal (id, type, data)
+VALUES ('reverse-snap-001', 'execute-snapshot',
+        '{"data-collections": ["public.customer"], "type": "incremental"}');
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-triggering-an-incremental-snapshot[Debezium -- Triggering an incremental snapshot]
+
+In the run, the snapshot rows appeared on `modern.public.customer` with `"op": "r"` and `"source.snapshot":
+"incremental"`, and the log notification channel reported the snapshot as `IN_PROGRESS`, `TABLE_SCAN_COMPLETED`
+and `COMPLETED`. The signal had been inserted while Kafka Connect was down; the connector read it from the WAL after
+the restart and ran the snapshot then, which shows that the source channel survives connector outages. Signals and
+notifications are covered in full on
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications].
+
+== PostgreSQL in the cloud
+
+Managed PostgreSQL services do not let you edit `postgresql.conf` or install plug-ins, so each one has its own switch
+for logical decoding, and all of them need `plugin.name=pgoutput`.
+
+[cols="1,3",options="header"]
+|===
+| Service | What to configure
+
+| Amazon RDS for PostgreSQL
+| Set the parameter `rds.logical_replication` to `1` in the instance parameter group. This sets `wal_level` to
+  `logical` after a restart (check with `SHOW wal_level`). The replicating user needs the `rds_replication` role
+  (`GRANT rds_replication TO dbz_legacy`), plus `SELECT` on the captured tables for snapshots. For IAM
+  authentication, set `database.connection.factory.class` to
+  `io.debezium.connector.postgresql.connection.PostgresAwsIamConnectionFactory` and add the AWS Advanced JDBC
+  Wrapper to the plug-in directory. Idle instances need heartbeats with an action query (see above).
+
+| Amazon Aurora PostgreSQL
+| The same `rds.logical_replication` parameter, set in the DB *cluster* parameter group, as described in the AWS
+  documentation on Aurora PostgreSQL logical replication.
+
+| Azure Database for PostgreSQL
+| The Debezium documentation shows the Azure CLI for the older single-server offering
+  (`azure.replication_support=logical`). On Flexible Server, set the server parameter `wal_level` to `logical`, as
+  described in the Microsoft documentation on logical replication and logical decoding.
+
+| Cloud SQL for PostgreSQL
+| Set the database flag `cloudsql.logical_decoding` to `on`; it changes `wal_level` to `logical`. Create the user with
+  the `REPLICATION` attribute, logged in as a member of `cloudsqlsuperuser`.
+
+| CrunchyBridge
+| Logical replication is already enabled and `pgoutput` is available. Create the publication yourself or use
+  `publication.autocreate.mode=filtered`: the default `all_tables` fails, because creating a publication
+  `FOR ALL TABLES` needs privileges that the user does not have.
+|===
+
+.Cloud SQL: creating the replication user
+[source,sql]
+----
+CREATE USER replication_user WITH REPLICATION IN ROLE cloudsqlsuperuser LOGIN PASSWORD 'secret';
+-- or, for an existing user:
+ALTER USER existing_user WITH REPLICATION;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#debezium-postgresql-connector-create-a-replication-user[Debezium -- Create a replication user]
+
+.Amazon RDS: granting replication to a user other than the master user
+[source,sql]
+----
+GRANT rds_replication TO dbz_legacy;
+GRANT SELECT ON ALL TABLES IN SCHEMA sales TO dbz_legacy;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-on-amazon-rds[Debezium -- PostgreSQL on Amazon RDS]
+
+Managed services also run maintenance (minor upgrades, failovers) on their own schedule. Check whether your service
+keeps logical slots across a failover (the official documentation says RDS and Cloud SQL do, because they replicate the
+disk) and across a major version upgrade (usually not; see the next section). The wider comparison of managed
+databases and managed Kafka is on xref:database/migration/cloud-and-managed-services.adoc[Cloud Databases & Managed Kafka].
+
+== Upgrading PostgreSQL during a migration
+
+Migrations take months, and a PostgreSQL major upgrade often falls inside them, especially on an old legacy server.
+`pg_upgrade` and dump/restore do not keep logical replication slots. If the connector restarts after an upgrade with a
+new, automatically created slot, it asks that slot for the stored LSN, the slot cannot provide it, and the connector
+continues from the newest position. The changes in between are lost, and nothing reports it.
+
+The official procedure avoids that:
+
+. Stop the applications that write to the database, or put them in read-only mode, and back up the database.
+. Let the connector consume everything in the slot; check that the slot's confirmed LSN has reached the current WAL
+  position.
+. Stop the connector gracefully (stop Kafka Connect, or delete the connector).
+. As an administrator, drop the replication slot. Do not use `slot.drop.on.stop` for this.
+. Upgrade (`pg_upgrade`, or `pg_dump` and `pg_restore`) and start the database.
+. Create the logical replication slot manually *before* enabling writes, and check that the publication still exists
+  (recreate it if not, and update `publication.name`).
+. Register the connector under a new name, with `slot.name` set to the new slot and `snapshot.mode=no_data`.
+. Re-enable writes and restart the applications.
+
+If you could not confirm in step 2 that the connector had read everything, use `snapshot.mode=initial` instead of
+`no_data` so that a new snapshot covers the gap. The same procedure applies when you switch a connector from
+`decoderbufs` to `pgoutput`.
+
+.Checking that the slot is drained before the upgrade
+[source,sql]
+----
+SELECT slot_name,
+       confirmed_flush_lsn,
+       pg_current_wal_lsn(),
+       pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS bytes_behind
+FROM pg_replication_slots
+WHERE slot_name = 'crm_migration';
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#upgrading-postgresql[Debezium -- Upgrading PostgreSQL]
+
+== Monitoring
+
+The connector exposes JMX MBeans named after `topic.prefix`:
+
+* Snapshot: `debezium.postgres:type=connector-metrics,context=snapshot,server=<topic.prefix>`
+* Streaming: `debezium.postgres:type=connector-metrics,context=streaming,server=<topic.prefix>`
+
+For `bookshop-pg-source`, `server=modern`. The streaming attributes that matter most for a migration:
+
+[cols="1,3",options="header"]
+|===
+| Attribute | Why you watch it
+
+| `Connected` | `false` means the replication connection is down.
+| `MilliSecondsBehindSource` | Time between the commit in PostgreSQL and the connector processing the event: the
+  lag that the cut-over runbook drains to zero.
+| `MilliSecondsSinceLastEvent` | A value that keeps growing on a busy table means the pipeline has stopped.
+| `TotalNumberOfEventsSeen`, `TotalNumberOfCreateEventsSeen`, `TotalNumberOfUpdateEventsSeen`,
+  `TotalNumberOfDeleteEventsSeen` | Counts to compare with the target's write counts during reconciliation.
+| `QueueRemainingCapacity` | Near zero means Kafka cannot keep up with the database.
+| `NumberOfCommittedTransactions`, `LastTransactionId`, `SourceEventPosition` | Where the connector is in the WAL.
+|===
+
+Combine the JMX metrics with the `pg_replication_slots` query from <<_wal_disk_growth_and_heartbeats>>: the connector
+can look healthy while the slot's retained WAL grows, and only the database view shows that. Dashboards and alerts are
+on xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing].
+
+== When things go wrong
+
+Debezium does not lose events when the slot is intact. While it recovers from a fault, it may emit some events again
+(at-least-once delivery), so every consumer must be idempotent. The PostgreSQL-specific failure cases:
+
+[cols="2,3,3",options="header"]
+|===
+| Situation | What happens | What to do
+
+| Invalid configuration, wrong credentials, or the stored LSN is no longer available
+| The connector fails at start-up with an error that describes the problem.
+| Fix the cause and restart. If the WAL is gone (slot dropped or invalidated), start with a new slot and a snapshot
+  (`when_needed` or an incremental snapshot).
+
+| PostgreSQL becomes unavailable
+| The connector fails and stops.
+| Restart it when the database is back. It resumes from the stored LSN as long as the slot exists. Never drop the slot
+  on the primary.
+
+| Primary fails, PostgreSQL 17 or later with failover slots
+| The slot exists on the promoted standby.
+| Pause the connector, check that the slot is intact, update `database.hostname` if needed, promote the standby and
+  resume the connector. Do not drop or recreate the failover slot.
+
+| Primary fails, PostgreSQL 16 or earlier, or no failover slot
+| The new primary has no slot, or one at an unknown position.
+| Stop the connector, create the slot on the new primary before writes resume, update the configuration and take a new
+  snapshot (the official procedure uses `snapshot.mode=always`).
+
+| Kafka Connect worker crashes
+| Tasks restart on another worker from the last committed offset; recent events are emitted again.
+| Nothing, if consumers are idempotent (use `source.lsn` or `source.txId` to detect duplicates).
+
+| Kafka becomes unavailable
+| The connector pauses and resumes where it stopped.
+| Watch the slot's retained WAL while Kafka is down.
+
+| Connector stopped for a long time
+| PostgreSQL keeps all WAL since the slot position. The connector catches up when restarted.
+| Watch disk space. Consider `max_slot_wal_keep_size` and a deliberate re-snapshot over an unbounded outage.
+
+| Two connectors use the same slot
+| Each misses part of the changes, silently.
+| Give each connector its own slot (and publication).
+
+| Table included but not in the publication (`disabled` mode)
+| No events for that table, no error.
+| Compare `pg_publication_tables` with `table.include.list`.
+
+| Updates and deletes missing for a table
+| The table has no primary key and `REPLICA IDENTITY DEFAULT`.
+| Add a primary key or set `REPLICA IDENTITY FULL`.
+
+| `+__debezium_unavailable_value+` appears in the target
+| An unchanged TOAST value under `REPLICA IDENTITY DEFAULT`.
+| `REPLICA IDENTITY FULL`, a sink that ignores the placeholder, or the reselect post processor.
+|===
+
+More recovery procedures are on xref:database/migration/troubleshooting-and-failure-recovery.adoc[Troubleshooting &
+Failure Recovery] and xref:database/migration/offsets-restarts-and-exactly-once.adoc[Offsets, Restarts &
+Exactly-Once].
+
+== Verification checklist
+
+Before you rely on a PostgreSQL connector in a migration, check:
+
+* `SHOW wal_level` returns `logical`, and `max_replication_slots` and `max_wal_senders` leave room for every consumer.
+* `plugin.name` is set explicitly. If it is `decoderbufs`, `SHOW output_plugin_libraries` lists it.
+* Each connector has its own `slot.name` and, with `pgoutput`, its own `publication.name`.
+* `pg_publication_tables` lists exactly the captured tables plus the heartbeat and signal tables.
+* Every captured table has a primary key or a suitable replica identity, and tables whose deletes the target looks up
+  by a non-key column use `REPLICA IDENTITY FULL`.
+* The connector user is not a superuser and has only the grants listed above.
+* Heartbeats are configured, and `pg_replication_slots` shows the unconfirmed WAL staying small on a quiet table.
+* An alert exists on retained WAL per slot, and the team knows what happens at `max_slot_wal_keep_size`.
+* For reverse replication: the slot was created at the cut-over moment, the connector uses `snapshot.mode=no_data`,
+  and the mirror tables are not captured.
+* A PostgreSQL major upgrade or failover has a written runbook that recreates the slot before writes resume.
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html[Debezium -- PostgreSQL connector] (stable)
+  and https://debezium.io/documentation/reference/3.7/connectors/postgresql.html[3.7]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#setting-up-postgresql[Debezium -- Setting up PostgreSQL]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-server-configuration[Debezium -- Configuring the PostgreSQL server]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#_configuring_replication_slot[Debezium -- Configuring replication slot]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-in-the-cloud[Debezium -- PostgreSQL in the Cloud]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-replica-identity[Debezium -- Replica identity]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-toasted-values[Debezium -- Toasted values]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-wal-disk-space[Debezium -- WAL disk space consumption]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#enabling-postgresql-failover-slots[Debezium -- Enable failover slots]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-deploying-multiple-connectors[Debezium -- Setting up multiple connectors for the same database server]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#upgrading-postgresql[Debezium -- Upgrading PostgreSQL]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-connector-properties[Debezium -- PostgreSQL connector properties]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-monitoring[Debezium -- PostgreSQL monitoring]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-when-things-go-wrong[Debezium -- Behavior when things go wrong]
+* https://debezium.io/documentation/reference/stable/postgres-plugins.html[Debezium -- Logical decoding output plug-ins]
+* https://debezium.io/documentation/reference/stable/transformations/filtering.html[Debezium -- Message filtering]
+* https://debezium.io/blog/2026/09/29/debezium-3-7-final-released/[Debezium 3.7.0.Final release announcement]
+* https://debezium.io/releases/3.7/[Debezium 3.7 release overview and tested versions]
+* https://www.postgresql.org/docs/current/logicaldecoding.html[PostgreSQL -- Logical Decoding]
+* https://www.postgresql.org/docs/current/logical-replication.html[PostgreSQL -- Logical Replication]
+* https://www.postgresql.org/docs/current/runtime-config-replication.html[PostgreSQL -- Replication settings]
+* https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots]
+* https://www.postgresql.org/docs/current/sql-altertable.html[PostgreSQL -- ALTER TABLE (REPLICA IDENTITY)]
+* https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.Replication.Logical.html[AWS -- Logical replication for Aurora PostgreSQL]
+* https://learn.microsoft.com/en-us/azure/postgresql/flexible-server/concepts-logical[Microsoft Learn -- Logical replication and logical decoding in Azure Database for PostgreSQL]
+* https://cloud.google.com/sql/docs/postgres/replication/configure-logical-replication[Google Cloud -- Set up logical replication and decoding in Cloud SQL for PostgreSQL]
+
+The reverse-replication setup, the `bookshop-pg-source` connector, the incremental snapshot signal, the heartbeat and
+a `decoderbufs` connector against the Debezium example image were run with Docker on 2026-11-09 (Debezium
+3.7.1.Final, Kafka 4.3.1, PostgreSQL 18.6). The legacy-source connector, the cloud settings, failover slots and the
+upgrade procedure are derived from the official documentation and were not run.

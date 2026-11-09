@@ -1,0 +1,817 @@
+= Verifying and Reconciling the Migrated Data
+:description: How to prove that the new PostgreSQL database matches the legacy Oracle database while CDC keeps both changing, covering the levels of comparison (counts, aggregates, per-chunk checksums, row hashes and business invariants), a canonical row format that hashes identically in Oracle and PostgreSQL, complete per-key-range checksum SQL for both databases, drilling into a mismatched chunk, a comparison job driven by the CDC position with Oracle flashback queries and consumer lag, sampling, end-to-end lag from source.ts_ms and the MilliSecondsBehindSource metric, a parallel run of read paths behind feature flags, repairing drift with ad hoc incremental snapshots and additional-conditions, and reconciling the reverse direction after the write cut-over.
+:keywords: Debezium, reconciliation, verification, data validation, checksum, row hash, STANDARD_HASH, md5, key range, chunk, Oracle flashback query, AS OF SCN, SCN, consumer lag, MilliSecondsBehindSource, source.ts_ms, end-to-end lag, Micrometer, parallel run, shadow read, feature flag, drift, incremental snapshot, additional-conditions, execute-snapshot, Oracle, PostgreSQL, database migration, Bookshop
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A CDC pipeline that runs without errors is not proof that the new database holds the same data as the legacy one. A
+translator can map a status code wrongly, a `CHAR(3)` can keep its trailing spaces, an Oracle `DATE` can be read in
+the wrong time zone, a delete can be dropped by a filter, a sink can have skipped records after an error. None of
+these stops the pipeline. Reconciliation is the activity that finds them: it compares the two databases directly,
+independent of the pipeline that is supposed to keep them equal.
+
+This page builds the reconciliation for the Bookshop migration step by step, from row counts to per-chunk checksums
+that produce the same number in Oracle and in PostgreSQL, a comparison job that accounts for the changes still in
+flight, lag measurement, the parallel run of read paths, and the repair of drift with incremental snapshots. It
+supplies the checks behind the phase exit criteria of
+xref:database/migration/migration-patterns-with-cdc.adoc[Migration Patterns with CDC]: a clean reconciliation over a
+full business cycle ends phase 2, and a clean reverse reconciliation is part of the exit from phase 4.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, Oracle AI Database 26ai Free (image `gvenzl/oracle-free:23.26.3`, PDB `FREEPDB1`), PostgreSQL 18, Spring
+Boot 4.1 (Micrometer 1.17) and Java 21. The PostgreSQL checksum and drill-down queries were run on PostgreSQL 18.6.
+The row expression and per-bucket aggregation of the Oracle `BOOK` query were run on Oracle AI Database 26ai Free over
+the same rows as the PostgreSQL query (supplied inline rather than from `BOOKSHOP.BOOK`, without the flashback clause)
+and produced identical checksums. The Oracle `ORDERS` queries were not run. The shell script passed `bash -n` and
+ShellCheck, and its comparison stage was run on sample files; the script as a whole was not run against live
+databases. The Java classes were compiled with `javac --release 21`.
+
+== What has to match, at which level
+
+Reconciliation is a funnel. Cheap checks run often over everything; expensive checks run only where a cheap check
+found a difference.
+
+[cols="1,2,2,2",options="header"]
+|===
+| Level | What is compared | Finds | Cost
+
+| 1. Counts
+| Rows per table, per key range, per status
+| Missing or extra rows, lost deletes
+| One index scan per side
+
+| 2. Aggregates
+| Sums of money columns, counts per code
+| Wrong amounts, wrong code mapping (the `ORDERS` example on
+  xref:database/migration/migration-patterns-with-cdc.adoc#_phase_2_parallel_run_and_reconciliation[Migration Patterns with CDC])
+| One scan per side
+
+| 3. Per-chunk checksums
+| One hash per key range over a canonical form of every row
+| Any difference in any compared column, located to a chunk
+| One full scan per side, run per chunk
+
+| 4. Row hashes
+| One hash per row inside a mismatched chunk
+| The exact keys that differ
+| Only for mismatched chunks
+
+| 5. Business invariants
+| Rules that must hold on the new side (every order has lines, totals equal the sum of the lines)
+| Translator bugs that keep both sides "equal" but wrong
+| Domain queries on the new side
+|===
+
+The comparison is always made between the legacy table and the place where its data lands: a mirror table such as
+`legacy_book` (a 1:1 copy, easy to compare) or the remodelled tables such as `book`, `customer` and `purchase_order`
+(the comparison must apply the same translation rules as the anti-corruption layer). Comparing the remodelled tables
+is the more valuable check, because it also tests the translators.
+
+== Comparing two databases that keep changing
+
+Both databases change while the comparison runs: the legacy application keeps writing, and the pipeline applies those
+writes to PostgreSQL a second or two later. A naive comparison of "Oracle now" against "PostgreSQL now" reports every
+row that changed in the last few seconds as a difference. Three techniques deal with this:
+
+* **A consistent read on the legacy side.** Oracle flashback queries (`+SELECT ... AS OF SCN n+`) read every table as of
+  one system change number. All Oracle numbers of one comparison refer to the same instant, however long the queries
+  take. The user needs the `FLASHBACK` privilege on the tables, and the undo data must still cover the SCN.
+* **Waiting for the pipeline to pass that instant.** After taking the SCN, the job waits until the source connector
+  has read past it and the consumers have applied everything up to it. At that point PostgreSQL contains every change
+  up to the SCN, plus possibly some newer ones.
+* **Re-checking differences.** A chunk that differs because of a change newer than the SCN differs only once. The job
+  re-checks each mismatched chunk with a new SCN, and only chunks that differ in two consecutive runs, while their rows
+  were not modified in between, are reported as drift.
+
+The sequence of one comparison run:
+
+[mermaid]
+....
+sequenceDiagram
+    participant Job as Reconciliation job
+    participant Ora as Oracle FREEPDB1
+    participant Pipe as CDC pipeline
+    participant Pg as PostgreSQL bookshop
+    Job->>Ora: get current SCN S
+    Job->>Pipe: wait until lag covers S and consumer lag is zero
+    Job->>Ora: checksums per key range AS OF SCN S
+    Job->>Pg: checksums per key range
+    Job->>Job: compare chunks
+    Job->>Ora: re-check mismatched chunks at a new SCN
+    Job->>Pg: re-check mismatched chunks
+    Job->>Job: report chunks that differ twice as drift
+....
+
+== Read-only reconciliation users
+
+The job reads both databases with dedicated read-only accounts, never with the application or connector users. On
+the Oracle side it needs `SELECT` and `FLASHBACK` on the compared tables and access to `DBMS_FLASHBACK` to read the
+current SCN.
+
+.Reconciliation user on the legacy database (Oracle, as SYSDBA, in FREEPDB1)
+[source,sql]
+----
+ALTER SESSION SET CONTAINER = FREEPDB1;
+
+CREATE USER BOOKSHOP_RECON IDENTIFIED BY "change-me";
+GRANT CREATE SESSION TO BOOKSHOP_RECON;
+
+GRANT SELECT, FLASHBACK ON BOOKSHOP.BOOK       TO BOOKSHOP_RECON;
+GRANT SELECT, FLASHBACK ON BOOKSHOP.AUTHOR     TO BOOKSHOP_RECON;
+GRANT SELECT, FLASHBACK ON BOOKSHOP.CUSTOMER   TO BOOKSHOP_RECON;
+GRANT SELECT, FLASHBACK ON BOOKSHOP.ORDERS     TO BOOKSHOP_RECON;
+GRANT SELECT, FLASHBACK ON BOOKSHOP.ORDER_LINE TO BOOKSHOP_RECON;
+GRANT EXECUTE ON SYS.DBMS_FLASHBACK TO BOOKSHOP_RECON;
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SELECT.html[Oracle Database SQL Language Reference -- SELECT (flashback_query_clause)]
+
+.Reconciliation role on the new database (PostgreSQL, as the database owner)
+[source,sql]
+----
+CREATE ROLE bookshop_recon LOGIN PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE bookshop TO bookshop_recon;
+GRANT USAGE ON SCHEMA public TO bookshop_recon;
+GRANT SELECT ON book, book_author, author, customer, purchase_order, order_line,
+                legacy_book, legacy_author, legacy_supplier_catalogue
+      TO bookshop_recon;
+----
+Reference: https://www.postgresql.org/docs/current/sql-grant.html[PostgreSQL -- GRANT]
+
+== A canonical row format that hashes the same on both sides
+
+A checksum compares only if both databases hash exactly the same bytes. The canonical form below turns every row into
+one text value, field by field, separated by `|`, and both sides apply the same rules:
+
+[cols="2,3,3",options="header"]
+|===
+| Value | Oracle | PostgreSQL
+
+| `NULL`
+| Concatenating `NULL` gives an empty string (Oracle treats `+''+` as `NULL`)
+| `concat()` treats `NULL` as an empty string; `\|\|` would make the whole value `NULL`, so it is not used
+
+| Integer keys
+| Implicit conversion of `NUMBER(10)` to text
+| Implicit conversion of `bigint` to text
+
+| Money
+| `+TO_CHAR(PRICE, 'FM9999999999990.00')+`
+| `+to_char(price, 'FM9999999999990.00')+`; the same format model gives `0.50`, `11.99`
+
+| `CHAR(n)` codes
+| `RTRIM(CURRENCY)` removes the blank padding
+| `rtrim(currency)`, matching the translator, which trims
+
+| Dates without time
+| `+TO_CHAR(PUBLISHED, 'YYYY-MM-DD')+`
+| `+to_char(published_on, 'YYYY-MM-DD')+`
+
+| Dates with time (`ORDER_DT`)
+| `+TO_CHAR(ORDER_DT, 'YYYY-MM-DD"T"HH24:MI:SS')+`, the legacy wall-clock time
+| `+to_char(placed_at AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD"T"HH24:MI:SS')+`, converted back to the legacy time zone
+  that the translator assumed
+
+| Flags and codes
+| The legacy value (`Y`, `NW`)
+| Mapped back to the legacy value with `CASE`, using the translator's table
+|===
+
+The hash is MD5 on both sides (`+STANDARD_HASH(..., 'MD5')+` in Oracle and `md5()` in PostgreSQL). MD5 is used here
+only as a fast checksum, not for security. To add up hashes per chunk, the first 15 hexadecimal digits (60 bits) of
+each row hash are turned into a number, and the numbers are summed: the sum does not depend on the row order, and
+60-bit values summed over a chunk fit in Oracle `NUMBER` and in PostgreSQL `numeric` without overflow. Both databases
+must use UTF-8 (`AL32UTF8` in Oracle, `UTF8` in PostgreSQL), so that the same text gives the same bytes.
+
+The legacy time zone `Europe/Madrid` is the setting that the Bookshop consumers use when they turn Oracle `DATE` values
+into `timestamptz` (see xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]
+and xref:database/migration/data-types-and-precision.adoc[Data Types & Precision]). Use the value that your translator
+uses, from the same configuration.
+
+== Per-chunk checksums
+
+=== BOOK against book
+
+Chunks are ranges of the primary key: `BOOK_ID / 10000` gives chunks of 10,000 keys. Choose a size that makes one chunk
+query take well under a second; a chunk that differs is then cheap to drill into. The `+:scn+` bind variable is the SCN
+that the run compares at.
+
+.Checksums per key range of BOOKSHOP.BOOK at one SCN (Oracle, as BOOKSHOP_RECON)
+[source,sql]
+----
+VARIABLE scn NUMBER
+EXEC :scn := DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER;
+
+SELECT FLOOR(b.BOOK_ID / 10000)                       AS BUCKET,
+       COUNT(*)                                        AS ROW_COUNT,
+       MIN(b.BOOK_ID)                                  AS MIN_ID,
+       MAX(b.BOOK_ID)                                  AS MAX_ID,
+       TO_CHAR(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH(
+                 b.BOOK_ID || '|' || b.ISBN || '|' || b.TITLE || '|' ||
+                 TO_CHAR(b.PRICE, 'FM9999999999990.00') || '|' ||
+                 RTRIM(b.CURRENCY) || '|' ||
+                 TO_CHAR(b.PUBLISHED, 'YYYY-MM-DD') || '|' ||
+                 b.ACTIVE_FLG || '|' || b.SUPPLIER_ID,
+               'MD5')), 1, 15), 'XXXXXXXXXXXXXXX')),
+               'FM99999999999999999999999999999') AS CHECKSUM
+FROM   BOOKSHOP.BOOK AS OF SCN :scn b
+GROUP  BY FLOOR(b.BOOK_ID / 10000)
+ORDER  BY BUCKET;
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/STANDARD_HASH.html[Oracle Database SQL Language Reference -- STANDARD_HASH] and https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SELECT.html[Oracle Database SQL Language Reference -- SELECT (flashback query)]
+
+.Checksums per key range of book (PostgreSQL, as bookshop_recon, in psql)
+[source,sql]
+----
+\set bucket_size 10000
+
+SELECT b.id / :bucket_size                       AS bucket,
+       count(*)                                  AS row_count,
+       min(b.id)                                 AS min_id,
+       max(b.id)                                 AS max_id,
+       sum(('x' || substr(md5(concat(
+             b.id, '|', b.isbn, '|', b.title, '|',
+             to_char(b.price, 'FM9999999999990.00'), '|',
+             rtrim(b.currency), '|',
+             to_char(b.published_on, 'YYYY-MM-DD'), '|',
+             CASE WHEN b.active THEN 'Y' ELSE 'N' END, '|',
+             b.supplier_id)), 1, 15))::bit(60)::bigint) AS checksum
+FROM   book b
+GROUP  BY b.id / :bucket_size
+ORDER  BY bucket;
+----
+Reference: https://www.postgresql.org/docs/current/functions-string.html[PostgreSQL -- String functions (md5, concat)] and https://www.postgresql.org/docs/current/functions-formatting.html[PostgreSQL -- Data type formatting functions]
+
+`+('x' || hex)::bit(60)::bigint+` is the PostgreSQL idiom for turning 15 hexadecimal digits into a number. Integer
+division of a positive `bigint` matches `FLOOR` in Oracle, so the bucket numbers line up. `BOOK.AUTHOR_ID` is not part
+of the `book` row in the new model; compare it separately as `book_author` links (the count of links per chunk, and a
+checksum over `book_id|author_id`), because the new model allows several authors per book.
+
+To compare the mirror table instead (`legacy_book`, written by the JDBC sink), use the same Oracle query and replace the
+PostgreSQL row expression with the mirror's own columns (`book_id`, `active_flg`, `rtrim(currency)` and so on), which
+need no mapping back.
+
+=== ORDERS against purchase_order
+
+Orders change shape more: the key becomes `uuid` with the legacy key in `legacy_id`, the customer reference goes through
+`customer.legacy_id`, the timestamp gets a time zone, and the status code becomes a word. The canonical form maps
+everything back to the legacy representation.
+
+.Checksums per key range of BOOKSHOP.ORDERS at one SCN (Oracle, as BOOKSHOP_RECON)
+[source,sql]
+----
+SELECT FLOOR(o.ORDER_ID / 100000)                    AS BUCKET,
+       COUNT(*)                                       AS ROW_COUNT,
+       TO_CHAR(SUM(o.TOTAL_AMT), 'FM9999999999990.00') AS TOTAL,
+       TO_CHAR(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH(
+                 o.ORDER_ID || '|' || o.CUST_ID || '|' ||
+                 TO_CHAR(o.ORDER_DT, 'YYYY-MM-DD"T"HH24:MI:SS') || '|' ||
+                 o.STATUS_CD || '|' ||
+                 TO_CHAR(o.TOTAL_AMT, 'FM9999999999990.00'),
+               'MD5')), 1, 15), 'XXXXXXXXXXXXXXX')),
+               'FM99999999999999999999999999999') AS CHECKSUM
+FROM   BOOKSHOP.ORDERS AS OF SCN :scn o
+GROUP  BY FLOOR(o.ORDER_ID / 100000)
+ORDER  BY BUCKET;
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/STANDARD_HASH.html[Oracle Database SQL Language Reference -- STANDARD_HASH]
+
+.Checksums per key range of purchase_order (PostgreSQL, as bookshop_recon, in psql)
+[source,sql]
+----
+\set bucket_size 100000
+
+SELECT po.legacy_id / :bucket_size                        AS bucket,
+       count(*)                                           AS row_count,
+       to_char(sum(po.total), 'FM9999999999990.00')       AS total,
+       sum(('x' || substr(md5(concat(
+             po.legacy_id, '|', c.legacy_id, '|',
+             to_char(po.placed_at AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD"T"HH24:MI:SS'), '|',
+             CASE po.status WHEN 'NEW'       THEN 'NW'
+                            WHEN 'PAID'      THEN 'PD'
+                            WHEN 'SHIPPED'   THEN 'SH'
+                            WHEN 'CANCELLED' THEN 'CN'
+                            ELSE po.status END, '|',
+             to_char(po.total, 'FM9999999999990.00'))), 1, 15))::bit(60)::bigint) AS checksum
+FROM   purchase_order po
+LEFT   JOIN customer c ON c.id = po.customer_id
+WHERE  po.legacy_id IS NOT NULL
+GROUP  BY po.legacy_id / :bucket_size
+ORDER  BY bucket;
+----
+Reference: https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-ZONECONVERT[PostgreSQL -- AT TIME ZONE]
+
+* `WHERE po.legacy_id IS NOT NULL` leaves out orders that were created in the new application after the write cut-over
+  of orders; they have no legacy counterpart.
+* The `LEFT JOIN` keeps an order whose customer has not been translated yet; its `c.legacy_id` is then empty, the hash
+  differs, and the chunk shows up as a mismatch, which is correct.
+* The `ELSE po.status` branch makes an unknown status visible as a mismatch instead of silently mapping it.
+* `TOTAL` is also returned on its own, because a difference in money is the first thing a business owner asks about.
+
+The same pattern covers `ORDER_LINE` (key `(ORDER_ID, LINE_NO)`, chunk on `ORDER_ID`, joined through
+`purchase_order.legacy_id` on the PostgreSQL side) and `CUSTOMER` (chunk on `CUST_ID` and `customer.legacy_id`, status
+`A`/`I` mapped back from `ACTIVE`/`INACTIVE`).
+
+== Drilling into a mismatched chunk
+
+When a chunk differs, list one hash per row for that chunk on both sides and compare the lists. The row hash uses the
+full 32-digit MD5, in lower case on both sides.
+
+.Row hashes of one ORDERS chunk (Oracle, as BOOKSHOP_RECON)
+[source,sql]
+----
+SELECT o.ORDER_ID || ',' ||
+       LOWER(RAWTOHEX(STANDARD_HASH(
+             o.ORDER_ID || '|' || o.CUST_ID || '|' ||
+             TO_CHAR(o.ORDER_DT, 'YYYY-MM-DD"T"HH24:MI:SS') || '|' ||
+             o.STATUS_CD || '|' ||
+             TO_CHAR(o.TOTAL_AMT, 'FM9999999999990.00'),
+           'MD5'))) AS LINE
+FROM   BOOKSHOP.ORDERS AS OF SCN :scn o
+WHERE  o.ORDER_ID >= :bucket * 100000
+AND    o.ORDER_ID <  (:bucket + 1) * 100000
+ORDER  BY o.ORDER_ID;
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/STANDARD_HASH.html[Oracle Database SQL Language Reference -- STANDARD_HASH]
+
+.Row hashes of one purchase_order chunk (PostgreSQL, psql with --csv -t -v bucket=N)
+[source,sql]
+----
+\set bucket_size 100000
+
+SELECT po.legacy_id AS order_id,
+       md5(concat(
+             po.legacy_id, '|', c.legacy_id, '|',
+             to_char(po.placed_at AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD"T"HH24:MI:SS'), '|',
+             CASE po.status WHEN 'NEW'       THEN 'NW'
+                            WHEN 'PAID'      THEN 'PD'
+                            WHEN 'SHIPPED'   THEN 'SH'
+                            WHEN 'CANCELLED' THEN 'CN'
+                            ELSE po.status END, '|',
+             to_char(po.total, 'FM9999999999990.00'))) AS row_hash
+FROM   purchase_order po
+LEFT   JOIN customer c ON c.id = po.customer_id
+WHERE  po.legacy_id >= :bucket * :bucket_size
+AND    po.legacy_id <  (:bucket + 1) * :bucket_size
+ORDER  BY po.legacy_id;
+----
+Reference: https://www.postgresql.org/docs/current/app-psql.html[PostgreSQL -- psql]
+
+Both queries print `order_id,hash` lines, so a plain `join` on the two sorted files gives the keys that are missing on
+one side and the keys whose hash differs. Print the canonical text (the argument of the hash) for those keys to see
+which field differs; that usually names the translator rule at fault.
+
+== A comparison job driven by the CDC position
+
+The script below automates one run for the `BOOK` table: it takes the current SCN, waits until the pipeline has caught
+up, computes the chunk checksums on both sides and prints the chunks that differ. It uses `sqlplus`, `psql` and the
+Kafka command-line tools, and is meant to run from a scheduler (a Kubernetes `CronJob`, for example) with the
+connection strings in its environment. The queries are the `BOOK` checksum queries above, reduced to one output
+column each.
+
+.reconcile-book.sh: one CDC-position-driven comparison of BOOK
+[source,bash]
+----
+#!/usr/bin/env bash
+# Compares BOOKSHOP.BOOK (Oracle, AS OF SCN) with book (PostgreSQL) per key range.
+# Environment:
+#   ORA_CONN      sqlplus connect string of BOOKSHOP_RECON, e.g. BOOKSHOP_RECON/secret@//oracle:1521/FREEPDB1
+#   PG_URI        libpq URI of bookshop_recon, e.g. postgresql://bookshop_recon:secret@postgres:5432/bookshop
+#   KAFKA_BIN     directory with kafka-consumer-groups.sh, e.g. /kafka/bin
+#   BOOTSTRAP     Kafka bootstrap servers, e.g. kafka:9092
+#   SETTLE_SECS   seconds to let the source connector read past the SCN (above its p99 MilliSecondsBehindSource)
+set -euo pipefail
+
+: "${ORA_CONN:?}" "${PG_URI:?}" "${KAFKA_BIN:?}" "${BOOTSTRAP:?}"
+SETTLE_SECS="${SETTLE_SECS:-30}"
+GROUPS_TO_DRAIN=("bookshop-legacy-sync" "connect-bookshop-pg-mirror-sink")
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# 1. The instant to compare at.
+SCN="$(sqlplus -s "$ORA_CONN" <<'SQL'
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 VERIFY OFF
+SELECT TO_CHAR(DBMS_FLASHBACK.GET_SYSTEM_CHANGE_NUMBER) FROM DUAL;
+EXIT
+SQL
+)"
+SCN="$(echo "$SCN" | tr -d '[:space:]')"
+echo "Comparing at SCN $SCN"
+
+# 2. Let the source connector read past the SCN, then wait until the consumers have applied everything.
+sleep "$SETTLE_SECS"
+for group in "${GROUPS_TO_DRAIN[@]}"; do
+  for attempt in $(seq 1 60); do
+    lag="$("$KAFKA_BIN/kafka-consumer-groups.sh" --bootstrap-server "$BOOTSTRAP" --describe --group "$group" 2>/dev/null \
+           | awk '$6 ~ /^[0-9]+$/ { sum += $6 } END { print sum + 0 }')"
+    [[ "$lag" -eq 0 ]] && break
+    echo "Group $group still has lag $lag (attempt $attempt)"
+    sleep 5
+  done
+  [[ "$lag" -eq 0 ]] || { echo "Group $group did not drain; aborting this run" >&2; exit 2; }
+done
+
+# 3. Checksums on both sides, as "bucket,row_count,checksum" lines.
+sqlplus -s "$ORA_CONN" > "$WORK/oracle.csv" <<SQL
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 400 TRIMSPOOL ON VERIFY OFF
+SELECT FLOOR(b.BOOK_ID / 10000) || ',' || COUNT(*) || ',' ||
+       TO_CHAR(SUM(TO_NUMBER(SUBSTR(RAWTOHEX(STANDARD_HASH(
+                 b.BOOK_ID || '|' || b.ISBN || '|' || b.TITLE || '|' ||
+                 TO_CHAR(b.PRICE, 'FM9999999999990.00') || '|' ||
+                 RTRIM(b.CURRENCY) || '|' || TO_CHAR(b.PUBLISHED, 'YYYY-MM-DD') || '|' ||
+                 b.ACTIVE_FLG || '|' || b.SUPPLIER_ID,
+               'MD5')), 1, 15), 'XXXXXXXXXXXXXXX')), 'FM99999999999999999999999999999')
+FROM   BOOKSHOP.BOOK AS OF SCN ${SCN} b
+GROUP  BY FLOOR(b.BOOK_ID / 10000);
+EXIT
+SQL
+
+psql "$PG_URI" --no-psqlrc -At -F ',' > "$WORK/postgres.csv" <<'SQL'
+SELECT b.id / 10000,
+       count(*),
+       sum(('x' || substr(md5(concat(
+             b.id, '|', b.isbn, '|', b.title, '|', to_char(b.price, 'FM9999999999990.00'), '|',
+             rtrim(b.currency), '|', to_char(b.published_on, 'YYYY-MM-DD'), '|',
+             CASE WHEN b.active THEN 'Y' ELSE 'N' END, '|', b.supplier_id)), 1, 15))::bit(60)::bigint)
+FROM book b
+GROUP BY b.id / 10000;
+SQL
+
+# 4. Chunks that differ or exist on one side only.
+sed '/^[[:space:]]*$/d' "$WORK/oracle.csv"   | sort -t, -k1,1 > "$WORK/o.sorted"
+sed '/^[[:space:]]*$/d' "$WORK/postgres.csv" | sort -t, -k1,1 > "$WORK/p.sorted"
+join -t, -a1 -a2 -e MISSING -o 0,1.2,1.3,2.2,2.3 "$WORK/o.sorted" "$WORK/p.sorted" \
+  | awk -F, -v scn="$SCN" '$2 != $4 || $3 != $5 { bad++; print "MISMATCH scn=" scn " bucket=" $1 " oracle_rows=" $2 " postgres_rows=" $4 }
+                           END { if (bad) exit 1; print "All chunks match at SCN " scn }'
+----
+Reference: https://kafka.apache.org/43/operations/basic-kafka-operations/#managing-consumer-groups[Apache Kafka -- Managing consumer groups] and https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-streaming-metrics[Debezium -- Oracle connector streaming metrics]
+
+How the pieces relate to the pipeline:
+
+* `bookshop-legacy-sync` is the consumer group of the translators; `connect-bookshop-pg-mirror-sink` is the group that
+  Kafka Connect gives the mirror sink (`connect-` followed by the connector name). The job waits for both, so that
+  neither the mirror nor the remodelled tables are behind.
+* `SETTLE_SECS` covers the time the source connector needs to read the redo log past the SCN. Consumer lag of zero
+  means only that the consumers have applied everything *that the connector has published*. Set it above the 99th
+  percentile of `MilliSecondsBehindSource` (next section). For a stricter check, read the connector's `CommittedScn`
+  LogMiner metric over JMX and wait until it exceeds the SCN.
+* The script exits with status 1 when a chunk differs. Run it again for the reported buckets after a minute; a bucket
+  that differs again is drift, and the drill-down queries name the keys.
+* The comparison costs one full scan of `BOOK` on each side. On large tables, run it per range of buckets (add a
+  `WHERE` on the key) and spread the ranges over the day, or compare only the buckets whose rows changed recently
+  plus a rotating share of the others.
+
+== Sampling
+
+Full checksums over hundreds of millions of rows are not always affordable. A random sample of keys, compared row by
+row, finds systematic translator errors (every row of one kind is wrong) with a few thousand rows. It cannot prove
+completeness, so it complements the counts and chunk checksums instead of replacing them.
+
+.Sample about 0.1% of the orders and print their row hashes (Oracle, then PostgreSQL)
+[source,sql]
+----
+-- Oracle: a row sample of about 0.1% of ORDERS, restricted to the rows that existed at the SCN of the run.
+-- The sample is drawn in a subquery without AS OF, and the flashback is applied to the outer table.
+SELECT o.ORDER_ID
+FROM   BOOKSHOP.ORDERS AS OF SCN :scn o
+WHERE  o.ORDER_ID IN (SELECT s.ORDER_ID FROM BOOKSHOP.ORDERS SAMPLE (0.1) s);
+
+-- PostgreSQL: the row hashes for the sampled keys, loaded into a temporary table first
+CREATE TEMP TABLE sampled_order (legacy_id bigint PRIMARY KEY);
+-- \copy sampled_order FROM 'sample.csv' WITH (FORMAT csv)
+SELECT po.legacy_id,
+       md5(concat(po.legacy_id, '|', c.legacy_id, '|',
+                  to_char(po.placed_at AT TIME ZONE 'Europe/Madrid', 'YYYY-MM-DD"T"HH24:MI:SS'), '|',
+                  CASE po.status WHEN 'NEW' THEN 'NW' WHEN 'PAID' THEN 'PD'
+                                 WHEN 'SHIPPED' THEN 'SH' WHEN 'CANCELLED' THEN 'CN' ELSE po.status END, '|',
+                  to_char(po.total, 'FM9999999999990.00'))) AS row_hash
+FROM   sampled_order s
+JOIN   purchase_order po ON po.legacy_id = s.legacy_id
+LEFT   JOIN customer c ON c.id = po.customer_id
+ORDER  BY po.legacy_id;
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SELECT.html[Oracle Database SQL Language Reference -- SELECT (sample_clause)] and https://www.postgresql.org/docs/current/sql-copy.html[PostgreSQL -- COPY]
+
+`SAMPLE (0.1)` is a row sample: each row is picked with a probability of 0.1%. `SAMPLE BLOCK (0.1)` picks whole
+blocks instead, which reads less but returns rows that were stored together. The query keeps the sample and the
+flashback in separate table references, so it does not depend on the order of the two clauses in one table reference.
+Without `SEED`, each run draws a different sample.
+
+Draw the sample on the legacy side, which is the source of truth in phases 1 to 3: a key that is missing in PostgreSQL
+then shows up as a missing row. The Oracle row hashes for the sampled keys come from the drill-down query, restricted to
+the sampled keys.
+
+== Measuring lag
+
+Reconciliation answers "is the data equal"; lag answers "how far behind is it". Both belong on the migration
+dashboard.
+
+=== At the source connector: MilliSecondsBehindSource
+
+Every Debezium source connector publishes `MilliSecondsBehindSource` in its streaming MBean: the time between the
+timestamp of the last change event and the moment the connector processed it. For Bookshop the MBean is
+`debezium.oracle:type=connector-metrics,context=streaming,server=legacy`. With `statistics.metrics.enabled`, the Oracle
+connector also publishes the quantiles `MilliSecondsBehindSourceP50`, `P95` and `P99`, which make better alert
+thresholds than the last value.
+xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing] shows how to export the
+MBeans to Prometheus.
+
+The metric stops at the connector. It does not include the time in Kafka or the time the translators need.
+
+=== End to end: source.ts_ms at the consumer
+
+The `source.ts_ms` field of every change event is the time of the change in the source database (for Oracle, the
+time of the change as recorded in the redo log), and the envelope's own `ts_ms` is the time at which the connector
+processed it. A consumer that subtracts `source.ts_ms` from the time at which its own transaction committed measures
+the full lag, including Kafka and the translator. `LegacyBookTranslator` and the other translators call the recorder
+below after each commit:
+
+.ReplicationLagRecorder: end-to-end lag per legacy table as a Micrometer timer (Java 21)
+[source,java]
+----
+package com.example.bookshop.migration;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import org.springframework.stereotype.Component;
+
+/**
+ * Records the end-to-end replication lag of each applied change event: the time between the commit in the legacy
+ * database (source.ts_ms of the Debezium envelope) and the commit of the translated change in PostgreSQL.
+ */
+@Component
+public class ReplicationLagRecorder {
+
+    private final MeterRegistry registry;
+    private final Clock clock;
+    private final ConcurrentMap<String, Timer> timers = new ConcurrentHashMap<>();
+
+    public ReplicationLagRecorder(MeterRegistry registry) {
+        this(registry, Clock.systemUTC());
+    }
+
+    ReplicationLagRecorder(MeterRegistry registry, Clock clock) {
+        this.registry = registry;
+        this.clock = clock;
+    }
+
+    /**
+     * Call after the PostgreSQL transaction that applied the event has committed.
+     *
+     * @param sourceTable the legacy table, for example BOOK (value of source.table)
+     * @param sourceTsMs  source.ts_ms of the event: when the change was committed in the legacy database
+     * @param snapshot    true for snapshot reads (op=r), which are not replication lag and are skipped
+     */
+    public void recordApplied(String sourceTable, long sourceTsMs, boolean snapshot) {
+        if (snapshot) {
+            return;
+        }
+        long lagMs = Math.max(0L, clock.millis() - sourceTsMs);
+        timers.computeIfAbsent(sourceTable, table -> Timer.builder("bookshop.cdc.end.to.end.lag")
+                        .description("Time from the legacy commit to the commit of the translated change")
+                        .tag("source.table", table)
+                        .publishPercentiles(0.5, 0.95, 0.99)
+                        .register(registry))
+                .record(Duration.ofMillis(lagMs));
+    }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-change-event-values[Debezium -- Oracle connector: change event values (source.ts_ms)] and https://docs.micrometer.io/micrometer/reference/concepts/timers.html[Micrometer -- Timers]
+
+Snapshot events are skipped because their `source.ts_ms` is the time of the snapshot read, not of a change, and an
+incremental snapshot would otherwise show as hours of "lag". The clocks of the database server and the application
+host must be synchronised (NTP); a skew shows up directly as lag. With Spring Boot Actuator and a Prometheus registry,
+the timer is exported as `bookshop_cdc_end_to_end_lag_seconds` with a `source_table` label.
+
+== Parallel run of read paths behind feature flags
+
+Checksums prove that the *data* is equal. The parallel run proves that the new application *answers the same
+questions the same way*. In phase 2, each migrated read path (a catalogue search, a customer's order history) runs on
+both systems for real requests: the legacy answer is returned to the user, the new answer is computed in the
+background, the two are compared and the differences are logged. A feature flag switches the shadow read on and off
+per read path, so it can start with a cohort and be turned off at once if it loads the new database too much, as
+described in
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_feature_flags_and_cohort_based_cut_over[Feature flags and cohort-based cut-over]
+and, for the technique itself, in the "parallel run" part of
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_branch_by_abstraction_and_parallel_run[Branch by abstraction and parallel run].
+
+.ShadowReadComparator: run a read on both sides and keep the legacy answer (Java 21)
+[source,java]
+----
+package com.example.bookshop.migration;
+
+import java.lang.System.Logger;
+import java.lang.System.Logger.Level;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
+
+/**
+ * Parallel run of one read path: the legacy answer is always returned, and while the shadow flag is on the new
+ * answer is computed too, compared and logged. A failure of the new path never affects the caller.
+ */
+public final class ShadowReadComparator {
+
+    private static final Logger LOG = System.getLogger(ShadowReadComparator.class.getName());
+
+    private final BooleanSupplier shadowEnabled;
+    private final AtomicLong compared = new AtomicLong();
+    private final AtomicLong mismatched = new AtomicLong();
+
+    public ShadowReadComparator(BooleanSupplier shadowEnabled) {
+        this.shadowEnabled = Objects.requireNonNull(shadowEnabled);
+    }
+
+    public <T> T read(String readPath, String key, Supplier<T> legacyRead, Supplier<T> newRead) {
+        T legacy = legacyRead.get();
+        if (!shadowEnabled.getAsBoolean()) {
+            return legacy;
+        }
+        try {
+            T candidate = newRead.get();
+            compared.incrementAndGet();
+            if (!Objects.equals(legacy, candidate)) {
+                mismatched.incrementAndGet();
+                LOG.log(Level.WARNING, "Shadow read mismatch on {0} for key {1}: legacy={2}, new={3}",
+                        readPath, key, legacy, candidate);
+            }
+        } catch (RuntimeException e) {
+            mismatched.incrementAndGet();
+            LOG.log(Level.WARNING, "Shadow read failed on " + readPath + " for key " + key, e);
+        }
+        return legacy;
+    }
+
+    public long comparedCount() {
+        return compared.get();
+    }
+
+    public long mismatchCount() {
+        return mismatched.get();
+    }
+}
+----
+Reference: https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/lang/System.Logger.html[Java SE 21 -- System.Logger]
+
+The two answers must be comparable values: records with the same fields in the same normalised form (trimmed strings,
+`BigDecimal` with the same scale, statuses in the new vocabulary). A mismatch right after a write is often only lag;
+log the end-to-end lag with each mismatch, and count as real only mismatches that persist when the same key is read
+again a few seconds later. The ratio of `mismatchCount` to `comparedCount` per read path, over a business cycle, is the
+evidence for the read cut-over of phase 3.
+
+== Repairing drift
+
+Reconciliation finds three kinds of drift, and each has its own repair:
+
+[cols="2,3,3",options="header"]
+|===
+| Drift | Typical cause | Repair
+
+| Rows missing or stale in PostgreSQL
+| A skipped record after an error, a bug fixed in the translator, a table added late
+| Ad hoc incremental snapshot of the affected key range (below)
+
+| Rows present in PostgreSQL but deleted in Oracle
+| A lost delete (`delete.enabled=false` on the sink, a filter that dropped delete events)
+| Delete them on the PostgreSQL side; a snapshot only reads rows that exist, so it cannot repair this
+
+| Rows whose translation is wrong everywhere
+| A translator rule error
+| Fix and deploy the translator, then re-snapshot the whole table
+|===
+
+An incremental snapshot re-reads rows from the legacy table in chunks and emits them as `op=r` events, interleaved
+with the live stream, so the consumers apply them through the same upsert logic as normal changes. With
+`additional-conditions`, the snapshot is restricted to the rows that the drill-down found, for example one bucket of
+`BOOK`:
+
+.Re-read one key range of BOOK (Oracle, as a user with INSERT on the signal table)
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('repair-book-bucket-1-2026-11-09',
+        'execute-snapshot',
+        '{"data-collections": ["FREEPDB1.BOOKSHOP.BOOK"],
+          "type": "incremental",
+          "additional-conditions": [
+            {"data-collection": "FREEPDB1.BOOKSHOP.BOOK",
+             "filter": "BOOK_ID >= 10000 AND BOOK_ID < 20000"}]}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-incremental-snapshots-additional-conditions[Debezium -- Oracle connector: ad hoc incremental snapshots with additional-conditions]
+
+The same request through the Kafka signal channel, which needs no write access to the legacy database (the key of the
+message is the `topic.prefix`, `legacy`):
+
+.Re-read one key range of BOOK through the Kafka signal topic
+[source,shell]
+----
+echo 'legacy|{"type":"execute-snapshot","data":{"data-collections":["FREEPDB1.BOOKSHOP.BOOK"],"type":"INCREMENTAL","additional-conditions":[{"data-collection":"FREEPDB1.BOOKSHOP.BOOK","filter":"BOOK_ID >= 10000 AND BOOK_ID < 20000"}]}}' \
+  | /kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:9092 --topic legacy.signals \
+      --reader-property parse.key=true --reader-property key.separator='|'
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#_message_format[Debezium -- Kafka signaling channel: message format]
+
+After the snapshot completes (the connector sends an incremental snapshot notification to `legacy.notifications`, see
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications]), run the comparison again for
+the repaired buckets. xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking
+Snapshots] explains the watermarking that keeps the re-read rows consistent with concurrent changes, and the signal
+table name used by the Bookshop configuration.
+
+For rows that exist only in PostgreSQL, the drill-down gives the keys. Delete them in one transaction on the side that
+the pipeline writes (the mirror table, or the remodelled tables through the translator's own delete logic), and record
+the repair with the reconciliation run that found it, so that the audit trail explains every manual change.
+
+== Reconciling the reverse direction
+
+After the write cut-over of a capability (phase 4), PostgreSQL is the source of truth for its tables and Oracle is the
+follower, kept current by reverse replication (see
+xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication]). The same queries
+apply with the roles swapped:
+
+* Read PostgreSQL in a `REPEATABLE READ` transaction, so that all its numbers refer to one snapshot, and wait until the
+  reverse pipeline (`bookshop-pg-source`, `connect-bookshop-oracle-reverse-sink` and any reverse translator group) has
+  no lag before reading Oracle.
+* Rows created in the new application have no legacy key until the reverse translator assigns one; compare them by the
+  key that the reverse mapping writes into Oracle.
+* A clean reverse reconciliation is part of the exit criterion of phase 4, because it is what proves that a rollback to
+  the legacy application would not lose data.
+
+.Read PostgreSQL at one snapshot for a reverse reconciliation (psql)
+[source,sql]
+----
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_current_wal_lsn()                       AS compared_at_lsn,
+       pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0') AS compared_at_lsn_number;
+-- run the book and book_author checksum queries here
+COMMIT;
+----
+Reference: https://www.postgresql.org/docs/current/transaction-iso.html#XACT-REPEATABLE-READ[PostgreSQL -- Repeatable Read isolation level]
+
+The reported LSN plays the role of the SCN. `pg_current_wal_lsn()` returns it in the text form `0/20C16C0`, and
+`+pg_wal_lsn_diff(..., '0/0')+` turns it into the plain number that Debezium writes into the `lsn` field of the `source`
+block. The reverse pipeline has passed the snapshot when the `lsn` of the last applied `+modern.*+` event is at least
+`compared_at_lsn_number`.
+
+== What goes wrong
+
+[cols="2,3,3",options="header"]
+|===
+| Symptom | Cause | Fix
+
+| Every chunk differs
+| The canonical forms differ (a format model, a missing `RTRIM`, a different time zone, a database not in UTF-8)
+| Compare the canonical text of one key on both sides and align the expressions.
+
+| Chunks differ in one run and match in the next
+| Changes newer than the compared SCN
+| Normal; report only chunks that differ twice.
+
+| `ORA-01555 snapshot too old` or `ORA-08181` on the flashback query
+| The SCN is older than the undo retention
+| Take the SCN closer to the comparison, compare fewer buckets per run, or raise `UNDO_RETENTION`.
+
+| Counts match, checksums differ in a few chunks
+| Stale rows: an update was lost or applied out of order
+| Drill down, then re-snapshot the key range.
+
+| PostgreSQL has more rows than Oracle
+| Lost deletes
+| Check `delete.enabled` and filters, delete the extra keys, fix the cause before the next run.
+
+| The job never starts comparing
+| A consumer group never reaches zero lag (a stopped sink, a stuck partition)
+| That is a finding in itself; check the sink status before anything else.
+|===
+
+== Exit criteria supported by reconciliation
+
+* **Phase 1**: counts per table match after the initial snapshot, and the snapshot-completed notification has arrived.
+* **Phase 2**: per-chunk checksums of every migrated table are clean on every run for a full business cycle, the
+  shadow-read mismatch ratio is at zero for real mismatches, and every repair is documented.
+* **Phase 3**: end-to-end lag stays within its objective at peak.
+* **Phase 4**: the reverse reconciliation is clean, and the rollback has been rehearsed with it.
+
+== References
+
+* https://debezium.io/documentation/reference/stable/operations/monitoring.html[Debezium -- Monitoring Debezium]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-streaming-metrics[Debezium -- Oracle connector: streaming metrics (MilliSecondsBehindSource, CommittedScn)]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-change-event-values[Debezium -- Oracle connector: change event values]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html[Debezium -- Sending signals to a Debezium connector]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-incremental-snapshots-additional-conditions[Debezium -- Oracle connector: incremental snapshots with additional-conditions]
+* https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/STANDARD_HASH.html[Oracle -- STANDARD_HASH]
+* https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SELECT.html[Oracle -- SELECT (flashback query and sample clauses)]
+* https://www.postgresql.org/docs/current/functions-string.html[PostgreSQL -- String functions]
+* https://www.postgresql.org/docs/current/functions-formatting.html[PostgreSQL -- Data type formatting functions]
+* https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-ZONECONVERT[PostgreSQL -- AT TIME ZONE]
+* https://www.postgresql.org/docs/current/transaction-iso.html[PostgreSQL -- Transaction isolation]
+* https://kafka.apache.org/43/operations/basic-kafka-operations/#managing-consumer-groups[Apache Kafka -- Managing consumer groups]
+* https://docs.micrometer.io/micrometer/reference/concepts/timers.html[Micrometer -- Timers]
+* https://martinfowler.com/bliki/ParallelChange.html[Martin Fowler -- ParallelChange]
+
+What was run is described in the introduction; the remaining SQL, the signal examples and the end-to-end use of the
+script were derived from the official documentation above and were not run.

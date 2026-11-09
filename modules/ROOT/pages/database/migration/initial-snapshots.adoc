@@ -1,0 +1,685 @@
+= Initial Snapshots and Snapshot Modes
+:description: How a Debezium source connector copies the existing rows of the legacy database before it starts streaming changes, covering every snapshot.mode value (initial, initial_only, no_data, when_needed, always, recovery, configuration_based, custom and the deprecated schema_only and schema_only_recovery), the snapshot workflow and the hand-over to streaming at the recorded log position, locking and isolation per connector (snapshot.locking.mode, snapshot.isolation.mode), snapshot.select.statement.overrides, snapshot.include.collection.list, snapshot.max.threads, snapshot.fetch.size, snapshot metrics and notifications, Oracle ORA-01555 and ORA-01466, and how to size and plan a multi-terabyte snapshot for the Bookshop Oracle to PostgreSQL migration.
+:keywords: Debezium, initial snapshot, snapshot.mode, initial, initial_only, no_data, when_needed, always, recovery, configuration_based, custom snapshotter, schema_only deprecated, snapshot.locking.mode, snapshot.isolation.mode, snapshot.select.statement.overrides, snapshot.include.collection.list, snapshot.max.threads, snapshot.fetch.size, flashback query, SCN, LSN, binlog position, ORA-01555, ORA-01466, UNDO_RETENTION, READ event, op r, database migration, Oracle, PostgreSQL, MySQL, SQL Server, MongoDB
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A change data capture pipeline only ever sees *changes*. The legacy Bookshop Oracle schema, though, already holds
+millions of rows in `BOOK`, `CUSTOMER`, `ORDERS` and `ORDER_LINE` that were written years before anyone thought about
+Debezium, and the redo logs that described those writes have long since been archived and deleted. Before the new
+PostgreSQL `bookshop` database can be kept in sync by streaming, it has to be *filled*. That is the job of the
+**initial snapshot**: the first time a Debezium source connector starts, it reads the current content of every captured
+table, emits one `READ` event (`"op": "r"`) per row to the same topics that will later carry the `c`, `u` and `d`
+events, and then switches to streaming from the exact log position at which it took the snapshot, so that no change is
+lost and none is skipped.
+
+This page explains what the initial snapshot does, how each `snapshot.mode` value changes that behaviour, how the
+connectors lock and isolate the source tables while they read them, how to restrict or reshape the snapshot, and how to
+plan the snapshot of a large legacy database so that it finishes before the database's undo or log retention runs
+out. For snapshots that run *after* the connector is already streaming (ad hoc incremental and blocking snapshots) see
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots]. For the signals and
+notifications that control and report on snapshots see
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications].
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final (Oracle AI Database 26ai Free, image `gvenzl/oracle-free:23.26.3`, PostgreSQL 18, Kafka 4.x in KRaft mode).
+The configuration on this page is derived from the official Debezium 3.7 connector documentation; it was not run as
+part of writing the page.
+
+== Why the snapshot matters for a migration
+
+During a strangler-fig migration (see
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_data_synchronisation_during_the_overlap[Migration Path: From a Legacy Stack to a Modern One])
+the new system needs two things from the legacy database:
+
+* a **baseline**: the full current state of every table that the new system reads, and
+* a **continuous feed** of every change that is committed after that baseline.
+
+If the baseline and the feed do not join exactly, the new database drifts. A row that was updated between "copy the
+table" and "start reading the log" is lost if the feed starts too late, or applied twice if it starts too early. Batch
+ETL jobs that dump the tables and then "start CDC from now" have exactly this gap. The Debezium initial snapshot closes
+it: the connector records the log position (Oracle SCN, PostgreSQL LSN, MySQL binlog position or GTID set, SQL Server
+LSN, MongoDB resume token) *before* it reads the data, reads the data as it was at that position, and starts streaming
+from that same position. Every row is therefore either in the snapshot or in the stream.
+
+The snapshot is also where most of the operational risk of the first phase sits. On a large legacy schema it can run
+for hours or days, it holds locks or long-running transactions on a production database, it writes a burst of events
+that the Kafka cluster, the sinks and the anti-corruption layer consumers must absorb, and a failure in the middle
+usually means starting again from the beginning. Choosing the right mode and planning the run is part of the migration
+plan, not a connector detail.
+
+== How the initial snapshot works
+
+The detailed workflow differs per connector, but every relational connector follows the same shape. The Oracle
+workflow, which is the one the Bookshop source `bookshop-oracle-source` runs, is:
+
+. Connect to the database and determine the tables to capture (from `table.include.list` and `table.exclude.list`).
+. Take a `ROW SHARE` lock on each captured table (the default `snapshot.locking.mode=shared`), so that DDL that needs
+  an exclusive lock cannot change the table structure while the schema is read.
+. Read the current system change number (SCN) from the redo log.
+. Capture the structure of the tables and write it to the schema history topic `legacy.schema-history`.
+. For each captured table, run a flashback query `+SELECT * FROM ... AS OF SCN <scn>+` and emit one `READ` event per row.
+  All `READ` events carry the same SCN in their `source` block.
+. Release the locks and record in the connector offsets that the snapshot completed.
+. Start streaming with LogMiner from the SCN read in step 3.
+
+PostgreSQL runs the scan in one transaction that uses the isolation level from `snapshot.isolation.mode`, reads the
+current LSN, scans the tables and commits. MySQL takes a global read lock (or table locks when global locks are not
+allowed), starts a `REPEATABLE READ` transaction, reads the binlog position and schema, releases the global lock and then
+scans. SQL Server uses the isolation level from `snapshot.isolation.mode`. MongoDB reads the collections and resumes the
+change stream from the resume token it recorded before the copy.
+
+The following sequence diagram shows the hand-over for the Bookshop Oracle connector.
+
+[mermaid]
+....
+sequenceDiagram
+    participant Ora as Oracle FREEPDB1
+    participant Con as bookshop-oracle-source
+    participant Hist as legacy.schema-history
+    participant Top as legacy.BOOKSHOP.* topics
+    participant Offsets as Connect offsets
+    Con->>Ora: lock captured tables (ROW SHARE)
+    Con->>Ora: read current SCN (for example 4711000)
+    Con->>Hist: write table structures (DDL)
+    loop every captured table
+        Con->>Ora: SELECT rows AS OF SCN 4711000
+        Con->>Top: READ events (op r, snapshot true/first/last)
+    end
+    Con->>Ora: release locks
+    Con->>Offsets: snapshot completed, SCN 4711000
+    Note over Con,Ora: streaming starts at SCN 4711000
+    Ora-->>Con: LogMiner changes committed after SCN 4711000
+    Con->>Top: c / u / d events (snapshot false)
+....
+
+Two details matter for the consumers that apply these events to PostgreSQL:
+
+* Snapshot events have `"op": "r"` and `source.snapshot` set to `first`, `true`, `first_in_data_collection`,
+  `last_in_data_collection` or `last` (events from an incremental snapshot use `incremental`, and streamed events use
+  `false`). An anti-corruption-layer consumer such as `LegacyBookTranslator` must treat `r` as an upsert, exactly like
+  `c`. The xref:database/migration/jdbc-sink-connector.adoc[JDBC Sink Connector] with `insert.mode=upsert` already does.
+* A change committed while the snapshot is running is captured by the stream after the snapshot, because streaming
+  starts from the earlier SCN. A row can therefore arrive as a `READ` event and then again as an `UPDATE` with a newer
+  value. Consumers must be idempotent and must let the later event win; see
+  xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications].
+
+If the connector stops after the snapshot started but before the completion was recorded in the offsets, it starts the
+whole snapshot again after the restart. The events of the first, partial attempt are already in Kafka, so the topics
+then contain duplicate `READ` events. Upserting consumers absorb them, but the duplicated volume must be planned for.
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#default-workflow-for-performing-an-initial-snapshot[Debezium -- Oracle: default workflow for an initial snapshot]
+
+== The snapshot modes
+
+`snapshot.mode` decides *whether* the connector takes a snapshot when it starts, *what* it captures (schema only, or
+schema and data) and *whether it streams afterwards*. The default for every connector is `initial`.
+
+[cols="2,5,4",options="header"]
+|===
+| Value | What the connector does | When to use it in a migration
+
+| `initial` (default)
+| Takes a snapshot of schema and data the first time it starts (when no offsets exist for the `topic.prefix`), then
+  streams. On later restarts it resumes streaming from the stored offset. MySQL also re-runs the snapshot when it
+  detects that an earlier snapshot did not complete.
+| The normal choice for the first phase of a migration: copy the legacy tables once, then keep the new database in
+  sync.
+
+| `initial_only`
+| Takes the snapshot and then stops. It never streams.
+| A one-off copy, for example to load a test or rehearsal environment, or to measure how long a full snapshot takes
+  against a production clone.
+
+| `no_data`
+| Captures only the table structures (for the connectors that keep a schema history) and emits no `READ` events.
+  Streaming starts at the current log position. For PostgreSQL the connector never snapshots: it streams from the stored
+  LSN, or from the point at which the replication slot was created.
+| When the data is loaded by other means, when only changes from now on are needed (for example a reverse-replication
+  connector on the new database), or as the first step of the "no_data + incremental snapshot" pattern for very large
+  tables.
+
+| `schema_only`
+| Deprecated alias of `no_data`.
+| Do not use it in new configurations. Replace it with `no_data`.
+
+| `when_needed`
+| Takes a snapshot only if no offsets exist, or if the stored offset points to a log position that is no longer
+  available on the server (archived redo logs, purged binlogs or WAL deleted).
+| A safety net for long migrations: if the connector was down for longer than the log retention, it re-snapshots instead
+  of failing. Combine it with idempotent consumers, because the re-snapshot re-emits every row.
+
+| `always`
+| Takes a snapshot every time the connector starts, then streams.
+| Rarely appropriate for a large legacy database. PostgreSQL documents it for cases where WAL segments were lost or a
+  new primary was promoted after a failover.
+
+| `recovery`
+| Rebuilds a lost or corrupted schema history topic from the current table structures, then streams from the stored
+  offset (connectors with a schema history: Oracle, MySQL, MariaDB, SQL Server, Db2 and others). It is safe only if no
+  schema change was committed since the connector last stopped.
+| When `legacy.schema-history` was deleted or damaged, or to prune a history topic that grew unexpectedly.
+
+| `schema_only_recovery`
+| Deprecated alias of `recovery`.
+| Replace it with `recovery`.
+
+| `configuration_based`
+| Decides through five boolean properties with the prefix `snapshot.mode.configuration.based.`: `snapshot.data`,
+  `snapshot.schema`, `start.stream`, `snapshot.on.schema.error` and `snapshot.on.data.error` (all `false` by default).
+| When none of the named modes fits, for example "schema and data, but do not stream" combined with "re-snapshot on a
+  data error".
+
+| `custom`
+| Delegates the decision to an implementation of the `io.debezium.spi.snapshot.Snapshotter` interface, named by
+  `snapshot.mode.custom.name`.
+| For organisation-specific rules. The Snapshotter SPI is marked incubating.
+|===
+
+Not every connector accepts every value. The table below lists the values that each connector's 3.7 property
+reference documents:
+
+[cols="2,6",options="header"]
+|===
+| Connector | `snapshot.mode` values
+
+| Oracle
+| `always`, `initial`, `initial_only`, `no_data`, `recovery`, `when_needed`, `configuration_based`, `custom` (deprecated:
+  `schema_only`, `schema_only_recovery`)
+
+| PostgreSQL
+| `always`, `initial`, `initial_only`, `no_data`, `when_needed`, `configuration_based`, `custom` (no `recovery`: the
+  connector has no schema history topic)
+
+| MySQL and MariaDB
+| `always`, `initial`, `initial_only`, `no_data`, `recovery`, `when_needed`, `configuration_based`, `custom` (deprecated:
+  `schema_only`, `schema_only_recovery`)
+
+| SQL Server
+| `always`, `initial`, `initial_only`, `no_data`, `recovery`, `when_needed`, `when_needed_no_data`,
+  `configuration_based`, `custom` (deprecated: `schema_only`)
+
+| MongoDB
+| `always`, `initial`, `initial_only`, `no_data`, `when_needed`, `configuration_based`, `custom`
+|===
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-mode[Debezium -- Oracle connector: snapshot.mode]
+
+=== The modes in the Bookshop pipeline
+
+The Bookshop migration uses three different modes for three different connectors:
+
+* `bookshop-oracle-source` uses `initial`: it fills the `+legacy.BOOKSHOP.*+` topics once and then streams.
+* `bookshop-pg-source`, the reverse-replication connector on the new PostgreSQL database (see
+  xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication]), uses `no_data`. The
+  rows already in PostgreSQL came *from* Oracle; snapshotting them back would write every row to Oracle a second time.
+* A rehearsal connector against a clone of production uses `initial_only` to measure the snapshot duration before the
+  real run.
+
+The `configuration_based` mode can express each of these. The following fragment is equivalent to `initial_only`:
+
+.Snapshot schema and data, do not stream (configuration_based)
+[source,json]
+----
+{
+  "snapshot.mode": "configuration_based",
+  "snapshot.mode.configuration.based.snapshot.schema": "true",
+  "snapshot.mode.configuration.based.snapshot.data": "true",
+  "snapshot.mode.configuration.based.start.stream": "false",
+  "snapshot.mode.configuration.based.snapshot.on.schema.error": "false",
+  "snapshot.mode.configuration.based.snapshot.on.data.error": "false"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-mode-configuration-based-snapshot-data[Debezium -- Oracle connector: snapshot.mode.configuration.based.* properties]
+
+== A complete Oracle source configuration for the initial snapshot
+
+The following connector registers `bookshop-oracle-source` with explicit snapshot settings. Connection and LogMiner
+settings are explained on the xref:database/migration/oracle-connector.adoc[Oracle Connector] page; this example
+focuses on the snapshot properties.
+
+.bookshop-oracle-source with snapshot settings (POST to http://localhost:8083/connectors)
+[source,json]
+----
+{
+  "name": "bookshop-oracle-source",
+  "config": {
+    "connector.class": "io.debezium.connector.oracle.OracleConnector",
+    "tasks.max": "1",
+    "database.hostname": "oracle",
+    "database.port": "1521",
+    "database.user": "c##dbzuser",
+    "database.password": "${file:/kafka/secrets/oracle.properties:password}",
+    "database.dbname": "FREE",
+    "database.pdb.name": "FREEPDB1",
+    "topic.prefix": "legacy",
+    "table.include.list": "BOOKSHOP.BOOK,BOOKSHOP.AUTHOR,BOOKSHOP.CUSTOMER,BOOKSHOP.ORDERS,BOOKSHOP.ORDER_LINE,BOOKSHOP.SUPPLIER_CATALOGUE",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "legacy.schema-history",
+    "schema.history.internal.store.only.captured.tables.ddl": "false",
+    "decimal.handling.mode": "string",
+    "provide.transaction.metadata": "true",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "shared",
+    "snapshot.fetch.size": "10000",
+    "snapshot.max.threads": "1",
+    "snapshot.delay.ms": "10000",
+    "streaming.delay.ms": "120000",
+    "snapshot.include.collection.list": "FREEPDB1.BOOKSHOP.BOOK,FREEPDB1.BOOKSHOP.AUTHOR,FREEPDB1.BOOKSHOP.CUSTOMER,FREEPDB1.BOOKSHOP.ORDERS,FREEPDB1.BOOKSHOP.ORDER_LINE",
+    "snapshot.select.statement.overrides": "FREEPDB1.BOOKSHOP.ORDERS",
+    "snapshot.select.statement.overrides.FREEPDB1.BOOKSHOP.ORDERS": "SELECT * FROM BOOKSHOP.ORDERS WHERE ORDER_DT >= DATE '2016-01-01'",
+
+    "signal.enabled.channels": "source,kafka",
+    "signal.data.collection": "FREEPDB1.BOOKSHOP.DEBEZIUM_SIGNAL",
+    "signal.kafka.topic": "legacy.signals",
+    "signal.kafka.bootstrap.servers": "kafka:9092",
+    "notification.enabled.channels": "sink,log",
+    "notification.sink.topic.name": "legacy.notifications"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties]
+
+What each snapshot setting does in this example:
+
+* `snapshot.mode=initial`: snapshot once, then stream.
+* `snapshot.locking.mode=shared`: the default `ROW SHARE` lock (see the next section).
+* `snapshot.fetch.size=10000`: the JDBC fetch size, that is, how many rows the connector reads per round trip (10000 is
+  the Oracle default).
+* `snapshot.max.threads=1`: one table at a time (see "Parallel snapshots" below).
+* `snapshot.delay.ms`: wait 10 seconds after start before the snapshot begins, so that a Connect rebalance caused by
+  registering several connectors at once does not interrupt it.
+* `streaming.delay.ms`: wait before streaming starts after the snapshot. The official guidance is to set it higher than
+  the worker's `offset.flush.interval.ms`, so that the "snapshot completed" offset is flushed before streaming starts and
+  a crash right after the snapshot does not trigger a second full snapshot.
+* `snapshot.include.collection.list`: snapshot only these tables. `SUPPLIER_CATALOGUE` is captured
+  (`table.include.list`) but not snapshotted here, because the supplier feed reloads it completely every night. It is
+  streamed from now on and can be backfilled later with an incremental snapshot. In a CDB the names here use the PDB
+  name, `FREEPDB1.BOOKSHOP.BOOK`.
+* `snapshot.select.statement.overrides`: replaces the default `+SELECT *+` for `ORDERS` with a query that skips
+  orders from before 2016, which the new system does not migrate. The overrides apply only to the snapshot; streamed
+  changes to old orders still arrive and must be filtered by the consumer or a
+  xref:database/migration/single-message-transformations.adoc[transformation].
+* The signal and notification settings are not needed for the initial snapshot itself, but they enable the incremental
+  snapshots and the progress notifications that the rest of this sub-section uses. A runbook can wait for the
+  `Initial Snapshot` / `COMPLETED` notification on `legacy.notifications`; see
+  xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications].
+
+The `+${file:...}+` placeholder is resolved by Kafka's `FileConfigProvider`, which must be enabled on the Connect worker
+(`config.providers=file`); see xref:database/migration/security-and-data-protection.adoc[Security & Data Protection].
+
+=== Overriding the snapshot query
+
+`snapshot.select.statement.overrides` takes a comma-separated list of fully-qualified table names, and then one extra
+property per listed table, `snapshot.select.statement.overrides.<fully-qualified table name>`, whose value is the
+complete `SELECT` statement. Uses during a migration:
+
+* Skip historical rows that will not be migrated (the `ORDERS` example above).
+* Skip soft-deleted rows, for example `+SELECT * FROM BOOKSHOP.BOOK WHERE ACTIVE_FLG = 'Y'+`, if the new system does not
+  import inactive books. Remember that a later update that sets `ACTIVE_FLG` back to `+'Y'+` arrives as an `UPDATE` for a
+  row that the target never received, so the consumer must upsert rather than update.
+* Order the rows, for example by primary key, so that a restarted consumer can see how far it got.
+
+Keep the column list as `+SELECT *+` (or the full column list). The connector maps result columns to the table schema
+it captured, and leaving columns out produces events with `null` values for them.
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-select-statement-overrides[Debezium -- Oracle connector: snapshot.select.statement.overrides]
+
+== Locking and isolation per connector
+
+A consistent snapshot needs the table structure to stay the same while it is read, and the data to be read as of a
+single point in the log. Each database offers different tools for that, so each connector has different settings.
+
+[cols="2,3,6",options="header"]
+|===
+| Connector | Property and default | Values and effect
+
+| Oracle
+| `snapshot.locking.mode`, default `shared`
+| `shared`: `ROW SHARE` lock during the snapshot; reads and writes continue, DDL that needs an exclusive lock is
+  blocked, but Oracle non-blocking DDL (for example `+ALTER TABLE ... ADD COLUMN+` on 23.3 and later) is not.
+  `extended`: `SHARE` lock that blocks all DDL *and all writes* to the captured tables until the snapshot completes;
+  the connector waits up to `snapshot.lock.timeout.ms` (default 10000) for each lock.
+  `none`: no locks; safe only if no DDL runs during the snapshot. `custom`: a `SnapshotLock` implementation named by
+  `snapshot.locking.mode.custom.name`. The data itself is read with flashback queries at the snapshot SCN, so no row
+  locks are taken.
+
+| PostgreSQL
+| `snapshot.locking.mode`, default `none`; `snapshot.isolation.mode`, default `serializable`
+| Locking: `shared` (a lock that prevents exclusive access while schemas are read), `none`, `custom`. Isolation:
+  `serializable` (default, the historical behaviour, most consistent), `repeatable_read` (new rows can appear twice,
+  once in the snapshot and once in the stream, which is tolerable for mirroring), `read_committed` (least restrictive;
+  PostgreSQL treats read uncommitted as read committed). The isolation mode applies to the initial snapshot and to
+  blocking snapshots.
+
+| MySQL and MariaDB
+| `snapshot.locking.mode`, default `minimal`
+| `minimal`: global read lock only while the schema and binlog position are read, then a `REPEATABLE READ` transaction
+  for the data. `extended`: blocks writes for the whole snapshot. `none`: no locks, safe only without concurrent DDL
+  (MyISAM tables are always locked). `custom`. If global read locks are not permitted (common on managed services) the
+  connector uses table-level locks and needs the `LOCK TABLES` privilege.
+
+| SQL Server
+| `snapshot.isolation.mode`, default `repeatable_read`; `snapshot.locking.mode`, default `exclusive`
+| Isolation: `read_uncommitted`, `read_committed`, `repeatable_read`, `snapshot`, `exclusive`. Only `snapshot` and
+  `exclusive` guarantee that snapshot and stream form a linear history; `repeatable_read` and `read_committed` can
+  produce a row twice; `read_uncommitted` gives no guarantees. Locking: `exclusive` (lock while the schema is read),
+  `none`, `custom`.
+
+| MongoDB
+| no locking property
+| The connector copies the collections and resumes the change stream from the position it recorded before the copy.
+  `snapshot.collection.filter.overrides` plays the role of the select overrides.
+|===
+
+For the Bookshop Oracle source, `shared` is the right default: the legacy Struts application keeps writing orders during
+the snapshot, and only DDL is blocked. Freeze schema changes on the legacy schema for the duration of the snapshot
+(agree a change freeze with the legacy team). If that is not possible, the official mitigations for non-blocking DDL
+are `extended` (which stops all writes, usually unacceptable during business hours) or `no_data` followed by an
+incremental snapshot.
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-locking-mode[Debezium -- Oracle connector: snapshot.locking.mode]
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-snapshot-isolation-mode[Debezium -- PostgreSQL connector: snapshot.isolation.mode]
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-property-snapshot-isolation-mode[Debezium -- SQL Server connector: snapshot.isolation.mode]
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-snapshot-locking-mode[Debezium -- MySQL connector: snapshot.locking.mode]
+
+== Oracle: ORA-01555 and ORA-01466
+
+Two Oracle errors end a long initial snapshot, and both force it to start again from the beginning.
+
+**ORA-01555 "snapshot too old".** The flashback query `AS OF SCN` needs the undo data for that SCN. Oracle keeps undo
+for `UNDO_RETENTION` seconds (900 seconds, 15 minutes, by default) and only as long as the undo tablespace has room. If
+reading one large table takes longer, the query fails. The official FAQ lists two remedies:
+
+. Ask the DBA to raise `UNDO_RETENTION` temporarily (it can be changed online) and to make sure the undo tablespace is
+  large enough to hold the undo generated during the snapshot.
+. Do not rely on the initial snapshot for the data: start with `snapshot.mode=no_data` and load the data with an
+  incremental snapshot, which reads in chunks and does not use flashback queries.
+
+.Check and raise the undo retention for the snapshot window (run as a DBA)
+[source,sql]
+----
+-- current setting, in seconds
+SELECT name, value FROM v$parameter WHERE name = 'undo_retention';
+
+-- largest undo actually needed so far, and the longest query, in seconds
+SELECT MAX(tuned_undoretention) AS tuned_retention_s, MAX(maxquerylen) AS longest_query_s
+FROM v$undostat;
+
+-- raise it for the snapshot (here 12 hours); no restart needed
+ALTER SYSTEM SET UNDO_RETENTION = 43200 SCOPE = MEMORY;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#what-causes-ora-01555-and-how-to-handle-it[Debezium -- Oracle connector FAQ: ORA-01555]
+
+**ORA-01466 "unable to read data -- table definition has changed".** A flashback query fails if the table definition
+changed after the snapshot SCN (DDL on the table, or a change to one of its indexes). The failure cannot be retried with
+the same SCN, so the connector stops and the snapshot restarts. The default `shared` lock blocks most DDL but not
+Oracle non-blocking DDL; the remedies are a DDL freeze, `snapshot.locking.mode=extended`, or `no_data` plus an
+incremental snapshot.
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshots[Debezium -- Oracle connector: snapshots]
+
+== Snapshots and the schema history
+
+Connectors with a schema history topic (Oracle, MySQL, MariaDB, SQL Server, Db2) capture the *structure* of tables in
+the snapshot as well as their data. By default they store the DDL of **every** table in the database, not only the
+captured ones, so that a table can be added to `table.include.list` later without a missing-schema error. On a legacy
+Oracle instance with thousands of tables in other schemas, that makes the schema snapshot slow and the history topic
+large. Setting `schema.history.internal.store.only.captured.tables.ddl=true` would store only the six `BOOKSHOP`
+tables. The Bookshop source keeps the default, `false`, as written out in the example above, because rollback and
+reverse replication depend on the history of tables that are not captured yet, and because adding a table later stays
+simple.
+
+The trade-off of `true`: adding a table that was not captured before (for example a new `BOOKSHOP.PROMOTION` table that
+joins the migration scope) then needs extra steps. The official procedure for a table whose structure did not change is: stop the
+connector, delete the schema history topic, set `snapshot.mode=recovery`, add the table to `table.include.list`,
+restart, run an incremental snapshot for the new table, then set `snapshot.mode` back. When the structure did change,
+the documented procedures involve clearing the connector offsets as well. Those steps are covered on
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots] and
+xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes].
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#understanding-why-initial-snapshots-capture-the-schema-history-for-all-tables[Debezium -- Oracle connector: why initial snapshots capture the schema history for all tables]
+
+== Parallel snapshots
+
+`snapshot.max.threads` (default `1`) lets the relational connectors snapshot with several threads. In 3.7 the default
+behaviour for a value above 1 is **chunk-based**: each table is split into ranges of primary key values, and the
+threads take chunks as they finish, which keeps all threads busy. `snapshot.max.threads.multiplier` (default `1`)
+creates more, smaller chunks per thread. The older table-per-thread behaviour is still available with
+`legacy.snapshot.max.threads=true`. The Oracle documentation marks chunk-based parallel snapshotting as **incubating**.
+
+Rules that matter for the Bookshop tables:
+
+* Tables without a primary key, and tables with a `snapshot.select.statement.overrides` query (the `ORDERS` example
+  above), fall back to one chunk and one thread.
+* `ORDER_LINE` and `SUPPLIER_CATALOGUE` have composite keys; chunking still works on the primary key ranges.
+* Each thread holds its own database connection and its own long-running read. On Oracle, more threads finish sooner
+  and so reduce the ORA-01555 risk, but they also increase load on the production database. Agree the thread count with
+  the DBA.
+
+.Parallel chunk-based snapshot (incubating) for the large legacy tables
+[source,json]
+----
+{
+  "snapshot.max.threads": "4",
+  "snapshot.max.threads.multiplier": "2",
+  "legacy.snapshot.max.threads": "false"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#debezium-oracle-chunk-based-parallel-snapshots[Debezium -- Oracle connector: chunk-based parallel snapshots]
+
+MongoDB's `snapshot.max.threads` sets how many threads copy collections in a replica set. MySQL additionally offers
+`snapshot.tables.order.by.row.count` (`ascending`, `descending` or `disabled`) to choose which tables go first.
+
+== Sizing a multi-terabyte snapshot
+
+A Bookshop-sized schema snapshots in minutes. A real legacy database with a 2 TB `ORDER_LINE` table needs a plan. Work
+through these questions before the production run.
+
+[cols="2,5",options="header"]
+|===
+| Question | What to check
+
+| How long does it take?
+| Run `initial_only` against a production clone and read `SnapshotDurationInSeconds` and `RowsScanned` from the snapshot
+  MBean. Throughput is usually limited by the slowest of: the source read, the connector (one task per Oracle
+  connector), the Kafka producer, or the sinks.
+
+| Does the source keep what the snapshot needs for that long?
+| Oracle: `UNDO_RETENTION` and undo tablespace size (ORA-01555), plus enough archived redo to cover the snapshot
+  duration, because streaming starts from the snapshot SCN. PostgreSQL: the replication slot retains WAL from the
+  snapshot start, so disk usage on the primary grows during the snapshot. MySQL: `binlog_expire_logs_seconds` must
+  exceed the duration.
+
+| Can Kafka hold it?
+| Every row becomes one event on the table topic, usually larger than the row (the envelope carries `before`, `after`
+  and `source`, plus the schema when the JSON converter has `schemas.enable=true`). Size the brokers' disks and the
+  topic retention for the full snapshot plus the streaming backlog. Use Avro or Protobuf with a schema registry to
+  shrink events; see xref:database/migration/serialization-avro-and-schema-registries.adoc[Serialization & Schema Registries].
+  Pre-create the topics with enough partitions, or configure topic auto-creation; see
+  xref:database/migration/installation-and-deployment.adoc[Installing Debezium].
+
+| Can the sinks keep up?
+| The JDBC sink and the anti-corruption-layer consumers receive the whole table in a burst. Scale the sink tasks and the
+  consumer group `bookshop-legacy-sync`, and consider disabling secondary indexes and foreign keys on the PostgreSQL
+  mirror tables during the load and re-creating them afterwards.
+
+| What happens if it fails at 90 %?
+| The initial snapshot is not resumable: it restarts from the beginning, and the partial events stay in Kafka. If a
+  failure would be too costly, use `no_data` and an incremental snapshot, which is resumable chunk by chunk.
+
+| How is the connector tuned?
+| `snapshot.fetch.size` (rows per database round trip), `max.batch.size` and `max.queue.size` (events per batch and the
+  internal queue between the reader and Kafka Connect), and the producer settings of the worker (`linger.ms`,
+  `batch.size`, `compression.type`). Increase in small steps and watch the queue metrics
+  (`QueueRemainingCapacity`, `CurrentQueueSizeInBytes`).
+|===
+
+For very large tables, the usual recommendation is to split the work:
+
+. Start the connector with `snapshot.mode=no_data`. It records the current SCN and starts streaming immediately, so
+  the log retention is no longer a race against a multi-day snapshot.
+. Trigger incremental snapshots table by table (small reference tables first, `ORDER_LINE` last), optionally with
+  `additional-conditions` to load ranges such as one year of orders at a time.
+. Pause and resume the incremental snapshot around the legacy system's batch window.
+
+Incremental snapshots read in chunks of `incremental.snapshot.chunk.size` rows, interleave with streaming, need no
+flashback query and resume where they stopped. The cost is a slower total load and a signal table that the connector
+writes to. The details are on xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots].
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-ad-hoc-snapshots[Debezium -- Oracle connector: ad hoc snapshots]
+
+== Watching the snapshot
+
+=== Snapshot metrics
+
+Each relational connector exposes a snapshot MBean. For the Oracle connector it is
+`debezium.oracle:type=connector-metrics,context=snapshot,server=legacy` (the last part is the `topic.prefix`). The
+attributes that matter during a migration:
+
+[cols="2,5",options="header"]
+|===
+| Attribute | Use
+
+| `SnapshotRunning`, `SnapshotCompleted`, `SnapshotAborted`, `SnapshotPaused`, `SnapshotSkipped`
+| The state of the snapshot. `SnapshotCompleted=true` is the gate for the next runbook step.
+
+| `TotalTableCount`, `RemainingTableCount`, `CapturedTables`
+| How many tables are left.
+
+| `RowsScanned`
+| Rows read per table so far. Compare with `+SELECT COUNT(*)+` on the source to estimate progress.
+
+| `SnapshotDurationInSeconds`, `SnapshotPausedDurationInSeconds`
+| Elapsed time, used to calibrate the next run.
+
+| `TableChunkCounts`, `TableChunksCompletedCounts`
+| Progress of a parallel chunk-based snapshot.
+
+| `QueueRemainingCapacity`, `CurrentQueueSizeInBytes`
+| Back-pressure between the reader and Kafka. A queue that stays full means Kafka or the producer is the bottleneck.
+|===
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshot-metrics[Debezium -- Oracle connector: snapshot metrics]
+
+Exporting these metrics to Prometheus and alerting on them is covered on
+xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing].
+
+=== Snapshot notifications
+
+With `notification.enabled.channels=sink` and `notification.sink.topic.name=legacy.notifications`, the connector also
+publishes `Initial Snapshot` notifications: `STARTED`, `IN_PROGRESS` (with the current table),
+`TABLE_SCAN_COMPLETED` (with `total_rows_scanned` and a `status` of `SUCCEEDED` or `SQL_EXCEPTION`) and finally
+`COMPLETED`, `ABORTED` or `SKIPPED`. A migration runbook can block on the `COMPLETED` notification before it starts the
+JDBC sinks or the consumers; a complete Java program that does this is on
+xref:database/migration/signaling-and-notifications.adoc#_waiting_for_the_initial_snapshot_in_a_runbook[Signaling & Notifications].
+
+.A COMPLETED notification for the Bookshop source (value, schemas disabled)
+[source,json]
+----
+{
+  "id": "5563ae14-49f8-4579-9641-c1bbc2d76f99",
+  "aggregate_type": "Initial Snapshot",
+  "type": "COMPLETED",
+  "additional_data": {
+    "connector_name": "legacy"
+  },
+  "timestamp": 1762680046353
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-status-of-an-initial-snapshot[Debezium -- Notifications about the status of an initial snapshot]
+
+=== Verifying the result
+
+After the `COMPLETED` notification, check that the baseline arrived:
+
+.Count rows in the legacy schema (Oracle, as the BOOKSHOP owner)
+[source,sql]
+----
+SELECT 'BOOK' AS table_name, COUNT(*) AS row_count FROM BOOKSHOP.BOOK
+UNION ALL SELECT 'AUTHOR', COUNT(*) FROM BOOKSHOP.AUTHOR
+UNION ALL SELECT 'CUSTOMER', COUNT(*) FROM BOOKSHOP.CUSTOMER
+UNION ALL SELECT 'ORDERS', COUNT(*) FROM BOOKSHOP.ORDERS WHERE ORDER_DT >= DATE '2016-01-01'
+UNION ALL SELECT 'ORDER_LINE', COUNT(*) FROM BOOKSHOP.ORDER_LINE;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshots[Debezium -- Oracle connector: snapshots]
+
+.Count the mirror rows written by the JDBC sink (PostgreSQL bookshop database)
+[source,sql]
+----
+SELECT 'legacy_book' AS table_name, COUNT(*) AS row_count FROM legacy_book
+UNION ALL SELECT 'legacy_author', COUNT(*) FROM legacy_author;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html[Debezium -- JDBC sink connector]
+
+Counts that match at a quiet moment are a first signal only. The
+xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation] page compares checksums
+and samples per key, which also catches type conversion problems such as `DATE` columns that lost their time part.
+
+== What goes wrong
+
+[cols="3,5",options="header"]
+|===
+| Symptom | Cause and fix
+
+| The snapshot restarts from zero after a Connect rebalance or a worker restart.
+| The initial snapshot is not resumable. Set `snapshot.delay.ms` so that rebalances from registering several connectors
+  settle first, set `streaming.delay.ms` above `offset.flush.interval.ms`, and run large snapshots on a dedicated, stable
+  Connect cluster. For multi-day loads, use `no_data` plus incremental snapshots.
+
+| `ORA-01555: snapshot too old` after a few hours.
+| Undo retention shorter than the scan of the largest table. Raise `UNDO_RETENTION`, add threads, or switch to `no_data`
+  plus an incremental snapshot.
+
+| `ORA-01466` and the connector stops.
+| DDL (often non-blocking `ADD COLUMN`) on a captured table during the snapshot. Freeze DDL, use
+  `snapshot.locking.mode=extended`, or use an incremental snapshot.
+
+| After the snapshot the connector fails because the start position is no longer available.
+| Logs purged during a long snapshot (archived redo deleted by RMAN, binlogs expired, a PostgreSQL slot dropped). Extend
+  the retention for the snapshot window; `when_needed` re-snapshots automatically but repeats the whole load.
+
+| The new database has fewer rows than the legacy one.
+| A `snapshot.select.statement.overrides` filter, a `snapshot.include.collection.list` that misses a table, or a table
+  name with the wrong case. Oracle names are upper case (`BOOKSHOP.BOOK`), and the include lists are matched as anchored
+  regular expressions.
+
+| A table appears in the schema history but has no `READ` events.
+| It is in the database but not in `table.include.list`: the snapshot stores its structure only. Add it and run an
+  incremental snapshot.
+
+| The Connect worker runs out of memory during the snapshot.
+| A very large `snapshot.fetch.size`, `max.queue.size` or `max.batch.size`, or large LOB columns. Lower the values or set
+  `max.queue.size.in.bytes`.
+
+| `"snapshot.mode": "schema_only"` produces a deprecation warning.
+| Use `no_data`. Likewise use `recovery` instead of `schema_only_recovery`.
+|===
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshots[Debezium -- Oracle connector: snapshots]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#default-workflow-for-performing-an-initial-snapshot[Debezium -- Oracle connector: default initial snapshot workflow]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#debezium-oracle-chunk-based-parallel-snapshots[Debezium -- Oracle connector: chunk-based parallel snapshots]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshot-metrics[Debezium -- Oracle connector: snapshot metrics]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#what-causes-ora-01555-and-how-to-handle-it[Debezium -- Oracle connector FAQ: ORA-01555]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-snapshots[Debezium -- PostgreSQL connector: snapshots]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-snapshot-isolation-mode[Debezium -- PostgreSQL connector: snapshot.isolation.mode]
+* https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-snapshots[Debezium -- MySQL connector: snapshots]
+* https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-snapshot-locking-mode[Debezium -- MySQL connector: snapshot.locking.mode]
+* https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-property-snapshot-isolation-mode[Debezium -- SQL Server connector: snapshot.isolation.mode]
+* https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-property-snapshot-mode[Debezium -- MongoDB connector: snapshot.mode]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#connector-custom-snapshot[Debezium -- Custom snapshotter SPI]
+* https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-status-of-an-initial-snapshot[Debezium -- Notifications about the status of an initial snapshot]
+* https://debezium.io/documentation/reference/stable/connectors/jdbc.html[Debezium -- JDBC sink connector]
+* https://debezium.io/releases/3.7/[Debezium 3.7 release series]
+
+The configuration and SQL on this page were derived from the official documentation listed above and were not run.

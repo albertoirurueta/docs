@@ -1,0 +1,731 @@
+= MongoDB Connector
+:description: How the Debezium MongoDB connector captures document changes through MongoDB change streams during a migration, covering supported topologies (replica sets and sharded clusters, converting a standalone server), read preference, mongodb.connection.string, capture.scope and capture.target, user permissions, capture.mode and pre-images with changeStreamPreAndPostImages, json.serialization.mode, the string-based event format, oplog sizing and heartbeats, incremental snapshots through a signal collection, oversized documents, a tested lab that migrates the legacy bookshop.reviews collection to a PostgreSQL book_review table with the JDBC sink and the MongoToRelationalMapper transformation, monitoring, and recovery from an invalid resume token.
+:keywords: Debezium, MongoDB, change streams, oplog, replica set, sharded cluster, resume token, capture.mode, pre-image, changeStreamPreAndPostImages, json.serialization.mode, MongoToRelationalMapper, ExtractNewDocumentState, JDBC sink, PostgreSQL, document to relational migration, ChangeStreamHistoryLost
+
+include::partial$database-migration-disclaimer.adoc[]
+
+Not every legacy system keeps its data in a relational database. Many applications built in the 2010s stored part of
+their data in MongoDB, and a migration often has to move documents into relational tables (or the reverse). In the
+Bookshop running example, the legacy application stored customer reviews in a MongoDB collection,
+`bookshop.reviews`, while the rest of the shop lived in Oracle. The new Spring Boot application keeps reviews in a
+PostgreSQL table, `book_review`, next to `book` and `customer`, so that reports can join them. The Debezium MongoDB
+connector is the piece that turns every insert, update and delete in `bookshop.reviews` into an event, so that the new
+table stays in sync while the old review pages keep working.
+
+The MongoDB connector differs from the relational connectors in three ways that shape the whole pipeline:
+
+* it reads **change streams**, which only exist on replica sets and sharded clusters, so a standalone server must be
+  converted first;
+* the document parts of its events (`before`, `after`, `updateDescription.updatedFields`) are **JSON strings**, not
+  structured records, so a transformation is needed before a relational sink can write columns;
+* it has **no schema history topic**: MongoDB has no DDL, and each event carries the whole document as text.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, MongoDB 8.0 (`mongo:8.0`), Kafka 4.x in KRaft mode and PostgreSQL
+18. Debezium 3.7 is tested with MongoDB 6.0, 7.0 and 8.0. The lab on this page (a one-node MongoDB 8.0 replica set,
+`quay.io/debezium/kafka:3.7.1.Final`, `quay.io/debezium/connect:3.7.1.Final` and `postgres:18`, the
+`bookshop-mongo-source` connector and a JDBC sink with the `MongoToRelationalMapper` transformation) was run with
+Docker on 2026-11-09, including the snapshot, an update, a `$unset`, a delete and an incremental snapshot.
+The user and role script was not run
+with access control enabled.
+
+== How the MongoDB connector works
+
+MongoDB replication works through the **oplog**: the primary of a replica set records every write in this capped
+collection, and the secondaries replay it. The Debezium connector does not join the replica set and does not read the
+oplog directly. It opens a MongoDB **change stream**, a server feature that decodes the oplog and returns one change
+document per write, and turns each change document into a Debezium change event.
+
+[mermaid]
+....
+flowchart LR
+    App[Legacy review pages] -->|insert / update / delete| Primary[(Replica set primary)]
+    Primary --> Oplog[(oplog: capped collection)]
+    Oplog --> Secondary[(Secondaries)]
+    Oplog -->|change stream| Dbz[Debezium MongoDB connector]
+    Dbz -->|change events| Topic[(legacy-mongo.bookshop.reviews)]
+    Dbz -->|resume token as offset| Offsets[(Connect offsets topic)]
+    Topic --> Sink[JDBC sink + MongoToRelationalMapper]
+    Sink --> PG[(PostgreSQL book_review)]
+....
+
+On the first start the connector records the current position of the change stream, copies the documents of every
+captured collection as `r` (read) events, and then opens the change stream at the recorded position, so changes made
+during the snapshot are not lost. As it processes events it stores the **resume token** of the change stream as its
+offset (the interval is the Kafka Connect worker setting `offset.flush.interval.ms`). After a graceful stop it resumes
+exactly where it stopped; after a crash it resumes from the last flushed offset and may repeat some events, so
+consumers must be idempotent.
+
+The oplog is capped. If the connector is stopped for longer than the oplog window, the resume token points to an entry
+that no longer exists, and the connector cannot resume. That failure, and how to prevent it, is covered in
+<<_oplog_sizing_and_heartbeats>> and <<_when_things_go_wrong>>.
+
+== Supported topologies
+
+[cols="1,3",options="header"]
+|===
+|Topology |Support
+
+|Replica set
+|Supported. Set `mongodb.connection.string` to the replica set connection string (with `replicaSet=<name>`). Production
+replica sets have at least three members.
+
+|Sharded cluster
+|Supported. Each shard is a replica set; the connector connects to the `mongos` routers with the sharded cluster
+connection string, and all changes of a sharded collection go to one topic.
+
+|Standalone server
+|**Not supported.** A standalone server has no oplog. Convert it to a one-member replica set first.
+|===
+
+Many old MongoDB installations are standalone servers. Converting one to a one-member replica set is a restart with the
+`--replSet` option (or `replication.replSetName` in the configuration file) followed by `rs.initiate()`. It changes
+nothing for the application's queries, but it does need a restart, so plan it as the first step of the migration.
+
+.Convert a standalone server to a one-member replica set (run once, after restarting mongod with --replSet rs0)
+[source,javascript]
+----
+// mongod was restarted with: mongod --replSet rs0 --bind_ip_all
+rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongodb:27017" }] });
+while (!db.hello().isWritablePrimary) { sleep(500); }
+db.hello().setName;   // "rs0"
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-standalone-server[Debezium -- MongoDB standalone server]
+and https://www.mongodb.com/docs/manual/tutorial/convert-standalone-to-replica-set/[MongoDB -- Convert a standalone to a replica set]
+
+The replica set concepts behind this (elections, the oplog, read preference) are explained in the
+xref:database/mongodb/replication.adoc[MongoDB Reference: replication] and
+xref:database/mongodb/change-streams.adoc[change streams] pages.
+
+=== Read preference
+
+By default the connector streams from the primary. To keep the capture load off a busy legacy primary, set
+`readPreference=secondaryPreferred` in the connection string. Change streams only emit changes once they are majority
+committed, and a secondary adds its replication lag, so events can arrive a little later. After an election, the
+connector notices that the member it reads from no longer matches the read preference at the next check (controlled by
+`mongodb.heartbeat.frequency.ms`), closes the change stream and resumes on an eligible member from the last offset.
+
+== The Bookshop reviews collection
+
+The legacy application wrote one document per review. The legacy book and customer identifiers are stored as 64-bit
+integers, because they reference the Oracle `BOOK_ID` and `CUST_ID` keys:
+
+.A legacy review document in bookshop.reviews
+[source,javascript]
+----
+db.getSiblingDB("bookshop").reviews.insertOne({
+  bookId: NumberLong("1001"),            // legacy BOOK.BOOK_ID
+  customerLegacyId: NumberLong("501"),   // legacy CUSTOMER.CUST_ID
+  rating: 5,
+  title: "A classic",
+  body: "Read it twice.",
+  createdAt: ISODate("2019-03-14T10:15:00Z"),
+  helpfulVotes: 12,
+  tags: ["classic", "gift"]
+});
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-events[Debezium -- MongoDB data change events]
+
+The target in the new PostgreSQL `bookshop` database keeps the typed columns that the new application queries and the
+whole original document as `jsonb`, so that fields the new model does not use yet (such as `tags`) are not lost:
+
+.Target table book_review in PostgreSQL
+[source,sql]
+----
+CREATE TABLE book_review (
+    id                 text PRIMARY KEY,   -- the Debezium key: the _id as extended JSON
+    book_id            bigint,
+    customer_legacy_id bigint,
+    rating             smallint,
+    title              text,
+    body               text,
+    helpful_votes      integer,
+    created_at         timestamptz,
+    document_json      jsonb
+);
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-primary-key-handling[Debezium -- JDBC sink primary key handling]
+
+The `id` column holds the key that the connector produces for the document, which for an `ObjectId` is the string
+`+{"$oid": "6af189a0c788084b3fbe7dcc"}+`. That is not a pretty key, but it is stable and it is what makes updates and
+deletes find the right row. The anti-corruption layer
+(xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]) can later
+attach a `uuid` and resolve `book_id` to the new `book` table.
+
+== Lab: bookshop.reviews to PostgreSQL
+
+The lab runs MongoDB as a one-member replica set, Kafka in KRaft mode, Kafka Connect with the Debezium connectors, and
+PostgreSQL 18. The `quay.io/debezium/connect:3.7.1.Final` image already contains the MongoDB source connector, the JDBC
+sink connector and the PostgreSQL JDBC driver.
+
+.compose.yaml
+[source,yaml]
+----
+services:
+  kafka:
+    image: quay.io/debezium/kafka:3.7.1.Final
+    ports:
+      - "9092:9092"
+    environment:
+      - CLUSTER_ID=5Yr1SIgYQz-b-dgRabWx4g
+      - NODE_ID=1
+      - NODE_ROLE=combined
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+
+  mongodb:
+    image: mongo:8.0
+    hostname: mongodb
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  postgres:
+    image: postgres:18
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: bookshop
+      POSTGRES_USER: bookshop
+      POSTGRES_PASSWORD: bookshop
+
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    ports:
+      - "8083:8083"
+    depends_on:
+      - kafka
+      - mongodb
+      - postgres
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: bookshop-connect
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+----
+Reference: https://github.com/debezium/debezium-examples/blob/main/tutorial/docker-compose-mongodb.yaml[debezium-examples -- tutorial/docker-compose-mongodb.yaml]
+
+The MongoDB in this lab runs without access control, to keep it short. Production settings for users and TLS follow in
+<<_users_and_permissions>>.
+
+=== Initialise the replica set and the legacy data
+
+The script initiates the replica set, creates the `reviews` collection with pre- and post-images enabled (so the
+connector can fill `before`), creates the signal collection, and inserts two reviews.
+
+.init.js (run with: docker compose exec -T mongodb mongosh --quiet < init.js)
+[source,javascript]
+----
+rs.initiate({ _id: "rs0", members: [{ _id: 0, host: "mongodb:27017" }] });
+while (!db.hello().isWritablePrimary) { sleep(500); }
+
+const bookshop = db.getSiblingDB("bookshop");
+bookshop.createCollection("reviews", { changeStreamPreAndPostImages: { enabled: true } });
+bookshop.createCollection("debezium_signal");
+bookshop.reviews.insertMany([
+  { bookId: NumberLong("1001"), customerLegacyId: NumberLong("501"), rating: 5,
+    title: "A classic", body: "Read it twice.", createdAt: ISODate("2019-03-14T10:15:00Z"),
+    helpfulVotes: 12, tags: ["classic", "gift"] },
+  { bookId: NumberLong("1002"), customerLegacyId: NumberLong("502"), rating: 3,
+    title: "Uneven", body: "Good start, slow middle.", createdAt: ISODate("2021-07-02T18:40:00Z"),
+    helpfulVotes: 1, tags: [] }
+]);
+printjson(bookshop.reviews.countDocuments());
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-pre-image-support[Debezium -- MongoDB pre-image support]
+
+Create the `book_review` table shown above in PostgreSQL (`docker compose exec -T postgres psql -U bookshop -d
+bookshop < book_review.sql`).
+
+=== Register the source connector
+
+.bookshop-mongo-source.json
+[source,json]
+----
+{
+  "name": "bookshop-mongo-source",
+  "config": {
+    "connector.class": "io.debezium.connector.mongodb.MongoDbConnector",
+    "tasks.max": "1",
+    "mongodb.connection.string": "mongodb://mongodb:27017/?replicaSet=rs0",
+    "topic.prefix": "legacy-mongo",
+    "capture.scope": "database",
+    "capture.target": "bookshop",
+    "collection.include.list": "bookshop.reviews",
+    "capture.mode": "change_streams_update_full_with_pre_image",
+    "json.serialization.mode": "extended",
+    "snapshot.mode": "initial",
+    "signal.data.collection": "bookshop.debezium_signal",
+    "heartbeat.interval.ms": "10000",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-connector-properties[Debezium -- MongoDB connector properties]
+
+.Register the connector and list the topics
+[source,shell]
+----
+curl -s -X POST -H 'Content-Type: application/json' \
+  --data @bookshop-mongo-source.json http://localhost:8083/connectors
+
+curl -s http://localhost:8083/connectors/bookshop-mongo-source/status
+
+docker compose exec kafka /kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-adding-connector-configuration[Debezium -- Adding MongoDB connector configuration]
+
+In the run, the connector and its task reported `RUNNING` (Kafka Connect 4.3.1, connector version 3.7.1.Final), and two
+topics appeared: `legacy-mongo.bookshop.reviews` and the heartbeat topic `+__debezium-heartbeat.legacy-mongo+`. The
+signal collection does not need to be in `collection.include.list`: signals were processed without it.
+
+=== Register the JDBC sink with the relational mapping
+
+The sink reads the topic, converts the document strings into typed fields with the `MongoToRelationalMapper`
+transformation (new in Debezium 3.7), and upserts into `book_review`. The mapping is a JSON object whose members are the
+output columns; each has a JSON Pointer `path` into the document and a Kafka Connect `type`. An empty path keeps the
+whole document.
+
+.bookshop-pg-review-sink.json
+[source,json]
+----
+{
+  "name": "bookshop-pg-review-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "topics": "legacy-mongo.bookshop.reviews",
+    "connection.url": "jdbc:postgresql://postgres:5432/bookshop",
+    "connection.username": "bookshop",
+    "connection.password": "bookshop",
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_key",
+    "primary.key.fields": "id",
+    "delete.enabled": "true",
+    "schema.evolution": "none",
+    "collection.name.format": "book_review",
+    "use.time.zone": "UTC",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+    "transforms": "map",
+    "transforms.map.type": "io.debezium.connector.mongodb.transforms.MongoToRelationalMapper",
+    "transforms.map.schema.mapping.bookshop.reviews": "{\"book_id\":{\"path\":\"/bookId\",\"type\":\"int64\"},\"customer_legacy_id\":{\"path\":\"/customerLegacyId\",\"type\":\"int64\"},\"rating\":{\"path\":\"/rating\",\"type\":\"int16\"},\"title\":{\"path\":\"/title\",\"type\":\"string\"},\"body\":{\"path\":\"/body\",\"type\":\"string\"},\"helpful_votes\":{\"path\":\"/helpfulVotes\",\"type\":\"int32\"},\"created_at\":{\"path\":\"/createdAt\",\"type\":\"org.apache.kafka.connect.data.Timestamp\"},\"document_json\":{\"path\":\"\",\"type\":\"io.debezium.data.Json\"}}"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/transformations/mongodb-relational-mapping.html#_configuring_collection_projections[Debezium -- MongoDB Relational Mapping: configuring collection projections]
+and https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-configuration[Debezium -- JDBC connector configuration]
+
+Why each choice was made:
+
+* `MongoToRelationalMapper` keeps the Debezium envelope, the key and `op`, so the JDBC sink can still tell inserts,
+  updates and deletes apart. It is applied **on the sink**, so the topic keeps the original MongoDB events for other
+  consumers (for example a MongoDB sink, see xref:database/migration/mongodb-sink-connector.adoc[MongoDB Sink
+  Connector]).
+* A fixed projection gives a stable column set. Without one, the transformation infers a schema from each event, which
+  can change from event to event.
+* The mapper needs a full `after` document for updates, which is why the source uses a `+change_streams_update_full*+`
+  capture mode.
+* `primary.key.mode=record_key` is required for `delete.enabled=true`; the key struct has one field, `id`.
+* `json.serialization.mode=extended` on the source keeps BSON types (for example `$numberLong`) in the strings, so the
+  mapper converts `bookId` as a 64-bit integer without guessing.
+
+Event flattening with `ExtractNewDocumentState`, the older way of turning MongoDB events into flat records, and a
+comparison with the mapper are on xref:database/migration/event-flattening.adoc[Event Flattening]. All JDBC sink options
+are on xref:database/migration/jdbc-sink-connector.adoc[JDBC Sink Connector].
+
+=== Check the result
+
+.Query the target table
+[source,shell]
+----
+docker compose exec -T postgres psql -U bookshop -d bookshop -c \
+  "select id, book_id, rating, title, helpful_votes, created_at from book_review order by book_id"
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-configuration[Debezium -- JDBC connector configuration]
+
+.Output after the initial snapshot (object identifiers differ on every run)
+[source,text]
+----
+                  id                  | book_id | rating |   title   | helpful_votes |       created_at
+--------------------------------------+---------+--------+-----------+---------------+------------------------
+ {"$oid": "6af189a0c788084b3fbe7dcc"} |    1001 |      5 | A classic |            12 | 2019-03-14 10:15:00+00
+ {"$oid": "6af189a0c788084b3fbe7dcd"} |    1002 |      3 | Uneven    |             1 | 2021-07-02 18:40:00+00
+(2 rows)
+----
+
+Then change the legacy data the way the old application would, and query again:
+
+.Update, unset a field, insert and delete in the legacy collection
+[source,javascript]
+----
+const reviews = db.getSiblingDB("bookshop").reviews;
+reviews.updateOne({ bookId: NumberLong("1002") },
+                  { $set: { rating: 4, title: "Better on a second read" }, $inc: { helpfulVotes: 1 } });
+reviews.updateOne({ bookId: NumberLong("1001") }, { $unset: { body: "" } });
+reviews.insertOne({ bookId: NumberLong("1003"), customerLegacyId: NumberLong("503"), rating: 1,
+                    title: "Spam", body: "x", createdAt: new Date(), helpfulVotes: 0, tags: [] });
+reviews.deleteOne({ title: "Spam" });
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-update-events[Debezium -- MongoDB update events]
+
+In the run, row 1002 showed rating 4, the new title and `helpful_votes` 2; row 1001 had `body` set to `NULL` (the mapper
+turns a removed field into `null`, and the upsert clears the column); and the spam review was inserted and then deleted,
+so it was no longer in the table.
+
+== Users and permissions
+
+The connector authenticates as a MongoDB user. The official list of what that user needs:
+
+* read access to what it captures, depending on `capture.scope`: any database (`deployment`), the database in
+  `capture.target` (`database`), or the collection in `capture.target` (`collection`);
+* permission to run the `hello` command;
+* read access to the `config.shards` collection for sharded clusters (and for connectors upgraded from Debezium 2.5 or
+  earlier, for offset consolidation).
+
+The incremental snapshot also writes watermark documents into the signal collection, so the user needs to insert into
+it. A custom role grants exactly that.
+
+.Create a least-privilege user for bookshop-mongo-source (capture.scope=database)
+[source,javascript]
+----
+const admin = db.getSiblingDB("admin");
+admin.createRole({
+  role: "debeziumBookshopSignals",
+  privileges: [
+    { resource: { db: "bookshop", collection: "debezium_signal" }, actions: ["find", "insert", "update", "remove"] }
+  ],
+  roles: []
+});
+admin.createUser({
+  user: "dbz_bookshop",
+  pwd: passwordPrompt(),
+  roles: [
+    { role: "read", db: "bookshop" },
+    { role: "debeziumBookshopSignals", db: "admin" }
+  ]
+});
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#required-user-permissions[Debezium -- MongoDB required user permissions]
+and https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-creating-a-signal-data-collection[Debezium -- Creating a signaling data collection]
+
+For a sharded cluster, also give the user read access to `config.shards` (for example the built-in `read` role on the
+`config` database). With access control on, the connection string carries the credentials and the authentication
+database, and TLS should be enabled:
+
+.Connection properties for an authenticated, encrypted replica set
+[source,json]
+----
+{
+  "mongodb.connection.string": "mongodb://mongo1:27017,mongo2:27017,mongo3:27017/?replicaSet=rs0&readPreference=secondaryPreferred",
+  "mongodb.user": "dbz_bookshop",
+  "mongodb.password": "${file:/opt/kafka/secrets/mongodb.properties:password}",
+  "mongodb.authsource": "admin",
+  "mongodb.ssl.enabled": "true"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-property-mongodb-connection-string[Debezium -- mongodb.connection.string]
+
+`mongodb.connection.string` replaced the old `mongodb.hosts` property; settings in the connection string override the
+ones set by the authentication class. MongoDB Atlas only accepts TLS connections, so `mongodb.ssl.enabled` must be
+`true` there. The user and role script above was not run in the lab, which had access control disabled.
+
+== Choosing what to capture
+
+Three properties decide which change streams the connector opens:
+
+[cols="1,1,3",options="header"]
+|===
+|Property |Default |Meaning
+
+|`capture.scope`
+|`deployment`
+|`deployment` opens one change stream for all non-system collections of all databases except `admin`, `local` and
+`config`; `database` opens one for a single database; `collection` opens one for a single collection (incubating, and
+it disables incremental snapshots because the source signal channel cannot be used).
+
+|`capture.target`
+|none
+|The database (scope `database`) or `database.collection` (scope `collection`) to watch. Required for those scopes.
+
+|`collection.include.list` / `collection.exclude.list`
+|empty
+|Regular expressions (or literals, with `filters.match.mode=literal`) matched against `databaseName.collectionName`.
+|===
+
+For a migration, `capture.scope=database` with an include list is a good default: the change stream only sees the legacy
+database, the user only needs read access to it, and the signal collection can live in the same database (which the
+official documentation requires for this scope). `field.exclude.list` and `field.renames` drop or rename fields before
+the event leaves the connector, which is the place to remove personal data that must not reach Kafka.
+
+== Capture modes and pre-images
+
+MongoDB change streams describe an update as a set of changed fields, not as a full document. `capture.mode` decides
+what the connector adds:
+
+[cols="2,1,1,3",options="header"]
+|===
+|`capture.mode` |`after` on update |`before` |Notes
+
+|`change_streams`
+|no
+|no
+|Only `updateDescription` (changed and removed fields). The consumer must apply the patch itself.
+
+|`change_streams_update_full` (default)
+|yes
+|no
+|The full document after the update, fetched as set by `capture.mode.full.update.type`.
+
+|`change_streams_update_full_with_pre_image`
+|yes
+|yes
+|Full document and the document before the change. Requires pre-images on the collection (MongoDB 6.0+).
+
+|`change_streams_with_pre_image`
+|no
+|yes
+|Pre-image only.
+|===
+
+Two details matter when the target is a relational table:
+
+* With the default `capture.mode.full.update.type=lookup`, the connector fetches the current document after receiving
+  the update. If several updates happen quickly, the `after` of an early event can already contain a later state, and if
+  the document was deleted in between, `after` is `null`. The alternative `post_image` uses MongoDB post-images (6.0+),
+  which must be enabled on the collection before the changes happen.
+* Pre- and post-images are enabled per collection with `changeStreamPreAndPostImages`, at creation time (as in the lab)
+  or later with `collMod`. They are only available for changes made after they were enabled.
+
+.Enable pre- and post-images on an existing collection
+[source,javascript]
+----
+db.getSiblingDB("bookshop").runCommand({
+  collMod: "reviews",
+  changeStreamPreAndPostImages: { enabled: true }
+});
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-property-capture-mode[Debezium -- capture.mode]
+and https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-pre-image-support[pre-image support]
+
+A change stream event is limited to 16 MB, and pre-images make that limit easier to reach.
+`cursor.oversize.handling.mode` decides what happens to an oversized event: `fail` (default), `skip` (above
+`cursor.oversize.skip.threshold`), or `split`, which uses `$changeStreamSplitLargeEvent` (MongoDB 6.0.9 or newer) and
+recombines the fragments into one event.
+
+== The event format
+
+The key of every event has one string field, `id`, holding the document's `_id` in extended JSON: `"1004"` for an
+integer, `"\"1004\""` for a string and `+{"$oid": "..."}+` for an ObjectId. The value is the usual envelope, but the
+document fields are strings of type `io.debezium.data.Json`. This is the snapshot event that the lab produced for the
+first review (schema omitted):
+
+.Snapshot event value captured in the lab (json.serialization.mode=extended)
+[source,json]
+----
+{
+  "before": null,
+  "after": "{\"_id\": {\"$oid\": \"6af189a0c788084b3fbe7dcc\"},\"bookId\": {\"$numberLong\": \"1001\"},\"customerLegacyId\": {\"$numberLong\": \"501\"},\"rating\": {\"$numberInt\": \"5\"},\"title\": \"A classic\",\"body\": \"Read it twice.\",\"createdAt\": {\"$date\": {\"$numberLong\": \"1552558500000\"}},\"helpfulVotes\": {\"$numberInt\": \"12\"},\"tags\": [\"classic\",\"gift\"]}",
+  "updateDescription": null,
+  "source": {
+    "version": "3.7.1.Final",
+    "connector": "mongodb",
+    "name": "legacy-mongo",
+    "ts_ms": 1794214334615,
+    "snapshot": "true",
+    "db": "bookshop",
+    "collection": "reviews",
+    "ord": -1,
+    "lsid": null,
+    "txnNumber": null
+  },
+  "op": "r",
+  "ts_ms": 1794214334615,
+  "transaction": null
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-change-events-value[Debezium -- MongoDB change event values]
+
+An update event in the lab carried `before` and `after` (because of the pre-image mode) and an `updateDescription` with
+`updatedFields` as a string, `+"{\"helpfulVotes\": {\"$numberInt\": \"2\"},\"rating\": {\"$numberInt\": \"4\"},...}"+`,
+plus `removedFields` and `truncatedArrays`. A delete event has `op` `d`, a `before` when pre-images are on, and is
+followed by a tombstone (`tombstones.on.delete=true` by default).
+
+`json.serialization.mode` controls how BSON values are written inside those strings:
+
+[cols="1,3",options="header"]
+|===
+|Value |Representation
+
+|`legacy` (default)
+|Extended JSON v1 strict for `after`/`before`, v2 relaxed for `updatedFields` (so dates look different in the two).
+
+|`strict`
+|Extended JSON v1 strict everywhere.
+
+|`extended`
+|Extended JSON v2 canonical everywhere: every number keeps its BSON type (`$numberInt`, `$numberLong`).
+
+|`relaxed`
+|Extended JSON v2 relaxed everywhere: numbers are plain JSON numbers.
+|===
+
+For a migration into typed columns, `extended` is the safest choice: a `NumberLong` stays a 64-bit integer, which the
+relational mapping documentation recommends when source BSON types must be preserved. The general envelope is explained
+on xref:database/migration/change-event-structure.adoc[Anatomy of a Change Event].
+
+Topic names are `<topic.prefix>.<database>.<collection>`, so the reviews go to `legacy-mongo.bookshop.reviews`. The
+official page recommends logical names made of letters, digits and underscores, because schema names must be valid Avro
+names. The canonical prefix `legacy-mongo` contains a hyphen; with the JSON converter the run showed schema names such as
+`legacy-mongo.bookshop.reviews.Key`, which is fine. If you switch to Avro, set `schema.name.adjustment.mode=avro` so the
+hyphen is replaced (see xref:database/migration/serialization-avro-and-schema-registries.adoc[Serialization & Schema
+Registries]).
+
+== Snapshots and incremental snapshots
+
+The MongoDB snapshot modes are `initial` (default), `always`, `initial_only`, `no_data`, `when_needed`,
+`configuration_based` and `custom` (`never` is deprecated in favour of `no_data`). A snapshot copies each collection
+with up to `snapshot.max.threads` threads. If the connector stops before the snapshot completes, it starts the snapshot
+again on restart, so avoid rebalancing Connect while a large collection is being copied.
+
+An incremental snapshot re-reads a collection in chunks while streaming continues, which is how you back-fill or repair
+the `book_review` table without stopping the pipeline. With the `source` channel, insert a signal document into the
+signal collection:
+
+.Request an incremental snapshot of bookshop.reviews
+[source,javascript]
+----
+db.getSiblingDB("bookshop").debezium_signal.insertOne({
+  type: "execute-snapshot",
+  data: { "data-collections": ["bookshop.reviews"], type: "incremental" }
+});
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-triggering-an-incremental-snapshot[Debezium -- MongoDB: triggering an incremental snapshot]
+
+In the run, the connector logged `Requested 'INCREMENTAL' snapshot of data collections '[bookshop.reviews]'` and emitted
+one `r` event per document with `"snapshot": "incremental"` in the `source` block. The upsert sink absorbed them without
+creating duplicates. Blocking snapshots, the Kafka signal channel and progress notifications are covered on
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots] and
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications].
+
+== Oplog sizing and heartbeats
+
+The oplog decides how long the connector can be down. The official guidance is to size it from the oplog growth rate
+and the time it takes to react to a failure:
+
+____
+maximum oplog size = Oplog GB/hour × average reaction time to a Debezium failure
+____
+
+For example, if the oplog grows by 3 GB per hour and you want to survive a two-hour outage, the oplog needs at least
+6 GB. Since MongoDB 4.4 you can also set a minimum retention period in hours, which keeps entries even if the size limit
+is reached. Monitor *Oplog GB/Hour* and the *Replication Oplog Window* during the migration.
+
+.Resize the oplog to 16 GB and keep at least 48 hours
+[source,javascript]
+----
+// run on each replica set member (size is in megabytes)
+db.adminCommand({ replSetResizeOplog: 1, size: 16384, minRetentionHours: 48 });
+db.getSiblingDB("local").oplog.rs.stats().maxSize;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-optimal-oplog-config[Debezium -- Optimal oplog config]
+and https://www.mongodb.com/docs/manual/reference/command/replSetResizeOplog/[MongoDB -- replSetResizeOplog]
+
+Heartbeats are the second safeguard. If only collections that are not captured change for a long time, the connector
+reads the change stream but emits nothing, so its offset is never committed, and the stored resume token can fall out of
+the oplog. `heartbeat.interval.ms` (0 by default, which disables heartbeats) makes the connector emit heartbeat records,
+which commit the offset. The lab used 10 seconds.
+
+== Monitoring
+
+The streaming metrics MBean is `debezium.mongodb:type=connector-metrics,context=streaming,server=<topic.prefix>`, and the
+snapshot metrics use `context=snapshot` plus `task=<task.id>`. Watch `MilliSecondsBehindSource` (with its quantiles),
+`MilliSecondsSinceLastEvent`, `Connected` and the queue metrics, and on the MongoDB side the oplog window. Use
+`custom.metric.tags` to give dashboards a stable name. Scraping is explained on
+xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing].
+
+== When things go wrong
+
+[cols="2,3,3",options="header"]
+|===
+|Symptom |Cause |What to do
+
+|Startup fails with `Command failed with error 286 (ChangeStreamHistoryLost)` (invalid resume token)
+|The connector was stopped longer than the oplog window; its resume token is no longer in the oplog.
+|Delete the connector and create a new one with the same configuration and a **different name**, so it takes a new
+snapshot; or pause it and remove its offsets. Then resize the oplog and enable heartbeats.
+
+|Connector fails at startup on a standalone server
+|No oplog, so no change streams.
+|Convert the server to a one-member replica set.
+
+|Connector stops after reconnection attempts
+|The replica set member is unavailable for longer than the backoff allows (defaults: first delay 1 s, maximum 120 s,
+16 attempts, about 20 minutes in total).
+|Fix MongoDB, then restart the connector; tune `connect.backoff.initial.delay.ms`, `connect.backoff.max.delay.ms` and
+`connect.max.attempts` if needed.
+
+|`after` is `null` on some updates
+|The full-document lookup did not find the document (deleted right after the update, or moved by a shard-key change).
+|Use `capture.mode.full.update.type=post_image` with post-images enabled, or make the consumer tolerate it.
+
+|Sink fails on an event over 16 MB
+|Large document, often with pre-images.
+|`cursor.oversize.handling.mode=split` (MongoDB 6.0.9+) or `skip` with a threshold.
+
+|Duplicate events after a Connect crash
+|Offsets are flushed periodically.
+|Expected; the upsert sink and idempotent consumers absorb them.
+
+|Changes that never appear
+|MongoDB itself can lose writes when a primary crashes before the secondaries replicate them.
+|No connector-side fix; use majority write concern in the legacy application where possible.
+|===
+
+== Verification checklist
+
+. `db.hello().setName` returns the replica set name (or the connector connects through `mongos`).
+. `+db.getCollectionInfos({name: "reviews"})+` shows `changeStreamPreAndPostImages` enabled if you use a pre-image mode.
+. The connector and task status are `RUNNING`, and the topic `legacy-mongo.bookshop.reviews` received one `r` event per
+  document.
+. An update, a `$unset` and a delete in the legacy collection are reflected in `book_review` within the agreed lag.
+. `db.getSiblingDB("bookshop").reviews.countDocuments()` equals `+select count(*) from book_review+`; spot-check
+  `document_json` against the source documents
+  (xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation]).
+. The oplog window is longer than the longest outage you plan for, and heartbeats are flowing.
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/mongodb.html[Debezium -- MongoDB connector]
+  (https://debezium.io/documentation/reference/stable/connectors/mongodb.html#change-streams[change streams],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#supported-mongodb-topologies[supported topologies],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#required-user-permissions[required user permissions],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-optimal-oplog-config[optimal oplog config],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-pre-image-support[pre-image support],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-events[events],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-connector-properties[properties],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#connector-error-invalid-resume-token[invalid resume token])
+* https://debezium.io/documentation/reference/stable/transformations/mongodb-relational-mapping.html[Debezium -- MongoDB Relational Mapping]
+* https://debezium.io/documentation/reference/stable/transformations/mongodb-event-flattening.html[Debezium -- MongoDB New Document State Extraction]
+* https://debezium.io/documentation/reference/stable/connectors/jdbc.html[Debezium -- JDBC sink connector]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html[Debezium -- Sending signals to Debezium]
+* https://debezium.io/releases/3.7/[Debezium 3.7 releases and tested versions]
+* https://github.com/debezium/debezium-examples/tree/main/tutorial[debezium-examples -- tutorial]
+* https://www.mongodb.com/docs/manual/changeStreams/[MongoDB -- Change Streams]
+* https://www.mongodb.com/docs/manual/tutorial/convert-standalone-to-replica-set/[MongoDB -- Convert a standalone to a replica set]
+* https://www.mongodb.com/docs/manual/reference/command/replSetResizeOplog/[MongoDB -- replSetResizeOplog]
+
+The lab (compose stack, initialisation script, source connector, JDBC sink with the relational mapping, updates,
+`$unset`, delete and incremental snapshot) was run with Docker on 2026-11-09; the user/role script and the TLS
+connection properties were not run.

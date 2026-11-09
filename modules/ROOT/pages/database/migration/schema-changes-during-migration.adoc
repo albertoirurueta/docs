@@ -1,0 +1,696 @@
+= Handling Schema Changes During a Migration
+:description: What happens when the legacy schema or the new schema changes while Debezium is capturing changes during a migration, covering how each connector learns table structures, the schema history topic (schema.history.internal.kafka.topic) and how to recover it with snapshot.mode=recovery, schema change events and the include.schema.changes topic, the SchemaChangeEventFilter transformation, DDL parsing limits and Oracle surrogate schema evolution, SQL Server capture instances, PostgreSQL publications and the lack of DDL events in logical decoding, JDBC sink schema.evolution, schema registry compatibility, and an expand/contract runbook that coordinates legacy DDL with Liquibase or Flamingock changes on the new database.
+:keywords: Debezium, schema changes, DDL, schema history topic, schema.history.internal.kafka.topic, schema.history.internal.store.only.captured.tables.ddl, schema.history.internal.skip.unparseable.ddl, snapshot.mode recovery, include.schema.changes, schema change topic, SchemaChangeEventFilter, surrogate schema evolution, schema-changes signal, SQL Server capture instance, sp_cdc_enable_table, PostgreSQL publication, publication.autocreate.mode, logical decoding DDL, JDBC sink schema.evolution, Apicurio Registry, compatibility rules, expand/contract, Liquibase, Flamingock, Oracle, PostgreSQL, database migration
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A migration that takes months will not run against a frozen schema. The legacy Bookshop application still gets
+maintenance releases while the new `bookshop` application grows: a column is added to `BOOKSHOP.BOOK` for a new
+supplier feed, a `VARCHAR2(200)` title is widened because some titles are longer, a nightly job gets a new staging
+table. On the new side, the PostgreSQL schema changes even more often, through Liquibase or Flamingock changesets.
+Every one of those changes crosses the CDC pipeline: the source connector must notice it, the events must change shape
+in a way that consumers can still read, and the sink or the translator must be ready for the new shape *before* the
+first event with it arrives.
+
+This page explains how Debezium tracks table structures for each kind of source database, what the schema history
+topic is and how to recover it, which events tell consumers about a schema change, where DDL parsing stops, and how
+to coordinate a legacy DDL change with an expand/contract change on the new database so that the pipeline never
+stops. The patterns behind the coordination (expand/contract, one logical change per changeset) are on
+xref:database/schema-evolution/best-practices.adoc[Schema evolution best practices] and in
+xref:database/schema-evolution/index.adoc[Evolving the Database Model]; this page applies them to a database that
+is fed by change events.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, Oracle AI Database 26ai Free (image `gvenzl/oracle-free:23.26.3`, PDB `FREEPDB1`), PostgreSQL 18, Kafka 4.x
+in KRaft mode and Liquibase as described on the schema evolution pages. The connector fragments, SQL and the Liquibase
+changeset on this page are derived from the official documentation listed under <<_references,References>> and were
+not run.
+
+== Why schema changes are the long-running risk
+
+Data changes are the normal business of a CDC pipeline. Schema changes are rare, and each one is different, which is
+why they cause most of the unplanned stops of a migration pipeline. A schema change can break the pipeline at four
+points:
+
+[cols="1,2,2",options="header"]
+|===
+| Where | What breaks | Typical symptom
+
+| Source connector
+| It cannot parse the DDL, or it has no history for a table it is asked to capture
+| The connector task fails with a parsing error or a "missing schema" error
+
+| Kafka and the schema registry
+| The new event schema is not compatible with the rules of the subject
+| The producer (the connector) fails to register the new schema and the task stops
+
+| Sink connector
+| The target table has no column for a new field, or a column is too narrow
+| The JDBC sink fails on the first write, or writes `NULL` where data was expected
+
+| Translator (anti-corruption layer)
+| The code expects a field that was renamed or dropped
+| Consumer exceptions, records sent to a dead-letter topic, or silently missing data
+|===
+
+None of these failures loses data by itself: offsets are not committed past an event that was not processed. But a
+stopped pipeline lets the legacy redo or archive logs, or the PostgreSQL WAL, grow until they are a problem in their
+own right (see xref:database/migration/troubleshooting-and-failure-recovery.adoc[Troubleshooting & Failure Recovery]).
+The aim of this page is that every schema change is planned so that none of the four breaks happens.
+
+== How each connector learns the table structure
+
+A change event carries the values of a row, and the connector needs the table structure that was valid *when the row
+changed*, not the structure that is valid now. Connectors solve this in two different ways, which decide what you must
+do when the schema changes.
+
+[cols="2,3,2,2",options="header"]
+|===
+| Connector | Where the structure comes from | Schema history topic | Schema change events
+
+| MySQL, MariaDB
+| DDL statements in the binlog, parsed by the connector
+| Required
+| Yes, on the topic named after `topic.prefix`
+
+| Oracle
+| DDL statements in the redo log, parsed by the connector
+| Required
+| Yes, on the topic named after `topic.prefix`
+
+| SQL Server
+| The capture instance (change table) that SQL Server CDC creates per source table
+| Required
+| Yes, when a new capture instance is picked up
+
+| Db2
+| The change tables of the Db2 ASN capture, similar to SQL Server
+| Required
+| Yes
+
+| PostgreSQL
+| Relation messages that logical decoding sends before the first change of each table, plus catalog queries
+| Not used
+| No: logical decoding does not support DDL
+
+| MongoDB
+| No fixed structure; each document carries its own fields
+| Not used
+| No
+|===
+
+The practical consequence for Bookshop: the forward pipeline (`bookshop-oracle-source`) depends on a schema history
+topic and on the connector's DDL parser. The reverse pipeline (`bookshop-pg-source`, see
+xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication]) has no history topic
+and never reports DDL, so a change to the new PostgreSQL schema becomes visible only when the next row of the changed
+table arrives.
+
+== The schema history topic
+
+=== What it stores
+
+The Oracle connector, like the MySQL and SQL Server connectors, writes every DDL statement it sees, together with the
+log position at which it appeared, to an internal Kafka topic. When the connector restarts, it reads that topic from
+the beginning and replays the DDL up to the position at which it resumes streaming, so that it knows the structure
+that each table had at that point in the redo log. The topic is for the connector only. Applications that want to
+know about schema changes read the schema change topic, described in the next section.
+
+For Bookshop the topic is `legacy.schema-history`. The relevant properties of `bookshop-oracle-source` are these (the
+full connector is on xref:database/migration/oracle-connector.adoc[Oracle Connector]):
+
+.Schema history settings of bookshop-oracle-source (fragment)
+[source,json]
+----
+{
+  "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+  "schema.history.internal.kafka.topic": "legacy.schema-history",
+  "schema.history.internal.store.only.captured.tables.ddl": "false",
+  "schema.history.internal.skip.unparseable.ddl": "false",
+  "include.schema.changes": "true"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-database-history-kafka-topic[Debezium -- Oracle connector: schema.history.internal.kafka.topic and related properties]
+
+* `schema.history.internal.store.only.captured.tables.ddl=false` (the default) records the structure of *all*
+  tables that the connector user can see in `ALL_TABLES`, not only the captured ones. During a migration that is what
+  you want: when a capability moves later and its tables are added to `table.include.list`, their history is already
+  there, and the connector can start capturing them without a recovery snapshot.
+* `schema.history.internal.skip.unparseable.ddl=false` (the default) stops the connector when it meets a DDL
+  statement that it cannot parse. The official description warns that skipping can lead to data loss or mangling.
+  Keep the default and use the procedure in <<_ddl_parsing_limits>> when it happens.
+* `include.schema.changes=true` publishes the schema change events for consumers, described below.
+
+=== Creating the topic correctly
+
+The connector creates the history topic when it does not exist, but the settings matter too much to leave to the
+broker defaults. The official documentation states two rules: the topic needs **infinite retention**, and it must
+**never be partitioned** (one partition, so that the DDL keeps its order). Create it before the first registration:
+
+.Create the schema history topic (Kafka 4.x, inside the Kafka container)
+[source,shell]
+----
+/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+  --create --topic legacy.schema-history \
+  --partitions 1 --replication-factor 3 \
+  --config cleanup.policy=delete \
+  --config retention.ms=-1 \
+  --config retention.bytes=-1
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-history-topic[Debezium -- Oracle connector: schema history topic] and https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-mode[Debezium -- Oracle connector: snapshot.mode (history topics require infinite retention)]
+
+Use a replication factor of 1 in a single-broker lab. `cleanup.policy=delete` with infinite retention keeps every
+record; do not use compaction, because the records have no meaningful key for it. A history topic that lost its
+oldest records through a broker default of seven days looks fine until the next restart, when the connector cannot
+rebuild the structure of a table and fails.
+
+=== Recovering a lost or corrupted history
+
+If the history topic is deleted, truncated by retention, or grows unexpectedly large, the connector can rebuild it
+from the current table structures with `snapshot.mode=recovery` (which replaces the deprecated
+`schema_only_recovery`). The official Oracle procedure is:
+
+. Stop the connector.
+. Delete the history topic named in `schema.history.internal.kafka.topic` (and recreate it as above).
+. Set `snapshot.mode` to `recovery`. Optionally set `schema.history.internal.store.only.captured.tables.ddl` to
+  `false`, so that later additions to `table.include.list` work without another recovery.
+. Restart the connector. It takes a schema-only snapshot of the current structures and continues streaming from the
+  stored offset.
+. Afterwards, set `snapshot.mode` back to its previous value (`initial` for Bookshop, or `no_data`), so that a later
+  restart does not run the recovery again.
+
+.Switch bookshop-oracle-source to recovery mode (Kafka Connect REST, Kafka 3.5 or later)
+[source,shell]
+----
+curl -s -X PUT http://localhost:8083/connectors/bookshop-oracle-source/stop
+
+/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --delete --topic legacy.schema-history
+# recreate it with the command shown above
+
+curl -s -X PATCH -H "Content-Type: application/json" \
+     --data '{"snapshot.mode": "recovery"}' \
+     http://localhost:8083/connectors/bookshop-oracle-source/config
+
+curl -s -X PUT http://localhost:8083/connectors/bookshop-oracle-source/resume
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/status
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-capturing-data-from-tables-not-captured-by-the-initial-snapshot-no-schema-change[Debezium -- Oracle connector: rebuilding the schema history with snapshot.mode=recovery] and https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+
+The mode carries one condition that is easy to overlook: recovery is safe only if **no schema change happened between
+the moment the connector stopped and the moment the recovery snapshot runs**. The snapshot records the structure as it
+is now. If a column was added while the connector was down, the redo entries written before the change are read with
+the new structure, and their events are wrong. Freeze legacy DDL (a change-freeze ticket for the DBA team is enough)
+for the duration of a recovery. xref:database/migration/offsets-restarts-and-exactly-once.adoc[Offsets, Restarts &
+Exactly-Once] describes the stop/resume and offset endpoints in more detail.
+
+== Schema change events for consumers
+
+With `include.schema.changes=true`, the connector publishes one event per DDL statement to a topic named after
+`topic.prefix`, which for Bookshop is the topic `legacy`. Each event value has the DDL text (`ddl`), the database and
+schema names, and a structured `tableChanges` array with the complete structure of each affected table after the
+change: column names, JDBC types, type names, length, scale, position, optionality and the primary key columns.
+Consumers do not need a DDL parser to understand it.
+
+.Watch the Bookshop schema change topic
+[source,shell]
+----
+/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --topic legacy --from-beginning \
+  --formatter-property print.timestamp=true
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-change-topic[Debezium -- Oracle connector: schema change topic]
+
+During a migration, this topic is an early-warning system. A legacy DDL that nobody announced shows up here before
+the first data event with the new structure, so an alert on this topic (any new record outside a planned change window)
+gives the team time to prepare the target. The topic also receives an event when the connector starts streaming a new
+table.
+
+Not every DDL should reach consumers. A legacy maintenance job that drops and recreates a staging table every night,
+or a `TRUNCATE` that the migration must not follow, can be removed from the schema change topic with the
+`SchemaChangeEventFilter` transformation. It sets matching schema change events to `null`, and the connector does not
+send them:
+
+.Drop DROP and TRUNCATE schema change events (fragment of bookshop-oracle-source)
+[source,json]
+----
+{
+  "transforms": "dropDestructiveDdl",
+  "transforms.dropDestructiveDdl.type": "io.debezium.transforms.SchemaChangeEventFilter",
+  "transforms.dropDestructiveDdl.schema.change.event.exclude.list": "DROP,TRUNCATE"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/transformations/schema-change-event-filter.html#schema-change-event-filter-configuration[Debezium -- SchemaChangeEventFilter configuration]
+
+The filter acts only on what consumers see. The connector itself still applies the DDL to its in-memory model and to
+the history topic, so data events keep the correct structure.
+xref:database/migration/single-message-transformations.adoc#_schema_change_event_filter[Debezium Transformations]
+covers the transformation together with the other SMTs.
+
+== DDL parsing limits
+
+The Oracle, MySQL and MariaDB connectors maintain their own DDL parsers. They cover the statements that legacy
+applications usually run (`CREATE`, `ALTER` and `DROP` of tables, columns and constraints), but a database with decades
+of history can produce statements that a parser does not know: vendor extensions, exotic partitioning clauses,
+statements generated by a tool. When the parser fails, the connector stops with the default settings, and the
+`TotalSchemaChangeParseErrorCount` streaming metric of the Oracle connector counts the failures.
+
+Three ways out, from the safest to the riskiest:
+
+. **Surrogate schema evolution (Oracle).** Send a `schema-changes` signal that contains the *complete new structure*
+  of each affected table (columns, types, primary key), then restart the connector with
+  `schema.history.internal.skip.unparseable.ddl=true` so that it passes the failed statement, and set the property back
+  to `false` once the connector's commit SCN has moved past the DDL. The structure in the signal replaces the parsed
+  result, so nothing is guessed. The official page describes the parameters of the signal; build it from the output of
+  `DBMS_METADATA.GET_DDL` or `ALL_TAB_COLUMNS` for the table.
+. **Recovery snapshot.** If the unparseable statement changed a table that is not captured, or no captured data
+  changed since, `snapshot.mode=recovery` (above) rebuilds the structures from the database catalog.
+. **Skip the statement.** `schema.history.internal.skip.unparseable.ddl=true` without a surrogate structure is
+  acceptable only for DDL that does not touch captured tables (for example, a statement on a reporting schema).
+  Otherwise the next event of the changed table is decoded with the old structure.
+
+Two further rules from the official documentation apply to every connector:
+
+* **No schema change during an incremental snapshot.** The Oracle and PostgreSQL connectors do not support schema
+  changes on a table while an incremental snapshot of it is running. MySQL and SQL Server can detect them with
+  `incremental.snapshot.allow.schema.changes`, but changes to the primary key are still not supported. Schedule
+  backfills (see xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots])
+  outside DDL windows.
+* **Supplemental logging follows the table, not the column.** On Oracle, a table that has
+  `SUPPLEMENTAL LOG DATA (ALL) COLUMNS` keeps logging all columns after an `ADD COLUMN`. A *new table* has no
+  supplemental logging at all, and every table added to the connector configuration needs its own
+  `+ALTER TABLE ... ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS+`.
+
+.Supplemental logging for a new legacy table before it is captured (Oracle, FREEPDB1)
+[source,sql]
+----
+ALTER SESSION SET CONTAINER = FREEPDB1;
+
+-- BOOKSHOP.PROMOTION: a hypothetical table added by a later legacy release
+ALTER TABLE BOOKSHOP.PROMOTION ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+
+-- Check: one row with LOG_GROUP_TYPE = 'ALL COLUMN LOGGING' per captured table
+SELECT OWNER, TABLE_NAME, LOG_GROUP_TYPE
+FROM   ALL_LOG_GROUPS
+WHERE  OWNER = 'BOOKSHOP'
+ORDER  BY TABLE_NAME;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#_preparing_the_database[Debezium -- Oracle connector: preparing the database (supplemental logging)]
+
+xref:database/migration/oracle-connector.adoc[Oracle Connector] shows the whole database preparation.
+
+== Oracle: adding a captured table later
+
+Phases run per capability, so the Oracle connector is reconfigured several times over a migration as new tables enter
+the forward direction. Whether the connector can start capturing a new table at once depends on whether its structure
+is already in the history topic:
+
+[cols="2,3",options="header"]
+|===
+| Situation | Procedure
+
+| The history contains all tables (`store.only.captured.tables.ddl=false`, the Bookshop setting)
+| Add the table to `table.include.list` (and add its supplemental logging), restart, then run an incremental snapshot
+  of the table to copy its existing rows.
+
+| The history contains only captured tables, and the new table has had no DDL since
+| Stop, delete the history topic, set `snapshot.mode=recovery`, add the table, restart, run an incremental snapshot,
+  then reset `snapshot.mode`.
+
+| The history contains only captured tables, and the new table changed structure in the meantime
+| A schema snapshot after clearing the history topic *and* the connector offsets, as described in the official
+  procedure. Clearing offsets is a last-resort operation; rehearse it on a copy first.
+|===
+
+The backfill signal for a newly added table uses the fully-qualified name with the PDB name, as on
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots]:
+
+.Backfill a table that was just added to bookshop-oracle-source (Oracle, as a user with INSERT on the signal table)
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('add-promotion-2026-11-09',
+        'execute-snapshot',
+        '{"data-collections": ["FREEPDB1.BOOKSHOP.PROMOTION"], "type": "incremental"}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-capturing-data-from-new-tables-with-schema-changes[Debezium -- Oracle connector: capturing tables not captured by the initial snapshot]
+
+The `signal.data.collection` value that makes the connector read this table is discussed on
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications]. Bookshop uses the PDB form
+`FREEPDB1.BOOKSHOP.DEBEZIUM_SIGNAL`; the root database form that the property description mentions
+(`FREE.BOOKSHOP.DEBEZIUM_SIGNAL`) was silently ignored by Debezium 3.7.1 in the
+xref:database/migration/worked-example-oracle-to-postgresql.adoc#_pitfalls_found_while_running_it[worked example].
+
+== SQL Server: capture instances
+
+Bookshop's legacy database is Oracle, but many legacy systems run on SQL Server, where schema changes need an operator.
+SQL Server CDC copies changes into a *change table* that belongs to a *capture instance*, and the change table keeps the
+column list it had when the instance was created. A column added to the source table does not appear in the change
+table, so the connector keeps emitting events without it. The fix is a second capture instance with the new structure;
+Debezium switches to it and emits a notification when it has finished reading the old one.
+
+The official documentation offers an offline procedure (stop the application, drain, stop the connector, change the
+schema, create the new capture instance, restart) and an online one that needs no downtime but can leave a short gap in
+which events still have the old structure. The online variant for a hypothetical `dbo.book` table:
+
+.Online schema update with a second capture instance (SQL Server, as a db_owner)
+[source,sql]
+----
+ALTER TABLE dbo.book ADD format VARCHAR(10) NULL;
+GO
+
+EXEC sys.sp_cdc_enable_table
+     @source_schema = 'dbo',
+     @source_name = 'book',
+     @role_name = NULL,
+     @supports_net_changes = 0,
+     @capture_instance = 'dbo_book_v2';
+GO
+
+-- After the connector has started reading dbo_book_v2 (see its notification or log), drop the old instance
+EXEC sys.sp_cdc_disable_table
+     @source_schema = 'dbo',
+     @source_name = 'book',
+     @capture_instance = 'dbo_book';
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#online-schema-updates[Debezium -- SQL Server connector: online schema updates] and https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-schema-evolution[Debezium -- SQL Server connector: database schema evolution]
+
+SQL Server allows at most two capture instances per table, so finish one schema update completely before the next one,
+and batch several DDL statements into one update. SQL Server also refuses some changes on CDC-enabled tables, such as
+renaming a column or changing its type, and a change of `NULL` to `NOT NULL` is reflected in the events only after a
+new capture instance. xref:database/migration/sql-server-connector.adoc[SQL Server Connector] has the full setup.
+
+== PostgreSQL: no DDL events, and publications for new tables
+
+On PostgreSQL, the source of schema information is the logical decoding stream itself. The `pgoutput` plug-in sends a
+relation message with the current column list before the first change of a table in a session and again after the
+table changed, and the connector refreshes its in-memory structure when an incoming message does not match it
+(`schema.refresh.mode=columns_diff`, the default and safest setting). Two consequences follow:
+
+* **No schema change events.** The official documentation states that logical decoding does not support DDL, so the
+  connector cannot report DDL to consumers. A new column becomes visible to consumers only in the first data event
+  after the change.
+* **No history topic to break or recover.** Restarts never depend on old DDL.
+
+The part that does need care is the *publication*. With `publication.autocreate.mode=filtered`, the connector creates
+the publication for the tables in `table.include.list`, and when the publication already exists it runs
+`+ALTER PUBLICATION ... SET TABLE+` with the current list at startup. A new table therefore needs a configuration change
+and a restart before any of its changes are published. With `all_tables`, a new table is published automatically, but
+the connector role needs the privileges to create a `FOR ALL TABLES` publication, and every table in the database is
+decoded.
+
+Bookshop's reverse connector `bookshop-pg-source` uses the third mode, `disabled`: the publication
+`bookshop_reverse_pub` is created by a Liquibase changeset as the table owner (see
+xref:database/migration/cut-over-and-reverse-replication.adoc#_preparing_postgresql_for_reverse_capture[Cut-over & Reverse Replication]),
+and the connector never changes it. Changing `table.include.list` alone therefore publishes nothing new; the
+publication must be extended first. Adding `purchase_order` and `order_line` when orders reach phase 4 looks like this:
+
+.Add tables to the reverse direction and check the publication (PostgreSQL)
+[source,shell]
+----
+# As the table owner (bookshop is the owner and superuser in the worked-example stack)
+psql -h localhost -U bookshop -d bookshop <<'SQL'
+GRANT SELECT ON purchase_order, order_line TO dbz_reverse;
+ALTER TABLE purchase_order REPLICA IDENTITY FULL;
+ALTER TABLE order_line     REPLICA IDENTITY FULL;
+ALTER PUBLICATION bookshop_reverse_pub ADD TABLE purchase_order, order_line;
+SQL
+
+curl -s -X PATCH -H "Content-Type: application/json" \
+     --data '{"table.include.list": "public.book,public.book_author,public.author,public.purchase_order,public.order_line"}' \
+     http://localhost:8083/connectors/bookshop-pg-source/config
+
+psql -h localhost -U bookshop -d bookshop -c \
+  "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = 'bookshop_reverse_pub' ORDER BY tablename;"
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-publication-autocreate-mode[Debezium -- PostgreSQL connector: publication.autocreate.mode] and https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-schema-refresh-mode[Debezium -- PostgreSQL connector: schema.refresh.mode]
+
+A Liquibase changeset that adds a column to a captured PostgreSQL table therefore needs no connector action, but the
+consumers of the `+modern.*+` topics (the reverse sink into Oracle) must be ready for the new field, which is the subject
+of the rest of this page.
+
+== Schema registry compatibility
+
+When the pipeline uses Avro with Apicurio Registry or Confluent Schema Registry (see
+xref:database/migration/serialization-avro-and-schema-registries.adoc[Serialization & Schema Registries]), every
+structural change of a table produces a new version of the value schema of its topic, and the registry checks the new
+version against the compatibility rule of the subject or artifact before the connector can publish.
+
+[cols="2,2,3",options="header"]
+|===
+| Legacy change | Effect on the event schema | Backward compatible?
+
+| Add a nullable column
+| A new optional field
+| Yes. Old consumers ignore it; new consumers see `null` in old events.
+
+| Add a `NOT NULL` column with a default
+| A new field, optional or with a default depending on the connector
+| Usually yes; check the generated schema in the registry before the change reaches production.
+
+| Widen a column (`VARCHAR2(200)` to `VARCHAR2(400)`)
+| Often no schema change for strings; a precision change for `NUMBER` columns changes the decimal parameters
+| Strings: yes. Decimals: depends on `decimal.handling.mode` (see
+  xref:database/migration/data-types-and-precision.adoc[Data Types & Precision]).
+
+| Rename a column
+| One field removed, another added
+| No under `BACKWARD` if the removed field had no default. Plan it as add, copy, remove.
+
+| Drop a column
+| A field removed
+| Allowed under `BACKWARD` only if consumers do not need it; usually rejected under `FULL`.
+
+| Change a column type
+| A field changes type
+| No. Treat it as a new column plus a migration of the values.
+|===
+
+The rule of thumb for a migration: run the registry with `BACKWARD` (or stricter) compatibility on the CDC topics, so
+that an incompatible legacy change fails at the connector, where it is visible at once, instead of in a consumer
+weeks later. A failed registration stops the connector task; fix it by preparing the consumers and, if the change is
+intended, by registering the new version explicitly with the registry's own API.
+
+== Coordinating legacy DDL with the new schema: expand/contract
+
+The safe order for any structural change is the expand/contract sequence of
+xref:database/schema-evolution/best-practices.adoc[Schema evolution best practices], applied across the pipeline:
+**make every downstream component able to accept the new shape before the upstream component produces it**. For a
+change in the legacy database, downstream means the mirror tables, the translators and, after the cut-over, nothing
+(the legacy side is then the follower).
+
+The following flow follows an `ALTER TABLE` from the legacy database to the new one.
+
+[mermaid]
+....
+flowchart LR
+    DDL["ALTER TABLE BOOKSHOP.BOOK ADD FORMAT"] --> Redo["Oracle redo log"]
+    Redo --> Src["bookshop-oracle-source parses the DDL"]
+    Src --> Hist["legacy.schema-history (internal)"]
+    Src --> Sct["topic legacy (schema change event)"]
+    Src --> Data["legacy.BOOKSHOP.BOOK events with FORMAT"]
+    Data --> Reg["New value schema: embedded in JSON, or a registry version with Avro"]
+    Data --> Sink["bookshop-pg-mirror-sink, schema.evolution=none"]
+    Data --> Tr["LegacyBookTranslator"]
+    Sink --> Mirror["legacy_book.format (added first by Liquibase)"]
+    Tr --> Book["book.format (added first by Liquibase)"]
+    Sct --> Alert["Alert: unplanned DDL"]
+....
+
+=== Worked example: a new FORMAT column on BOOK
+
+The legacy team adds `FORMAT VARCHAR2(10)` (`HARDCOVER`, `PAPERBACK`, `EBOOK`) to `BOOKSHOP.BOOK` in the next legacy
+release. The catalogue is in phase 2 (parallel run). The steps, in order:
+
+. **Expand the new database.** A Liquibase changeset adds the column to the mirror table and to the new model. Both
+  are nullable, because existing rows have no value yet.
++
+.Liquibase changeset: expand the mirror and the new model (YAML)
+[source,yaml]
+----
+databaseChangeLog:
+  - changeSet:
+      id: 2026-11-09-book-format-expand
+      author: bookshop-migration
+      changes:
+        - addColumn:
+            tableName: legacy_book
+            columns:
+              - column:
+                  name: format
+                  type: varchar(10)
+        - addColumn:
+            tableName: book
+            columns:
+              - column:
+                  name: format
+                  type: text
+----
++
+Reference: https://docs.liquibase.com/change-types/add-column.html[Liquibase -- addColumn]
++
+With `quote.identifiers=false`, the JDBC sink writes the field `FORMAT` into the column `format`, as explained on
+xref:database/migration/jdbc-sink-connector.adoc#_table_names_and_case_sensitivity[JDBC Sink Connector].
+. **Deploy a tolerant translator.** `LegacyBookTranslator` reads `FORMAT` as an optional field: absent or `null`
+  means "unknown" and leaves `book.format` empty. The same version must still run correctly on events *without* the
+  field, because the topic holds both shapes for as long as its retention.
+. **Run the legacy DDL.** The DBA runs the change in a planned window. The connector parses it, writes it to the
+  history topic, publishes a schema change event to `legacy`, and the next `BOOK` events carry `FORMAT`.
++
+.The legacy change (Oracle, FREEPDB1)
+[source,sql]
+----
+ALTER TABLE BOOKSHOP.BOOK ADD (FORMAT VARCHAR2(10));
+----
++
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-history-topic[Debezium -- Oracle connector: schema history topic (how DDL is tracked)]
+. **Backfill.** Rows that do not change after the DDL never produce an event, so `format` stays empty for them in
+  PostgreSQL. If the legacy release fills the column for existing rows with an `UPDATE`, those updates flow through the
+  pipeline like any other change. If it does not, run an incremental snapshot of `BOOK` (signal shown above, with
+  `FREEPDB1.BOOKSHOP.BOOK`) after the DDL, or restrict it with `additional-conditions` to the rows that need it.
+. **Reconcile.** Extend the per-chunk checksum of
+  xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation] with the new column and
+  run it.
+. **Contract later, if at all.** A column that exists only because of the legacy model (for example a code that the new
+  model turned into a boolean) is removed from the new schema only after the capability has left phase 4 and nothing
+  reads the mirror any more.
+
+=== The other kinds of legacy change
+
+[cols="2,4",options="header"]
+|===
+| Legacy change | Order of steps
+
+| Add a nullable column
+| Expand the mirror and the new model, deploy a tolerant translator, run the legacy DDL, backfill, reconcile (the worked
+  example).
+
+| Widen a column
+| Widen the mirror column first (`ALTER TABLE legacy_book ALTER COLUMN title TYPE varchar(400)`), then the legacy DDL.
+  With `text` columns in the new model nothing is needed there.
+
+| Rename a column
+| Treat it as add + copy + drop on the legacy side if you can influence the legacy release. If the legacy team renames
+  in one step, add the new column to the mirror first, deploy a translator that reads either name, run the legacy DDL,
+  then backfill with an incremental snapshot, and drop the old mirror column later.
+
+| Drop a column
+| Make the translator stop depending on it first; leave the mirror column in place (it simply stays empty for new rows)
+  and drop it in a later contract step.
+
+| New legacy table
+| Create the mirror table or translator target, add supplemental logging, add the table to `table.include.list`
+  (and to the JDBC sink `topics`), restart, backfill with an incremental snapshot.
+
+| Change a column type
+| Add a new column of the new type on the legacy side if possible. A type change in place (for example `NUMBER` to
+  `VARCHAR2`) changes the event schema incompatibly: stop the consumers, apply the change on both sides in one
+  maintenance window, and re-snapshot the table.
+|===
+
+=== Changes on the new side
+
+The new database changes more often than the legacy one, and in phases 1 to 3 those changes are local: no pipeline
+reads PostgreSQL. What matters there is that the JDBC sink and the translators keep working, which the expand/contract
+discipline of the schema evolution pages already guarantees (see
+xref:database/schema-evolution/liquibase-changelogs-and-changesets.adoc[Liquibase changelogs and changesets] or
+xref:database/schema-evolution/flamingock-changes-and-target-systems.adoc[Flamingock changes and target systems]).
+
+After the write cut-over the direction reverses, and the rule applies in the other direction: the legacy Oracle tables
+are now downstream. A new column on `book` is published by `bookshop-pg-source` in the next event of the table. The
+reverse sink or the reverse translator must either ignore it (a column that has no legacy equivalent) or have a place
+for it in Oracle *before* the Liquibase change is deployed. A dropped or renamed column in PostgreSQL that the reverse
+mapping still uses breaks the reverse pipeline, and with it the rollback path. Until the capability has left phase 4,
+treat the columns that the reverse mapping reads as a contract, and change them only by expand/contract.
+
+=== JDBC sink schema evolution
+
+The JDBC sink can run DDL on the target itself. Its `schema.evolution` property has three modes: `none` (the default,
+no DDL), `validate-only` (new in 3.7: checks at startup that each statically resolvable destination table exists, without
+checking columns), and `basic` (creates missing tables and adds missing columns, but never changes a type, drops or
+renames a column, or changes a primary key). The Bookshop mirror sink uses `none` with pre-created tables, because
+`validate-only` cannot resolve `+legacy_${source.table}+` and refuses to start with it. The reasons for preferring
+hand-made tables, and what `basic` cannot do, are on
+xref:database/migration/jdbc-sink-connector.adoc#_schema_evolution[JDBC Sink Connector].
+
+.The schema.evolution setting of the mirror sink (fragment)
+[source,json]
+----
+{
+  "schema.evolution": "none",
+  "collection.name.format": "legacy_${source.table}",
+  "quote.identifiers": "false"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-schema-evolution[Debezium -- JDBC sink connector: schema evolution]
+
+== What goes wrong
+
+[cols="2,3,3",options="header"]
+|===
+| Symptom | Cause | Fix
+
+| After a restart the Oracle connector fails, saying it has no schema for a table
+| The history topic lost old records (finite retention), or the table was never recorded
+  (`store.only.captured.tables.ddl=true`)
+| Recreate the topic with infinite retention and run the recovery procedure; keep `store.only.captured.tables.ddl=false`.
+
+| The connector stops on a DDL statement
+| The DDL parser does not support the statement
+| Surrogate schema evolution with a `schema-changes` signal, then a temporary `skip.unparseable.ddl=true`.
+
+| The JDBC sink fails with an unknown column or a value too long
+| The legacy DDL ran before the mirror table was expanded
+| Expand the mirror table and restart the sink task; nothing is lost, the sink retries the same records.
+
+| New column is empty in PostgreSQL for old rows
+| Rows that did not change after the DDL produced no events
+| Incremental snapshot of the table (optionally with `additional-conditions`).
+
+| SQL Server events lack a new column
+| The capture instance still has the old column list
+| Create a second capture instance, then drop the old one.
+
+| Changes of a new PostgreSQL table never reach Kafka
+| The table is not in the publication
+| Add it to `table.include.list` (with `filtered` publication mode) and restart, or add it to the publication by hand.
+
+| The connector fails to register a schema
+| The change is incompatible with the registry rule
+| Prepare consumers, then register the version deliberately; never relax the rule globally to get past one change.
+|===
+
+== Verification checklist
+
+* The history topic `legacy.schema-history` has one partition, `retention.ms=-1` and `retention.bytes=-1`:
+  `kafka-configs.sh --bootstrap-server kafka:9092 --describe --entity-type topics --entity-name legacy.schema-history`.
+* The schema change topic `legacy` shows an event for every planned DDL, and an alert exists for unplanned ones.
+* `TotalSchemaChangeParseErrorCount` of the Oracle streaming MBean stays at zero.
+* Every captured Oracle table appears in `ALL_LOG_GROUPS` with `ALL COLUMN LOGGING`.
+* `pg_publication_tables` for `bookshop_reverse_pub` lists exactly the tables in phase 4.
+* After each schema change, the per-chunk reconciliation of
+  xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation] includes the new column
+  and is clean.
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-history-topic[Debezium -- Oracle connector: schema history topic]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-change-topic[Debezium -- Oracle connector: schema change topic]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-database-history-kafka-topic[Debezium -- Oracle connector: schema history properties]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-mode[Debezium -- Oracle connector: snapshot.mode]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-capturing-data-from-tables-not-captured-by-the-initial-snapshot-no-schema-change[Debezium -- Oracle connector: capturing tables not captured by the initial snapshot]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#surrogate-schema-evolution[Debezium -- Oracle connector: surrogate schema evolution]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#_preparing_the_database[Debezium -- Oracle connector: preparing the database]
+* https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-schema-history-topic[Debezium -- MySQL connector: schema history topic]
+* https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-schema-history-topic[Debezium -- SQL Server connector: schema history topic]
+* https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-schema-evolution[Debezium -- SQL Server connector: database schema evolution]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-limitations[Debezium -- PostgreSQL connector: limitations of logical decoding]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-publication-autocreate-mode[Debezium -- PostgreSQL connector: publication.autocreate.mode]
+* https://debezium.io/documentation/reference/stable/transformations/schema-change-event-filter.html[Debezium -- SchemaChangeEventFilter]
+* https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-schema-evolution[Debezium -- JDBC sink connector: schema evolution]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+* https://www.apicur.io/registry/docs/[Apicurio Registry documentation]
+* https://docs.liquibase.com/change-types/add-column.html[Liquibase -- addColumn]
+* https://www.postgresql.org/docs/current/logical-replication-publication.html[PostgreSQL -- Publication]
+
+The configuration fragments, commands and SQL on this page were derived from the official documentation above and were
+not run.

@@ -1,0 +1,806 @@
+= Troubleshooting and Failure Recovery
+:description: How to diagnose and recover a Debezium 3.7 change data capture pipeline during a database migration: a triage method with the Kafka Connect REST API, task traces and runtime log levels, a symptom to cause to fix table built from the official Debezium FAQ and the connector "when things go wrong" sections with the exact error messages, PostgreSQL WAL growth and lost replication slots, purged MySQL binlogs, lost Oracle archive logs, invalid MongoDB resume tokens, a lost or corrupted schema history topic, connectors stuck in a snapshot, slow LogMiner sessions and large transactions, database failover with PostgreSQL failover slots and MySQL GTIDs, source error handling properties, sink error tolerance and dead-letter queues, a safe connector reset procedure and the reconciliation that follows every incident.
+:keywords: Debezium, Debezium 3.7, troubleshooting, failure recovery, FAQ, when things go wrong, Kafka Connect REST API, task trace, admin loggers, replication slot, WAL disk space, max_slot_wal_keep_size, idle_replication_slot_timeout, wal_status, heartbeat.interval.ms, heartbeat.action.query, slot.failover, synchronized_standby_slots, binlog purged, binlog_expire_logs_seconds, when_needed, GTID, Oracle archive log, offset SCN, LogMiner, ChangeStreamHistoryLost, InvalidResumeToken, oplog, schema history topic, recovery snapshot mode, offset.flush.timeout.ms, RecordTooLargeException, producer.override.max.request.size, errors.max.retries, event.processing.failure.handling.mode, errors.tolerance, dead-letter queue, DELETE offsets, reset connector, Bookshop, database migration
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A change data capture pipeline is a chain of long-running processes: the legacy database writes its log, a Debezium
+source connector reads it, Kafka stores the events, and sink connectors and consumers apply them to the new database.
+In a migration that chain has to run for weeks or months without losing a change, because every lost change is a row
+that is wrong in the new system on the day of the cut-over. Most failures are not dramatic. A task goes to `FAILED`
+in the middle of the night, a disk fills up on the legacy server because a replication slot holds back the
+write-ahead log, or a connector that was stopped over a long weekend cannot find its position when it restarts.
+
+This page is the runbook for those situations. It starts with a triage method that works for every connector, then
+gives a symptom -> cause -> fix table built from the official
+https://debezium.io/documentation/faq/[Debezium FAQ] and from the "when things go wrong" and FAQ sections of each
+connector, and then walks through the recovery procedures that need more than one line: lost log positions, lost
+replication slots, invalid resume tokens, a lost schema history, database failover, oversized messages and failing
+sinks. Connector-specific errors that already have a full explanation on their own page (for example the `ORA-` errors
+of the Oracle connector) are only summarised here and linked.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, Kafka 4.x (the `quay.io/debezium/connect:3.7.1.Final` image ships
+Kafka Connect 4.3.1), PostgreSQL 18, MySQL 8.4, MongoDB 8.0 and Oracle AI Database 26ai Free (image `gvenzl/oracle-free:23.26.3`). The error messages quoted on
+this page come from the official documentation where it gives them; the messages for lost log positions and a missing
+schema history were read from the 3.7.1.Final class files of `debezium-connector-common` and
+`debezium-connector-oracle`. The procedures are derived from the official documentation; no failure scenario on this
+page was reproduced with a running pipeline.
+
+== How Debezium behaves when something fails
+
+Before fixing anything, it helps to know what the connectors promise. Every connector's "when things go wrong"
+section says the same thing: Debezium never loses an event while the system runs normally or is stopped gracefully,
+and it delivers each change exactly once in that case. When something crashes, Debezium still does not lose events,
+but it can deliver some of them more than once while it recovers. In those situations it gives *at-least-once*
+delivery, like Kafka itself.
+
+Three facts follow from that and shape every recovery on this page:
+
+* *Duplicates are normal after a crash.* A Kafka Connect worker that crashes has not flushed its latest offsets, so
+  the restarted task re-reads the log from the last committed position and emits some events again. Sinks and
+  consumers must be idempotent. The JDBC sink does this with `insert.mode=upsert`
+  (xref:database/migration/jdbc-sink-connector.adoc#_idempotent_writes_and_upsert_syntax[JDBC Sink Connector]), and the
+  Bookshop translators do it with the `processed_change` table
+  (xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]).
+* *The position lives outside the database.* The connector's offset (an LSN, a binlog position or GTID set, an SCN, a
+  resume token) is stored in the Kafka Connect offsets topic. The database only keeps the log that the offset points
+  to for a limited time. Most serious failures are a mismatch between the two: the offset points to a log that no
+  longer exists.
+* *A connector that fails stops.* It does not skip data on its own. A stopped connector is the best possible failure
+  for a migration, because nothing is lost yet and the log is still accumulating on the source. The danger starts when
+  the stop lasts longer than the log retention.
+
+How offsets are stored, read and changed is explained on
+xref:database/migration/offsets-restarts-and-exactly-once.adoc[Offsets, Restarts & Exactly-Once]. The delivery
+guarantees in general are on xref:database/migration/debezium-features-and-guarantees.adoc[Features & Delivery
+Guarantees].
+
+== Triage: where to look first
+
+The same five steps find the cause of almost every incident, whatever the connector:
+
+[mermaid]
+....
+flowchart TD
+    A[Alert or user report] --> B[GET connector status]
+    B -->|connector or task FAILED| C[Read the task trace]
+    B -->|RUNNING but no events| D[Check metrics and lag]
+    C --> E[Match the exception with the table below]
+    D --> F[Streaming metrics: Connected, MilliSecondsBehindSource, QueueRemainingCapacity]
+    F --> G[Source database: slot, binlog, archive logs, oplog]
+    E --> H[Fix the cause]
+    G --> H
+    H --> I[Restart failed tasks]
+    I --> J[Reconcile the affected tables]
+....
+
+. *Read the status.* The Kafka Connect REST API returns the state of the connector and of each task. A task in
+  `FAILED` state carries a `trace` field with the Java stack trace of the exception that stopped it.
+. *Read the trace and the log.* The first `Caused by:` line usually names the problem. The worker log has the lines
+  before the failure, which often explain it (retries, warnings about the log position, a slow query).
+. *Check the metrics.* A task can be `RUNNING` and still be stuck: connected but not reading, or reading but far
+  behind. The streaming metrics `Connected`, `MilliSecondsBehindSource`, `QueueRemainingCapacity` and the
+  connector-specific ones (for Oracle `OldestScnAgeInMilliseconds`) tell you which. They are described on
+  xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing].
+. *Check the source database.* Replication slot state on PostgreSQL, binlog files on MySQL, archive logs on Oracle,
+  the oplog window on MongoDB. The queries are in the sections below.
+. *Fix, restart, reconcile.* After any incident in which events could have been skipped or a snapshot was repeated,
+  reconcile the affected tables as described on
+  xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation].
+
+.Read the connector status and the task trace
+[source,shell]
+----
+# Connector and task states
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/status | jq
+
+# Only the first lines of the trace of each failed task
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/status \
+  | jq -r '.tasks[] | select(.state == "FAILED") | .trace' | head -20
+
+# All connectors with their state in one call
+curl -s "http://localhost:8083/connectors?expand=status" \
+  | jq 'to_entries[] | {name: .key, connector: .value.status.connector.state, tasks: [.value.status.tasks[].state]}'
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+
+When the cause is fixed, restart only what failed. Since Kafka 3.0 the restart endpoint can restart the connector and
+its failed tasks in one call. A plain `+POST .../restart+` without parameters restarts only the connector instance, not
+its tasks, which is a common reason why "the restart did nothing".
+
+.Restart the failed tasks of a connector
+[source,shell]
+----
+curl -s -X POST \
+  "http://localhost:8083/connectors/bookshop-oracle-source/restart?includeTasks=true&onlyFailed=true"
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+
+To see what a running connector is doing without restarting the worker, raise the log level of the Debezium package for
+that connector through the `admin/loggers` endpoint. Send the request to the worker that runs the task (the `worker_id`
+in the status response), because the change applies to the worker that receives it, and it is lost when the worker
+restarts. Set it back to `INFO` when you are done, because `DEBUG` on a busy LogMiner connector produces a large volume
+of output.
+
+.Raise the log level of the Oracle connector at runtime
+[source,shell]
+----
+curl -s -X PUT -H "Content-Type: application/json" \
+  -d '{"level": "DEBUG"}' \
+  http://localhost:8083/admin/loggers/io.debezium.connector.oracle
+
+curl -s http://localhost:8083/admin/loggers | jq
+
+curl -s -X PUT -H "Content-Type: application/json" \
+  -d '{"level": "INFO"}' \
+  http://localhost:8083/admin/loggers/io.debezium.connector.oracle
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (admin/loggers)] and https://debezium.io/documentation/reference/stable/operations/logging.html[Debezium -- Logging]
+
+A connector that fails during registration never gets a task. Validate the configuration first: the validation
+endpoint runs the same checks as the registration and lists every property with its error, without starting anything.
+
+.Validate a connector configuration before registering it
+[source,shell]
+----
+jq '.config' bookshop-oracle-source.json \
+  | curl -s -X PUT -H "Content-Type: application/json" --data @- \
+      http://localhost:8083/connector-plugins/io.debezium.connector.oracle.OracleConnector/config/validate \
+  | jq '.error_count, [.configs[] | select(.value.errors | length > 0) | {name: .value.name, errors: .value.errors}]'
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+
+== Symptom, cause and fix
+
+The table collects the problems that the official FAQ and the connector documentation describe, plus the messages that
+Debezium 3.7.1 itself writes when a log position is lost. Messages are quoted exactly; `<offset>`, `<scn>` and similar
+stand for the values that the connector prints. The longer procedures are in the sections after the table.
+
+[cols="3,3,4",options="header"]
+|===
+| Symptom (message or observation) | Cause | Fix
+
+| Task `FAILED` right after registration; the trace names a property, a host or a login
+| The configuration is invalid, or the connector cannot connect to the database with the given parameters.
+| Validate the configuration as shown above, fix it, and restart. Every connector documents this case under
+  "Configuration and startup errors".
+
+| `+The connector is trying to read change stream starting at <offset>, but this is no longer available on the server. Reconfigure the connector to use a snapshot mode when needed.+`
+| The offset points to a log position (binlog file and position or GTID set, LSN) that the database has already
+  purged. The connector was stopped for longer than the log retention.
+| See <<_when_the_log_position_is_gone>>. For MySQL, `snapshot.mode=when_needed` makes the connector take a new
+  snapshot automatically in this case.
+
+| PostgreSQL disk fills up with WAL; `pg_replication_slots` shows a slot with a `restart_lsn` far behind
+| An inactive slot (connector stopped or deleted), a captured database with little traffic while other databases on the
+  same server are busy, or a stalled connector.
+| See <<_postgresql_wal_growth_and_lost_replication_slots>>: heartbeats with `heartbeat.action.query`, dropping
+  orphaned slots, and `max_slot_wal_keep_size` as a safety limit.
+
+| PostgreSQL slot shows `wal_status = lost`, or `invalidation_reason` is `wal_removed` or `idle_timeout`
+| PostgreSQL invalidated the slot because it retained more than `max_slot_wal_keep_size`, or it was idle longer than
+  `idle_replication_slot_timeout` (PostgreSQL 18).
+| The slot cannot be used again. Drop it, let the connector create a new one, and take a new snapshot of the captured
+  tables (see <<_postgresql_wal_growth_and_lost_replication_slots>>).
+
+| `+Online REDO LOG files or archive log files do not contain the offset scn <scn>. Please perform a new snapshot.+`
+| Oracle: the low-watermark `scn` in the offset is older than the oldest available online or archive log.
+| Take a new snapshot (no data loss) or, only as a last resort, move the offset forward (data loss). See
+  <<_when_the_log_position_is_gone>> and the
+  xref:database/migration/oracle-connector.adoc#_when_things_go_wrong[Oracle Connector] page.
+
+| `+None of the log files contain offset SCN: <scn> after <n> attempts. This could be due to a slow archiver process in the database.+` (the message continues with advice on the retry property)
+| Oracle: the archiver has not yet registered the log in `V$ARCHIVED_LOG`, or the log is really gone.
+| Usually transient under load. If it persists, check the archive destination. The FAQ names the internal property
+  `internal.log.mining.query.max.retries` (default 5) for slow archivers.
+
+| `+Redo Thread X is inconsistent; an archive log with sequence 12345 is not available+`
+| Oracle: a required log is queued for archiving, a RAC node is shutting down, or the archive destination is full.
+| As above; see the xref:database/migration/oracle-connector.adoc#_when_things_go_wrong[Oracle Connector] page.
+
+| Oracle connector `RUNNING`, but `OldestScnAgeInMilliseconds` keeps growing and the offset does not move
+| A long-running or abandoned transaction pins the mining window.
+| Find it with the `log-pending-transactions` signal and handle it as described in
+  xref:database/migration/oracle-connector.adoc#_long_running_transactions[Long-running transactions].
+
+| `+Command failed with error 286 (ChangeStreamHistoryLost): 'PlanExecutor error during aggregation :: caused by :: Resume of change stream was not possible, as the resume point may no longer be in the oplog+`
+| MongoDB: the resume token in the offset is older than the oldest oplog entry.
+| Create the connector again under a new name (it takes a new snapshot), or stop it and remove its offsets. Size the
+  oplog for the longest outage. See <<_mongodb_invalid_resume_token>>.
+
+| MongoDB connector fails on a change event larger than the BSON size limit
+| A change stream document exceeds the 16 MB BSON limit, which can happen with `capture.mode` values that include the
+  full document even if the stored documents are smaller.
+| Configure `cursor.oversize.handling.mode` and `cursor.oversize.skip.threshold` as the FAQ describes.
+
+| `+The db history topic is missing. You may attempt to recover it by reconfiguring the connector to recovery.+`
+| The schema history topic was deleted, emptied by retention, or the connector points at another topic.
+| See <<_a_lost_or_corrupted_schema_history_topic>>: `snapshot.mode=recovery`, only if no schema change happened in
+  between.
+
+| The connector restarts its initial snapshot from the beginning after every restart
+| A blocking initial snapshot is not resumable: if the connector stops before the snapshot completes, it starts again.
+| Use `no_data` plus an incremental snapshot for very large tables, which is resumable chunk by chunk. See
+  xref:database/migration/initial-snapshots.adoc#_what_goes_wrong[Initial Snapshots] and
+  xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots].
+
+| `ORA-01555: snapshot too old` during the initial snapshot
+| The flashback query of the snapshot outlived `UNDO_RETENTION`.
+| Raise `UNDO_RETENTION`, or use `no_data` plus an incremental snapshot; see
+  xref:database/migration/initial-snapshots.adoc#_oracle_ora_01555_and_ora_01466[Initial Snapshots].
+
+| `+Failed to flush, timed out while waiting for producer to flush outstanding 218630 messages+`
+| Kafka Connect cannot write its offsets fast enough: a slow broker replica with `acks=all`, very fast record
+  production, or very large Debezium batches.
+| Shorten `offset.flush.interval.ms` and raise `offset.flush.timeout.ms` on the worker, or reduce `max.batch.size`
+  and `max.queue.size` on the connector.
+
+| `+org.apache.kafka.common.errors.RecordTooLargeException: The message is 1740572 bytes when serialized which is larger than 1048576, which is the value of the max.request.size configuration.+`
+| A change event (often from a large transaction or a wide row with LOBs) is larger than the producer limit.
+| Raise the limit per connector with `producer.override.max.request.size`, which the worker's
+  `connector.client.config.override.policy` must allow. See <<_large_events_and_large_transactions>>.
+
+| `+EventDataDeserializationException: Failed to deserialize data of EventHeaderV4{...}+` about one minute after start, caused by `java.io.EOFException` or `java.net.SocketException: Connection reset`
+| MySQL closes the idle binlog connection.
+| Raise the MySQL server variables `slave_net_timeout` and `thread_pool_idle_timeout` (the FAQ uses 120 seconds).
+
+| `+Caused by: java.lang.IllegalStateException: Cannot read the binlog filename and position via 'SHOW MASTER STATUS'. Make sure your server is correctly configured+`
+| Amazon RDS for MySQL read replica: `log_bin` is `OFF` until backups or read replicas are enabled.
+| Enable automated backups (or a read replica) on the RDS instance, which turns on the binlog. See
+  xref:database/migration/cloud-and-managed-services.adoc[Cloud Databases & Managed Kafka].
+
+| Rows deleted in MySQL do not produce delete events
+| They were deleted by a `CASCADE` foreign key; those deletes are not written to the binlog.
+| Capture the parent delete and derive the child deletes in the consumer, or reconcile the child tables.
+
+| MySQL `TIMESTAMP` values differ between snapshot and streaming events
+| The JDBC driver cannot read the database time zone, so snapshot values are not normalised to UTC.
+| Set the pass-through property `database.connectionTimeZone`.
+
+| MySQL connector crashes while `gh-ost` or `pt-online-schema-change` runs
+| The tools create helper tables that the connector does not capture, and then rename them.
+| Add the helper tables to the include list.
+
+| Debezium Engine application: `+Unable to find minimal snapshot lock mode. Please check your configuration+`
+| A fat JAR lost the `META-INF/services` files of the connector because the build did not merge them.
+| Add the Maven Shade `ServicesResourceTransformer` (or the equivalent of your build tool); see
+  xref:database/migration/debezium-engine.adoc[Debezium Engine].
+
+| JSON messages have no `schema` part, or consumers fail because they expect one (or the opposite)
+| `schemas.enable` of the JSON converter differs between what the connector writes and what consumers expect.
+| Set `key.converter.schemas.enable` and `value.converter.schemas.enable` explicitly on the worker or on the connector,
+  and write consumers that accept both forms. The Bookshop source sets both to `true`, because the JDBC mirror sink
+  skips every record whose schema is missing.
+
+| The JDBC sink task fails with duplicate keys, deletes do not reach the mirror, or tables are not found
+| Sink configuration (`insert.mode`, `delete.enabled`, `quote.identifiers`, `collection.name.format`).
+| See the xref:database/migration/jdbc-sink-connector.adoc#_troubleshooting[JDBC Sink Connector troubleshooting] table.
+|===
+
+Reference: https://debezium.io/documentation/faq/[Debezium -- Frequently Asked Questions],
+https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-when-things-go-wrong[PostgreSQL -- Behavior when things go wrong],
+https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-when-things-go-wrong[MySQL -- Behavior when things go wrong],
+https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Oracle -- Frequently Asked Questions],
+https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-when-things-go-wrong[MongoDB -- Common issues] and
+https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-faq[JDBC sink -- FAQ]
+
+== When the log position is gone
+
+All log-based connectors fail in the same way when their offset points to a part of the log that the database has
+already removed: the MySQL binlog was purged, the Oracle archive log was deleted by RMAN, the PostgreSQL WAL was
+recycled after the slot was dropped, the MongoDB oplog rolled over. In Debezium 3.7.1 the connectors share the check,
+and the generic message is:
+
+.The message for a lost log position (Debezium 3.7.1.Final)
+[source,text]
+----
+The connector is trying to read change stream starting at <offset>, but this is no longer available on the server.
+Reconfigure the connector to use a snapshot mode when needed.
+----
+Reference: https://github.com/debezium/debezium/blob/v3.7.1.Final/debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java[Debezium source code -- BaseSourceTask (3.7.1.Final)]
+
+The Oracle connector, which checks its SCN against the available logs itself, reports the
+`+Online REDO LOG files or archive log files do not contain the offset scn <scn>. Please perform a new snapshot.+`
+message instead. MongoDB reports `ChangeStreamHistoryLost` from the server.
+
+Whatever the wording, the changes between the old offset and the oldest available log are no longer readable from the
+log. There are only three ways forward, and for a migration only the first two are acceptable:
+
+[cols="1,3,3",options="header"]
+|===
+| Option | What happens | When to use it
+
+| Snapshot again
+| The connector discards its position and copies the current state of the captured tables again, then streams from
+  the new position. Consumers receive a `r` (read) event for every row, which an idempotent sink applies as an upsert.
+  Rows that were *deleted* during the gap are not in the snapshot, so they stay in the target.
+| The default. Follow it with a reconciliation that finds and removes the rows deleted during the gap.
+
+| Snapshot only what changed
+| Restart streaming from a new position (`no_data`) and run an incremental snapshot of the tables that changed during
+  the gap, using `additional-conditions` if you know the time window (for example `LAST_UPD` after the outage started).
+| Very large tables where a full re-snapshot takes too long. Needs a reliable change timestamp in the legacy tables;
+  deletes still need reconciliation.
+
+| Move the offset forward
+| Edit the offset so that it points to the oldest available position. Every change in between is lost without
+  trace.
+| Never for a migration, except for a table set that is reloaded completely anyway. The Oracle FAQ calls this
+  "not recommended".
+|===
+
+For MySQL, the snapshot mode `when_needed` automates the first option: when the recorded binlog position or GTID set is
+not available on the server, the connector takes a new snapshot instead of failing. That is convenient, but it also
+hides the incident. For a migration, keep `initial`, let the connector fail, and decide on the recovery deliberately,
+so that the reconciliation step is not forgotten. The same applies to the PostgreSQL and Oracle `when_needed` modes.
+
+To take a full new snapshot with the same connector name, reset the connector as described in
+<<_resetting_a_connector_safely>>. To keep the old offsets for later analysis, register the connector again under a
+new name instead. A new name means a new offset key, so the connector starts with a snapshot. The topic names do not
+change, because they depend on `topic.prefix`, not on the connector name.
+
+The best fix is prevention: the log retention on the source must be longer than the longest outage you are prepared to
+handle, and you must alert long before it runs out. The settings are `binlog_expire_logs_seconds` for MySQL (see
+https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-purges-binlog-files-used-by-debezium[MySQL
+purges binlog files]), the archive log deletion policy for Oracle (see
+xref:database/migration/oracle-connector.adoc#_archive_log_only_mining_and_log_retention[Archive-log-only mining and log
+retention]) and the oplog size for MongoDB. PostgreSQL is the opposite case: the slot retains WAL indefinitely, which
+protects the connector and endangers the disk.
+
+== PostgreSQL: WAL growth and lost replication slots
+
+A PostgreSQL logical replication slot is a promise from the server to keep every WAL segment that the slot's consumer
+has not confirmed. While the Debezium connector runs and confirms its position, the server recycles WAL normally. When
+the connector stops, or when it runs but has nothing to confirm, the slot keeps the WAL, and `pg_wal` grows until the
+disk is full. For a migration this matters twice: the legacy database (if it is PostgreSQL) must not go down because of
+the migration, and after the cut-over the reverse-replication source `bookshop-pg-source` with the slot
+`bookshop_reverse` runs on the *new* production database.
+
+The official documentation lists three causes of abnormal WAL growth:
+
+* *Normal batch reclamation.* `confirmed_flush_lsn` advances regularly but `restart_lsn` lags. The database reclaims
+  space in blocks. Nothing to do.
+* *Few relevant changes.* The database has many changes, but very few in the captured tables, so the connector seldom
+  has an event whose position it can confirm. Heartbeats solve it.
+* *A quiet database on a busy server.* The captured database is quiet, another database on the same server is busy.
+  WAL is shared by the whole server, but slots belong to one database, so the connector is not even invoked. Heartbeats
+  with an action query that writes to the captured database solve it. Amazon RDS has the same effect on an idle
+  instance, because its own system writes are invisible to clients.
+
+.Check the replication slots and how much WAL each one retains
+[source,sql]
+----
+SELECT slot_name,
+       plugin,
+       active,
+       wal_status,
+       invalidation_reason,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn))         AS retained_wal,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed,
+       safe_wal_size
+FROM pg_replication_slots
+WHERE slot_type = 'logical';
+----
+Reference: https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots]
+
+`wal_status` is the early warning. `reserved` and `extended` are fine. `unreserved` means the slot no longer retains
+all its WAL and some of it will be removed at the next checkpoint. `lost` means the slot can no longer be used.
+`invalidation_reason` (`wal_removed`, `rows_removed`, `wal_level_insufficient`, `idle_timeout`) says why.
+
+The heartbeat configuration for the reverse-replication source looks like this. The heartbeat table must exist in the
+captured database and, when the publication is not `FOR ALL TABLES`, must be added to the publication, otherwise the
+connector never sees the heartbeat changes.
+
+.Heartbeats for a PostgreSQL source on a quiet database (fragment)
+[source,json]
+----
+{
+  "heartbeat.interval.ms": "10000",
+  "heartbeat.action.query": "INSERT INTO public.debezium_heartbeat (id, ts) VALUES (1, now()) ON CONFLICT (id) DO UPDATE SET ts = EXCLUDED.ts"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-wal-disk-space[Debezium -- PostgreSQL WAL disk space consumption]
+
+.The heartbeat table and its publication membership
+[source,sql]
+----
+CREATE TABLE public.debezium_heartbeat (
+    id integer PRIMARY KEY,
+    ts timestamptz NOT NULL
+);
+
+ALTER PUBLICATION bookshop_reverse_pub ADD TABLE public.debezium_heartbeat;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-wal-disk-space[Debezium -- PostgreSQL WAL disk space consumption]
+
+Two server settings put a limit on the damage. Both turn a disk-full incident into a lost slot, so they trade one
+failure for another, and the right choice is to monitor and alert well before either limit is reached:
+
+* `max_slot_wal_keep_size` (default `-1`, unlimited) caps the WAL that slots may retain at checkpoint time. A slot that
+  falls further behind becomes `unreserved` and then `lost`.
+* `idle_replication_slot_timeout` (new in PostgreSQL 18, default `0`, disabled) invalidates slots that have been
+  inactive longer than the value.
+
+A slot that belongs to a connector you deleted for good keeps retaining WAL until someone drops it. Deleting the
+connector through the REST API does not drop the slot. Drop it explicitly, and never drop the slot of a connector that
+you still need: the official documentation is explicit that dropping the slot on the primary loses data. The
+`slot.drop.on.stop=true` property is meant only for test environments.
+
+.Drop the slot of a connector that was removed permanently
+[source,sql]
+----
+-- The slot must not be active; stop or delete the connector first
+SELECT pg_drop_replication_slot('bookshop_reverse');
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-slot-drop-on-stop[Debezium -- PostgreSQL slot.drop.on.stop] and https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION[PostgreSQL -- Replication management functions]
+
+If a slot was lost or dropped while the connector still needed it, the connector cannot resume. Let it create a new
+slot (or create it yourself), and take a new snapshot of the captured tables, then reconcile. A second connector that
+tries to use a slot that is still active fails with the PostgreSQL error that the slot `is active for PID` followed by a
+process id. Each connector needs its own slot and publication.
+
+== Database failover
+
+A failover moves the primary role to another server. Whether the connector survives it depends on whether its position
+exists on the new primary.
+
+*PostgreSQL.* Logical slots are created on the primary. Before PostgreSQL 16 they are not replicated to standbys at
+all; in PostgreSQL 16 slots can be created on replicas but must be synchronised by hand; from PostgreSQL 17 a slot can
+be marked as a *failover slot*, and the server synchronises it to the standbys listed in `synchronized_standby_slots`.
+With PostgreSQL 18 as the new Bookshop database, the reverse-replication connector should use a failover slot:
+
+.Failover slot for the reverse-replication source (fragment)
+[source,json]
+----
+{
+  "slot.name": "bookshop_reverse",
+  "slot.failover": "true"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#enabling-postgresql-failover-slots[Debezium -- Enable failover slots for the PostgreSQL connector]
+
+.Primary server setting and check for the failover slot
+[source,sql]
+----
+-- postgresql.conf on the primary (the physical slot used by the standby is named standby1_slot here):
+--   synchronized_standby_slots = 'standby1_slot'
+-- On the standby, slot synchronisation must also be enabled (sync_replication_slots = on).
+
+SELECT slot_name, failover, synced
+FROM pg_replication_slots
+WHERE slot_name = 'bookshop_reverse';
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#enabling-postgresql-failover-slots[Debezium -- Enable failover slots for the PostgreSQL connector] and https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-SYNCHRONIZED-STANDBY-SLOTS[PostgreSQL -- synchronized_standby_slots]
+
+The recovery after a failover with a failover slot is: pause the connector, verify that the slot on the promoted server
+is intact (do not drop or re-create it), update `database.hostname` and the other connection properties if the
+connector does not connect through a virtual address, and resume. Without a failover slot, the documented procedure is
+to create the slot on the new primary before writes resume, restart the connector, and take a snapshot with
+`snapshot.mode=always` so that the changes made between the promotion and the restart are not missed. Some managed
+services (the documentation names Amazon RDS and Google Cloud SQL) replicate the slot at the disk level and handle this
+for you.
+
+*MySQL.* With GTIDs enabled on the cluster, the connector's offset is a GTID set that is meaningful on every server.
+After a failover the connector reconnects (directly, or through a proxy such as HAProxy), finds the last transaction
+it processed in the new server's binlog, and continues. Without GTIDs the offset is a binlog file name and position
+that exist only on the old primary. The official
+https://github.com/debezium/debezium-examples/tree/main/failover[failover example] demonstrates the GTID case with two
+MySQL servers behind HAProxy. `gtid.source.includes` and `gtid.source.excludes` restrict the GTID sources the connector
+uses, which matters in multi-source topologies.
+
+*Oracle.* A physical standby keeps the same SCNs as the primary, so after the DBA promotes it, point the connector at
+the new primary and it resumes from its offset. RAC is not a failover in this sense: the connector mines all redo
+threads (see xref:database/migration/oracle-connector.adoc#_rac_standby_databases_and_secure_connections[RAC, standby
+databases and secure connections]).
+
+*MongoDB.* The connector follows the replica set and reconnects to the new primary with exponential backoff
+(`connect.backoff.initial.delay.ms`, `connect.backoff.max.delay.ms`, `connect.max.attempts`, which together allow
+about 20 minutes with the defaults). The official documentation warns that MongoDB itself can lose writes when a
+primary crashes before secondaries replicate its oplog, and that the connector cannot capture such lost commits.
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-cluster-failures[Debezium -- PostgreSQL cluster failures],
+https://debezium.io/documentation/reference/stable/connectors/mysql.html#enable-mysql-gtids[Debezium -- Enabling MySQL GTIDs],
+https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-becomes-unavailable-while-debezium-is-running[Debezium -- MongoDB becomes unavailable]
+
+== MongoDB: invalid resume token
+
+The MongoDB connector stores a change stream resume token as its offset. If the connector stays stopped longer than
+the oplog window, the token points to an entry that no longer exists, and the server answers with error 286:
+
+.MongoDB error when the resume token is no longer in the oplog
+[source,text]
+----
+Command failed with error 286 (ChangeStreamHistoryLost): 'PlanExecutor error during aggregation :: caused by ::
+Resume of change stream was not possible, as the resume point may no longer be in the oplog
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#connector-error-invalid-resume-token[Debezium -- InvalidResumeToken or ChangeStreamHistoryLost]
+
+With `snapshot.mode=initial` the connector cannot fall back to a snapshot either, because an offset exists. The
+documented ways out are to delete the connector and create a new one with the same configuration under a different
+name (it takes a new snapshot), or to stop the connector and remove its offsets. For the Bookshop reviews pipeline
+(`bookshop-mongo-source`, `topic.prefix=legacy-mongo`), the second option keeps the name and the dashboards:
+
+.Reset the MongoDB connector offsets after ChangeStreamHistoryLost
+[source,shell]
+----
+curl -s -X PUT    http://localhost:8083/connectors/bookshop-mongo-source/stop
+curl -s           http://localhost:8083/connectors/bookshop-mongo-source/status | jq '.connector.state'   # STOPPED
+curl -s -X DELETE http://localhost:8083/connectors/bookshop-mongo-source/offsets
+curl -s -X PUT    http://localhost:8083/connectors/bookshop-mongo-source/resume
+----
+Reference: https://debezium.io/documentation/faq/#reset-offsets-kafka-3.6[Debezium FAQ -- Removing offsets with Kafka Connect 3.6 or later]
+
+Prevention is oplog sizing: the oplog window (`rs.printReplicationInfo()` shows it) must cover the longest planned
+connector outage with a margin. The connector documentation has a section on the optimal oplog configuration.
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-optimal-oplog-config[Debezium -- Optimal oplog configuration] and https://www.mongodb.com/docs/manual/core/replica-set-oplog/[MongoDB -- Replica set oplog]
+
+== A lost or corrupted schema history topic
+
+Relational connectors other than PostgreSQL (Oracle, MySQL, MariaDB, SQL Server, Db2, Informix) keep the DDL history of
+the captured tables in the schema history topic (`legacy.schema-history` for Bookshop) and replay it at every start to
+rebuild the table structures that belong to each log position. If the topic is gone while the offsets still exist, the
+connector refuses to start:
+
+.The message for a missing schema history (Debezium 3.7.1.Final)
+[source,text]
+----
+The db history topic is missing. You may attempt to recover it by reconfiguring the connector to recovery.
+----
+Reference: https://github.com/debezium/debezium/blob/v3.7.1.Final/debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java[Debezium source code -- BaseSourceTask (3.7.1.Final)]
+
+The common causes are an administrator who deleted the topic while cleaning up, a topic that was created by hand with
+the cluster's default retention (so old DDL expired), and a configuration change that points
+`schema.history.internal.kafka.topic` at a new, empty topic. When Debezium creates the topic itself, it creates it
+with one partition, `cleanup.policy=delete`, `retention.bytes=-1` and `retention.ms` set to the largest possible value.
+Check that the topic has not been changed:
+
+.Check the configuration of the schema history topic
+[source,shell]
+----
+docker compose exec kafka /kafka/bin/kafka-configs.sh --bootstrap-server kafka:9092 \
+  --entity-type topics --entity-name legacy.schema-history --describe
+
+docker compose exec kafka /kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+  --describe --topic legacy.schema-history
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-history-topic[Debezium -- Oracle schema history topic]
+
+The recovery is the `recovery` snapshot mode (the deprecated name was `schema_only_recovery`). The connector reads
+the *current* structure of the captured tables, writes it to the schema history topic, and continues streaming from
+its existing offset. This is only correct if no schema change happened to the captured tables between the offset
+position and the moment of the recovery snapshot, because every event in that range is interpreted with today's
+structure. Agree a DDL freeze with the legacy team until the recovery has completed.
+
+.Recover the schema history of the Oracle source
+[source,shell]
+----
+# 1. Change snapshot.mode to recovery
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/config \
+  | jq '."snapshot.mode" = "recovery"' \
+  | curl -s -X PUT -H "Content-Type: application/json" --data @- \
+      http://localhost:8083/connectors/bookshop-oracle-source/config
+
+# 2. When the task is RUNNING again and streaming, set the mode back
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/config \
+  | jq '."snapshot.mode" = "initial"' \
+  | curl -s -X PUT -H "Content-Type: application/json" --data @- \
+      http://localhost:8083/connectors/bookshop-oracle-source/config
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-mode[Debezium -- Oracle snapshot.mode]
+
+Setting the mode back matters: `recovery` would otherwise run again at every restart, and the next run might happen
+after a schema change. If a schema change *did* happen in the gap, the only safe recovery is a new full snapshot.
+Schema changes during the migration in general are covered on
+xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes].
+
+== Large events and large transactions
+
+Two different limits are involved when a legacy batch job updates a million rows in one transaction.
+
+*The Kafka message size.* Each change event is one Kafka record, and the producer refuses records larger than
+`max.request.size` (1 MB by default) with a `RecordTooLargeException`. Wide rows, LOB columns and the JSON converter
+with schemas make events larger than expected. The fix is per connector, so that the rest of the worker keeps the safe
+default. The topic (or broker) must accept the size too, through `max.message.bytes`, and consumers through
+`max.partition.fetch.bytes`.
+
+.Allow larger records for one source connector (fragment)
+[source,json]
+----
+{
+  "producer.override.max.request.size": "5242880"
+}
+----
+Reference: https://debezium.io/documentation/faq/#how_to_enlarge_the_maximum_size_of_the_message_delivered_to_kafka[Debezium FAQ -- How to enlarge the maximum size of the message delivered to Kafka]
+
+The FAQ also tells you to set `connector.client.config.override.policy=ALL` on the worker
+(`CONNECT_CONNECTOR_CLIENT_CONFIG_OVERRIDE_POLICY` in the Debezium image). With the Kafka 4.x workers used in this
+section that is already the default: the Kafka Connect configuration reference lists `All` as the default policy, with
+`None`, `Allowlist` (together with `connector.client.config.override.allowlist`) and the deprecated `Principal` as the
+alternatives. The same documentation recommends `Allowlist` since Kafka 4.2 and announces it as the default for Kafka
+5.0. With `Allowlist` the override must be listed in `connector.client.config.override.allowlist`, and with `None` no
+override is possible; otherwise the connector is rejected at registration with a validation error on the
+`+producer.override.*+` property.
+
+Reference: https://kafka.apache.org/43/configuration/kafka-connect-configs/#connectconfigs_connector.client.config.override.policy[Apache Kafka -- connector.client.config.override.policy] and https://kafka.apache.org/43/kafka-connect/user-guide/#security[Apache Kafka -- Kafka Connect security]
+
+*The transaction size.* The Oracle connector buffers every open transaction until it commits, in memory by default.
+A huge transaction can exhaust the heap of the Connect worker, and a transaction that stays open for hours pins the
+mining window. The Oracle page explains the buffer types (`memory`, Infinispan, Ehcache), `log.mining.window.max.ms`
+and the limits that discard transactions, which for a migration mean silent data loss
+(xref:database/migration/oracle-connector.adoc#_event_buffering[Event buffering] and
+xref:database/migration/oracle-connector.adoc#_long_running_transactions[Long-running transactions]). The other
+connectors stream rows as they read them, but the downstream sinks still see a burst: the JDBC sink and the Bookshop
+translators should be sized for the largest legacy batch, not the average.
+
+*Heap and queue.* The connector's internal queue holds up to `max.queue.size` records (8192 by default) in batches of
+`max.batch.size` (2048). `max.queue.size.in.bytes` adds a memory bound. The FAQ's rule of thumb for the default 256 MB
+heap of the Connect image is a database with fewer than 10,000 columns in total across all tables; a legacy schema with
+thousands of tables needs a bigger heap (`HEAP_OPTS` in the Debezium image, `KAFKA_HEAP_OPTS` in plain Kafka).
+
+== Source connector error handling
+
+Debezium source connectors distinguish retriable errors (a lost connection, a database restart) from errors in a
+single event. Three properties control what happens:
+
+[cols="2,1,4",options="header"]
+|===
+| Property | Default | Effect
+
+| `errors.max.retries`
+| `-1`
+| For retriable errors: `-1` restarts and retries without limit, `0` fails immediately, a positive number retries that
+  many times and then fails.
+
+| `retriable.restart.connector.wait.ms`
+| `10000`
+| How long the connector waits before it restarts after a retriable error.
+
+| `event.processing.failure.handling.mode`
+| `fail`
+| For an event that cannot be processed: `fail` stops the connector and logs the offset of the event, `warn` logs the
+  offset and skips the event, `skip` skips it silently.
+|===
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-advanced-configuration-properties[Debezium -- PostgreSQL advanced configuration properties]
+
+For a migration, keep `event.processing.failure.handling.mode=fail`. `warn` and `skip` keep the pipeline green while
+the new database silently diverges. If an event really cannot be processed, the connector stops with the offset in
+the log, and you can decide whether the table should be re-snapshotted after the fix. Unlimited retries
+(`errors.max.retries=-1`) are a good default for network errors, but combine them with an alert on the
+`Connected` streaming metric and on the restart count, so that a connector that retries forever is noticed.
+
+== Sink error tolerance and dead-letter queues
+
+On the sink side, Kafka Connect's standard `+errors.*+` properties decide what happens to a record that cannot be
+converted, transformed or written. With `errors.tolerance=none` (the default) the task stops at the first bad record.
+With `errors.tolerance=all` bad records are skipped, logged (with `errors.log.enable=true`) and, if
+`errors.deadletterqueue.topic.name` is set, written to a dead-letter topic with `+__connect.errors.*+` headers
+describing the failure.
+
+For the Bookshop mirror sink the details are on the JDBC sink page: in 3.7.1 write failures reach the dead-letter
+queue only with `internal.enable.sces=true`, `errors.tolerance=none` together with a dead-letter topic is rejected, and
+a misconfigured sink can divert a whole table into the queue while its status stays `RUNNING`
+(xref:database/migration/jdbc-sink-connector.adoc#_error_handling_and_dead_letter_queues[Error handling and dead-letter
+queues]). The Spring Boot translators use the Spring for Apache Kafka `DefaultErrorHandler` with a dead-letter topic
+per source topic (`legacy.BOOKSHOP.ORDERS.DLT`), with retries that keep the order of each partition
+(xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]).
+
+The rules for a migration are the same on both sides:
+
+. Start with no tolerance. A stopped sink is visible and nothing is lost: the events wait in Kafka.
+. Add a dead-letter queue only together with an alert on its size, and on `TotalNumberOfErrantRecords` for the JDBC
+  sink.
+. Every record in a dead-letter queue is a row that is wrong in the new database. Fix the cause, replay the records (or
+  re-snapshot the affected keys with an incremental snapshot), and reconcile.
+
+.Count the records in the dead-letter topic of the mirror sink
+[source,shell]
+----
+docker compose exec kafka /kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:9092 \
+  --topic bookshop-pg-mirror-sink.dlq
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#error-reporting-in-connect[Apache Kafka -- Error reporting in Connect]
+
+== Resetting a connector safely
+
+Sometimes the right fix is to start a connector from scratch: after a lost log position, after a misconfiguration
+in the first days of a pipeline, or before a planned full re-load. Since Kafka 3.6 the Connect REST API can reset
+offsets directly, which replaces the old procedure of writing tombstones into the offsets topic with `kafkacat`. The
+official FAQ gives four steps, adapted here to the Oracle source:
+
+.Reset the bookshop-oracle-source connector and take a new snapshot
+[source,shell]
+----
+# 1. Stop the connector (STOPPED keeps the configuration; PAUSED would not allow the reset)
+curl -s -X PUT http://localhost:8083/connectors/bookshop-oracle-source/stop
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/status | jq '.connector.state'
+
+# 2. Remove its offsets (destructive and cannot be undone; keep a copy first)
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/offsets > bookshop-oracle-source.offsets.json
+curl -s -X DELETE http://localhost:8083/connectors/bookshop-oracle-source/offsets
+
+# 3. Remove the schema history topic (all connectors except PostgreSQL have one)
+docker compose exec kafka /kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+  --delete --topic legacy.schema-history
+
+# 4. Resume: with no offsets, snapshot.mode=initial takes a new snapshot
+curl -s -X PUT http://localhost:8083/connectors/bookshop-oracle-source/resume
+----
+Reference: https://debezium.io/documentation/faq/#reset-offsets-kafka-3.6[Debezium FAQ -- Removing offsets with Kafka Connect 3.6 or later]
+
+Points to check before you run it:
+
+* The connector must be in the `STOPPED` state (`+PUT .../stop+`), not `PAUSED`. Resetting the offsets of a running
+  connector has unpredictable results.
+* The saved offsets file is the only way back. For Oracle it contains `scn` and `commit_scn` under the key
+  `+["bookshop-oracle-source",{"server":"legacy"}]+`.
+* Deleting the schema history topic is required for every connector except PostgreSQL. A connector with no offsets but
+  an old history would start with a history that does not match its new snapshot.
+* The snapshot republishes every row as an `r` event. Sinks must be idempotent (they are, with upsert and the
+  `processed_change` table), and consumers that react to events (notifications, caches) must tolerate the replay.
+* Rows deleted in the legacy database while the connector had no valid position are not in the snapshot.
+  Reconcile.
+
+Moving an offset to a specific position, instead of removing it, uses `+PATCH .../offsets+` on a stopped connector and is
+explained on xref:database/migration/offsets-restarts-and-exactly-once.adoc[Offsets, Restarts & Exactly-Once]. The
+FAQ still documents the older method of writing to the offsets topic with `kafkacat` for Kafka Connect 3.5 and
+earlier; with the Kafka 4.x images used in this section it is not needed.
+
+== After every incident: reconcile
+
+A pipeline that is green again is not proof that the new database is correct. After any of the failures on this page,
+run the checks from xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation] for the
+tables that the incident touched:
+
+* Row counts and aggregates (for example `+COUNT(*)+` and `SUM(PRICE)` of `BOOKSHOP.BOOK` against `legacy_book` and
+  `book`).
+* Rows present only in the target, which are typically deletes that happened while the position was lost.
+* The dead-letter topics, which must be empty or explained.
+* The `AbandonedTransactionCount` of the Oracle connector, which must be zero.
+
+Write down what happened, how long the pipeline was degraded and which recovery option was used. During the cut-over
+review that log answers the question "can we trust the new database?", as described on
+xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication].
+
+== References
+
+* https://debezium.io/documentation/faq/[Debezium -- Frequently Asked Questions] (sections
+  https://debezium.io/documentation/faq/#what_happens_when_debezium_stops_or_crashes[What happens when Debezium stops or crashes],
+  https://debezium.io/documentation/faq/#why_must_consuming_applications_expect_duplicate_events[Why must consuming applications expect duplicate events],
+  https://debezium.io/documentation/faq/#how_to_remove_committed_offsets_for_a_connector[How to remove committed offsets for a connector],
+  https://debezium.io/documentation/faq/#how_to_solve_offset_flush_timeouts[How to solve offset flush timeouts],
+  https://debezium.io/documentation/faq/#how_to_enlarge_the_maximum_size_of_the_message_delivered_to_kafka[How to enlarge the maximum size of the message delivered to Kafka],
+  https://debezium.io/documentation/faq/#what_is_causing_intermittent_eventdatadeserializationexceptions_with_the_mysql_connector[Intermittent EventDataDeserializationExceptions],
+  https://debezium.io/documentation/faq/#why_debezium_mysql_connector_fails_to_consume_data_from_a_rds_mysql_read_replica[RDS MySQL read replica],
+  https://debezium.io/documentation/faq/#mongodb_connector_fails_with_maximum_bson_size_error[MongoDB maximum BSON size],
+  https://debezium.io/documentation/faq/#debezium_engine_applications_fails_with_unable_to_find_minimal_snapshot_lock_mode_please_check_your_configuration_error[Unable to find minimal snapshot lock mode])
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-when-things-go-wrong[Debezium -- PostgreSQL: behavior when things go wrong],
+  https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-wal-disk-space[WAL disk space consumption],
+  https://debezium.io/documentation/reference/stable/connectors/postgresql.html#enabling-postgresql-failover-slots[Enable failover slots],
+  https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-cluster-failures[Cluster failures],
+  https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-advanced-configuration-properties[Advanced configuration properties]
+* https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-when-things-go-wrong[Debezium -- MySQL: behavior when things go wrong],
+  https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-purges-binlog-files-used-by-debezium[MySQL purges binlog files],
+  https://debezium.io/documentation/reference/stable/connectors/mysql.html#enable-mysql-gtids[Enabling GTIDs]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Debezium -- Oracle: Frequently Asked Questions],
+  https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-snapshot-mode[snapshot.mode],
+  https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-history-topic[Schema history topic]
+* https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-when-things-go-wrong[Debezium -- MongoDB connector common issues],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#connector-error-invalid-resume-token[InvalidResumeToken or ChangeStreamHistoryLost],
+  https://debezium.io/documentation/reference/stable/connectors/mongodb.html#mongodb-optimal-oplog-config[Optimal oplog configuration]
+* https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-faq[Debezium -- JDBC sink connector FAQ] and
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-error-handling-and-dead-letter-queues[error handling and dead letter queues]
+* https://debezium.io/documentation/reference/stable/operations/logging.html[Debezium -- Logging]
+* https://github.com/debezium/debezium-examples/tree/main/failover[debezium-examples -- failover (MySQL with GTIDs behind HAProxy)]
+* https://github.com/debezium/debezium/blob/v3.7.1.Final/debezium-connector-common/src/main/java/io/debezium/connector/common/BaseSourceTask.java[Debezium source code -- BaseSourceTask (3.7.1.Final)],
+  https://github.com/debezium/debezium/blob/v3.7.1.Final/debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/AbstractLogMinerStreamingChangeEventSource.java[AbstractLogMinerStreamingChangeEventSource] and
+  https://github.com/debezium/debezium/blob/v3.7.1.Final/debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/logminer/LogFileCollector.java[LogFileCollector] (error messages)
+* https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API] and
+  https://kafka.apache.org/43/kafka-connect/user-guide/#error-reporting-in-connect[Error reporting in Connect]
+* https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots],
+  https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE[max_slot_wal_keep_size],
+  https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-IDLE-REPLICATION-SLOT-TIMEOUT[idle_replication_slot_timeout],
+  https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION[Replication management functions]
+* https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html[MySQL -- Binary logging options and variables]
+* https://www.mongodb.com/docs/manual/core/replica-set-oplog/[MongoDB -- Replica set oplog]

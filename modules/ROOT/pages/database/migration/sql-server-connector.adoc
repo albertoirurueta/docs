@@ -1,0 +1,925 @@
+= SQL Server Connector
+:description: How the Debezium SQL Server connector turns SQL Server change data capture into Kafka change events during a legacy database migration, covering sys.sp_cdc_enable_db and sys.sp_cdc_enable_table, the SQL Server Agent and the capture and cleanup jobs, gating roles and a least-privilege connector login, a complete connector configuration for a SQL Server copy of the Bookshop schema, snapshot and isolation modes, topic and schema history naming, multiple databases with database.names, online and offline schema updates with a new capture instance, signals and incremental snapshots, Always On replicas, encryption, Azure SQL and Amazon RDS for SQL Server, monitoring and the failures that most often stop a migration.
+:keywords: Debezium, SQL Server, change data capture, CDC, sys.sp_cdc_enable_db, sys.sp_cdc_enable_table, capture instance, SQL Server Agent, sys.sp_cdc_change_job, gating role, database.names, schema history, online schema update, Azure SQL, Amazon RDS, Always On, database migration, Kafka Connect
+
+include::partial$database-migration-disclaimer.adoc[]
+
+Many legacy line-of-business systems run on Microsoft SQL Server. When such a database is the source of a
+strangler-fig migration, the Debezium SQL Server connector is the component that turns every committed `INSERT`,
+`UPDATE` and `DELETE` into a change event in Kafka, so that the new application and its new database can be kept in
+sync while both systems run side by side. Unlike the Oracle, PostgreSQL and MySQL connectors, the SQL Server connector
+does not read the transaction log itself. It relies on SQL Server's own *change data capture* (CDC) feature, which
+copies changes from the log into change tables, and then polls those change tables. Most of what can go wrong in a SQL
+Server migration follows from that design: CDC must be enabled per database and per table, the SQL Server Agent must
+run, change tables have a retention period, and a schema change needs a new *capture instance*.
+
+This page explains that design from the migration point of view, shows the database-side setup in T-SQL, gives a
+complete connector configuration for a SQL Server copy of the Bookshop legacy schema, and lists how to verify each step.
+The general concepts (snapshots, signals, the change-event envelope, the JDBC sink) are explained on their own pages
+and linked from here.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, with Kafka 4.x (KRaft) and the
+`quay.io/debezium/connect:3.7.1.Final` image, which already contains the SQL Server connector and the Microsoft JDBC
+driver. Debezium 3.7 is tested against SQL Server 2017, 2019 and 2022. The T-SQL and connector configuration on this
+page are derived from the official Debezium and Microsoft documentation; they were not run (a SQL Server 2022 container
+needs more memory than the shared test host had available on that date).
+
+== How the SQL Server connector works
+
+SQL Server CDC is a database feature. When it is enabled for a table, a *capture job* that runs under the SQL Server
+Agent reads the transaction log and writes one row for every changed row into a *change table* in the `cdc` schema
+(for example `cdc.dbo_BOOK_CT`). A *cleanup job* removes old rows from the change tables after a retention period.
+The Debezium connector never touches the transaction log. It connects with JDBC and:
+
+. takes an initial snapshot of the captured tables and records their structure in its schema history topic;
+. for each change table, reads every change between the last stored maximum LSN (log sequence number) and the current
+  maximum LSN;
+. sorts the changes by commit LSN and change LSN, so that they are replayed in the order in which they were committed;
+. emits one change event per changed row and passes the commit and change LSNs to Kafka Connect as the offset;
+. stores the new maximum LSN and starts again.
+
+[mermaid]
+....
+flowchart LR
+    App[Legacy application] -->|INSERT / UPDATE / DELETE| Tables[(dbo.BOOK, dbo.ORDERS ...)]
+    Tables --> Log[(Transaction log)]
+    Agent[SQL Server Agent: capture job] -->|reads| Log
+    Agent -->|writes| CT[(cdc.dbo_BOOK_CT, cdc.dbo_ORDERS_CT ...)]
+    Cleanup[SQL Server Agent: cleanup job] -->|deletes rows older than retention| CT
+    Dbz[Debezium SQL Server connector] -->|polls with JDBC| CT
+    Dbz -->|change events| Kafka[(Kafka topics)]
+    Dbz -->|DDL| History[(Schema history topic)]
+....
+
+Three consequences matter for a migration:
+
+* **Latency has two parts.** A change first waits for the capture job (which by default scans the log every few
+  seconds) and then for the connector's own poll (`poll.interval.ms`). The `source.ts_ms` field of each event still
+  carries the commit time, so the lag is measurable.
+* **The change tables are a buffer with a deadline.** If the connector is stopped for longer than the cleanup
+  retention, the changes it has not read are deleted and the only safe recovery is a new snapshot. Size the retention
+  to your longest planned or unplanned outage of the pipeline.
+* **CDC captures what the change table captures.** If a column is added to the source table, the existing change table
+  does not get it. A new capture instance is needed, which is why schema changes need the procedure described in
+  <<_schema_changes_and_capture_instances>>.
+
+The connector is fault tolerant in the same way as the other Debezium source connectors. Offsets are committed
+periodically, so after a crash it resumes from the last committed LSN and may re-emit some events. Consumers must be
+idempotent; see xref:database/migration/offsets-restarts-and-exactly-once.adoc[Offsets, Restarts & Exactly-Once].
+
+== The Bookshop example on SQL Server
+
+The Bookshop running example of this section uses an Oracle legacy database (see
+xref:database/migration/oracle-connector.adoc[Oracle Connector]). To show the SQL Server connector with the same
+domain, this page assumes that the legacy schema lives in a SQL Server database called `BOOKSHOP`, schema `dbo`, with the
+same upper-case tables: `BOOK`, `AUTHOR`, `CUSTOMER`, `ORDERS`, `ORDER_LINE` and `SUPPLIER_CATALOGUE`. The connector is
+called `bookshop-sqlserver-source` and uses `topic.prefix=legacy-mssql`, so its topics do not collide with the
+Oracle pipeline's `+legacy.*+` topics.
+
+The SQL Server connector puts the database name into each topic name, so the `BOOK` table is published to
+`legacy-mssql.BOOKSHOP.dbo.BOOK`. Everything downstream (the JDBC sink that fills the `+legacy_*+` mirror tables, the
+Spring Boot translators of the anti-corruption layer) works exactly as described on
+xref:database/migration/worked-example-oracle-to-postgresql.adoc[Worked Example: Oracle to PostgreSQL]; only the
+topic names and the `source` block of the events change.
+
+.Legacy SQL Server tables used on this page
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+CREATE TABLE dbo.AUTHOR (
+    AUTHOR_ID  NUMERIC(10)   NOT NULL PRIMARY KEY,
+    FULL_NAME  VARCHAR(200)  NOT NULL
+);
+CREATE TABLE dbo.BOOK (
+    BOOK_ID     NUMERIC(10)    NOT NULL PRIMARY KEY,
+    ISBN        VARCHAR(13)    NULL,
+    TITLE       VARCHAR(200)   NOT NULL,
+    AUTHOR_ID   NUMERIC(10)    NULL,
+    PRICE       NUMERIC(10,2)  NULL,
+    CURRENCY    CHAR(3)        NULL,
+    PUBLISHED   DATE           NULL,
+    ACTIVE_FLG  CHAR(1)        NOT NULL DEFAULT 'Y',
+    SUPPLIER_ID NUMERIC(10)    NULL,
+    LAST_UPD    DATETIME2(3)   NULL
+);
+CREATE TABLE dbo.CUSTOMER (
+    CUST_ID     NUMERIC(10)    NOT NULL PRIMARY KEY,
+    CUST_NAME   VARCHAR(200)   NULL,
+    EMAIL       VARCHAR(320)   NULL,
+    STATUS_CD   CHAR(1)        NOT NULL DEFAULT 'A',
+    CREATED_DT  DATETIME2(3)   NULL
+);
+CREATE TABLE dbo.ORDERS (
+    ORDER_ID   NUMERIC(12)    NOT NULL PRIMARY KEY,
+    CUST_ID    NUMERIC(10)    NOT NULL,
+    ORDER_DT   DATETIME2(3)   NOT NULL,
+    STATUS_CD  VARCHAR(2)     NOT NULL,
+    TOTAL_AMT  NUMERIC(12,2)  NULL
+);
+CREATE TABLE dbo.ORDER_LINE (
+    ORDER_ID    NUMERIC(12)    NOT NULL,
+    LINE_NO     NUMERIC(4)     NOT NULL,
+    BOOK_ID     NUMERIC(10)    NOT NULL,
+    QTY         NUMERIC(5)     NOT NULL,
+    UNIT_PRICE  NUMERIC(10,2)  NOT NULL,
+    CONSTRAINT PK_ORDER_LINE PRIMARY KEY (ORDER_ID, LINE_NO)
+);
+CREATE TABLE dbo.SUPPLIER_CATALOGUE (
+    SUPPLIER_ID     NUMERIC(10)    NOT NULL,
+    ISBN            VARCHAR(13)    NOT NULL,
+    SUPPLIER_PRICE  NUMERIC(10,2)  NULL,
+    FEED_TS         DATETIME2(6)   NULL,
+    CONSTRAINT PK_SUPPLIER_CATALOGUE PRIMARY KEY (SUPPLIER_ID, ISBN)
+);
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-data-types[Debezium -- SQL Server data type mappings]
+
+The Oracle `DATE` columns become `DATETIME2(3)` here because SQL Server's `DATE` has no time part. How each SQL Server
+type is mapped to a Kafka Connect type (and how `time.precision.mode` and `decimal.handling.mode` change that) is
+covered on xref:database/migration/data-types-and-precision.adoc[Data Types & Precision].
+
+== Prerequisites
+
+Before the connector can capture anything, a SQL Server administrator has to prepare the database. The official
+prerequisites are:
+
+* a SQL Server edition and version that supports CDC (the connector is based on the CDC feature available in SQL Server
+  2016 SP1 and later, Standard or Enterprise edition; Debezium 3.7 is tested with 2017, 2019 and 2022);
+* membership in the `sysadmin` fixed server role to enable CDC on the database, and `db_owner` to enable it on tables;
+* a running **SQL Server Agent**, because the capture and cleanup jobs are Agent jobs;
+* CDC can only be enabled on user databases; it cannot be enabled on `master`.
+
+In a container lab, the Agent is enabled with the `MSSQL_AGENT_ENABLED=true` environment variable of the official
+`mcr.microsoft.com/mssql/server` image. On an installed server, start the *SQL Server Agent* service and set it to start
+automatically. A stopped Agent is the most common reason for a connector that runs but emits nothing.
+
+== Enabling CDC on the database
+
+CDC is enabled once per database with the system stored procedure `sys.sp_cdc_enable_db`. It creates the `cdc` schema,
+the `cdc` user, the metadata tables and the Agent jobs.
+
+.Enable CDC on the BOOKSHOP database
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+EXEC sys.sp_cdc_enable_db;
+GO
+
+-- Check: is_cdc_enabled must be 1
+SELECT name, is_cdc_enabled FROM sys.databases WHERE name = 'BOOKSHOP';
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_enabling_cdc_on_the_sql_server_database[Debezium -- Enabling CDC on the SQL Server database]
+
+On Amazon RDS for SQL Server the `sysadmin` role is not available, so the database is enabled with the RDS procedure
+`msdb.dbo.rds_cdc_enable_db` instead (see <<_azure_sql_and_amazon_rds_for_sql_server>>).
+
+== Enabling CDC on the tables
+
+CDC must then be enabled for **every** table that the migration needs, with `sys.sp_cdc_enable_table`. Each call creates
+a *capture instance*: a change table plus the functions that read it. The parameters that matter for Debezium are:
+
+`@source_schema` and `@source_name`:: the table to capture.
+`@role_name`:: the *gating role*. Only members of this role (and `sysadmin` / `db_owner`) can read the change table.
+Create a dedicated role for the connector instead of passing `NULL`; with `NULL`, no role restricts access to the
+captured data.
+`@filegroup_name`:: the filegroup that holds the change table. It must already exist. The Debezium documentation
+recommends not putting change tables in the same filegroup as the source tables, so that change-table growth does not
+compete with the business data.
+`@supports_net_changes`:: whether SQL Server also builds the "net changes" function. Debezium reads every change, not
+the net changes, so the official example sets it to `0`.
+`@capture_instance`:: the name of the capture instance. If it is omitted, SQL Server uses `<schema>_<table>` (for example
+`dbo_BOOK`). Naming it explicitly, with a version suffix, makes the later schema-change procedure easier to follow.
+
+.Enable CDC on the Bookshop tables with a gating role and a dedicated filegroup
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+-- A filegroup and file for the change tables, separate from the data filegroup
+ALTER DATABASE BOOKSHOP ADD FILEGROUP BOOKSHOP_CT;
+ALTER DATABASE BOOKSHOP ADD FILE (NAME = 'BOOKSHOP_CT', FILENAME = '/var/opt/mssql/data/BOOKSHOP_CT.ndf')
+    TO FILEGROUP BOOKSHOP_CT;
+GO
+-- The gating role that will be granted to the Debezium login
+CREATE ROLE cdc_reader;
+GO
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'BOOK',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_BOOK_v1';
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'AUTHOR',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_AUTHOR_v1';
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'CUSTOMER',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_CUSTOMER_v1';
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'ORDERS',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_ORDERS_v1';
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'ORDER_LINE',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_ORDER_LINE_v1';
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'SUPPLIER_CATALOGUE',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_SUPPLIER_CATALOGUE_v1';
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_enabling_cdc_on_a_sql_server_table[Debezium -- Enabling CDC on a SQL Server table]
+
+The physical file path in `ADD FILE` is the default data directory of the Linux container image; on Windows or on a
+managed service, use the path (or the default filegroup) that the database administrator chooses.
+
+Indexed views (materialized views) cannot be captured, because SQL Server CDC requires the base object of a capture
+instance to be a table. If the legacy application keeps important data only in an indexed view, capture its base tables
+instead and rebuild the view in the new system.
+
+== A least-privilege connector login
+
+The Debezium documentation examples connect as `sa`, which is acceptable in a lab and never in a migration that touches
+production data. The connector needs:
+
+* `SELECT` on the captured columns of the source tables, for the initial and incremental snapshots;
+* membership of the gating role, to read the change tables;
+* a way to check whether the SQL Server Agent is running. The connector checks the Agent when it finds no maximum LSN.
+  The built-in query needs `VIEW SERVER STATE`, which is an instance-wide permission. The alternative is to set
+  `database.sqlserver.agent.status.query` to a query that calls a function you control;
+* `INSERT` on the signaling table, if incremental snapshots are used (Debezium writes snapshot watermarks into it).
+
+.Create a dedicated login and user for the connector
+[source,sql]
+----
+USE master;
+GO
+CREATE LOGIN dbz_bookshop WITH PASSWORD = 'change-me-to-a-secret', CHECK_POLICY = ON;
+GO
+USE BOOKSHOP;
+GO
+CREATE USER dbz_bookshop FOR LOGIN dbz_bookshop;
+ALTER ROLE cdc_reader ADD MEMBER dbz_bookshop;          -- gating role: read the change tables
+GRANT SELECT ON SCHEMA::dbo TO dbz_bookshop;            -- snapshots read the source tables
+GO
+-- Optional: let the connector check the Agent without VIEW SERVER STATE.
+-- The function runs with the owner's rights (EXECUTE AS OWNER).
+CREATE FUNCTION dbo.func_is_sql_server_agent_running()
+RETURNS BIT
+WITH EXECUTE AS OWNER
+AS
+BEGIN
+    RETURN (SELECT CASE WHEN dss.[status] = 4 THEN 1 ELSE 0 END
+            FROM sys.dm_server_services dss
+            WHERE dss.[servicename] LIKE N'SQL Server Agent (%');
+END;
+GO
+GRANT EXECUTE ON dbo.func_is_sql_server_agent_running TO dbz_bookshop;
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_no_maximum_lsn_recorded_in_the_database[Debezium -- No maximum LSN recorded in the database]
+
+With that function in place, the connector property becomes
+`database.sqlserver.agent.status.query=SELECT [#db].dbo.func_is_sql_server_agent_running()`, where `[#db]` is the
+placeholder that Debezium replaces with the database name. A function that reads `sys.dm_server_services` under
+`EXECUTE AS OWNER` still needs an owner who has the permission; agree with the database administrator on how the
+function is signed or owned in your environment.
+
+=== Verifying access
+
+The connector user must see every capture instance. Log in **as the connector user** and run
+`sys.sp_cdc_help_change_data_capture`; if the result is empty, the user is not in the gating role or cannot read the
+captured columns.
+
+.Check, as the connector user, which capture instances are visible
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+EXECUTE AS LOGIN = 'dbz_bookshop';
+EXEC sys.sp_cdc_help_change_data_capture;
+REVERT;
+GO
+-- The Agent jobs that CDC created for this database
+SELECT job_type, maxtrans, maxscans, continuous, pollinginterval, retention
+FROM msdb.dbo.cdc_jobs
+WHERE database_id = DB_ID('BOOKSHOP');
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_verifying_that_the_user_has_access_to_the_cdc_table[Debezium -- Verifying that the user has access to the CDC table]
+
+== Capture and cleanup job parameters
+
+The capture job's polling behaviour is a trade-off between latency and load on the legacy server: each scan of the log
+costs CPU on a database that is still serving production traffic. The parameters live in `msdb.dbo.cdc_jobs` and are
+changed with `sys.sp_cdc_change_job`. The Debezium documentation lists the three that matter most:
+
+[cols="1,1,3",options="header"]
+|===
+|Parameter |Default |Effect
+
+|`pollinginterval`
+|5 (seconds)
+|Seconds the capture job waits between log scan cycles. Higher means less load and more latency; `0` means no wait.
+
+|`maxtrans`
+|500
+|Maximum number of transactions processed in one scan cycle. Lower means less load per cycle and more latency.
+
+|`maxscans`
+|10
+|Maximum number of scan cycles the job runs to read the whole log before it pauses for `pollinginterval`. Lower means
+less load and more latency.
+|===
+
+The *cleanup* job has a `retention` (in minutes) that decides how long change rows stay in the change tables. For a
+migration this is the more important number: it is the longest time the Debezium connector can be stopped without
+losing changes. Set it explicitly, and make it longer than the longest connector outage you are prepared to recover
+from without a new snapshot.
+
+.Tune the capture job and set a seven-day change-table retention
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+-- Capture job: scan every 2 seconds, up to 1000 transactions per cycle
+EXEC sys.sp_cdc_change_job @job_type = N'capture', @pollinginterval = 2, @maxtrans = 1000;
+-- Cleanup job: keep change rows for 7 days (10080 minutes)
+EXEC sys.sp_cdc_change_job @job_type = N'cleanup', @retention = 10080;
+GO
+-- Changes take effect only after the job is restarted
+EXEC sys.sp_cdc_stop_job  @job_type = N'capture';
+EXEC sys.sp_cdc_start_job @job_type = N'capture';
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_sql_server_capture_job_agent_configuration_parameters[Debezium -- SQL Server capture job agent configuration parameters]
+and https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sys-sp-cdc-change-job-transact-sql[Microsoft -- sys.sp_cdc_change_job]
+
+Longer retention means larger change tables, which is why the change tables belong in their own filegroup. Watch its
+size during the first weeks of the migration.
+
+== Connector configuration
+
+The following configuration captures the Bookshop tables from the `BOOKSHOP` database. It uses the dedicated login, a
+truststore for the encrypted connection, the Agent-status function, a signal table and the canonical heartbeat
+setting. Credentials are read from a file by the Kafka Connect `FileConfigProvider` rather than written in the JSON; see
+xref:database/migration/security-and-data-protection.adoc[Security & Data Protection].
+
+.bookshop-sqlserver-source connector configuration
+[source,json]
+----
+{
+  "name": "bookshop-sqlserver-source",
+  "config": {
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+    "tasks.max": "1",
+    "database.hostname": "sqlserver",
+    "database.port": "1433",
+    "database.user": "dbz_bookshop",
+    "database.password": "${file:/opt/kafka/secrets/sqlserver.properties:password}",
+    "database.names": "BOOKSHOP",
+    "topic.prefix": "legacy-mssql",
+    "table.include.list": "dbo.BOOK,dbo.AUTHOR,dbo.CUSTOMER,dbo.ORDERS,dbo.ORDER_LINE,dbo.SUPPLIER_CATALOGUE,dbo.DEBEZIUM_SIGNAL",
+    "database.sqlserver.agent.status.query": "SELECT [#db].dbo.func_is_sql_server_agent_running()",
+    "driver.encrypt": "true",
+    "driver.trustServerCertificate": "false",
+    "driver.trustStore": "/opt/kafka/secrets/sqlserver-truststore.jks",
+    "driver.trustStorePassword": "${file:/opt/kafka/secrets/sqlserver.properties:truststore.password}",
+    "snapshot.mode": "initial",
+    "snapshot.isolation.mode": "snapshot",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "legacy-mssql.schema-history",
+    "include.schema.changes": "true",
+    "signal.data.collection": "BOOKSHOP.dbo.DEBEZIUM_SIGNAL",
+    "heartbeat.interval.ms": "10000",
+    "decimal.handling.mode": "precise",
+    "time.precision.mode": "adaptive",
+    "tombstones.on.delete": "true",
+    "custom.metric.tags": "pipeline=bookshop,role=legacy-source"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-connector-properties[Debezium -- SQL Server connector properties]
+
+The `+${file:...}+` placeholders need the worker to be started with
+`config.providers=file` and `config.providers.file.class=org.apache.kafka.common.config.provider.FileConfigProvider`.
+Register the connector with the Kafka Connect REST API and check its status:
+
+.Register the connector and check its status
+[source,shell]
+----
+curl -s -X POST -H 'Content-Type: application/json' \
+  --data @bookshop-sqlserver-source.json http://localhost:8083/connectors
+
+curl -s http://localhost:8083/connectors/bookshop-sqlserver-source/status
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-adding-connector-configuration[Debezium -- Adding SQL Server connector configuration]
+
+The properties that deserve an explanation in a migration:
+
+[cols="2,1,4",options="header"]
+|===
+|Property |Default |Why it matters in a migration
+
+|`database.names`
+|none
+|Comma-separated list of databases to capture. One connector can capture several legacy databases of the same instance;
+see <<_capturing_several_databases>>.
+
+|`topic.prefix`
+|none
+|Namespace of every topic and schema name. Never change it after the first start: the connector would write to new
+topics and could not recover its schema history.
+
+|`table.include.list`
+|all non-system tables
+|Regular expressions matched against `schemaName.tableName`. Capture only what the migration needs; every extra table
+costs snapshot time and change-table space.
+
+|`snapshot.isolation.mode`
+|`repeatable_read`
+|How the initial snapshot reads and locks; see the next section. Only `snapshot` and `exclusive` guarantee that the
+snapshot and the stream form one linear history.
+
+|`database.sqlserver.agent.status.query`
+|built-in query
+|Custom query that tells the connector whether the Agent runs, avoiding `VIEW SERVER STATE`.
+
+|`data.query.mode`
+|`direct`
+|`direct` queries the change tables directly; `function` calls the `+cdc.fn_cdc_get_all_changes_*+` functions.
+
+|`poll.interval.ms`
+|500
+|How long the connector waits before it checks the change tables again. Values above 5000 ms are capped at 5000 ms,
+and heartbeats can only be emitted once per polling cycle.
+
+|`heartbeat.interval.ms`
+|0 (off)
+|Emits heartbeat records to `+__debezium-heartbeat.legacy-mssql+` so that offsets advance while captured tables are
+quiet, and so that monitoring can tell "no changes" from "stuck".
+
+|`include.schema.changes`
+|`true`
+|Also publishes schema change events to a topic named after `topic.prefix`, for consumers that must react to DDL.
+
+|`decimal.handling.mode`
+|`precise`
+|`precise` keeps `NUMERIC`/`DECIMAL` exact (bytes plus scale); `double` and `string` are alternatives for consumers that
+cannot decode the logical type. Keep `precise` for money.
+
+|`guardrail.collections.max`
+|0 (off)
+|Upper limit on the number of captured tables, a safety net against a too-broad include list on a large legacy schema.
+|===
+
+== Snapshots and isolation modes
+
+When the connector starts with `snapshot.mode=initial` and no offsets, it reads the current maximum LSN, captures the
+structure of the tables, reads every row as a `r` (read) event at that LSN, and then streams from the same LSN, so no
+change is lost between the two phases. The snapshot modes are the same family as for the other relational connectors
+(`always`, `initial`, `initial_only`, `no_data`, `recovery`, `when_needed`, `when_needed_no_data`,
+`configuration_based`, `custom`); `schema_only` is deprecated in favour of `no_data`. Choosing between them is explained
+on xref:database/migration/initial-snapshots.adoc[Initial Snapshots].
+
+What is specific to SQL Server is `snapshot.isolation.mode`, which decides the transaction isolation level of the
+snapshot and how long tables are locked:
+
+[cols="1,3",options="header"]
+|===
+|Value |Behaviour
+
+|`read_uncommitted`
+|No locks and no consistency guarantee at all: data can be lost or corrupted. Do not use it for a migration.
+
+|`read_committed`
+|Does not block writers. A row changed during the snapshot can appear twice (once in the snapshot, once in the stream),
+which an upsert-based sink tolerates.
+
+|`repeatable_read` (default)
+|Prevents concurrent updates of rows already read. Duplicates are still possible, as with `read_committed`.
+
+|`snapshot`
+|Uses SQL Server snapshot isolation. Does not block writers and, with `exclusive`, is one of the two modes that guarantee
+that the snapshot and the stream form a linear history. Requires snapshot isolation to be allowed on the database.
+
+|`exclusive`
+|Repeatable read plus an exclusive lock on every captured table for the whole snapshot. Consistent but blocks the legacy
+application.
+|===
+
+For a legacy database that must stay online, `snapshot` is usually the right choice. It requires the database option to
+be switched on first:
+
+.Allow snapshot isolation for the initial snapshot
+[source,sql]
+----
+ALTER DATABASE BOOKSHOP SET ALLOW_SNAPSHOT_ISOLATION ON;
+GO
+SELECT name, snapshot_isolation_state_desc FROM sys.databases WHERE name = 'BOOKSHOP';
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-property-snapshot-isolation-mode[Debezium -- snapshot.isolation.mode]
+
+Large tables can be snapshotted in parallel with `snapshot.max.threads` (chunk-based parallel snapshots split each
+table by primary-key ranges), and tables that were added later can be back-filled with an incremental snapshot without
+stopping the stream; see xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots].
+
+== Topics and the schema history topic
+
+The connector writes the events of each captured table to its own topic, named
+`<topic.prefix>.<databaseName>.<schemaName>.<tableName>`:
+
+[cols="1,2",options="header"]
+|===
+|Table |Topic
+
+|`BOOKSHOP.dbo.BOOK` |`legacy-mssql.BOOKSHOP.dbo.BOOK`
+|`BOOKSHOP.dbo.ORDERS` |`legacy-mssql.BOOKSHOP.dbo.ORDERS`
+|`BOOKSHOP.dbo.ORDER_LINE` |`legacy-mssql.BOOKSHOP.dbo.ORDER_LINE`
+|schema change events |`legacy-mssql`
+|transaction metadata (if `provide.transaction.metadata=true`) |`legacy-mssql.transaction`
+|heartbeats |`+__debezium-heartbeat.legacy-mssql+`
+|===
+
+Like the MySQL, Oracle and Db2 connectors, the SQL Server connector keeps an internal **schema history topic**
+(`schema.history.internal.kafka.topic`). It records the structure of the tables, taken from the change tables, so that
+each event can be built with the schema that was in effect when the change happened, including after a restart. The
+topic is for the connector only; consumers must not read it. It must have a single partition and infinite retention,
+and losing it means running the connector with `snapshot.mode=recovery` to rebuild it. Both topics are explained in
+xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes].
+
+By default the initial snapshot records the schema of **every** table in capture mode, not just the included ones. That
+makes it possible to add a table to `table.include.list` later without a schema error. If you set
+`schema.history.internal.store.only.captured.tables.ddl=true` to keep the topic small, adding a table later needs a
+schema snapshot first.
+
+== The change events
+
+The events follow the standard Debezium envelope (`before`, `after`, `source`, `op`, `ts_ms`), described on
+xref:database/migration/change-event-structure.adoc[Anatomy of a Change Event]. The SQL Server `source` block carries the
+database, schema and table, and three position fields:
+
+* `change_lsn`: the LSN of the individual change;
+* `commit_lsn`: the LSN of the commit of the transaction;
+* `event_serial_no`: distinguishes several events with the same commit and change LSN (an update is stored by CDC as a
+  "before" and an "after" row).
+
+.Value of an update event for dbo.BOOK (JSON converter, schema omitted)
+[source,json]
+----
+{
+  "before": {
+    "BOOK_ID": "A+k=", "ISBN": "9780000000011", "TITLE": "The Legacy Years",
+    "AUTHOR_ID": "AfU=", "PRICE": "Aq8=", "CURRENCY": "EUR",
+    "PUBLISHED": 18262, "ACTIVE_FLG": "Y", "SUPPLIER_ID": "Bw==",
+    "LAST_UPD": 1762680000000
+  },
+  "after": {
+    "BOOK_ID": "A+k=", "ISBN": "9780000000011", "TITLE": "The Legacy Years",
+    "AUTHOR_ID": "AfU=", "PRICE": "AvM=", "CURRENCY": "EUR",
+    "PUBLISHED": 18262, "ACTIVE_FLG": "Y", "SUPPLIER_ID": "Bw==",
+    "LAST_UPD": 1762680600000
+  },
+  "source": {
+    "version": "3.7.1.Final",
+    "connector": "sqlserver",
+    "name": "legacy-mssql",
+    "ts_ms": 1762680600000,
+    "snapshot": "false",
+    "db": "BOOKSHOP",
+    "schema": "dbo",
+    "table": "BOOK",
+    "change_lsn": "00000027:00000ac0:0002",
+    "commit_lsn": "00000027:00000ac0:0007",
+    "event_serial_no": "2"
+  },
+  "op": "u",
+  "ts_ms": 1762680602113,
+  "transaction": null
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-update-events[Debezium -- SQL Server update events]
+
+Two things in this example need attention downstream. `PRICE` is a `NUMERIC(10,2)`, so with
+`decimal.handling.mode=precise` it is encoded as the bytes of an unscaled integer (`AvM=` is 755, which with scale 2 is
+7.55). `NUMERIC(10)` keys are not integers either: they arrive as decimals encoded the same way (`A+k=` is 1001,
+`AfU=` is 501 and `Bw==` is 7), which is why the
+xref:database/migration/data-types-and-precision.adoc[Data Types & Precision] page recommends converting them before
+they reach a `bigint` column. A delete produces a `d` event with `after` null, followed by a tombstone when
+`tombstones.on.delete=true`.
+
+== Schema changes and capture instances
+
+A schema change is where SQL Server differs most from the other connectors. When a column is added to `dbo.BOOK`, the
+existing change table `cdc.dbo_BOOK_v1_CT` keeps its old structure, so the connector keeps emitting events **without**
+the new column. Debezium cannot update capture tables; a database operator with elevated privileges has to create a new
+capture instance. SQL Server allows two capture instances per table, and the connector switches from the old one to the
+new one at the LSN where the new one starts.
+
+[mermaid]
+....
+sequenceDiagram
+    participant DBA as Database operator
+    participant SQL as SQL Server
+    participant Dbz as Debezium connector
+    DBA->>SQL: ALTER TABLE dbo.BOOK ADD FORMAT_CD CHAR(2)
+    Note over SQL,Dbz: changes still go to dbo_BOOK_v1 (old structure)
+    DBA->>SQL: sp_cdc_enable_table ... @capture_instance = dbo_BOOK_v2
+    SQL-->>Dbz: two capture instances for dbo.BOOK
+    Dbz->>Dbz: finish dbo_BOOK_v1 up to the start LSN of dbo_BOOK_v2
+    Dbz->>Dbz: switch schema, read dbo_BOOK_v2
+    Dbz-->>DBA: notification: old capture instance fully read
+    DBA->>SQL: sp_cdc_disable_table ... @capture_instance = dbo_BOOK_v1
+....
+
+The official documentation describes two procedures:
+
+* **Online schema update.** Apply the DDL, create the new capture instance, wait until Debezium streams from it, then
+  drop the old one. There is no downtime, but changes made between the DDL and the creation of the new instance are
+  captured with the old structure (the new column is missing from those events).
+* **Offline schema update.** Suspend the legacy application, wait for the connector to drain all changes, stop the
+  connector, apply the DDL, create the new capture instance, resume the application, start the connector, and then drop
+  the old instance. This is the safest option but needs a maintenance window.
+
+.Online schema update: add a column to BOOK and switch capture instances
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+-- 1. Apply all DDL for the table in one batch
+ALTER TABLE dbo.BOOK ADD FORMAT_CD CHAR(2) NULL;
+GO
+-- 2. Create a second capture instance with the new structure
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'BOOK',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT',
+     @supports_net_changes = 0, @capture_instance = N'dbo_BOOK_v2';
+GO
+-- 3. Only after Debezium streams from dbo_BOOK_v2 (check the connector log or notification):
+EXEC sys.sp_cdc_disable_table @source_schema = N'dbo', @source_name = N'BOOK',
+     @capture_instance = N'dbo_BOOK_v1';
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#online-schema-updates[Debezium -- Online schema updates]
+
+Rules that come from the official page and that a migration plan must respect:
+
+* finish the whole procedure for one table before starting another schema change on the same table, and put all the DDL
+  for a table in one batch so that the procedure runs once;
+* SQL Server does not allow some changes on CDC-enabled tables, such as renaming a column or changing a column type;
+* after changing a column from `NULL` to `NOT NULL` (or the reverse), the events keep the old optionality until a new
+  capture instance exists;
+* after `sp_rename` of a table, events keep the old table name until the connector restarts.
+
+How the new column then flows to the JDBC sink and to the anti-corruption layer, and how to sequence it with the
+expand/contract pattern, is covered on xref:database/migration/schema-changes-during-migration.adoc[Handling Schema
+Changes] and xref:database/schema-evolution/best-practices.adoc[Schema Evolution Best Practices].
+
+== Capturing several databases
+
+Legacy SQL Server estates often spread one application over several databases of the same instance (for example
+`BOOKSHOP` and `BOOKSHOP_ARCHIVE`). One connector can capture them all with `database.names`. Each database must have CDC
+enabled, and `tasks.max` can be raised up to the number of databases so that the connector reads them in parallel.
+
+.Capture two databases with one connector and one task per database
+[source,json]
+----
+{
+  "name": "bookshop-sqlserver-multi-source",
+  "config": {
+    "connector.class": "io.debezium.connector.sqlserver.SqlServerConnector",
+    "tasks.max": "2",
+    "database.hostname": "sqlserver",
+    "database.port": "1433",
+    "database.user": "dbz_bookshop",
+    "database.password": "${file:/opt/kafka/secrets/sqlserver.properties:password}",
+    "database.names": "BOOKSHOP,BOOKSHOP_ARCHIVE",
+    "topic.prefix": "legacy-mssql",
+    "table.include.list": "dbo.BOOK,dbo.ORDERS,dbo.ORDER_LINE,dbo.DEBEZIUM_SIGNAL",
+    "signal.data.collection": "BOOKSHOP.dbo.DEBEZIUM_SIGNAL,BOOKSHOP_ARCHIVE.dbo.DEBEZIUM_SIGNAL",
+    "driver.encrypt": "true",
+    "driver.trustStore": "/opt/kafka/secrets/sqlserver-truststore.jks",
+    "driver.trustStorePassword": "${file:/opt/kafka/secrets/sqlserver.properties:truststore.password}",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "legacy-mssql.schema-history"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-property-database-names[Debezium -- database.names]
+and https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-property-signal-data-collection[signal.data.collection]
+
+Because the database name is part of every topic name, the two databases produce separate topics
+(`legacy-mssql.BOOKSHOP.dbo.ORDERS` and `legacy-mssql.BOOKSHOP_ARCHIVE.dbo.ORDERS`). With more than one task, give each
+database its own signal table, as above; the official page marks support for several signal tables as a Technology
+Preview in the Red Hat build.
+
+== Signals and incremental snapshots
+
+Ad hoc snapshots (to back-fill a table added to the migration, or to repair a mirror table) are requested through a
+signal. With the `source` channel, the signal is an `INSERT` into a signal table. On SQL Server, as on Db2, the signal
+table must itself be enabled for CDC, because the connector only sees what the change tables contain.
+
+.Create the signal table, enable CDC on it and request an incremental snapshot of BOOK
+[source,sql]
+----
+USE BOOKSHOP;
+GO
+CREATE TABLE dbo.DEBEZIUM_SIGNAL (
+    id   VARCHAR(42)   PRIMARY KEY,
+    type VARCHAR(32)   NOT NULL,
+    data VARCHAR(2048) NULL
+);
+GO
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'DEBEZIUM_SIGNAL',
+     @role_name = N'cdc_reader', @filegroup_name = N'BOOKSHOP_CT', @supports_net_changes = 0;
+GRANT INSERT ON dbo.DEBEZIUM_SIGNAL TO dbz_bookshop;   -- watermarks of incremental snapshots
+GO
+INSERT INTO BOOKSHOP.dbo.DEBEZIUM_SIGNAL (id, type, data)
+VALUES ('backfill-book-1', 'execute-snapshot',
+        '{"data-collections": ["BOOKSHOP.dbo.BOOK"], "type": "incremental"}');
+GO
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-triggering-an-incremental-snapshot[Debezium -- SQL Server: triggering an incremental snapshot]
+and https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-enabling-source-signaling-channel[Debezium -- Enabling the source signaling channel]
+
+The data collection names in a signal are case-sensitive and fully qualified (`database.schema.table`). The other
+channels (Kafka, JMX, file) and the notifications that report snapshot progress are covered on
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications].
+
+== Always On availability groups
+
+The connector can read from an Always On **read-only replica**, which keeps the polling load off the primary of a busy
+legacy system. CDC must be configured on the primary (SQL Server does not support CDC on replicas), and the connector
+must set `driver.applicationIntent=ReadOnly`. When Debezium sees that option, it forces `snapshot.isolation.mode` to
+`snapshot` (the only mode supported on read-only replicas) and commits the read-only transaction on every streaming
+loop, so that it sees the latest CDC data.
+
+.Connector properties for reading from an Always On secondary
+[source,json]
+----
+{
+  "database.hostname": "bookshop-ag-listener",
+  "database.port": "1433",
+  "driver.applicationIntent": "ReadOnly"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-always-on-replica[Debezium -- SQL Server Always On]
+
+Replication lag between the primary and the secondary adds to the event latency; include it in the lag budget of the
+migration.
+
+== Encrypted connections
+
+The Microsoft JDBC driver encrypts connections by default. The connector configuration passes driver options through
+with the `driver.` prefix. In production, validate the server certificate against a truststore
+(`driver.trustServerCertificate=false`, `driver.trustStore`, `driver.trustStorePassword`), as in the configuration above.
+In a local lab with a self-signed certificate you can set `driver.trustServerCertificate=true`; the official page warns
+that this skips certificate-chain and host-name validation and must not be used in production. Setting
+`driver.encrypt=false` disables encryption for servers that do not use TLS.
+
+.Lab-only driver settings for a self-signed SQL Server certificate
+[source,json]
+----
+{
+  "driver.encrypt": "true",
+  "driver.trustServerCertificate": "true"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_encrypting_connections[Debezium -- Encrypting connections]
+
+== Azure SQL and Amazon RDS for SQL Server
+
+Many "legacy" SQL Server databases have already been lifted to a managed service. The connector works with them, with
+these differences:
+
+[cols="1,3",options="header"]
+|===
+|Service |What changes
+
+|Azure SQL Database
+|Enable CDC on the database and tables with the same procedures (`sys.sp_cdc_enable_db`, `sys.sp_cdc_enable_table`) and
+point the connector at the Azure SQL endpoint. Azure SQL Database runs the capture and cleanup with its own scheduler
+instead of the SQL Server Agent. Microsoft Entra authentication is configured with
+`driver.authentication=ActiveDirectoryManagedIdentity` (the legacy value `ActiveDirectoryMSI` also works), in which case
+`database.password` is optional.
+
+|Azure SQL Managed Instance
+|Behaves like an installed SQL Server with the Agent available; the same T-SQL applies.
+
+|Amazon RDS for SQL Server
+|`sysadmin` is not available, so the database is enabled with `exec msdb.dbo.rds_cdc_enable_db 'BOOKSHOP'`. After that,
+any `db_owner` of the database enables tables with `sys.sp_cdc_enable_table` as usual. A snapshot restore or
+point-in-time restore disables CDC and removes its metadata, so a restored database needs CDC enabled again (and the
+connector needs a new snapshot).
+|===
+
+.Enable CDC on Amazon RDS for SQL Server
+[source,sql]
+----
+EXEC msdb.dbo.rds_cdc_enable_db 'BOOKSHOP';
+GO
+USE BOOKSHOP;
+GO
+EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'BOOK',
+     @role_name = N'cdc_reader', @supports_net_changes = 0;
+GO
+----
+Reference: https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.SQLServer.CommonDBATasks.CDC.html[AWS -- Using change data capture for Amazon RDS for SQL Server]
+and https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-on-azure[Debezium -- SQL Server on Azure]
+and https://learn.microsoft.com/en-us/azure/azure-sql/database/change-data-capture-overview[Microsoft -- CDC with Azure SQL Database]
+
+Managed Kafka and managed connector runtimes are compared on
+xref:database/migration/cloud-and-managed-services.adoc[Cloud Databases & Managed Kafka].
+
+== Monitoring
+
+The connector exposes snapshot, streaming and schema history metrics through JMX (how to scrape them is on
+xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing]). For a SQL Server migration,
+watch at least:
+
+* `MilliSecondsBehindSource` (and its P95/P99 variants): the end-to-end lag, which includes the capture job's polling;
+* `MilliSecondsSinceLastEvent` together with heartbeats: a quiet table and a stopped Agent look the same without them;
+* `Connected`: whether the connector currently has a database connection;
+* `NumberOfCommittedTransactions` and `SourceEventPosition`: whether the LSN keeps moving;
+* `QueueRemainingCapacity`: back pressure from Kafka.
+
+Because the default MBean names depend on `topic.prefix`, the configuration above sets `custom.metric.tags`, so that
+dashboards keep working even if the MBean name changes. On the database side, watch the size of the change-table
+filegroup and the CDC log scan sessions (`sys.dm_cdc_log_scan_sessions`) to see whether the capture job keeps up.
+
+== When things go wrong
+
+[cols="2,3,3",options="header"]
+|===
+|Symptom |Cause |What to do
+
+|Log says `No maximum LSN recorded in the database; SQL Server Agent is not running`
+|The Agent is stopped, so the capture job does not fill the change tables.
+|Start the Agent. If the connector cannot check the Agent status, grant `VIEW SERVER STATE` or configure
+`database.sqlserver.agent.status.query`. "No maximum LSN" without this message is normal on an idle database.
+
+|Connector runs but a table produces no events
+|CDC is not enabled for the table, the connector user is not in its gating role, or the table is not in
+`table.include.list`.
+|Run `sys.sp_cdc_help_change_data_capture` as the connector user; check the include list.
+
+|New column missing from events after a DDL change
+|The capture instance still has the old structure.
+|Create a new capture instance (online or offline procedure), then drop the old one.
+
+|Changes missing after a long outage
+|The cleanup job removed change rows the connector had not read.
+|Re-snapshot the affected tables (incremental snapshot, or a new connector with a new name); raise the cleanup
+`retention` to cover realistic outages.
+
+|Connector fails with a schema history error after adding a table
+|The table's schema is not in the schema history topic (for example with `store.only.captured.tables.ddl=true`).
+|Run a schema snapshot or an initial snapshot for the table, as described in the official procedure.
+
+|Duplicate events after a crash or rebalance
+|Offsets are committed periodically, not per event.
+|Expected (at-least-once). Make sinks and consumers idempotent.
+
+|Events go to new topics after a configuration change
+|`topic.prefix` was changed.
+|Restore the old value. Never change it on a running pipeline.
+|===
+
+Most of these failures are easier to recover from when the pipeline has been rehearsed; see
+xref:database/migration/troubleshooting-and-failure-recovery.adoc[Troubleshooting & Failure Recovery].
+
+== Verification checklist
+
+Before you rely on a SQL Server source in a migration, check that:
+
+. `sys.databases.is_cdc_enabled` is `1` for every captured database and the Agent (or the Azure scheduler) runs;
+. `sys.sp_cdc_help_change_data_capture`, run as the connector user, lists one capture instance for every table in the
+  include list, including the signal table;
+. the cleanup `retention` in `msdb.dbo.cdc_jobs` is longer than the outage you are prepared to absorb;
+. the connector status is `RUNNING` for the connector and every task, and the snapshot completed (snapshot metrics or
+  the snapshot notification);
+. an `UPDATE` of one `BOOK` row reaches `legacy-mssql.BOOKSHOP.dbo.BOOK` within the agreed latency, and a `DELETE`
+  produces a `d` event and a tombstone;
+. row counts and checksums of the source tables match the mirror tables
+  (xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation]).
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/sqlserver.html[Debezium -- SQL Server connector]
+  (https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#setting-up-sqlserver[setting up],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_enabling_cdc_on_the_sql_server_database[enabling CDC on the database],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_enabling_cdc_on_a_sql_server_table[enabling CDC on a table],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#_sql_server_capture_job_agent_configuration_parameters[capture job parameters],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-schema-evolution[schema evolution],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#online-schema-updates[online schema updates],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-connector-properties[connector properties],
+  https://debezium.io/documentation/reference/stable/connectors/sqlserver.html#sqlserver-monitoring[monitoring])
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html[Debezium -- Sending signals to Debezium]
+* https://debezium.io/releases/3.7/[Debezium 3.7 releases and tested versions]
+* https://github.com/debezium/container-images[debezium/container-images (GitHub)]
+* https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/about-change-data-capture-sql-server[Microsoft -- About change data capture (SQL Server)]
+* https://learn.microsoft.com/en-us/sql/relational-databases/system-stored-procedures/sys-sp-cdc-change-job-transact-sql[Microsoft -- sys.sp_cdc_change_job]
+* https://learn.microsoft.com/en-us/azure/azure-sql/database/change-data-capture-overview[Microsoft -- Change data capture with Azure SQL Database]
+* https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Appendix.SQLServer.CommonDBATasks.CDC.html[AWS -- Using change data capture for Amazon RDS for SQL Server]
+
+The T-SQL and connector configuration on this page were derived from the official documentation listed above and were
+not run.

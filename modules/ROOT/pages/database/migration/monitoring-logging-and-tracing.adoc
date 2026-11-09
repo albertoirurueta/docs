@@ -1,0 +1,1134 @@
+= Monitoring, Logging and Tracing
+:description: How to observe the Debezium side of a database migration: the JMX MBeans and metric names for snapshot, streaming, LogMiner and schema history metrics of the Oracle connector (and the PostgreSQL and MySQL MBean names), custom metric tags, exporting the metrics to Prometheus with the JMX exporter configuration of the official monitoring example, the Strimzi and Debezium Operator equivalents, the official Grafana dashboards, the alerts that matter during a migration (task failed or missing, lag, queue capacity, long Oracle transactions, replication slot growth), Java Flight Recorder in the Connect image, logging with Log4j and mapped diagnostic contexts, changing log levels at runtime with the Kafka Connect REST API, OpenTelemetry tracing with the ActivateTracingSpan SMT, and OpenLineage lineage.
+:keywords: Debezium, Debezium 3.7, monitoring, JMX, MBean, connector-metrics, snapshot metrics, streaming metrics, schema history metrics, LogMiner metrics, MilliSecondsBehindSource, MilliSecondsSinceLastEvent, QueueRemainingCapacity, OldestScnAgeInMilliseconds, custom.metric.tags, Prometheus, JMX exporter, jmx_prometheus_javaagent, Grafana, PrometheusRule, PodMonitor, Strimzi metricsConfig, Jolokia, Java Flight Recorder, JFR, Log4j, MDC, dbz.connectorLogicalName, admin/loggers, OpenTelemetry, ActivateTracingSpan, debezium-interceptor, OpenLineage, Bookshop, database migration
+
+include::partial$database-migration-disclaimer.adoc[]
+
+During the Bookshop migration, the PostgreSQL database and the new `bookshop` application are only as current as the
+`bookshop-oracle-source` connector. If the connector stops, nothing fails visibly: the legacy application keeps
+writing to Oracle, the new application keeps serving old data, and the archive logs that the connector needs to resume
+are deleted on schedule. If it falls behind, the reconciliation jobs report drift that is really lag. Monitoring is
+therefore not an afterthought for the cut-over day. It must be in place before the initial snapshot starts, because the
+questions it answers ("Is the snapshot progressing?", "How far behind Oracle is the pipeline?", "Is a legacy batch job
+holding a transaction open?") decide when the migration can move to its next phase.
+
+This page covers the three signals that Debezium gives you: metrics (JMX MBeans, exported to Prometheus), logs (Log4j
+with Debezium's diagnostic contexts), and traces and lineage (OpenTelemetry and OpenLineage). General Prometheus and
+Grafana usage is covered in xref:database/prometheus/index.adoc[Prometheus & Monitoring], and Kafka broker and consumer
+monitoring in xref:backend/messaging/kafka-operations-and-monitoring.adoc[Kafka Operations and Monitoring]. This page
+explains what is specific to Debezium and to a migration.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, the `quay.io/debezium/connect:3.7.1.Final` image (Kafka 4.3.1,
+Java 25), and the Prometheus JMX exporter Java agent 1.0.1 with the configuration of the official `monitoring` example in
+`debezium/debezium-examples`. The JMX exporter set-up, the exported metric names, Jolokia, Java Flight Recorder, the
+diagnostic context keys and the runtime log level endpoints were run with Docker on 2026-11-09 against a PostgreSQL test
+connector (the Oracle connector has the same MBean structure, with the Oracle metric names copied from the official
+documentation). The Strimzi, alerting, tracing and lineage configuration is derived from the official documentation and
+was not run.
+
+== What to watch during a migration
+
+Each phase of the migration (see xref:database/migration/migration-patterns-with-cdc.adoc[Migration Patterns with
+CDC]) has its own question, and each question maps to a small set of metrics:
+
+[cols="1,2,2",options="header"]
+|===
+| Question | Metric (MBean context and attribute) | Notes
+
+| Is the connector running at all?
+| Kafka Connect task status (`kafka.connect:type=connector-task-metrics`), `Connected` (streaming)
+| A stopped connector has no task metrics at all, so alert on their absence, not only on a `failed` value.
+
+| How far is the initial snapshot?
+| `TotalTableCount`, `RemainingTableCount`, `RowsScanned`, `SnapshotRunning`, `SnapshotCompleted`, `SnapshotAborted`
+  (snapshot)
+| `RowsScanned` is a map per table. Compare it with `+SELECT COUNT(*)+` on the legacy tables.
+
+| How far behind Oracle is the pipeline?
+| `MilliSecondsBehindSource` and its `P50`/`P95`/`P99` (streaming), `LagFromSourceInMilliseconds` (LogMiner)
+| The value is `-1` until the first streamed event. Downstream lag (sink, application) is measured with Kafka
+  consumer lag.
+
+| Is anything happening?
+| `MilliSecondsSinceLastEvent`, `TotalNumberOfEventsSeen` (streaming), heartbeat topic
+| A quiet legacy database is normal at night. Heartbeats keep the offset moving.
+
+| Is Kafka slowing Debezium down?
+| `QueueRemainingCapacity` against `QueueTotalCapacity`, `CurrentQueueSizeInBytes` (snapshot and streaming)
+| A queue that stays near empty capacity means the producer side (Kafka, converters, SMTs) is the bottleneck.
+
+| Is a legacy job holding a transaction open?
+| `OldestScnAgeInMilliseconds`, `NumberOfActiveTransactions`, `NumberOfEventsInBuffer`, `AbandonedTransactionCount`
+  (LogMiner)
+| A transaction that stays open longer than `log.mining.transaction.retention.ms` is abandoned and its events are lost.
+
+| Did the connector skip or fail events?
+| `NumberOfErroneousEvents`, `NumberOfEventsFiltered`, `TotalSchemaChangeParseErrorCount` (LogMiner)
+| Any increase of the first and last ones needs investigation before the cut-over.
+
+| Can the connector restart safely?
+| Schema history `Status`, `ChangesRecovered`, `OffsetScn` (LogMiner) against the oldest available archive log
+| An `OffsetScn` older than the oldest archive log means the next restart fails.
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-monitoring[Debezium -- Oracle connector monitoring] and https://debezium.io/documentation/reference/stable/operations/monitoring.html#metrics-monitoring-connectors[Debezium -- Metrics for monitoring Debezium connectors]
+
+The rest of the page explains where these values come from, how to collect them, and how to alert on them.
+
+== Debezium metrics are JMX MBeans
+
+Kafka, Kafka Connect and the Debezium connectors all publish their metrics as JMX MBeans. Debezium adds connector
+MBeans on top of the Kafka and Kafka Connect ones. Each connector registers one MBean per *context*:
+
+* `snapshot`, while a snapshot runs or after one has run since the last connector start (snapshot metrics are not
+  exposed otherwise);
+* `streaming`, for change capture from the log;
+* `schema-history`, for connectors that keep a schema history (Oracle, MySQL, MariaDB, SQL Server, Db2). PostgreSQL has
+  none.
+
+The MBean object names contain the connector type and the `topic.prefix`, not the connector name:
+
+[cols="1,2",options="header"]
+|===
+| Connector | MBean object names
+
+| Oracle (`bookshop-oracle-source`, `topic.prefix=legacy`)
+| `debezium.oracle:type=connector-metrics,context=snapshot,server=legacy` +
+  `debezium.oracle:type=connector-metrics,context=streaming,server=legacy` +
+  `debezium.oracle:type=connector-metrics,context=schema-history,server=legacy`
+
+| PostgreSQL (`bookshop-pg-source`, `topic.prefix=modern`, used for reverse replication)
+| `debezium.postgres:type=connector-metrics,context=snapshot,server=modern` +
+  `debezium.postgres:type=connector-metrics,context=streaming,server=modern`
+
+| MySQL (`topic.prefix=<prefix>`)
+| `debezium.mysql:type=connector-metrics,context=snapshot,server=<prefix>` +
+  `debezium.mysql:type=connector-metrics,context=streaming,server=<prefix>` +
+  `debezium.mysql:type=connector-metrics,context=schema-history,server=<prefix>`
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshot-metrics[Debezium -- Oracle snapshot metrics], https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-monitoring[Debezium -- PostgreSQL connector monitoring] and https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-monitoring[Debezium -- MySQL connector monitoring]
+
+Two consequences follow. First, a change of `topic.prefix` changes the MBean names and breaks dashboards and alerts,
+which is one more reason never to change it on a running connector. Second, two connectors with the same prefix on one
+worker would collide, which Debezium prevents.
+
+=== Custom metric tags
+
+Since the default names depend on the configuration, Debezium lets you append your own key/value pairs to the MBean
+object name with `custom.metric.tags`. For Bookshop:
+
+.Fragment of bookshop-oracle-source.json: stable tags for monitoring
+[source,json]
+----
+{
+  "custom.metric.tags": "pipeline=bookshop-migration,source=legacy-oracle"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-custom-metric-tags[Debezium -- Oracle connector property custom.metric.tags] and https://debezium.io/documentation/reference/stable/connectors/oracle.html#_customized_mbean_names[Debezium -- Customized MBean names]
+
+The streaming MBean then becomes
+`debezium.oracle:type=connector-metrics,context=streaming,server=legacy,pipeline=bookshop-migration,source=legacy-oracle`.
+Keys must be valid JMX property keys (no `:`, `+*+`, `?`, `,` or `=`). The JMX exporter rules shown later match the default
+name shape, ending in `+server=...+`. If you add tags, add a rule that captures them as labels, or the default rule puts the
+whole tail (`+legacy,pipeline=...+`) into the `name` label.
+
+=== Snapshot metrics
+
+The snapshot MBean reports the progress of the initial snapshot and of incremental and blocking snapshots. The most
+useful attributes for a migration are listed below with their documented names and types. The full list is on the
+connector page.
+
+[cols="2,1,3",options="header"]
+|===
+| Attribute | Type | Use in the migration
+
+| `SnapshotRunning`, `SnapshotPaused`, `SnapshotCompleted`, `SnapshotAborted`, `SnapshotSkipped`
+| boolean
+| Phase gate: the mirror tables are complete only after `SnapshotCompleted` and a quiet `RemainingTableCount`.
+
+| `TotalTableCount`, `RemainingTableCount`
+| int
+| Progress by table.
+
+| `RowsScanned`
+| `Map<String, Long>`
+| Rows read per table so far. Exported by the JMX exporter as one series per table.
+
+| `SnapshotDurationInSeconds`, `SnapshotPausedDurationInSeconds`
+| long
+| Input for the snapshot window estimate of the next environment.
+
+| `TotalNumberOfEventsSeen`, `TotalNumberOfReadEventsSeen`, `NumberOfEventsFiltered`, `NumberOfErroneousEvents`
+| long
+| Sanity checks: read events should equal the rows of the captured tables.
+
+| `QueueTotalCapacity`, `QueueRemainingCapacity`, `MaxQueueSizeInBytes`, `CurrentQueueSizeInBytes`
+| int / long
+| Back-pressure between the snapshot threads and Kafka Connect.
+
+| `MilliSecondsSinceLastEvent`, `LastEvent`
+| long / string
+| A snapshot that stops producing events is stuck (locks, a long flashback query, `ORA-01555`).
+
+| `ChunkId`, `ChunkFrom`, `ChunkTo`, `TableFrom`, `TableTo`, `TableChunkCounts`, `TableChunksCompletedCounts`
+| string / map
+| Incremental snapshot and chunked snapshot progress.
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-snapshot-metrics[Debezium -- Oracle connector snapshot metrics]
+
+How snapshots work, and how to restart one safely, is in xref:database/migration/initial-snapshots.adoc[Initial
+Snapshots] and xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots].
+
+=== Streaming metrics
+
+The streaming MBean exists from the moment the connector starts streaming. All connectors share a common set:
+
+[cols="2,1,3",options="header"]
+|===
+| Attribute | Type | Use in the migration
+
+| `Connected`
+| boolean
+| Whether the connector is connected to the database.
+
+| `MilliSecondsBehindSource`
+| long
+| Time between the change's timestamp in the source and its processing by the connector. `-1` before the first event.
+
+| `MilliSecondsBehindSourceMinValue`, `MilliSecondsBehindSourceMaxValue`, `MilliSecondsBehindSourceAverageValue`
+| long
+| Lag statistics since the connector started.
+
+| `MilliSecondsBehindSourceP50`, `MilliSecondsBehindSourceP95`, `MilliSecondsBehindSourceP99`
+| double
+| Lag percentiles, available while `statistics.metrics.enabled` is `true` (the default).
+
+| `MilliSecondsSinceLastEvent`, `LastEvent`
+| long / string
+| Time since the last event. Large values are normal on a quiet database without heartbeats.
+
+| `TotalNumberOfEventsSeen`, `TotalNumberOfCreateEventsSeen`, `TotalNumberOfUpdateEventsSeen`, `TotalNumberOfDeleteEventsSeen`
+| long
+| Throughput, and the mix of operations for capacity planning of the sinks.
+
+| `NumberOfCommittedTransactions`, `LastTransactionId`, `SourceEventPosition`
+| long / string / map
+| Position in the source and transaction count.
+
+| `NumberOfEventsFiltered`, `NumberOfUnchangedEventsSkipped`, `NumberOfErroneousEvents`
+| long
+| Filtered and skipped events. Erroneous events need investigation.
+
+| `QueueTotalCapacity`, `QueueRemainingCapacity`, `MaxQueueSizeInBytes`, `CurrentQueueSizeInBytes`
+| int / long
+| Back-pressure between the streaming thread and Kafka Connect.
+
+| `CapturedTables`
+| string[]
+| The tables the connector captures. Not exported as a number.
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-common-streaming-metrics[Debezium -- Oracle connector common streaming metrics]
+
+=== Oracle LogMiner streaming metrics
+
+The Oracle connector adds many LogMiner-specific attributes to the same streaming MBean. These are the ones that answer
+migration questions. The connector page lists about eighty in total.
+
+[cols="2,1,3",options="header"]
+|===
+| Attribute | Type | What it tells you
+
+| `CurrentScn`, `OffsetScn`, `CommittedScn`, `OldestScn`
+| BigInteger
+| The newest SCN processed, the SCN written to the offsets, the last committed SCN, and the oldest SCN still in the
+  transaction buffer. The archive logs from `OffsetScn` onwards must stay available.
+
+| `OldestScnAgeInMilliseconds`
+| long
+| Age of the oldest open transaction. A legacy batch job that keeps a transaction open shows here first.
+
+| `NumberOfActiveTransactions`, `NumberOfEventsInBuffer`
+| long
+| The size of the in-memory buffer, which drives the worker heap.
+
+| `AbandonedTransactionCount`, `TotalAbandonedTransactionCount`, `AbandonedTransactionIds`
+| long / string[]
+| Transactions dropped because they exceeded `log.mining.transaction.retention.ms`. Their changes are missing downstream.
+
+| `NumberOfOversizedTransactions`
+| long
+| Transactions discarded because they exceeded `log.mining.buffer.transaction.events.threshold`.
+
+| `LagFromSourceInMilliseconds`, `MaxLagFromSourceInMilliseconds`, `MinLagFromSourceInMilliseconds`
+| long
+| Time between a change in the logs and its arrival in the buffer.
+
+| `LastDurationOfFetchQueryInMilliseconds`, `MaxDurationOfFetchQueryInMilliseconds`, `LastBatchProcessingTimeInMilliseconds`
+| long
+| Cost of each mining query. Rising values point to LogMiner or dictionary problems.
+
+| `CurrentMinedLogCount`, `MinimumMinedLogCount`, `MaximumMinedLogCount`, `LogSwitchCount`
+| long
+| How many logs each session reads, and how often the database switches logs (log switches in the last day).
+
+| `ScnFreezeCount`
+| long
+| How often the SCN was found not to advance.
+
+| `TotalSchemaChangeParseErrorCount`
+| long
+| DDL records that the DDL parser could not parse. A non-zero value can mean a stale table schema.
+
+| `ErrorCount`, `WarningCount`
+| long
+| Errors and warnings detected by the streaming loop.
+
+| `MiningSessionProcessGlobalAreaMemoryInBytes`, `MiningSessionProcessGlobalAreaMaxMemoryInBytes`
+| long
+| PGA used by the LogMiner session in the database (relates to `ORA-04036`).
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-logminer-streaming-metrics[Debezium -- Oracle connector LogMiner streaming metrics]
+
+What each of these means for the connector's behaviour (mining windows, buffers, long-running transactions) is explained in
+xref:database/migration/oracle-connector.adoc[Oracle Connector].
+
+=== Schema history metrics
+
+The schema history MBean shows whether the connector could rebuild its table schemas at start-up:
+
+[cols="2,1,3",options="header"]
+|===
+| Attribute | Type | Meaning
+
+| `Status`
+| string
+| `STOPPED`, `RECOVERING` (reading the history topic) or `RUNNING`.
+
+| `RecoveryStartTime`, `ChangesRecovered`, `MilliSecondsSinceLastRecoveredChange`
+| long
+| Progress of the recovery at start-up. A long recovery means a large history topic.
+
+| `ChangesApplied`, `MilliSecondsSinceLastAppliedChange`, `LastRecoveredChange`, `LastAppliedChange`
+| long / string
+| DDL applied during recovery and while running.
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-schema-history-metrics[Debezium -- Oracle connector schema history metrics]
+
+Legacy DDL during the migration is covered in xref:database/migration/schema-changes-during-migration.adoc[Handling Schema
+Changes].
+
+== Looking at the MBeans directly
+
+Before building dashboards, it helps to look at the raw values. The Debezium Connect image offers two ways.
+
+*Remote JMX.* The image enables JMX when both `JMXPORT` and `JMXHOST` are set. `JMXHOST` is the address the JVM
+advertises to JMX clients, so `localhost` does not work from another container. The documentation suggests `0.0.0.0` or
+the Docker host's address. Then connect JConsole or JDK Mission Control to `<host>:<JMXPORT>`.
+
+*Jolokia.* With `ENABLE_JOLOKIA=true` the image's entrypoint starts the Jolokia JVM agent on port 8778, which serves the
+MBeans as JSON over HTTP. This is convenient for a quick check with `curl`, but it is not mentioned in the monitoring
+page and has no authentication in this form, so use it only in the lab.
+
+.compose.yaml fragment -- JMX and Jolokia on the Connect service
+[source,yaml]
+----
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    ports:
+      - 8083:8083
+      - 9012:9012
+      - 8778:8778
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=bookshop-connect
+      - CONFIG_STORAGE_TOPIC=bookshop_connect_configs
+      - OFFSET_STORAGE_TOPIC=bookshop_connect_offsets
+      - STATUS_STORAGE_TOPIC=bookshop_connect_statuses
+      - JMXPORT=9012
+      - JMXHOST=0.0.0.0
+      - ENABLE_JOLOKIA=true
+----
+Reference: https://debezium.io/documentation/reference/stable/operations/monitoring.html#kafka-connect-jmx-environment-variables-docker[Debezium -- Kafka Connect JMX environment variables in Docker]
+
+.Reading Oracle streaming metrics through Jolokia
+[source,shell]
+----
+curl -s "http://localhost:8778/jolokia/read/debezium.oracle:type=connector-metrics,context=streaming,server=legacy/MilliSecondsBehindSource"
+curl -s "http://localhost:8778/jolokia/read/debezium.oracle:type=connector-metrics,context=streaming,server=legacy/OffsetScn"
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-streaming-metrics[Debezium -- Oracle connector streaming metrics]
+
+Run against a PostgreSQL test connector, the same kind of request returned
+`+{"request":{"mbean":"debezium.postgres:context=streaming,server=lab,type=connector-metrics","attribute":"Connected","type":"read"},"value":true,...}+`.
+Note that JMX sorts the keys of the object name when it prints it, which does not matter for lookups.
+
+== Exporting metrics to Prometheus
+
+Prometheus cannot read JMX. The usual bridge is the Prometheus JMX exporter, a Java agent that runs inside the Connect
+JVM, reads the MBeans, turns them into Prometheus metrics with a set of regular-expression rules, and serves them over
+HTTP. The Debezium documentation points to the `monitoring` example in `debezium/debezium-examples` for the configuration
+and the dashboards. In that example:
+
+* `debezium-jmx-exporter/Dockerfile` builds an image from `quay.io/debezium/connect`, downloads
+  `jmx_prometheus_javaagent` (version 0.15.0) into `/kafka/etc`, and copies `config.yml` next to it;
+* `docker-compose.yml` starts Connect with
+  `KAFKA_OPTS=-javaagent:/kafka/etc/jmx_prometheus_javaagent.jar=8080:/kafka/etc/config.yml`, so the metrics are served
+  on port 8080;
+* `debezium-prometheus/Dockerfile` adds `connect:8080` to the Prometheus scrape targets;
+* `debezium-grafana` provisions the dashboards `debezium-dashboard.json` and `debezium-mysql-connector-dashboard.json`.
+
+These dashboards are not part of Debezium itself and are maintained on a best-effort basis.
+
+=== The JMX exporter rules
+
+This is the official `config.yml`, followed by two extra rules for this section: the per-connector worker metrics and the
+task status, which the alerts below need. The two extra rules are adapted from the Strimzi Kafka Connect example
+configuration.
+
+.debezium-jmx-exporter/config.yml -- official rules plus connector and task status
+[source,yaml]
+----
+startDelaySeconds: 0
+ssl: false
+lowercaseOutputName: false
+lowercaseOutputLabelNames: false
+rules:
+- pattern : "kafka.connect<type=connect-worker-metrics>([^:]+):"
+  name: "kafka_connect_worker_metrics_$1"
+- pattern : "kafka.connect<type=connect-metrics, client-id=([^:]+)><>([^:]+)"
+  name: "kafka_connect_metrics_$2"
+  labels:
+    client: "$1"
+- pattern: "debezium.([^:]+)<type=connector-metrics, context=([^,]+), server=([^,]+), key=([^>]+)><>RowsScanned"
+  name: "debezium_metrics_RowsScanned"
+  labels:
+    plugin: "$1"
+    name: "$3"
+    context: "$2"
+    table: "$4"
+- pattern: "debezium.([^:]+)<type=connector-metrics, server=([^,]+), task=([^,]+), context=([^,]+), database=([^>]+)>([^:]+)"
+  name: "debezium_metrics_$6"
+  labels:
+    plugin: "$1"
+    name: "$2"
+    task: "$3"
+    context: "$4"
+    database: "$5"
+- pattern: "debezium.([^:]+)<type=connector-metrics, server=([^,]+), task=([^,]+), context=([^>]+)>([^:]+)"
+  name: "debezium_metrics_$5"
+  labels:
+    plugin: "$1"
+    name: "$2"
+    task: "$3"
+    context: "$4"
+- pattern: "debezium.([^:]+)<type=connector-metrics, context=([^,]+), server=([^>]+)>([^:]+)"
+  name: "debezium_metrics_$4"
+  labels:
+    plugin: "$1"
+    name: "$3"
+    context: "$2"
+# Added for this section: per-connector task counts and task status
+- pattern: "kafka.connect<type=connect-worker-metrics, connector=([^>]+)><>([^:]+)"
+  name: "kafka_connect_worker_metrics_$2"
+  labels:
+    connector: "$1"
+- pattern: "kafka.connect<type=connector-task-metrics, connector=([^,]+), task=([^>]+)><>status: ([a-z-]+)"
+  name: "kafka_connect_connector_task_status"
+  value: 1
+  labels:
+    connector: "$1"
+    task: "$2"
+    status: "$3"
+----
+Reference: https://github.com/debezium/debezium-examples/blob/main/monitoring/debezium-jmx-exporter/config.yml[debezium-examples -- monitoring/debezium-jmx-exporter/config.yml] and https://github.com/strimzi/strimzi-kafka-operator/blob/1.3.1/packaging/examples/metrics/kafka-connect-metrics.yaml[Strimzi 1.3.1 example -- kafka-connect-metrics.yaml]
+
+How the rules work:
+
+* The exporter formats each attribute as `+domain<key=value, ...><>attribute: value+` (key order as registered), and the
+  first rule whose `pattern` matches wins.
+* The `debezium.` rules turn `debezium.oracle:type=connector-metrics,context=streaming,server=legacy` plus the attribute
+  `MilliSecondsBehindSource` into `+debezium_metrics_MilliSecondsBehindSource{plugin="oracle",name="legacy",context="streaming"}+`.
+  `lowercaseOutputName: false` keeps the CamelCase attribute names that the official dashboard queries.
+* The `task=` and `database=` variants serve connectors that register per-task MBeans (SQL Server, MongoDB and others
+  with several tasks or databases). The Oracle connector matches the last `debezium.` rule.
+* Only numeric and boolean attributes become metrics (booleans as `1.0`/`0.0`). String attributes such as `LastEvent` and
+  arrays such as `CapturedTables` are skipped, except where a rule turns the value into a label, as the task status rule
+  does.
+
+=== Running the agent with the Connect image
+
+The official example builds a derived image. A volume mount does the same without a build, which is handy in Compose.
+The configuration below was run with the 1.0.1 agent from Maven Central.
+
+.compose.yaml fragment -- Connect with the Prometheus JMX exporter agent
+[source,yaml]
+----
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    ports:
+      - 8083:8083
+      - 9404:8080
+    volumes:
+      # jmx_prometheus_javaagent-1.0.1.jar (renamed) and config.yml
+      - ./debezium-jmx-exporter:/kafka/etc:ro
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=bookshop-connect
+      - CONFIG_STORAGE_TOPIC=bookshop_connect_configs
+      - OFFSET_STORAGE_TOPIC=bookshop_connect_offsets
+      - STATUS_STORAGE_TOPIC=bookshop_connect_statuses
+      - KAFKA_OPTS=-javaagent:/kafka/etc/jmx_prometheus_javaagent.jar=8080:/kafka/etc/config.yml
+----
+Reference: https://github.com/debezium/debezium-examples/blob/main/monitoring/docker-compose.yml[debezium-examples -- monitoring/docker-compose.yml] and https://debezium.io/documentation/reference/stable/operations/monitoring.html#using-prometheus-grafana[Debezium -- Using Prometheus and Grafana]
+
+The agent listens on port 8080 inside the container, as in the official example, but is published on host port 9404:
+host port 8080 is already taken by Apicurio Registry (`localhost:8080`) in the stack of
+xref:database/migration/serialization-avro-and-schema-registries.adoc[Serialization & Schema Registries] and by the
+Debezium Server examples. Prometheus inside the Compose network still scrapes `connect:8080`.
+
+.Downloading the agent and checking the endpoint
+[source,shell]
+----
+mkdir -p debezium-jmx-exporter
+curl -fsSL -o debezium-jmx-exporter/jmx_prometheus_javaagent.jar \
+  https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/1.0.1/jmx_prometheus_javaagent-1.0.1.jar
+# copy config.yml from above into debezium-jmx-exporter/, then start the stack
+
+curl -s http://localhost:9404/metrics | grep -E '^debezium_metrics_(Connected|MilliSecondsBehindSource|QueueRemainingCapacity)'
+curl -s http://localhost:9404/metrics | grep -E '^kafka_connect_connector_task_status'
+----
+Reference: https://github.com/debezium/debezium-examples/blob/main/monitoring/debezium-jmx-exporter/Dockerfile[debezium-examples -- monitoring/debezium-jmx-exporter/Dockerfile]
+
+With a PostgreSQL test connector (`topic.prefix=lab`) the endpoint returned, among others:
+
+.Excerpt of /metrics from the test run
+[source,text]
+----
+debezium_metrics_Connected{context="streaming",name="lab",plugin="postgres"} 1.0
+debezium_metrics_MilliSecondsBehindSource{context="streaming",name="lab",plugin="postgres"} -1.0
+debezium_metrics_QueueRemainingCapacity{context="streaming",name="lab",plugin="postgres"} 8192.0
+debezium_metrics_QueueTotalCapacity{context="streaming",name="lab",plugin="postgres"} 8192.0
+debezium_metrics_RowsScanned{context="snapshot",name="lab",plugin="postgres",table="inventory.customers"} 4.0
+debezium_metrics_SnapshotCompleted{context="snapshot",name="lab",plugin="postgres"} 1.0
+debezium_metrics_TotalTableCount{context="snapshot",name="lab",plugin="postgres"} 5.0
+kafka_connect_connector_task_status{connector="lab-pg-source",status="running",task="0"} 1.0
+kafka_connect_worker_metrics_connector_failed_task_count{connector="lab-pg-source"} 0.0
+kafka_connect_worker_metrics_connector_running_task_count{connector="lab-pg-source"} 1.0
+jvm_memory_used_bytes{area="heap"} 1.61599312E8
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-monitoring[Debezium -- PostgreSQL connector monitoring]
+
+For `bookshop-oracle-source` the same series appear with `plugin="oracle"` and `name="legacy"`, plus the LogMiner and
+schema history attributes. Two things were observed in the run that matter for alerting: `MilliSecondsBehindSource` is
+`-1` until the first change is streamed, and after `PUT /connectors/<name>/stop` the task status series disappears
+instead of reporting `stopped`.
+
+One difference to the official dashboard: agent versions 1.x name the JVM metrics `jvm_memory_used_bytes` and so on,
+while the dashboard was built with the 0.15.0 agent and queries `jvm_memory_bytes_used`. With a current agent, edit the
+JVM panels, or they stay empty. The Debezium panels are not affected.
+
+=== Prometheus scrape configuration
+
+In Compose, add the Connect endpoint as a static target:
+
+.prometheus.yml -- scraping the Connect worker
+[source,yaml]
+----
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: bookshop-connect
+    static_configs:
+      - targets: ["connect:8080"]
+        labels:
+          pipeline: bookshop-migration
+----
+Reference: https://github.com/debezium/debezium-examples/blob/main/monitoring/debezium-prometheus/Dockerfile[debezium-examples -- monitoring/debezium-prometheus/Dockerfile]
+
+Service discovery and relabelling for larger set-ups are covered in
+xref:database/prometheus/service-discovery-and-relabeling.adoc[Service discovery & relabeling], and the exporter model in
+xref:database/prometheus/exporters-and-pushgateway.adoc[Exporters & the Pushgateway].
+
+=== On Kubernetes with Strimzi
+
+Strimzi bundles the JMX exporter agent in its Kafka images. The `KafkaConnect` resource from
+xref:database/migration/running-on-kubernetes.adoc[Running on Kubernetes] only needs a `metricsConfig` that points to a
+ConfigMap with the rules, and the Prometheus Operator finds the pods through a `PodMonitor` on the `tcp-prometheus` port.
+
+.bookshop-connect-metrics.yaml -- the rules ConfigMap and the KafkaConnect fragment that uses it
+[source,yaml]
+----
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bookshop-connect-metrics
+  namespace: bookshop-cdc
+data:
+  metrics-config.yml: |
+    lowercaseOutputName: false
+    lowercaseOutputLabelNames: false
+    rules:
+    - pattern: "debezium.([^:]+)<type=connector-metrics, context=([^,]+), server=([^,]+), key=([^>]+)><>RowsScanned"
+      name: "debezium_metrics_RowsScanned"
+      labels:
+        plugin: "$1"
+        name: "$3"
+        context: "$2"
+        table: "$4"
+    - pattern: "debezium.([^:]+)<type=connector-metrics, server=([^,]+), task=([^,]+), context=([^,]+), database=([^>]+)>([^:]+)"
+      name: "debezium_metrics_$6"
+      labels:
+        plugin: "$1"
+        name: "$2"
+        task: "$3"
+        context: "$4"
+        database: "$5"
+    - pattern: "debezium.([^:]+)<type=connector-metrics, server=([^,]+), task=([^,]+), context=([^>]+)>([^:]+)"
+      name: "debezium_metrics_$5"
+      labels:
+        plugin: "$1"
+        name: "$2"
+        task: "$3"
+        context: "$4"
+    - pattern: "debezium.([^:]+)<type=connector-metrics, context=([^,]+), server=([^>]+)>([^:]+)"
+      name: "debezium_metrics_$4"
+      labels:
+        plugin: "$1"
+        name: "$3"
+        context: "$2"
+    - pattern: "kafka.connect<type=connect-worker-metrics>([^:]+):"
+      name: "kafka_connect_worker_metrics_$1"
+    - pattern: "kafka.connect<type=connect-worker-metrics, connector=([^>]+)><>([^:]+)"
+      name: "kafka_connect_worker_metrics_$2"
+      labels:
+        connector: "$1"
+    - pattern: "kafka.connect<type=connector-task-metrics, connector=([^,]+), task=([^>]+)><>status: ([a-z-]+)"
+      name: "kafka_connect_connector_task_status"
+      value: 1
+      labels:
+        connector: "$1"
+        task: "$2"
+        status: "$3"
+---
+# Add to the spec of the KafkaConnect resource bookshop-connect:
+#
+#   metricsConfig:
+#     type: jmxPrometheusExporter
+#     valueFrom:
+#       configMapKeyRef:
+#         name: bookshop-connect-metrics
+#         key: metrics-config.yml
+#
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: bookshop-connect-metrics
+  namespace: bookshop-cdc
+spec:
+  selector:
+    matchLabels:
+      strimzi.io/kind: KafkaConnect
+      strimzi.io/cluster: bookshop-connect
+  podMetricsEndpoints:
+    - path: /metrics
+      port: tcp-prometheus
+----
+Reference: https://strimzi.io/docs/operators/latest/deploying.html#assembly-metrics-str[Strimzi -- Introducing metrics], https://strimzi.io/docs/operators/latest/configuring.html#type-JmxPrometheusExporterMetrics-reference[Strimzi -- JmxPrometheusExporterMetrics schema reference] and https://github.com/strimzi/strimzi-kafka-operator/blob/1.3.1/packaging/examples/metrics/prometheus-install/pod-monitors/kafka-resources-metrics.yaml[Strimzi 1.3.1 example -- PodMonitor for Kafka resources]
+
+The Strimzi example rules for Kafka Connect use `lowercaseOutputName: true` and a different metric naming. If you merge
+them with the Debezium rules, keep one naming convention, or the official Debezium dashboard queries no longer match.
+Monitoring Kubernetes workloads in general is covered in
+xref:database/prometheus/containers-and-kubernetes-monitoring.adoc[Containers & Kubernetes monitoring] and
+xref:backend/kubernetes/observability-logging-and-metrics.adoc[Observability: Logging, Metrics and Tracing].
+
+=== Debezium Server and the Management Platform
+
+The Debezium Server image ships the JMX exporter agent (`/debezium/lib_metrics/jmx_prometheus_javaagent-1.0.1.jar` in
+3.7.1.Final) and the OpenTelemetry Java agent. With the Debezium Operator, `spec.runtime.metrics.jmxExporter.enabled: true`
+turns the exporter on, and `configFrom` (a config map key reference) supplies your own rules, such as the ones above.
+`spec.runtime.metrics.openTelemetry` instead exports the JMX metrics through OTLP to a collector. The Management Platform
+uses that OpenTelemetry route: each pipeline's server sends metrics to an OpenTelemetry Collector, Prometheus stores them,
+and the platform UI shows built-in panels (event rates, source lag, time since the last event, queue usage, snapshot
+progress).
+
+Reference: https://debezium.io/documentation/reference/stable/operations/debezium-operator.html#debezium-operator-schema-reference-jmxexporter[Debezium Operator -- JmxExporter schema reference] and https://debezium.io/documentation/reference/stable/operations/debezium-platform.html#debezium-platform-monitoring-architecture[Debezium Management Platform -- Monitoring architecture]
+
+== Grafana dashboards
+
+Import `debezium-dashboard.json` from the example into Grafana and select the Prometheus data source. Its panels query the
+`+debezium_metrics_*+` series by `plugin`, `name` and `context`: `Connected`, `MilliSecondsSinceLastEvent`,
+`TotalNumberOfEventsSeen`, `NumberOfEventsSkipped`, the snapshot panels (`SnapshotRunning`, `SnapshotCompleted`,
+`SnapshotAborted`, `TotalTableCount`, `RemainingTableCount`, `RowsScanned`), and the JVM and Kafka Connect byte rates.
+`debezium-mysql-connector-dashboard.json` is a richer dashboard for the MySQL connector.
+
+For the Bookshop migration, add a row with the migration-specific panels that the official dashboard lacks:
+
+* `+debezium_metrics_MilliSecondsBehindSource{plugin="oracle",name="legacy",context="streaming"}+` and the `P95` series;
+* `debezium_metrics_OldestScnAgeInMilliseconds` and `debezium_metrics_NumberOfActiveTransactions`;
+* `1 - debezium_metrics_QueueRemainingCapacity / debezium_metrics_QueueTotalCapacity` (queue usage);
+* the consumer lag of the JDBC sink group (`connect-bookshop-pg-mirror-sink`) and of `bookshop-legacy-sync`, from a Kafka
+  exporter, as described in xref:backend/messaging/kafka-operations-and-monitoring.adoc[Kafka Operations and Monitoring].
+
+Reference: https://github.com/debezium/debezium-examples/tree/main/monitoring/debezium-grafana[debezium-examples -- monitoring/debezium-grafana]
+
+Dashboard building is covered in xref:database/prometheus/grafana-dashboards-and-visualization.adoc[Grafana: Dashboards &
+visualization].
+
+== Alerts that matter in a migration
+
+The rules below cover the failures that silently break a migration. Thresholds are starting points for the Bookshop
+volume. Tune them to your legacy workload, and route them through
+xref:database/prometheus/alertmanager.adoc[Alertmanager]. Writing rules in general is covered in
+xref:database/prometheus/recording-and-alerting-rules.adoc[Recording & alerting rules].
+
+.bookshop-cdc-alerts.yaml -- PrometheusRule for the Debezium side of the migration
+[source,yaml]
+----
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bookshop-cdc-alerts
+  namespace: bookshop-cdc
+spec:
+  groups:
+    - name: bookshop-cdc
+      rules:
+        - alert: DebeziumTaskFailed
+          expr: kafka_connect_connector_task_status{connector=~"bookshop-.*", status="failed"} == 1
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Connector {{ $labels.connector }} task {{ $labels.task }} has FAILED"
+            description: "Read the trace with GET /connectors/{{ $labels.connector }}/status and fix the cause before restarting."
+
+        - alert: DebeziumOracleSourceNotRunning
+          expr: absent(kafka_connect_connector_task_status{connector="bookshop-oracle-source", status="running"})
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "bookshop-oracle-source has no RUNNING task (stopped, paused, deleted or rebalancing)"
+
+        - alert: DebeziumOracleDisconnected
+          expr: debezium_metrics_Connected{plugin="oracle", name="legacy", context="streaming"} == 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "The Oracle connector is not connected to the legacy database"
+
+        - alert: DebeziumStreamingLagHigh
+          expr: debezium_metrics_MilliSecondsBehindSource{plugin="oracle", name="legacy", context="streaming"} > 300000
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The Oracle connector is more than 5 minutes behind the legacy database"
+
+        - alert: DebeziumNoEvents
+          expr: debezium_metrics_MilliSecondsSinceLastEvent{plugin="oracle", name="legacy", context="streaming"} > 120000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No event (not even a heartbeat change) for 2 minutes"
+
+        - alert: DebeziumQueueSaturated
+          expr: |
+            debezium_metrics_QueueRemainingCapacity{plugin="oracle", name="legacy"}
+              / debezium_metrics_QueueTotalCapacity{plugin="oracle", name="legacy"} < 0.1
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The {{ $labels.context }} queue is more than 90% full: Kafka or the converters are the bottleneck"
+
+        - alert: LegacyLongRunningTransaction
+          expr: debezium_metrics_OldestScnAgeInMilliseconds{plugin="oracle", name="legacy"} > 3600000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A legacy transaction has been open for more than 1 hour"
+            description: "Find it in V$TRANSACTION. Check log.mining.transaction.retention.ms before it is abandoned."
+
+        - alert: DebeziumAbandonedTransactions
+          expr: increase(debezium_metrics_TotalAbandonedTransactionCount{plugin="oracle", name="legacy"}[1h]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: "The Oracle connector abandoned a transaction: its changes are missing downstream"
+
+        - alert: DebeziumErroneousEvents
+          expr: increase(debezium_metrics_NumberOfErroneousEvents{plugin="oracle", name="legacy"}[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "The connector reported erroneous events in the {{ $labels.context }} phase"
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-streaming-metrics[Debezium -- Oracle connector streaming metrics] and https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+
+Notes on these rules:
+
+* *Failed versus absent.* `DebeziumTaskFailed` catches a task that Connect marked `FAILED`. It cannot catch a connector that
+  was stopped, deleted or never deployed, because then the series does not exist. `DebeziumOracleSourceNotRunning` uses
+  `absent()` for that. Silence it during planned maintenance.
+* *`MilliSecondsSinceLastEvent` needs heartbeats.* With `heartbeat.action.query` updating `BOOKSHOP.DEBEZIUM_HEARTBEAT`
+  every 10 seconds, a quiet legacy database still produces a change every 10 seconds, so two minutes without an event is
+  a real problem. Without the heartbeat query, this rule fires every night.
+* *Lag is per stage.* `MilliSecondsBehindSource` measures only the source connector. The JDBC sink and the `bookshop`
+  application add their own lag, measured as Kafka consumer group lag. The end-to-end lag for the cut-over decision is
+  the sum, or the difference between the `source.ts_ms` of the last applied event and the current time, as described in
+  xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation].
+* *Long transactions.* `OldestScnAgeInMilliseconds` grows while a legacy transaction stays open. Debezium cannot emit any
+  of its changes before the commit, and the offset `scn` cannot advance past its start, so the archive logs from that
+  point must be kept. An alert at one hour gives the DBA time to act before `log.mining.transaction.retention.ms` drops it.
+
+=== Database-side checks
+
+Some risks are visible only in the databases, not in the connector:
+
+.Oracle -- archive log space and the oldest log that is still on disk
+[source,sql]
+----
+-- Space of the fast recovery area, where the archive logs normally live
+SELECT name, space_limit, space_used, space_reclaimable, number_of_files
+  FROM v$recovery_file_dest;
+
+-- The oldest archive log still available: its FIRST_CHANGE# must stay below the connector's OffsetScn
+SELECT MIN(first_change#) AS oldest_available_scn
+  FROM v$archived_log
+ WHERE deleted = 'NO' AND status = 'A';
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Debezium -- Oracle connector FAQ (offset SCN not found in the logs)]
+
+.PostgreSQL -- WAL retained by the reverse replication slot
+[source,sql]
+----
+SELECT slot_name,
+       active,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed
+  FROM pg_replication_slots
+ WHERE slot_name = 'bookshop_reverse';
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-monitoring[Debezium -- PostgreSQL connector monitoring] and https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots]
+
+An inactive slot keeps WAL forever and can fill the disk of the new database. That matters most after the cut-over, when
+the reverse replication of xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication]
+runs from PostgreSQL. Export these queries as metrics with a SQL or PostgreSQL exporter and alert on growth, for example
+when `retained_wal` exceeds a few gigabytes or the slot is inactive for more than ten minutes.
+
+== Java Flight Recorder
+
+The Connect image can start a JDK Flight Recorder recording at start-up, which is the cheapest way to see where a slow
+connector spends its time (LogMiner fetches, converters, garbage collection) without a profiler. Set `ENABLE_JFR=true`.
+Variables prefixed with `+JFR_RECORDING_+` become options of `-XX:StartFlightRecording` (the rest of the name is
+lower-cased and `+_+` becomes `-`), and `+JFR_OPT_+` variables become `-XX:FlightRecorderOptions`.
+
+.compose.yaml fragment -- a continuous recording that is written when the worker stops
+[source,yaml]
+----
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    volumes:
+      - ./jfr:/kafka/jfr
+    environment:
+      - ENABLE_JFR=true
+      - JFR_RECORDING_FILENAME=/kafka/jfr/connect.jfr
+      - JFR_RECORDING_DUMPONEXIT=true
+----
+Reference: https://debezium.io/documentation/reference/stable/operations/monitoring.html#java-flight-recorder[Debezium -- Java Flight Recording]
+
+In the test run, the entrypoint logged `-XX:StartFlightRecording=dumponexit=true,filename=/kafka/jfr/connect.jfr` and
+`docker compose stop connect` left a 7 MB `connect.jfr` in the mounted directory. The documentation suggests dumping a
+running recording with `jcmd`, but the 3.7.1 image contains a Java 25 runtime without `jcmd` (its `bin` directory has
+`java`, `keytool` and `rmiregistry` only). Dump on exit as above, or connect JDK Mission Control over JMX (`JMXPORT` and
+`JMXHOST`) and dump the recording from there. The `jfr` directory must be writable by the container user.
+
+== Logging
+
+=== The default configuration
+
+Kafka Connect and Debezium log through Log4j. Debezium logs a lot while a connector starts (configuration, grants,
+snapshot steps) and little while it keeps up. In the Debezium Connect image, the configuration is
+`/kafka/config/log4j.properties` (Kafka 4.3 uses Log4j 2 with the Log4j 1 compatibility bridge, which reads that file).
+Logs go to the console, and so to `docker logs` and `kubectl logs`, and to files under `/kafka/logs`. Strimzi's Connect
+image uses a Log4j 2 configuration, which you change through `spec.logging` (see
+xref:database/migration/running-on-kubernetes.adoc[Running on Kubernetes]).
+
+The container image reads three kinds of environment variables:
+
+* `LOG_LEVEL` sets the level of the root logger and the console appender threshold (`LOG_LEVEL=DEBUG` makes everything
+  verbose, which is rarely what you want);
+* `CONNECT_LOG4J_LOGGERS` replaces the `log4j.rootLogger` value;
+* any other `+CONNECT_LOG4J_*+` variable is mapped to a property by removing `CONNECT_`, lower-casing the rest and replacing
+  `_` with `.`, so `CONNECT_LOG4J_LOGGER_IO_DEBEZIUM_CONNECTOR_ORACLE=DEBUG, stdout` adds
+  `log4j.logger.io.debezium.connector.oracle=DEBUG, stdout`.
+
+.compose.yaml fragment -- Oracle connector at DEBUG, everything else at INFO
+[source,yaml]
+----
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    environment:
+      - CONNECT_LOG4J_LOGGER_IO_DEBEZIUM_CONNECTOR_ORACLE=DEBUG, stdout
+      - CONNECT_LOG4J_ADDITIVITY_IO_DEBEZIUM_CONNECTOR_ORACLE=false
+----
+Reference: https://debezium.io/documentation/reference/stable/operations/logging.html#configuring-log-level-docker[Debezium -- Configuring the log level in the Debezium container images] and https://debezium.io/documentation/reference/stable/operations/logging.html#changing-logging-level[Debezium -- Setting the logging level by configuring loggers]
+
+The `additivity` line stops the messages from also going to the root logger's appenders, which would print them twice.
+Because property names are lower-cased by the mapping, this route cannot set properties whose names contain capitals,
+such as `ConversionPattern`. For those, provide the whole file, as in the next section.
+
+=== Diagnostic contexts: which connector wrote this line?
+
+A Connect worker runs many threads for several connectors. Debezium sets mapped diagnostic context (MDC) values on its
+threads so that each line can carry the connector type, the connector's logical name and the activity. The documented
+keys are `dbz.connectorType` (for example `Oracle`, `Postgres`), `dbz.connectorLogicalName` (the `topic.prefix`, so
+`legacy`) and `dbz.connectorContext` (for example `snapshot`, `streaming`). The 3.7.1 code also sets `dbz.taskId` and
+`dbz.databaseName`.
+
+The `log4j.properties` in the 3.7.1 Connect image uses `+%X{dbz.connectorName}+`, a key that Debezium does not set, so the
+middle field of every line is empty. The test run logged lines such as `INFO   Postgres||snapshot  Snapshot completed`.
+Replacing the key fixes it:
+
+.log4j.properties -- the image's file with the documented MDC keys
+[source,properties]
+----
+kafka.logs.dir=logs
+
+log4j.rootLogger=INFO, stdout, appender
+
+# Disable excessive reflection warnings - KAFKA-5229
+log4j.logger.org.reflections=ERROR
+
+log4j.appender.stdout=org.apache.log4j.ConsoleAppender
+log4j.appender.stdout.threshold=INFO
+log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
+log4j.appender.stdout.layout.ConversionPattern=%d{ISO8601} %-5p  %X{dbz.connectorType}|%X{dbz.connectorLogicalName}|%X{dbz.connectorContext}|%X{dbz.taskId}  %m   [%c]%n
+
+log4j.appender.appender=org.apache.log4j.DailyRollingFileAppender
+log4j.appender.appender.DatePattern='.'yyyy-MM-dd-HH
+log4j.appender.appender.File=${kafka.logs.dir}/connect-service.log
+log4j.appender.appender.layout=org.apache.log4j.PatternLayout
+log4j.appender.appender.layout.ConversionPattern=%d{ISO8601} %-5p  %X{dbz.connectorType}|%X{dbz.connectorLogicalName}|%X{dbz.connectorContext}|%X{dbz.taskId}  %m   [%c]%n
+----
+Reference: https://debezium.io/documentation/reference/stable/operations/logging.html#adding-mapped-diagnostic-contexts[Debezium -- Setting the logging level with mapped diagnostic contexts]
+
+Mount it over `/kafka/config/log4j.properties` (writable, because the entrypoint edits the file in place when `LOG_LEVEL`
+or `+CONNECT_LOG4J_*+` variables are set), or copy it into a derived image as the documentation suggests. With the file
+mounted, the test run logged `INFO   Postgres|lab|streaming|0  Processing messages`, and for Bookshop the lines read
+`Oracle|legacy|streaming|0`. In a log platform, parse the four fields into labels so you can filter all lines of the
+legacy source, or only its snapshot thread.
+
+=== Changing log levels at runtime
+
+The Kafka Connect admin endpoint changes a logger's level immediately, without a restart. The change applies to the
+worker that receives the request and is not persisted: it is lost when the worker restarts.
+
+.Turning on DEBUG for the Oracle connector, checking it, and turning it off again
+[source,shell]
+----
+curl -s -X PUT -H "Content-Type: application/json" \
+  http://localhost:8083/admin/loggers/io.debezium.connector.oracle -d '{"level": "DEBUG"}'
+# returns the list of loggers whose level changed
+
+curl -s http://localhost:8083/admin/loggers/io.debezium.connector.oracle
+# {"level":"DEBUG","last_modified":...}
+
+curl -s -X PUT -H "Content-Type: application/json" \
+  http://localhost:8083/admin/loggers/io.debezium.connector.oracle -d '{"level": "INFO"}'
+----
+Reference: https://debezium.io/documentation/reference/stable/operations/logging.html#setting-the-logging-level-with-the-kafka-connect-rest-api[Debezium -- Dynamically setting the logging level with the Kafka Connect REST API] and https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect admin REST API]
+
+With several workers (two on Kubernetes), send the request to the worker that runs the task (shown by
+`GET /connectors/bookshop-oracle-source/status`), or add `?scope=cluster` to the `PUT`, which Kafka Connect 3.7 and later
+apply to every worker in the cluster. Both forms were accepted by the 3.7.1 image in the test run. A `scope=cluster`
+request returns `204 No Content` instead of the list of changed loggers.
+
+DEBUG on the whole `io.debezium.connector.oracle` package is verbose at production volumes. Narrow it down to the class
+that is involved (the log line's `+[...]+` suffix shows it), as the logging page recommends, and turn it off after the
+investigation. Never leave TRACE on: at that level the connector can log row values, which may include personal data (see
+xref:database/migration/security-and-data-protection.adoc[Security & Data Protection]).
+
+== Tracing with OpenTelemetry
+
+Distributed tracing follows one business operation across services. For CDC, the chain is: the application writes to
+the database, Debezium reads the change, Kafka carries it, and a consumer applies it. Debezium supports OpenTelemetry for
+this chain with the `io.debezium.transforms.tracing.ActivateTracingSpan` SMT:
+
+. If the row carries a serialised span context (a `java.util.Properties` value in a column, `tracingspancontext` by
+  default), the SMT extracts it as the parent.
+. It creates a `db-log-write` span starting at the database log write time, with the `source` block fields as tags, and a
+  `debezium-read` processing span as its child, starting at the processing time.
+. It injects the processing span context into the Kafka message headers, so that a consumer can continue the trace.
+
+For the Bookshop *legacy* source, step 1 never happens: the Struts application does not write span contexts into Oracle.
+The SMT then starts a new trace per change event (`tracing.with.context.field.only=false`, the default), which still
+shows how long each event took from the redo log to Kafka and through the new application, but not which legacy user
+request caused it. For the *new* application's outbox (see xref:database/migration/outbox-event-router.adoc[Outbox Event
+Router]), the Outbox Quarkus extension writes the span context and the Event Router SMT continues the trace end to end.
+
+.Connector fragment -- the tracing SMT on bookshop-oracle-source
+[source,json]
+----
+{
+  "transforms": "tracing",
+  "transforms.tracing.type": "io.debezium.transforms.tracing.ActivateTracingSpan",
+  "transforms.tracing.tracing.operation.name": "debezium-read",
+  "transforms.tracing.tracing.with.context.field.only": "false"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/integrations/tracing.html#_activatetracingspan_smt[Debezium -- ActivateTracingSpan SMT] and https://debezium.io/documentation/reference/stable/integrations/tracing.html#_configuration_options[Debezium -- Tracing configuration options]
+
+The SMT options are named `+tracing.*+` themselves, which gives the doubled `transforms.tracing.tracing.` prefix. If the
+connector already has transforms, add `tracing` to the existing `transforms` list. Order matters: put it first, so that
+it sees the original envelope.
+
+The SMT needs the OpenTelemetry API on the Connect class path and the OpenTelemetry Java agent (the SDK) in the JVM. In
+the Connect image, the API JARs are in `/kafka/external_libs/otel` (version 1.23.x) and are added to the plug-ins when
+`ENABLE_OTEL=true`. The agent is not included, so download `io.opentelemetry.javaagent:opentelemetry-javaagent` from Maven
+Central and start it with `KAFKA_OPTS`. The settings below are the ones the documentation says Debezium was tested with
+(`otel.traces.exporter=otlp`, `otel.propagators=tracecontext`), expressed as environment variables.
+
+.compose.yaml fragment -- Connect with OpenTelemetry tracing
+[source,yaml]
+----
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    volumes:
+      - ./otel/opentelemetry-javaagent.jar:/kafka/otel/opentelemetry-javaagent.jar:ro
+    environment:
+      - ENABLE_OTEL=true
+      - KAFKA_OPTS=-javaagent:/kafka/otel/opentelemetry-javaagent.jar
+      - OTEL_SERVICE_NAME=bookshop-connect
+      - OTEL_TRACES_EXPORTER=otlp
+      - OTEL_PROPAGATORS=tracecontext
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+      - OTEL_METRICS_EXPORTER=none
+      - OTEL_LOGS_EXPORTER=none
+----
+Reference: https://debezium.io/documentation/reference/stable/integrations/tracing.html#open-telemetry-docker-installation[Debezium -- Using Docker to install OpenTelemetry] and https://debezium.io/documentation/reference/stable/integrations/tracing.html#_configuring_opentelemetry[Debezium -- Configuring OpenTelemetry]
+
+If the agent's own Kafka instrumentation is active, the Kafka producer span is created by the agent. The documentation
+describes an alternative: install the `debezium-interceptor` artifact (`io.debezium:debezium-interceptor`, which contains
+`io.debezium.tracing.DebeziumTracingProducerInterceptor`) and disable the automatic instrumentation with
+`otel.instrumentation.common.default-enabled=false`, so that the interceptor propagates the Debezium span context to the
+producer span. `KAFKA_OPTS` holds a single `-javaagent` here. If you also run the JMX exporter agent, list both
+`-javaagent` options in the same variable.
+
+On the consumer side, Spring for Apache Kafka continues the trace from the `traceparent` header when observation is
+enabled on the listener container (`spring.kafka.listener.observation-enabled=true` with Micrometer Tracing and the
+OpenTelemetry bridge), as described in xref:backend/messaging/spring-boot-kafka.adoc[Spring Boot and Kafka]. Then a trace
+shows the `debezium-read` span, the Kafka hop, and the `LegacyBookTranslator` processing in one view.
+
+== Lineage with OpenLineage
+
+Tracing follows events. Lineage follows datasets: which legacy tables feed which topics, and which topics feed which
+tables of the new database. For a migration this is the map auditors and data owners ask for ("where does
+`public.book.price` come from?"). Debezium emits OpenLineage run events (`START`, `RUNNING`, `COMPLETE`, `FAIL`) in which
+the connector is a *job* (named after `topic.prefix` and the task, for example `legacy.0`), the captured tables are
+*input datasets* with their columns, and the Kafka topics are *output datasets*. The JDBC and MongoDB sinks emit the
+reverse mapping, from topics to tables, when they run in Kafka Connect.
+
+The integration needs the JARs of the `debezium-openlineage-core` libs archive
+(`debezium-openlineage-core-3.7.1.Final-libs.tar.gz` on Maven Central) extracted into the Debezium plug-in directories,
+an `openlineage.yml` file for the OpenLineage client, and the following connector properties:
+
+.Connector fragment -- OpenLineage on bookshop-oracle-source
+[source,json]
+----
+{
+  "openlineage.integration.enabled": "true",
+  "openlineage.integration.config.file.path": "/kafka/openlineage.yml",
+  "openlineage.integration.job.namespace": "bookshop-migration",
+  "openlineage.integration.job.description": "CDC from the legacy BOOKSHOP Oracle schema",
+  "openlineage.integration.job.tags": "env=production,phase=migration,source=oracle",
+  "openlineage.integration.job.owners": "Bookshop migration team=maintainer",
+  "transforms": "openlineage",
+  "transforms.openlineage.type": "io.debezium.transforms.openlineage.OpenLineage"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/integrations/openlineage.html#debezium-openlineage-kafka-connect-configuration[Debezium -- OpenLineage Kafka Connect configuration] and https://debezium.io/documentation/reference/stable/integrations/openlineage.html#debezium-openlineage-kafka-connect-output-dataset-lineage[Debezium -- Kafka Connect output dataset lineage]
+
+.openlineage.yml -- send lineage events to an OpenLineage-compatible server
+[source,yaml]
+----
+transport:
+  type: http
+  url: http://marquez:5000
+  endpoint: /api/v1/lineage
+----
+Reference: https://debezium.io/documentation/reference/stable/integrations/openlineage.html#debezium-openlineage-configuring-the-openlineage-client[Debezium -- Configuring the OpenLineage client]
+
+The `OpenLineage` SMT is what produces the output datasets in Kafka Connect, so it must be in the `transforms` list. If
+the connector also uses the tracing SMT, combine them as `"transforms": "tracing,openlineage"`. Use
+`transport.type: console` first to see the events in the worker log before you point the client at a lineage server.
+
+== What goes wrong
+
+[cols="1,2",options="header"]
+|===
+| Symptom | Cause and fix
+
+| No `+debezium_metrics_*+` series, but `+jvm_*+` series are present
+| The connector has not started, or the rules do not match. Check the MBean names with Jolokia or JConsole. With
+  `custom.metric.tags`, add a rule for the extra keys.
+
+| Only snapshot metrics, or only streaming metrics
+| Snapshot metrics exist only while a snapshot runs or after one ran since the last start. Streaming metrics appear when
+  streaming starts. Both are normal.
+
+| `MilliSecondsBehindSource` is `-1`
+| No change has been streamed since the connector started. Normal right after a start or on a quiet database without
+  heartbeats.
+
+| The JVM panels of the official dashboard are empty
+| The dashboard queries 0.15-era names (`jvm_memory_bytes_used`). JMX exporter 1.x exports `jvm_memory_used_bytes`.
+
+| JMX clients cannot connect to the container
+| `JMXHOST` is `localhost`, or only one of `JMXPORT` and `JMXHOST` is set, or the JMX port is not published with the same
+  number inside and outside the container.
+
+| The middle field of the log pattern is empty
+| The image's pattern uses `dbz.connectorName`. Use `dbz.connectorLogicalName`.
+
+| A log level change via `/admin/loggers` "does nothing"
+| The request went to a worker that does not run the task. Use `?scope=cluster` or target the right worker. Changes are
+  lost on restart.
+
+| `ClassNotFoundException` for an OpenTelemetry class when the tracing SMT starts
+| `ENABLE_OTEL=true` is missing, so the API JARs were not added to the plug-ins.
+
+| The worker fails to start after adding a second Java agent
+| Two `KAFKA_OPTS` definitions overwrite each other. Put all `-javaagent` options in one value.
+|===
+Reference: https://debezium.io/documentation/reference/stable/operations/monitoring.html[Debezium -- Monitoring] and https://debezium.io/documentation/reference/stable/operations/logging.html[Debezium -- Logging]
+
+Connector failures themselves (missing archive logs, slot problems, schema history corruption) are in
+xref:database/migration/troubleshooting-and-failure-recovery.adoc[Troubleshooting & Failure Recovery].
+
+== References
+
+* https://debezium.io/documentation/reference/stable/operations/monitoring.html[Debezium -- Monitoring Debezium]
+* https://debezium.io/documentation/reference/stable/operations/logging.html[Debezium -- Logging]
+* https://debezium.io/documentation/reference/stable/integrations/tracing.html[Debezium -- OpenTelemetry]
+* https://debezium.io/documentation/reference/stable/integrations/openlineage.html[Debezium -- OpenLineage]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-monitoring[Debezium -- Oracle connector monitoring]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-monitoring[Debezium -- PostgreSQL connector monitoring]
+* https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-monitoring[Debezium -- MySQL connector monitoring]
+* https://debezium.io/documentation/reference/stable/operations/debezium-operator.html#debezium-operator-schema-reference-metrics[Debezium Operator -- Metrics schema reference]
+* https://debezium.io/documentation/reference/stable/operations/debezium-platform.html#_pipeline_monitoring[Debezium Management Platform -- Pipeline monitoring]
+* https://github.com/debezium/debezium-examples/tree/main/monitoring[debezium-examples -- monitoring (JMX exporter configuration, Prometheus and Grafana dashboards)]
+* https://github.com/prometheus/jmx_exporter[Prometheus JMX exporter]
+* https://strimzi.io/docs/operators/latest/deploying.html#assembly-metrics-str[Strimzi -- Introducing metrics]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (including admin/loggers)]
+* https://opentelemetry.io/docs/zero-code/java/agent/[OpenTelemetry -- Java agent]
+* https://openlineage.io/docs/[OpenLineage documentation]
+* https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots]
+
+The Prometheus, Jolokia, JFR and logging steps on this page were run with Docker on 2026-11-09 against a PostgreSQL test
+connector. The Oracle metric names, the Strimzi resources, the alert rules, tracing and lineage are derived from the
+official documentation and were not run.
