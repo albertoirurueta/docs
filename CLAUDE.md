@@ -34,12 +34,16 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   editing this file's `content.sources` list**, not writing new pages here.
 - The playbook also wires up the UI (`ui-bundle.zip`, a custom Antora UI bundle used with `snapshot: true`) and
   Antora/Asciidoctor extensions: `@sntke/antora-mermaid-extension` (`[mermaid]` diagram blocks) and
-  `@djencks/asciidoctor-mathjax` (LaTeX via `\( \)` / `\[ \]`) are active, and so is
+  `@djencks/asciidoctor-mathjax` (LaTeX math) are active, and so is
   `@antora/collector-extension`, which the site now depends on: the `irurueta-auth-server` example's
   `docs/antora.yml` uses `ext.collector` to populate its `example$` family, and the pages' includes fail without
   it. `@antora/lunr-extension` (site search) is
   currently commented out, so site search is disabled. Any doc content using diagrams or math depends on the
   active extensions staying configured here.
+- **Math needs `:stem: latexmath` in the page header** and is written as `stem:[…]` inline or as a `[stem]` block
+  delimited by `++++`. Bare `\( \)` / `\[ \]` in the AsciiDoc source are not converted and render as raw LaTeX, and the
+  Antora build reports nothing. Braces inside LaTeX that look like `{name}` attributes trigger "missing attribute"
+  warnings, so check the build output and the rendered page.
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
   `modules/ROOT/nav.adoc`. This is the site's landing/root component — its pages don't describe this repo, they
   describe the overall site and link out to each remote component.
