@@ -1,0 +1,285 @@
+= Performance Tuning Guide
+:description: A checklist of the PyTorch 2.15 performance recommendations from the official tuning guide, with runnable examples: data loading, gradient zeroing, channels_last, mixed precision, TF32, cuDNN autotuning, avoiding CPU-GPU syncs, CPU thread and allocator settings, and distributed tips.
+:keywords: PyTorch performance, tuning guide, DataLoader num_workers, pin_memory, set_to_none, channels_last, cudnn.benchmark, set_float32_matmul_precision, TF32, CUDA graphs, non_blocking, OMP_NUM_THREADS, DistributedDataParallel, no_sync, profiling
+
+include::partial$ml-pytorch-disclaimer.adoc[]
+
+Most slow PyTorch training jobs are not slow because of the framework. They are slow because the GPU is waiting for data, because the host synchronises with the device every step, because the arithmetic runs in float32 where lower precision would do, or because many tiny kernels are launched instead of a few fused ones. The official Performance Tuning Guide is a checklist of such fixes. This page walks through it item by item, adds the context needed to apply each item safely and ends with a recommended order of work.
+
+Examples were run on Python 3.13 with PyTorch 2.15 (CPU) on 2026-10-31; the CUDA graphs example (`mode="reduce-overhead"`) needs a CUDA GPU and was not executed. Always measure on your own hardware, because the size of every effect depends on the model, the GPU generation and the batch size. Measure first with the xref:ml/pytorch/profiling.adoc[profiler] so that you fix the real bottleneck.
+
+== Measure before tuning
+
+Two rules make tuning honest. First, CUDA kernels run asynchronously, so a naive timer measures launch time, not execution time. Call `torch.cuda.synchronize()` before reading the clock, or use CUDA events. Second, discard the first iterations: they include cuDNN autotuning, memory-pool growth and (with `torch.compile`) compilation.
+
+[source,python]
+----
+import time
+import torch
+
+
+def time_step(step_fn, warmup=5, iters=20):
+    for _ in range(warmup):
+        step_fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    for _ in range(iters):
+        step_fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return (time.perf_counter() - start) / iters
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+== General optimisations
+
+=== Load data asynchronously and pin memory
+
+Set `num_workers` greater than zero on the `DataLoader` so loading and augmentation overlap with training, and set `pin_memory=True` when training on a GPU so host-to-device copies use page-locked memory. Combine pinned memory with `non_blocking=True` copies so that the transfer overlaps with compute. The details (worker counts, prefetching, samplers, persistent workers) are in xref:ml/pytorch/dataloader-performance.adoc[Workers, Pinned Memory & Samplers].
+
+[source,python]
+----
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+ds = TensorDataset(torch.randn(1024, 32), torch.randint(0, 10, (1024,)))
+loader = DataLoader(ds, batch_size=64, shuffle=True,
+                    num_workers=4, pin_memory=True, persistent_workers=True)
+
+if __name__ == "__main__":         # required where workers start with spawn (macOS, Windows)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        break
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+On platforms that start workers with `spawn` (Windows, macOS) the loader code must sit under an `+if __name__ == "__main__":+` guard.
+
+=== Disable gradients where they are not needed
+
+Wrap validation and inference in `torch.no_grad()` (as a context manager or a decorator) so no graph is recorded and activations are freed immediately. `torch.inference_mode()` is stricter and slightly faster; see xref:ml/pytorch/grad-modes.adoc[no_grad, inference_mode & Grad Modes].
+
+=== Drop the convolution bias before normalisation
+
+If a batch-normalisation layer directly follows a convolution, the convolution bias is redundant because batch norm subtracts the mean. Create the convolution with `bias=False` to save parameters and a pointwise add.
+
+[source,python]
+----
+import torch.nn as nn
+
+block = nn.Sequential(
+    nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
+    nn.BatchNorm2d(64),
+    nn.ReLU(inplace=True),
+)
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+=== Zero gradients cheaply
+
+Setting `param.grad = None` is cheaper than filling the gradient tensors with zeros, and the next backward pass can then write gradients directly instead of accumulating into zeros. Use `optimizer.zero_grad(set_to_none=True)` or `model.zero_grad(set_to_none=True)`. In recent releases `set_to_none=True` is already the default of `zero_grad`, but spelling it out documents the intent and protects older code. The behavioural difference matters if you read `.grad` afterwards: it is `None` rather than a zero tensor, and optimizers skip parameters whose gradient is `None`.
+
+=== Fuse pointwise operations
+
+Chains of pointwise operations (GELU, bias, dropout, residual add) launch one kernel each and read and write memory every time. Decorating a pointwise function with `@torch.compile` fuses them into one kernel. The guide uses a hand-written GELU as its example. For whole models see xref:ml/pytorch/torch-compile.adoc[torch.compile] and, when the compiled model is not faster, xref:ml/pytorch/torch-compile-troubleshooting.adoc[Graph Breaks, Recompilation & Dynamic Shapes].
+
+[source,python]
+----
+import math
+import torch
+
+
+@torch.compile
+def gelu_tanh(x):
+    return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * x ** 3)))
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+=== Use channels_last for convolutional models
+
+Convolutions on NVIDIA tensor cores are faster when activations are laid out as NHWC. `channels_last` keeps the logical shape (N, C, H, W) but changes the strides, so no model code changes. The guide recommends it for vision models, ideally together with automatic mixed precision. Convert both the model and the input.
+
+[source,python]
+----
+import torch
+import torchvision
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = torchvision.models.resnet18().to(device, memory_format=torch.channels_last)
+x = torch.randn(32, 3, 224, 224, device=device).to(memory_format=torch.channels_last)
+with torch.autocast(device, dtype=torch.bfloat16):
+    y = model(x)
+print(y.dtype, y.shape)    # torch.bfloat16 torch.Size([32, 1000])
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html, memory format tutorial: https://docs.pytorch.org/tutorials/intermediate/memory_format_tutorial.html
+
+=== Trade compute for memory with checkpointing
+
+Activation checkpointing recomputes some intermediate buffers in the backward pass instead of storing them. It lets you use a larger batch or a longer sequence, which can improve utilisation. It is covered in xref:ml/pytorch/memory-management.adoc[GPU Memory & Activation Checkpointing].
+
+=== Turn debugging tools off in normal runs
+
+`torch.autograd.set_detect_anomaly(True)`, the profiler (including `emit_nvtx`) and `gradcheck`/`gradgradcheck` all add large overheads. Make sure none of them is enabled in a production or benchmark run.
+
+== CPU optimisations
+
+For CPU training and inference, thread placement dominates. These settings come from the guide and are environment variables or launcher options, not Python code:
+
+[source,bash]
+----
+# Bind a process to one NUMA node (local memory, no cross-socket traffic)
+numactl --cpunodebind=0 --membind=0 python train.py
+
+# Number of intra-op threads, usually the physical cores of the socket
+export OMP_NUM_THREADS=16
+
+# GNU OpenMP: static scheduling and thread pinning
+export OMP_SCHEDULE=STATIC
+export OMP_PROC_BIND=CLOSE
+export GOMP_CPU_AFFINITY="0-15"
+
+# Faster allocator than glibc malloc (jemalloc or tcmalloc)
+export LD_PRELOAD=/path/to/libjemalloc.so:$LD_PRELOAD
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+The guide also describes the Intel OpenMP runtime (`libiomp5`) preloaded through `LD_PRELOAD` with `KMP_AFFINITY=granularity=fine,compact,1,0` and `KMP_BLOCKTIME=1`. The thread count can also be set in code with `torch.set_num_threads(n)`. Avoid oversubscription: with several DataLoader workers or several processes per node, divide the cores between them instead of letting every process use all of them. The torchrun launcher sets `OMP_NUM_THREADS` to 1 per process when the variable is not set, to avoid exactly this, and prints a warning, so set it deliberately.
+
+== GPU optimisations
+
+=== Matmul precision and tensor cores
+
+By default float32 matrix multiplications use full IEEE precision (`"highest"`). On Ampere and newer GPUs, `torch.set_float32_matmul_precision("high")` lets them use TF32 tensor-core kernels (or a bfloat16-based scheme with `"medium"`), trading some mantissa precision for large speedups. The guide lists this as a first thing to try before reaching for mixed precision.
+
+[source,python]
+----
+import torch
+
+torch.set_float32_matmul_precision("high")   # default is "highest"
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+Lower precision training proper (bfloat16 or float16 autocast) is described in xref:ml/pytorch/mixed-precision.adoc[Mixed Precision with torch.amp]. The guide also reminds you that with AMP, tensor dimensions that are multiples of 8 (for fp16 tensor cores) make better use of the hardware, and that you should pad explicitly where needed, for example vocabulary sizes and hidden sizes. The CUDA notes also document dedicated switches for TF32 inside convolutions and matmuls under `torch.backends`; PyTorch has been moving these toward a unified precision setting, so check xref:ml/pytorch/devices-and-accelerators.adoc[Devices & Accelerators] and https://docs.pytorch.org/docs/stable/notes/cuda.html for the names current in your release before relying on older snippets.
+
+=== cuDNN autotuner
+
+For convolutional networks with fixed input sizes, `torch.backends.cudnn.benchmark = True` makes cuDNN benchmark several algorithms on the first call for each new configuration and cache the fastest. With variable input sizes it re-benchmarks every new shape, which can make training slower, so use it only when shapes repeat.
+
+[source,python]
+----
+import torch
+
+torch.backends.cudnn.benchmark = True
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+The autotuner can choose different algorithms across runs, which interacts with reproducibility: see xref:ml/pytorch/reproducibility.adoc[Reproducibility & Determinism].
+
+=== CUDA graphs
+
+CUDA graphs record a sequence of kernel launches and replay it with a single launch, removing CPU launch overhead for small kernels and short steps. The easiest route is `torch.compile` with `mode="reduce-overhead"` (CUDA graphs) or `mode="max-autotune"`. The guide notes the feature was still in development when written. Shapes must be static and tensors read by the graph must live at fixed addresses.
+
+[source,python]
+----
+import torch
+
+model = torch.nn.Linear(1024, 1024).cuda()
+compiled = torch.compile(model, mode="reduce-overhead")
+x = torch.randn(64, 1024, device="cuda")
+for _ in range(3):          # first calls warm up and record
+    y = compiled(x)
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+=== Avoid CPU-GPU synchronisation
+
+Anything that forces the host to wait for the GPU stalls the launch queue and exposes launch latency. The guide lists the usual suspects: printing a CUDA tensor, `.item()`, copies such as `.cuda()`, `.cpu()` and `.to(device)` without `non_blocking`, `.nonzero()` (its output size depends on data) and Python control flow that depends on CUDA tensor values. Accumulate metrics on the device and read them once per N steps.
+
+[source,python]
+----
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+running = torch.zeros((), device=device)
+for step in range(100):
+    loss = torch.rand((), device=device)
+    running += loss.detach()          # stays on the device, no sync
+    if (step + 1) % 50 == 0:
+        print(step + 1, (running / 50).item())   # one sync every 50 steps
+        running.zero_()
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html
+
+=== Create tensors directly on the device
+
+`torch.rand(size, device="cuda")` generates the numbers on the GPU. `torch.rand(size).cuda()` generates them on the CPU and then copies them, which costs time and a synchronisation. The same applies to `zeros`, `full`, `arange` and friends.
+
+=== Preallocate for variable-length inputs
+
+With the caching allocator, varying input sizes fragment memory and can trigger repeated allocations. The guide's trick: before training, run one forward and backward pass on a batch of the maximum size without an optimizer step, zero the gradients and then train normally. The allocator then already holds blocks large enough for every later batch. See xref:ml/pytorch/memory-management.adoc[GPU Memory & Activation Checkpointing] for allocator settings such as `expandable_segments`.
+
+== Distributed optimisations
+
+* Prefer `DistributedDataParallel` over `torch.nn.DataParallel`. DDP runs one process per device and overlaps communication with backward; `DataParallel` is single-process and multi-threaded and is slower even on one machine. See xref:ml/pytorch/distributed-data-parallel.adoc[DistributedDataParallel].
+* With gradient accumulation, wrap the first N-1 micro-batches in `ddp_model.no_sync()` so the all-reduce happens once per optimizer step.
+* If you set `find_unused_parameters=True`, declare layers in the constructor in the order they are executed. With the default `False` the order does not matter for correctness.
+* Balance the work across ranks. If one rank receives longer sequences, all other ranks wait for it at the next collective. Batch a roughly constant number of tokens, bucket by sequence length or sort by length. The guide gives no code for this.
+* For CPU distributed training the guide points to DDP with an Intel oneCCL based backend.
+
+[source,python]
+----
+import contextlib
+
+
+def train_epoch(ddp_model, loader, optimizer, loss_fn, accum_steps=4):
+    optimizer.zero_grad(set_to_none=True)
+    for i, (x, y) in enumerate(loader):
+        last_micro_batch = (i + 1) % accum_steps == 0
+        ctx = contextlib.nullcontext() if last_micro_batch else ddp_model.no_sync()
+        with ctx:
+            loss = loss_fn(ddp_model(x), y) / accum_steps
+            loss.backward()
+        if last_micro_batch:
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+----
+
+Source: https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html and https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
+
+Note that the forward pass must also be inside the `no_sync()` context, as in the example, otherwise gradients still synchronise.
+
+== Optimizer and parameter updates
+
+Optimizer steps launch many small kernels (one per parameter tensor in the `for-loop` implementation). The optimizer classes offer `foreach` (multi-tensor) and `fused` implementations that process groups of tensors per kernel; on CUDA they are chosen by default where supported (`foreach`) or can be requested (`fused=True`). Check the xref:ml/pytorch/optimizers.adoc[Optimizers] page and https://docs.pytorch.org/docs/stable/optim.html for the algorithms and devices that support them before relying on this.
+
+== A suggested order of work
+
+. Profile a few steps with xref:ml/pytorch/profiling.adoc[torch.profiler] and see whether the GPU is idle (data or launch bound) or busy (compute bound).
+. If idle: fix the data pipeline (workers, pinned memory, `non_blocking`), remove syncs, create tensors on the device.
+. If compute bound: set float32 matmul precision, enable bfloat16 autocast, use `channels_last` for convolutions, enable `cudnn.benchmark` for fixed shapes.
+. If many small kernels: try `torch.compile`, then CUDA graphs.
+. If memory bound: use checkpointing, a smaller activation footprint or sharding (xref:ml/pytorch/fsdp2.adoc[FSDP2]).
+. Re-measure after every change, keep a table of step time and peak memory, and stop when the cost of the next change exceeds its expected gain.
+
+For the conceptual background on hardware, precision and memory see xref:ml/hardware-and-mixed-precision.adoc[Hardware & Mixed Precision] and xref:ml/distributed-training.adoc[Distributed Training Concepts]; the xref:ml/training-deep-networks.adoc[Training Deep Networks] page covers the algorithmic side of making training efficient.
+
+== References
+
+* https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html[Performance Tuning Guide (PyTorch Tutorials)]
+* https://docs.pytorch.org/tutorials/intermediate/memory_format_tutorial.html[Channels Last Memory Format in PyTorch]
+* https://docs.pytorch.org/docs/stable/notes/cuda.html[CUDA semantics (PyTorch 2.15)]
+* https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html[DistributedDataParallel (PyTorch 2.15)]
+* https://docs.pytorch.org/docs/stable/optim.html[torch.optim (PyTorch 2.15)]

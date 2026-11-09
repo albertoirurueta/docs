@@ -1,0 +1,338 @@
+= GPU Memory & Activation Checkpointing
+:description: Where GPU memory goes in a PyTorch 2.15 training job, how the CUDA caching allocator works, how to measure and debug memory, allocator settings such as expandable_segments, and how activation checkpointing (reentrant, non-reentrant and selective) trades compute for memory.
+:keywords: GPU memory, CUDA out of memory, caching allocator, memory_allocated, memory_reserved, empty_cache, PYTORCH_ALLOC_CONF, PYTORCH_CUDA_ALLOC_CONF, expandable_segments, max_split_size_mb, memory snapshot, _record_memory_history, activation checkpointing, torch.utils.checkpoint, use_reentrant, selective activation checkpointing, gradient accumulation
+
+include::partial$ml-pytorch-disclaimer.adoc[]
+
+"CUDA out of memory" is the most common failure of a deep learning job, and the fix depends on which of several consumers filled the device. This page separates those consumers, shows how to measure them with PyTorch's own counters and snapshot tools, explains the caching allocator and its configuration, and then covers activation checkpointing, the standard way to trade extra computation for a smaller memory footprint.
+
+Examples were run on Python 3.13 with PyTorch 2.15 (CPU) on 2026-10-31. The allocator statistics and memory snapshot examples need a CUDA GPU and were not executed; the activation checkpointing examples ran on CPU. The memory snapshot functions live in a private-looking namespace (`+torch.cuda.memory._record_memory_history+` and friends), which the official guide documents but which may change between releases.
+
+== Where the memory goes
+
+For a training step on one device the main consumers are:
+
+. *Parameters.* Number of parameters times bytes per element (4 for float32, 2 for bfloat16).
+. *Gradients.* The same size as the parameters (kept in the parameter dtype, or float32 with some mixed-precision setups).
+. *Optimizer state.* Adam and AdamW keep two extra tensors per parameter (first and second moment), so with float32 parameters the total for parameters, gradients and Adam state is about 4 + 4 + 8 = 16 bytes per parameter. SGD without momentum keeps none; with momentum it keeps one.
+. *Activations.* Everything the forward pass saves for the backward pass. This grows with batch size, sequence length and depth, and is usually the term you can change most.
+. *Temporary buffers and workspace.* cuDNN and cuBLAS workspaces, communication buckets in distributed training, fragmentation overhead in the allocator.
+. *The CUDA context.* A few hundred megabytes outside PyTorch's control.
+
+For a 1-billion-parameter float32 model with Adam this is roughly 16 GB before a single activation is stored, which explains why single-GPU training of larger models needs sharding (xref:ml/pytorch/fsdp2.adoc[FSDP2]), lower precision (xref:ml/pytorch/mixed-precision.adoc[Mixed Precision with torch.amp]) or both. Inference needs only the parameters and transient activations, which is why it is far cheaper; see xref:ml/pytorch/grad-modes.adoc[no_grad, inference_mode & Grad Modes].
+
+== The caching allocator
+
+PyTorch does not call `cudaMalloc` and `cudaFree` for every tensor, because both are slow and `cudaFree` synchronises the device. Instead a caching allocator requests large segments from the driver, carves them into blocks for tensors and keeps freed blocks for reuse. Consequences:
+
+* `nvidia-smi` shows memory the allocator holds, not memory tensors use. A process can show 20 GB used while only 12 GB belong to live tensors.
+* Memory freed by `del tensor` returns to PyTorch's cache, not to other processes.
+* An out-of-memory error can occur although the cache holds free blocks, if no single free block is large enough (*fragmentation*).
+
+=== Measuring
+
+[source,python]
+----
+import torch
+
+assert torch.cuda.is_available()
+dev = torch.device("cuda")
+
+x = torch.empty(1024, 1024, 256, device=dev)          # 1 GiB of float32
+
+print("allocated MiB:", torch.cuda.memory_allocated() / 2**20)   # live tensors
+print("reserved  MiB:", torch.cuda.memory_reserved() / 2**20)    # held by the allocator
+print("peak allocated MiB:", torch.cuda.max_memory_allocated() / 2**20)
+
+del x
+print("after del, allocated:", torch.cuda.memory_allocated() / 2**20)
+print("after del, reserved :", torch.cuda.memory_reserved() / 2**20)   # cache still holds it
+
+torch.cuda.empty_cache()                                   # return cached blocks to the driver
+print("after empty_cache, reserved:", torch.cuda.memory_reserved() / 2**20)
+
+print(torch.cuda.memory_summary())                          # human-readable table
+----
+
+Source: https://docs.pytorch.org/docs/stable/notes/cuda.html
+
+`memory_allocated()` and `max_memory_allocated()` report memory occupied by tensors; `memory_reserved()` and `max_memory_reserved()` report what the allocator manages. `memory_stats()` returns detailed counters, `memory_snapshot()` the full allocator state, and `memory_summary()` a readable table that the guide calls useful for tuning. Use `torch.cuda.reset_peak_memory_stats()` before the region of interest to measure its peak alone.
+
+`torch.cuda.empty_cache()` releases unused cached blocks so other processes can use them. It does not free memory held by live tensors and does not make more memory available to PyTorch itself, so calling it every step only slows training down.
+
+=== Configuring the allocator
+
+The allocator reads the environment variable `PYTORCH_ALLOC_CONF`, formatted as `option:value,option2:value2`. In the 2.15 documentation this is the primary name, and `PYTORCH_CUDA_ALLOC_CONF` still works as an alias kept for backward compatibility; older posts only mention the latter. Set it before the process starts (or at least before the first CUDA allocation).
+
+[source,bash]
+----
+PYTORCH_ALLOC_CONF=expandable_segments:True python train.py
+
+# Several options, comma separated
+PYTORCH_ALLOC_CONF=garbage_collection_threshold:0.8,max_split_size_mb:512 python train.py
+----
+
+Source: https://docs.pytorch.org/docs/stable/notes/cuda.html
+
+[cols="2,4",options="header"]
+|===
+| Option | Purpose
+
+| `backend`
+| `native` (default) or `cudaMallocAsync` (needs CUDA 11.4 or newer).
+
+| `expandable_segments`
+| Experimental, off by default. Lets segments grow instead of allocating new fixed ones, reducing fragmentation when allocation sizes change often, for example with varying batch sizes or sequence lengths.
+
+| `max_split_size_mb`
+| Prevents blocks larger than the given size from being split, which limits fragmentation. Unlimited by default. The guide presents it as a last resort for out-of-memory failures and says it applies only to `backend:native`.
+
+| `roundup_power2_divisions`
+| Rounds allocation sizes to divisions of powers of two to improve block reuse. Native backend only.
+
+| `garbage_collection_threshold`
+| A fraction between 0.0 and 1.0 (default 1.0). When usage exceeds it the allocator starts reclaiming unused blocks. Native backend only.
+
+| `per_process_memory_fraction` (with `throw_on_cudamalloc_oom`)
+| Caps how much of the device a process may use; with `throw_on_cudamalloc_oom:True` an inference server can catch the `OutOfMemoryError` and reject a single request instead of crashing.
+|===
+
+Source: https://docs.pytorch.org/docs/stable/notes/cuda.html
+
+The notes also list further options (for example `large_segment_size_mb` and several `+pinned_*+` options for pinned host memory); check the page for your release before tuning them. Setting `PYTORCH_NO_CUDA_MEMORY_CACHING=1` disables caching entirely, which makes tools such as `cuda-memcheck` meaningful but is much slower.
+
+For a single GPU shared by an inference service, set the process fraction from Python with `torch.cuda.set_per_process_memory_fraction(fraction)`; the equivalent allocator option is the one in the table.
+
+== Understanding where memory is used: snapshots
+
+Counters tell you how much; the memory snapshot tool tells you which line of code allocated it. Enable recording before the code you want to observe, run it, dump a snapshot and open it in the viewer.
+
+[source,python]
+----
+import torch
+
+torch.cuda.memory._record_memory_history(max_entries=100_000)
+
+model = torch.nn.Sequential(torch.nn.Linear(4096, 4096), torch.nn.ReLU(),
+                            torch.nn.Linear(4096, 4096)).cuda()
+opt = torch.optim.AdamW(model.parameters())
+x = torch.randn(512, 4096, device="cuda")
+
+for _ in range(3):
+    loss = model(x).square().mean()
+    loss.backward()
+    opt.step()
+    opt.zero_grad(set_to_none=True)
+
+torch.cuda.memory._dump_snapshot("snapshot.pickle")
+torch.cuda.memory._record_memory_history(enabled=None)    # stop recording
+----
+
+Source: https://docs.pytorch.org/docs/stable/torch_cuda_memory.html
+
+Drag `snapshot.pickle` onto https://pytorch.org/memory_viz. The viewer runs locally and does not upload the data. Two views help most:
+
+* *Active Memory Timeline*: live tensors over time on one GPU. Hover over a block to see its allocation stack trace. You can see the characteristic staircase of activations growing during the forward pass and collapsing during the backward pass, and the flat bands of parameters and optimizer state.
+* *Allocator State History*: the allocator events over time. Selecting one shows each `cudaMalloc` segment split into allocated and free blocks at that moment, which is how fragmentation is diagnosed, including the state at an out-of-memory event.
+
+`+_record_memory_history+` takes `enabled` (`+'all'+` by default, `+'state'+`, or `None` to stop), `stacks` (`+'python'+` or `+'all'+` to add C{pp} frames) and `max_entries`, a ring buffer size. The default is effectively unlimited, so long-running jobs should set a limit; snapshots with large limits can reach gigabytes. The viewer does not yet display host memory.
+
+The profiler can also track per-operator memory with `profile_memory=True`; see xref:ml/pytorch/profiling.adoc[Profiling with torch.profiler].
+
+== Reducing memory: the toolbox
+
+In rough order of effort:
+
+[cols="2,3,3",options="header"]
+|===
+| Technique | Saves | Cost
+
+| Smaller batch with gradient accumulation
+| Activations
+| More steps per update; use `no_sync()` in DDP (see xref:ml/pytorch/distributed-data-parallel.adoc[DistributedDataParallel]).
+
+| bfloat16 or float16 autocast
+| Activations, and parameters/gradients if stored in half precision
+| Numerical care; see xref:ml/pytorch/mixed-precision.adoc[Mixed Precision with torch.amp].
+
+| `torch.no_grad()` or `inference_mode()` for evaluation
+| All saved activations
+| None, evaluation only.
+
+| `optimizer.zero_grad(set_to_none=True)`
+| Gradient tensors between steps
+| None.
+
+| Activation checkpointing
+| Activations
+| About one extra forward pass of recomputation.
+
+| Sharding (FSDP2) and CPU offload
+| Parameters, gradients and optimizer state
+| Communication, see xref:ml/pytorch/fsdp2.adoc[FSDP2 (fully_shard)].
+
+| Fused or lower-memory optimizers, 8-bit optimizer state
+| Optimizer state
+| Library dependent, see xref:ml/pytorch/optimizers.adoc[Optimizers].
+
+| Quantization for inference
+| Parameters
+| Accuracy, see xref:ml/pytorch/quantization-and-sparsity.adoc[Quantization, Sparsity & Pruning with torchao].
+|===
+
+Gradient accumulation and large-batch behaviour are discussed conceptually in xref:ml/distributed-training.adoc[Distributed Training Concepts] and xref:ml/hardware-and-mixed-precision.adoc[Hardware & Mixed Precision].
+
+== Activation checkpointing
+
+Normally autograd saves every intermediate tensor that the backward pass needs. With *activation checkpointing* (also called gradient checkpointing or rematerialisation) a segment of the network saves only its inputs; in the backward pass the segment's forward is run again to rebuild the activations, which are used for gradients and immediately freed. Memory for that segment drops from "all its activations" to "its input plus one segment's activations at a time", at the cost of about one extra forward pass over the checkpointed parts (the exact overhead depends on the model and on how much is checkpointed, so measure it).
+
+=== torch.utils.checkpoint.checkpoint
+
+[source,python]
+----
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
+
+
+class Block(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
+class Model(nn.Module):
+    def __init__(self, dim=1024, depth=12, use_checkpoint=True):
+        super().__init__()
+        self.blocks = nn.ModuleList(Block(dim) for _ in range(depth))
+        self.use_checkpoint = use_checkpoint
+
+    def forward(self, x):
+        for block in self.blocks:
+            if self.use_checkpoint and self.training:
+                x = checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
+        return x
+
+
+model = Model()
+x = torch.randn(32, 128, 1024, requires_grad=True)
+model(x).sum().backward()
+----
+
+Source: https://docs.pytorch.org/docs/stable/checkpoint.html
+
+Key parameters, as documented:
+
+* `use_reentrant` (default `None`): the documentation recommends `False` and says to pass it explicitly; a future release will raise an exception if it is omitted. Always write `use_reentrant=False` in new code.
+* `preserve_rng_state` (default `True`): stashes and restores the random number generator state so dropout inside the segment is identical in the recomputation. Disabling it saves some overhead but can give different outputs and incorrect gradients if the segment uses randomness. Under `torch.compile` the flag has no effect and the state is always preserved.
+* `context_fn`, `determinism_check`, `debug` and `early_stop` are available only with `use_reentrant=False`. `determinism_check` (`"default"` or `"none"`) compares shapes, dtypes and devices of recomputed tensors against the saved ones; `debug=True` adds a trace of forward and recomputed operators to error messages; `early_stop` (default `True`) stops recomputation once all needed tensors are rebuilt.
+* `function` omitted: `checkpoint(use_reentrant=False)(fn)` returns a decorator form.
+
+=== Reentrant versus non-reentrant
+
+The two implementations differ in important ways:
+
+[cols="2,3,3",options="header"]
+|===
+| Aspect | `use_reentrant=True` (legacy) | `use_reentrant=False` (recommended)
+
+| Recomputation
+| Always recomputes the whole function.
+| Can stop early once needed tensors are recomputed.
+
+| Autograd graph in forward
+| Forward runs under `no_grad`; no graph is recorded.
+| Graph is recorded; backward can run inside checkpointed regions.
+
+| Backward APIs
+| Only `torch.autograd.backward()` without the `inputs` argument.
+| All backward methods, including `torch.autograd.grad`.
+
+| Inputs
+| Needs at least one input and one output with `requires_grad=True`, otherwise the segment gets no gradients.
+| No such restriction.
+
+| Nested structures
+| Tensors inside lists, dicts and custom objects are ignored by autograd.
+| Included.
+
+| Keyword arguments
+| Not supported.
+| Supported.
+|===
+
+Source: https://docs.pytorch.org/docs/stable/checkpoint.html
+
+A classic symptom of the reentrant variant is "none of the inputs have requires_grad=True": gradients silently vanish for a checkpointed first layer because the input tensor is a plain data tensor. Using the non-reentrant variant removes this class of bug. With DDP, the reentrant variant works only if there are no unused parameters and each layer is checkpointed at most once; the non-reentrant variant has no such limitation.
+
+Checkpointed code must behave the same in the recomputation as in the original forward. If the function depends on a global that changes between forward and backward, results may be wrong without any error.
+
+=== checkpoint_sequential
+
+For an `nn.Sequential` (or list of callables) `+torch.utils.checkpoint.checkpoint_sequential(functions, segments, input, use_reentrant=...)+` splits the model into `segments` chunks. All but the last chunk discard intermediates and save only their inputs. With `n` layers, about the square root of `n` segments balances stored boundaries against segment size. Pass `use_reentrant` explicitly here too.
+
+=== Selective activation checkpointing
+
+Recomputing everything is wasteful: some operators are expensive (matrix multiplications) while others are cheap (pointwise). *Selective activation checkpointing* lets you save the expensive outputs and recompute the cheap ones, using a policy passed through `context_fn`.
+
+[source,python]
+----
+import functools
+import torch
+from torch.utils.checkpoint import (
+    checkpoint,
+    create_selective_checkpoint_contexts,
+    CheckpointPolicy,
+)
+
+ops_to_save = [torch.ops.aten.mm.default]
+
+
+def policy_fn(ctx, op, *args, **kwargs):
+    if op in ops_to_save:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+context_fn = functools.partial(create_selective_checkpoint_contexts, policy_fn)
+
+fn = torch.nn.Sequential(torch.nn.Linear(256, 256), torch.nn.GELU(), torch.nn.Linear(256, 256))
+x = torch.randn(64, 256, requires_grad=True)
+out = checkpoint(fn, x, use_reentrant=False, context_fn=context_fn)
+out.sum().backward()
+----
+
+Source: https://docs.pytorch.org/docs/stable/checkpoint.html
+
+`CheckpointPolicy` has `MUST_SAVE`, `PREFER_SAVE`, `MUST_RECOMPUTE`, `PREFER_RECOMPUTE`, `MUST_CPU_OFFLOAD` and `PREFER_CPU_OFFLOAD`. The `MUST_` values take precedence over the `PREFER_` values, so other subsystems such as `torch.compile` cannot override them; the offload values save the output, move it to the CPU and reload it during backward. As a shorthand, `create_selective_checkpoint_contexts` also accepts a list of operators to save, recomputing everything else. The policy runs during the forward pass only. The `respect_saved_tensors_hooks` argument of `checkpoint` controls whether tensors saved by selective checkpointing go through user `saved_tensors_hooks` such as `save_on_cpu()`; the default `None` keeps the legacy behaviour and emits a `FutureWarning` when a user hook is active.
+
+=== Where to checkpoint
+
+* Wrap repeating blocks (transformer layers, ResNet stages) rather than single layers; the saved boundary tensors are then few and the recomputed segment is large enough to be worth it.
+* Do not checkpoint the last block if its activations are needed immediately, and do not checkpoint tiny segments: the recomputation overhead outweighs the memory saved.
+* Combine with FSDP: apply checkpointing inside each sharded unit (see xref:ml/pytorch/fsdp2.adoc[FSDP2 (fully_shard)]).
+* Hugging Face transformer models expose the same idea as `gradient_checkpointing_enable()`; the underlying mechanism is the function above.
+* Compare the result with and without checkpointing in the xref:ml/pytorch/profiling.adoc[profiler]: peak memory should fall and step time should rise modestly.
+
+== Debugging an out-of-memory error
+
+. Read the message: it states how much PyTorch tried to allocate, how much is allocated and reserved, and how much is free on the device. If reserved is much larger than allocated, suspect fragmentation and try `expandable_segments:True`.
+. Reproduce with a tiny batch and print `max_memory_allocated()` after the forward, after the backward and after the optimizer step. Parameters, gradients and optimizer state appear in that order.
+. Take a snapshot as above and look at the Active Memory Timeline for the largest stack of blocks.
+. Look for accidental retention: storing `loss` (instead of `loss.item()` or `loss.detach()`) in a Python list keeps the whole graph alive; keeping references to outputs in a global cache does the same.
+. Check that evaluation runs under `no_grad` and that old models or optimizers are released before building new ones in a loop (call `del`, then `gc.collect()` and `torch.cuda.empty_cache()` in notebooks).
+. Check other processes with `nvidia-smi`: a dataloader worker or another job may hold memory.
+. Only then reach for `max_split_size_mb`, which the guide frames as a last resort.
+
+== References
+
+* https://docs.pytorch.org/docs/stable/notes/cuda.html#memory-management[CUDA semantics: Memory management (PyTorch 2.15)]
+* https://docs.pytorch.org/docs/stable/torch_cuda_memory.html[Understanding CUDA Memory Usage]
+* https://docs.pytorch.org/docs/stable/checkpoint.html[torch.utils.checkpoint (PyTorch 2.15)]
+* https://pytorch.org/memory_viz[Memory Visualizer]
+* https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html[Performance Tuning Guide]
