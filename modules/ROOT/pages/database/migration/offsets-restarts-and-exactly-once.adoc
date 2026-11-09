@@ -1,0 +1,729 @@
+= Offsets, Restarts and Exactly-Once
+:description: How Debezium remembers its position in the legacy database and what that means for a migration: source partitions and offsets (the Oracle scn and commit_scn fields, the PostgreSQL lsn fields), where offsets live (the Kafka Connect offsets topic, per-connector offsets topics, and the Debezium Server and Engine offset stores), inspecting, altering and resetting offsets with the Kafka Connect REST API (KIP-875 GET, PATCH and DELETE on /connectors/<name>/offsets, which require the STOPPED state) and with Strimzi, re-running a snapshot safely, why restarts produce duplicates under at-least-once delivery, topic auto-creation with topic.creation groups, and Kafka Connect exactly-once source support (exactly.once.source.support, exactly.once.support, transaction.boundary, ACLs and read_committed consumers) for the Debezium connectors.
+:keywords: Debezium, Debezium 3.7, offsets, source offset, source partition, offset.storage.topic, offsets.storage.topic, offset.flush.interval.ms, KIP-875, GET /connectors/<name>/offsets, PATCH offsets, DELETE offsets, PUT /connectors/<name>/stop, STOPPED, initial_state, Strimzi listOffsets, alterOffsets, strimzi.io/connector-offsets, scn, commit_scn, lsn, schema history, snapshot, incremental snapshot, at-least-once, duplicates, idempotent consumer, topic.creation.enable, topic.creation.default, topic.creation.groups, exactly-once, KIP-618, exactly.once.source.support, exactly.once.support, transaction.boundary, transactional.id, isolation.level, read_committed, Bookshop, database migration
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A Debezium source connector is a cursor over the legacy database's transaction log. Its *offset* is the position of that
+cursor: for the Bookshop `bookshop-oracle-source` connector, a pair of Oracle system change numbers (SCNs). Every restart,
+every rebalance of the Kafka Connect cluster, every upgrade and every recovery from a failure starts from that offset. If
+the offset is lost, the connector starts from scratch with a new snapshot. If it points to a position that the database no
+longer has (an archive log that was deleted), the connector cannot start at all. If it is moved by hand, changes are
+either skipped (data loss in the new database) or read again (duplicates). Understanding offsets is therefore the core of
+operating a migration for months without a gap in the data.
+
+This page explains what is in a Debezium offset, where it is stored, how to read and change it with the Kafka Connect REST
+API, how to re-run a snapshot without breaking the pipeline, why restarts produce duplicates and how exactly-once source
+support in Kafka Connect changes that. It also covers topic auto-creation, which decides how the change topics are created
+on the first write. The Kafka mechanics behind transactions and idempotent producers are explained in
+xref:backend/messaging/kafka-reliability-and-exactly-once.adoc[Kafka Reliability and Exactly-Once Semantics], and the
+Connect basics in xref:backend/messaging/kafka-connect.adoc[Kafka Connect].
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final and Apache Kafka 4.3 (the `quay.io/debezium/connect:3.7.1.Final` image
+runs Kafka Connect 4.3.1). The offsets REST endpoints (including the error returned when the connector is not stopped),
+the offsets topic settings, topic auto-creation and exactly-once source support (worker and connector settings, and the
+resulting transactional IDs) were run with Docker on 2026-11-09 against a PostgreSQL test connector. The Oracle offset
+fields come from the official Oracle connector documentation. The Oracle commands on this page were not run against an
+Oracle database.
+
+== What a Debezium offset is
+
+Kafka Connect stores source offsets as key/value pairs. The key is a *source partition*: a map that identifies what is
+being read. The value is the *source offset*: a map that says how far the connector has got. Both are defined by the
+connector. For Debezium connectors, the source partition is `+{"server": "<topic.prefix>"}+`, so for Bookshop it is
+`+{"server": "legacy"}+`. In the offsets topic, Kafka Connect prefixes it with the connector name, giving the record key
+`+["bookshop-oracle-source",{"server":"legacy"}]+`.
+
+The offset value depends on the connector:
+
+[cols="1,3",options="header"]
+|===
+| Connector | Offset fields
+
+| Oracle
+| `scn`, the low watermark from which mining must restart (the start of the oldest transaction that was still open), and
+  `commit_scn`, the commit position of the last emitted transaction. These two are the documented "critical values". During
+  and right after a snapshot, further snapshot fields are present.
+
+| PostgreSQL (observed in the test run)
+| `lsn` (the WAL position), `txId`, `ts_usec`, and while streaming `lsn_proc`, `lsn_events_processed` and `messageType`.
+  After a snapshot: `snapshot`, `snapshot_completed` and `last_snapshot_record`.
+
+| MySQL (from the Debezium FAQ)
+| `file` and `pos` (the binlog position), `row`, `event`, `server_id`, `ts_sec`, and `gtids` when GTIDs are used.
+|===
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Debezium -- Oracle connector FAQ (How do I change the position in the offsets?)] and https://debezium.io/documentation/faq/#how_to_change_the_offsets_of_the_source_database[Debezium FAQ -- How to change the offsets of the source database?]
+
+The Oracle FAQ shows an Oracle offset as read from the offsets topic with `kafkacat`, in the form
+`+Partition(11) ["inventory-connector",{"server":"server1"}] {"scn":"324567897", "commit_scn":"324567897: 0x2832343233323:1"}+`.
+The exact content of `commit_scn` (a plain SCN, or an SCN with a transaction and thread suffix) depends on the version and
+on the database (single instance or RAC). Never build an Oracle offset from memory. Read it first, as shown below, and
+change only what you have to.
+
+Offsets are only half of a Debezium connector's state. Connectors with a schema history (Oracle, MySQL, SQL Server, Db2)
+also keep the DDL of the captured tables in a separate topic (`legacy.schema-history` for Bookshop). The offset says
+_where_ to resume, the schema history says _what the tables looked like_ at that point. The two must always be kept,
+moved or deleted together.
+
+=== When offsets are written
+
+A source task does not write its offset for every event. Kafka Connect collects the offsets of the records that Kafka has
+acknowledged and flushes them to the offsets topic every `offset.flush.interval.ms` (60 seconds by default in Kafka and in
+the Debezium image, `OFFSET_FLUSH_INTERVAL_MS`), and when the task stops gracefully.
+
+[mermaid]
+....
+sequenceDiagram
+    participant DB as Oracle redo and archive logs
+    participant T as Debezium task
+    participant W as Connect worker
+    participant K as Kafka change topics
+    participant O as Connect offsets topic
+    T->>DB: mine changes from offset scn
+    T->>W: poll returns records with source offsets
+    W->>K: produce records
+    K-->>W: acks
+    Note over W: every offset.flush.interval.ms
+    W->>O: write latest acknowledged offset
+    Note over T,O: a crash here loses only the unflushed offset, so events are read again
+....
+
+The diagram shows why Debezium (like any Kafka Connect source) is *at least once* by default: the records reach Kafka
+before their offset is flushed. If the worker crashes in between, the task restarts from the last flushed offset and
+produces the same changes again. A graceful stop (a rolling restart, `PUT /connectors/<name>/stop`, a Strimzi
+`state: stopped`) flushes first, so duplicates come from crashes, killed pods and network partitions.
+
+== Where offsets live
+
+[cols="1,2,2",options="header"]
+|===
+| Runtime | Offset store | Configured by
+
+| Kafka Connect, distributed mode (the Bookshop default)
+| A compacted Kafka topic shared by all source connectors of the Connect cluster
+| Worker `offset.storage.topic` (`OFFSET_STORAGE_TOPIC` in the Debezium image, `spec.offsetStorageTopic` in Strimzi).
+  A connector can use its own topic with `offsets.storage.topic`.
+
+| Kafka Connect, standalone mode
+| A local file
+| Worker `offset.storage.file.filename`
+
+| Debezium Server and Debezium Engine
+| A store you choose: Kafka topic, file, memory, JDBC table, Redis, Kubernetes config map, or a custom class
+| `offset.storage` and its properties (`+debezium.source.offset.storage...+` in Debezium Server)
+|===
+Reference: https://debezium.io/documentation/reference/stable/configuration/storage.html#_overview[Debezium -- Store Debezium state] and https://kafka.apache.org/43/configuration/kafka-connect-configs/#sourceconnectorconfigs_offsets.storage.topic[Apache Kafka -- Source connector config offsets.storage.topic]
+
+In the test run, the offsets topic that the Connect worker created had 25 partitions and `cleanup.policy=compact`, the
+defaults. Compaction keeps the latest value per key, so the topic holds one current offset per connector and partition.
+Two rules follow for a migration:
+
+* *Never delete or re-create the offsets topic* while a migration is running. It holds the position of every source
+  connector of the Connect cluster. To reset one connector, use the REST API below.
+* *Back it up with the schema history.* If you rebuild the Kafka cluster (for example to move it into Kubernetes, see
+  xref:database/migration/running-on-kubernetes.adoc[Running on Kubernetes]), copy the offsets topic and
+  `legacy.schema-history` together, or plan for a new snapshot.
+
+A dedicated offsets topic per connector (`"offsets.storage.topic": "bookshop-oracle-source-offsets"`) isolates the legacy
+source from other connectors in the same Connect cluster. It is created on first use, and it is also the topic that
+exactly-once support writes to transactionally.
+
+Debezium Server keeps its offsets in the store you configure, and the KIP-875 REST endpoints below do not exist there.
+With the file store, the offset is a file on the pod's volume. Lose the volume and you lose the position, which is why the
+Debezium Operator offers Kafka, JDBC, Redis and config map stores. See
+xref:database/migration/debezium-server.adoc[Debezium Server] and xref:database/migration/debezium-engine.adoc[Debezium
+Engine (Embedded)].
+
+== Reading offsets
+
+Kafka 3.6 added offset management endpoints to the Kafka Connect REST API (KIP-875). `+GET /connectors/{name}/offsets+`
+works in any connector state and returns the offsets in the same JSON shape that `PATCH` accepts.
+
+.Reading the offsets of the legacy source
+[source,shell]
+----
+curl -s http://localhost:8083/connectors/bookshop-oracle-source/offsets | jq .
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (offsets management endpoints)]
+
+The response is an object with an `offsets` array. Each element has a `partition` (here `+{"server": "legacy"}+`) and an
+`offset` with the connector's fields (`scn`, `commit_scn` and any others that the connector currently writes). For
+comparison, this is what a PostgreSQL test connector returned in the test run, after its initial snapshot and then after
+one streamed `UPDATE`:
+
+.GET /connectors/<name>/offsets -- responses from the PostgreSQL test connector
+[source,json]
+----
+{"offsets":[{"partition":{"server":"lab"},"offset":{"last_snapshot_record":true,"lsn":37204080,"txId":792,"ts_usec":1794215580295304,"snapshot":"INITIAL","snapshot_completed":true}}]}
+
+{"offsets":[{"partition":{"server":"lab"},"offset":{"lsn_proc":45519144,"lsn_events_processed":1,"messageType":"UPDATE","lsn":45519144,"txId":796,"ts_usec":1794215601860885}}]}
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (GET /connectors/<name>/offsets)]
+
+Two observations from the run that also apply to Oracle: the snapshot fields disappear from the offset once streaming
+has committed its first change, and the response shows the last *flushed* offset, which can be up to
+`offset.flush.interval.ms` behind the position in the streaming metrics (`OffsetScn` for Oracle, see
+xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing]).
+
+Before Kafka 3.6, the only way to see an offset was to read the offsets topic, as the Debezium FAQ shows. This still works
+and is useful when the Connect REST API is not reachable:
+
+.Reading the offsets topic directly
+[source,shell]
+----
+docker run --rm --network dbz-bookshop_default quay.io/debezium/tooling:1.2 \
+  kcat -b kafka:9092 -C -t bookshop_connect_offsets -e -f 'Partition(%p) %k %s\n' \
+  | grep '"bookshop-oracle-source"'
+----
+Reference: https://debezium.io/documentation/faq/#how_to_change_the_offsets_of_the_source_database[Debezium FAQ -- How to change the offsets of the source database?]
+
+The topic contains every offset ever flushed (until compaction runs), so the last line for the key is the current one.
+The network name `dbz-bookshop_default` and the topic `bookshop_connect_offsets` are those of the Compose
+project `dbz-bookshop` in the xref:database/migration/worked-example-oracle-to-postgresql.adoc[worked example]. Do not write to the offsets topic with
+`kcat` while a REST API with KIP-875 is available. The REST API checks the connector state and writes in the format Connect
+expects.
+
+== Altering offsets with PATCH
+
+`+PATCH /connectors/{name}/offsets+` replaces offsets for the listed partitions. The connector must exist and be in the
+`STOPPED` state, which you reach with `+PUT /connectors/{name}/stop+`. A `PAUSED` connector is not enough: in the test run,
+both `DELETE` and `PATCH` returned the same error for a paused connector as for a running one.
+
+.The error returned when the connector is running or paused (from the test run)
+[source,json]
+----
+{"error_code":400,"message":"Connectors must be in the STOPPED state before their offsets can be modified. This can be done for the specified connector by issuing a 'PUT' request to the '/connectors/lab-pg-source/stop' endpoint"}
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (PUT /connectors/<name>/stop)]
+
+`stop` is different from `pause`: it shuts the tasks down and releases their resources (for Oracle, the LogMiner session
+and the JDBC connection), and it is the state in which the framework allows offset changes. `+PUT .../resume+` restarts a
+stopped connector. A connector can also be created directly in the stopped state with `"initial_state": "STOPPED"` in the
+`POST /connectors` body, which lets you set an offset before its first start.
+
+=== When to move an Oracle offset
+
+There are only two legitimate reasons to change the Oracle offset during a migration, and both have consequences that you
+must handle downstream:
+
+* *Moving forward*, when the archive logs for the offset `scn` are gone (`ORA-01291` or the connector reporting that it
+  cannot find the offset SCN in the available logs). The official FAQ calls this not recommended: the changes between the
+  old and the new SCN are lost. In a migration, follow it immediately with an incremental snapshot of the affected tables
+  (see xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots]), so that the
+  new database receives the current state of every row again.
+* *Moving backward*, to replay a period, for example after a sink wrote corrupted data. The replayed changes are
+  duplicates for every consumer, so this is only safe with idempotent sinks: the JDBC sink in `upsert` mode, and the
+  `bookshop` application's `processed_change` table (see
+  xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]). The archive
+  logs back to the target SCN must still exist.
+
+The procedure is the same in both cases:
+
+[mermaid]
+....
+sequenceDiagram
+    participant Op as Operator
+    participant C as Connect REST API
+    participant O as Offsets topic
+    Op->>C: PUT /connectors/bookshop-oracle-source/stop
+    C-->>Op: 204, connector STOPPED
+    Op->>C: GET /connectors/bookshop-oracle-source/offsets
+    C-->>Op: current partition and offset
+    Note over Op: edit scn and commit_scn only
+    Op->>C: PATCH /connectors/bookshop-oracle-source/offsets
+    C->>O: write the new offset
+    C-->>Op: 200, offsets altered
+    Op->>C: GET /connectors/bookshop-oracle-source/offsets
+    Op->>C: PUT /connectors/bookshop-oracle-source/resume
+....
+
+.Moving the Oracle offset to a new SCN
+[source,shell]
+----
+CONNECT=http://localhost:8083
+NAME=bookshop-oracle-source
+TARGET_SCN=3245675000        # chosen with the DBA, see the SQL below
+
+# 1. Stop the connector and wait until the status shows STOPPED
+curl -s -X PUT "$CONNECT/connectors/$NAME/stop"
+curl -s "$CONNECT/connectors/$NAME/status" | jq -r .connector.state
+
+# 2. Keep a copy of the current offsets, then build the new body from it
+curl -s "$CONNECT/connectors/$NAME/offsets" | tee "$NAME-offsets-$(date +%Y%m%d%H%M%S).json" \
+  | jq --arg scn "$TARGET_SCN" '.offsets[0].offset.scn = $scn | .offsets[0].offset.commit_scn = $scn' \
+  > patch.json
+cat patch.json
+
+# 3. Apply, verify, resume
+curl -s -X PATCH -H "Content-Type: application/json" "$CONNECT/connectors/$NAME/offsets" -d @patch.json
+curl -s "$CONNECT/connectors/$NAME/offsets" | jq .
+curl -s -X PUT "$CONNECT/connectors/$NAME/resume"
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (PATCH /connectors/<name>/offsets)] and https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Debezium -- Oracle connector FAQ (How do I change the position in the offsets?)]
+
+What this does and why:
+
+* The body is built from the `GET` response, so the partition (`+{"server":"legacy"}+`) and every other field of the offset
+  stay exactly as Debezium wrote them. Only `scn` and `commit_scn` change. The official FAQ example sets both fields to the
+  target position, with SCNs as strings, which is what the `jq` filter does. Setting only `scn` backwards would leave
+  `commit_scn` ahead, and the connector would skip the transactions it believes it has already emitted.
+* The saved copy of the original offsets is your rollback: `PATCH` it back if the connector does not start from the new
+  position.
+* Kafka Connect accepts any JSON map for a source offset. It does not validate the content, and Debezium only reads it at
+  the next start. A typo in a field name is therefore only visible in the connector log after `resume`. Check that the log
+  reports the expected starting SCN.
+* Rehearse the procedure on a non-production copy of the pipeline first. The response to a successful `PATCH` (seen in the
+  test run) also reminds you that offsets managed outside Kafka Connect are not affected:
+  `The Connect framework-managed offsets for this connector have been altered successfully. However, if this connector
+  manages offsets externally, they will need to be manually altered in the system that the connector uses.`
+
+To choose the target SCN, ask the DBA which archive logs exist:
+
+.Oracle -- the SCN range covered by the archive logs that are still on disk
+[source,sql]
+----
+SELECT MIN(first_change#) AS oldest_scn, MAX(next_change#) AS newest_scn
+  FROM v$archived_log
+ WHERE deleted = 'NO' AND status = 'A';
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Debezium -- Oracle connector FAQ (What happens if the connector cannot find logs with a given offset SCN?)]
+
+For a forward move, take an SCN shortly after `oldest_scn`. For a backward move, the target must be at or after
+`oldest_scn`. On RAC, the logs of every redo thread must cover the target.
+
+PostgreSQL is different: a logical replication slot cannot be rewound. The server only sends changes after the slot's
+confirmed position, so moving a PostgreSQL connector's `lsn` backwards does not replay anything. Use an incremental
+snapshot instead. For the reverse-replication source `bookshop-pg-source`, see
+xref:database/migration/postgresql-connector.adoc[PostgreSQL Connector].
+
+== Resetting offsets with DELETE
+
+`+DELETE /connectors/{name}/offsets+` removes all offsets of a stopped connector. On its next start the connector behaves as
+if it were new, so with `snapshot.mode=initial` it takes a new initial snapshot. The Debezium FAQ describes the full
+procedure, which has one Debezium-specific step: the schema history topic must go too, because a connector without offsets
+expects no schema history (this applies to all Debezium connectors except PostgreSQL, which has none).
+
+.Resetting bookshop-oracle-source to a clean start
+[source,shell]
+----
+CONNECT=http://localhost:8083
+NAME=bookshop-oracle-source
+
+# 1. Stop and wait for STOPPED
+curl -s -X PUT "$CONNECT/connectors/$NAME/stop"
+
+# 2. Keep a copy, then delete the offsets (destructive)
+curl -s "$CONNECT/connectors/$NAME/offsets" > "$NAME-offsets-before-reset.json"
+curl -s -X DELETE "$CONNECT/connectors/$NAME/offsets"
+curl -s "$CONNECT/connectors/$NAME/offsets"
+# {"offsets":[]}
+
+# 3. Delete the schema history topic of this connector only
+docker compose exec kafka /kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+  --delete --topic legacy.schema-history
+
+# 4. Resume: the connector starts again with snapshot.mode=initial
+curl -s -X PUT "$CONNECT/connectors/$NAME/resume"
+----
+Reference: https://debezium.io/documentation/faq/#reset-offsets-kafka-3.6[Debezium FAQ -- How to remove committed offsets for a connector? (Kafka Connect 3.6 or later)] and https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (DELETE /connectors/<name>/offsets)]
+
+In the test run with the PostgreSQL connector, `DELETE` returned
+`+The Connect framework-managed offsets for this connector have been reset successfully...+`, the following `GET` returned
+`+{"offsets":[]}+`, and after `resume` the connector took a new initial snapshot and wrote a new offset with
+`"snapshot":"INITIAL"`.
+
+A reset is the most disruptive operation on this page. Every row of every captured table is emitted again as a `read`
+event (`op: r`), the mirror tables receive upserts for all rows, and the `bookshop` application sees every legacy order
+again. Do it only when the alternatives below do not apply, and announce it to the owners of every consumer. If the
+schema history topic is shared by mistake with another connector, deleting it breaks that connector too, which is one
+reason to name it after the `topic.prefix`.
+
+=== With Strimzi
+
+When the connector is a `KafkaConnector` resource, the same operations are requests in the resource, triggered by the
+`strimzi.io/connector-offsets` annotation. Strimzi writes the `GET` result into a config map as `offsets.json`, applies the
+`offsets.json` of a config map for an alter, and calls `DELETE` for a reset.
+
+.Listing, altering and resetting offsets of the KafkaConnector
+[source,yaml]
+----
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnector
+metadata:
+  name: bookshop-oracle-source
+  namespace: bookshop-cdc
+  labels:
+    strimzi.io/cluster: bookshop-connect
+spec:
+  class: io.debezium.connector.oracle.OracleConnector
+  tasksMax: 1
+  state: stopped                      # required for alter and reset
+  listOffsets:
+    toConfigMap:
+      name: bookshop-oracle-source-offsets
+  alterOffsets:
+    fromConfigMap:
+      name: bookshop-oracle-source-offsets
+  config:
+    # ... unchanged connector configuration ...
+----
+Reference: https://strimzi.io/docs/operators/latest/deploying.html#proc-listing-connector-offsets-str[Strimzi -- Listing Kafka Connect connector offsets], https://strimzi.io/docs/operators/latest/deploying.html#proc-altering-connector-offsets-str[Strimzi -- Altering connector offsets] and https://strimzi.io/docs/operators/latest/deploying.html#proc-resetting-connector-offsets-str[Strimzi -- Resetting connector offsets]
+
+The `+# ... unchanged connector configuration ...+` line stands for the full `config` block from
+xref:database/migration/running-on-kubernetes.adoc[Running on Kubernetes]. Apply the resource with its real
+configuration, not with the placeholder.
+
+.The annotations that trigger each operation
+[source,shell]
+----
+kubectl -n bookshop-cdc annotate kafkaconnector bookshop-oracle-source strimzi.io/connector-offsets=list
+kubectl -n bookshop-cdc get configmap bookshop-oracle-source-offsets -o jsonpath='{.data.offsets\.json}' | jq .
+
+# edit offsets.json in the config map (scn and commit_scn), then:
+kubectl -n bookshop-cdc annotate kafkaconnector bookshop-oracle-source strimzi.io/connector-offsets=alter
+
+# or, for a reset:
+kubectl -n bookshop-cdc annotate kafkaconnector bookshop-oracle-source strimzi.io/connector-offsets=reset
+----
+Reference: https://strimzi.io/docs/operators/latest/deploying.html#proc-altering-connector-offsets-str[Strimzi -- Altering connector offsets]
+
+The annotation stays on the resource until the operation succeeds. Then set `spec.state: running` again. The schema history
+topic is not touched by a Strimzi reset. Delete the `KafkaTopic` for `legacy.schema-history` and re-create it, as in the
+REST procedure.
+
+== Re-running a snapshot safely
+
+"Re-run the snapshot" is one of the most frequent requests during a migration: a table was added to the include list, the
+mirror tables drifted, a sink bug corrupted data, or the reconciliation found missing rows. Resetting the offsets is the
+bluntest tool. Choose the narrowest one that solves the problem:
+
+[cols="2,2,2",options="header"]
+|===
+| Situation | Use | Effect on the pipeline
+
+| A few tables are missing rows, or a new table was added to `table.include.list`
+| An ad hoc *incremental snapshot* through the signal table or `legacy.signals`, optionally with
+  `additional-conditions`
+| Streaming continues. The chunks are interleaved with live changes and deduplicated against them by watermarks.
+
+| The whole set must be re-read while the connector keeps its position, and a pause in streaming is acceptable
+| A *blocking snapshot* signal
+| Streaming pauses while the snapshot runs, then resumes from the same offset.
+
+| The schema history is lost or corrupted, but the offset is valid
+| `snapshot.mode=recovery` for one start (it rebuilds the schema history from the current table structures)
+| No data is re-read. Only safe if no DDL happened since the offset.
+
+| The offset points to logs that no longer exist
+| Move the offset forward (above), then an incremental snapshot of all captured tables
+| A gap in the change history, closed by the snapshot's current state.
+
+| Everything must start again (a new environment, a rehearsal)
+| Stop, `DELETE` the offsets, delete the schema history topic, resume
+| A full initial snapshot. Every consumer sees every row again.
+|===
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html[Debezium -- Sending signals to Debezium] and https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties (snapshot.mode)]
+
+The signal syntax and the snapshot modes are covered in
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots],
+xref:database/migration/initial-snapshots.adoc[Initial Snapshots] and
+xref:database/migration/signaling-and-notifications.adoc[Signaling & Notifications].
+
+Two shortcuts that look attractive cause trouble later:
+
+* *A new connector name* (for example `bookshop-oracle-source-v2`) starts with no offsets, because the offset key contains
+  the connector name. That works, but it leaves the old offsets in the topic and, if the `topic.prefix` stays the same,
+  needs the old schema history deleted anyway.
+* *A new `topic.prefix`* changes the source partition, the topic names, the MBean names and the schema history. It is a
+  different pipeline. Every consumer must be moved to the new topics. Do not do this to "reset" a connector.
+
+== Restarts and duplicates
+
+Because of the flush interval, every unclean restart replays the changes since the last flushed offset. For Oracle, the
+replay starts at the offset `scn`, which is the start of the oldest transaction that was open at flush time, so a
+long-running legacy transaction can make the replay much longer than one flush interval. The connector skips
+transactions whose commit is at or below `commit_scn`, but changes produced after the last flush are produced again.
+
+What the migration must do about it:
+
+* *Make every consumer idempotent.* The JDBC sink in `upsert` mode with `primary.key.mode=record_key` writes the same row
+  twice without harm. Deletes are idempotent. The `bookshop` application records `(source_table, source_position)` in
+  `processed_change` and skips positions it has already applied. For Oracle the position is the `scn` and `commit_scn`
+  plus the transaction ID from the event's `source` block.
+* *Keep the flush interval moderate.* A shorter `offset.flush.interval.ms` (for example 10 seconds) shrinks the replay window
+  at the cost of more writes to the offsets topic. The Debezium FAQ also recommends a shorter interval and a longer
+  `offset.flush.timeout.ms` when the log shows `Failed to flush, timed out while waiting for producer to flush outstanding`
+  messages.
+* *Prefer graceful restarts.* `+PUT .../stop+` before maintenance, `terminationGracePeriodSeconds` long enough for a flush on
+  Kubernetes, and no `kill -9`.
+* *Or turn on exactly-once source support*, described next, which removes duplicates caused by the source side.
+
+Reference: https://debezium.io/documentation/faq/#how_to_solve_offset_flush_timeouts[Debezium FAQ -- How to solve offset flush timeouts?] and https://kafka.apache.org/43/configuration/kafka-connect-configs/#connectconfigs_offset.flush.interval.ms[Apache Kafka -- offset.flush.interval.ms]
+
+== Topic auto-creation
+
+Kafka can create topics in two ways: the broker (`auto.create.topics.enable`) creates any topic that a producer writes to,
+with the broker's defaults, and Kafka Connect (`topic.creation.enable`, `true` by default) creates the topics of a source
+connector with settings that the connector configuration provides. The Connect mechanism takes precedence when both are
+enabled. For a migration, disable broker creation (`auto.create.topics.enable=false`), so that a typo never creates a stray
+topic, and let Connect create the Debezium topics with explicit settings.
+
+Connect creates a topic only if the connector defines at least the *default topic creation group* with a replication
+factor and a partition count. Custom groups match topic names with regular expressions and can set any topic-level
+property. They must be registered in `topic.creation.groups`.
+
+.bookshop-oracle-source.json fragment -- topic creation groups for the Bookshop topics
+[source,json]
+----
+{
+  "topic.creation.default.replication.factor": "3",
+  "topic.creation.default.partitions": "1",
+  "topic.creation.default.cleanup.policy": "delete",
+  "topic.creation.default.retention.ms": "1209600000",
+
+  "topic.creation.groups": "mirror,orders",
+
+  "topic.creation.mirror.include": "legacy\\.BOOKSHOP\\.(BOOK|AUTHOR|SUPPLIER_CATALOGUE)",
+  "topic.creation.mirror.cleanup.policy": "compact",
+  "topic.creation.mirror.min.compaction.lag.ms": "86400000",
+
+  "topic.creation.orders.include": "legacy\\.BOOKSHOP\\.(ORDERS|ORDER_LINE|CUSTOMER)",
+  "topic.creation.orders.retention.ms": "2592000000"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/topic-auto-create-config.html#default-topic-creation-group-configuration[Debezium -- Default topic creation group], https://debezium.io/documentation/reference/stable/configuration/topic-auto-create-config.html#custom-topic-creation-group-configuration[Debezium -- Custom topic creation groups] and https://debezium.io/documentation/reference/stable/configuration/topic-auto-create-config.html#registering-custom-topic-creation-groups[Debezium -- Registering custom groups]
+
+How the groups apply:
+
+* The `mirror` group covers the tables that the JDBC sink copies 1:1 into `legacy_book`, `legacy_author` and
+  `legacy_supplier_catalogue`. Compaction keeps the latest event per key forever, so a new mirror database can be
+  rebuilt from the topics without a new snapshot. `min.compaction.lag.ms` keeps every change for at least one day, so
+  that consumers that are a few hours behind still see each change.
+* The `orders` group keeps the order and customer history for 30 days, enough for the `bookshop` application's
+  `LegacyOrderProjector` to recover from a long outage.
+* Everything else, including the heartbeat topic, uses the default group: three replicas, one partition, 14 days.
+  One partition per table keeps all changes of a table in commit order. Debezium keys events by primary key, so more
+  partitions would still keep each row in order, but not the order across rows.
+* Custom groups take only the replication factor and the partition count from the default group. Other properties (here
+  `retention.ms`) are not inherited, so the `mirror` topics do not get the 14-day retention.
+* The patterns are Java regular expressions. In JSON, the backslash that escapes each dot is itself escaped, hence `\\.`.
+* Topic creation applies only when a topic does not exist yet. Changing a group later does not alter existing topics. Use
+  `kafka-configs.sh` (or the `KafkaTopic` resource on Strimzi) for those.
+
+The schema history topic is not created by this mechanism. Debezium creates it itself (or you create it beforehand, as
+the Kubernetes page does), with one partition and unlimited retention. The test run showed Connect creating each data
+topic on the first write, with the log line `+Created topic (name=..., numPartitions=1, replicationFactor=1, ...)+` for the
+settings of that lab.
+
+== Exactly-once source support
+
+KIP-618 (Kafka 3.3) lets Kafka Connect write the records of a source task and the task's offset in one Kafka
+transaction. Either both are committed or neither is, so a crash between producing a record and storing its offset no
+longer causes a replay. Connect also fences out "zombie" tasks of an older generation before starting new ones, so that
+two copies of the same task cannot write at the same time after a rebalance. Debezium does not deduplicate on its own,
+but it can take part in this framework feature.
+
+=== Which connectors support it
+
+The Debezium documentation lists the MariaDB, MongoDB, MySQL, Oracle, PostgreSQL and SQL Server connectors as able to
+participate in Kafka Connect exactly-once delivery. Exactly-once source support requires Kafka Connect 3.3.0 or later in
+distributed mode. Standalone workers cannot provide it.
+
+The documentation is also explicit about a caveat. Kafka transactions are the basis of the feature, and public analyses
+(two Jepsen reports on Kafka-compatible systems) found correctness problems in the transaction protocol and its
+implementations. Several related Apache Kafka issues were still open (`KAFKA-17734`, `KAFKA-17754`, `KAFKA-17582`). The
+Debezium team therefore states that it is unclear whether the Connect exactly-once implementation is correct in all edge
+cases. Treat exactly-once as a strong reduction of duplicates, not as a reason to drop idempotency in the consumers.
+
+Reference: https://debezium.io/documentation/reference/stable/configuration/eos.html#_debezium_connectors_supporting_exactly_once_delivery[Debezium -- Connectors supporting exactly-once delivery] and https://debezium.io/documentation/reference/stable/configuration/eos.html#_known_issues_and_considerations[Debezium -- Exactly-once: known issues and considerations]
+
+=== Configuring the workers
+
+Every worker of the Connect cluster must have `exactly.once.source.support=enabled`. On a *new* cluster, set it from the
+start. On an *existing* cluster with running connectors (the usual case in the middle of a migration), do two rolling
+restarts: first set `preparing` on every worker, then `enabled` on every worker. The `preparing` step makes all workers
+able to fence and to read transactional offsets before any of them starts writing transactionally.
+
+.compose.yaml fragment -- Connect with exactly-once source support
+[source,yaml]
+----
+  connect:
+    image: quay.io/debezium/connect:3.7.1.Final
+    environment:
+      - BOOTSTRAP_SERVERS=kafka:9092
+      - GROUP_ID=bookshop-connect
+      - CONFIG_STORAGE_TOPIC=bookshop_connect_configs
+      - OFFSET_STORAGE_TOPIC=bookshop_connect_offsets
+      - STATUS_STORAGE_TOPIC=bookshop_connect_statuses
+      - CONNECT_EXACTLY_ONCE_SOURCE_SUPPORT=enabled
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/eos.html#_configuration_of_the_kafka_workers[Debezium -- Configuration of the Kafka workers] and https://kafka.apache.org/43/configuration/kafka-connect-configs/#connectconfigs_exactly.once.source.support[Apache Kafka -- exactly.once.source.support]
+
+The Debezium image maps `+CONNECT_*+` environment variables to worker properties, so `CONNECT_EXACTLY_ONCE_SOURCE_SUPPORT`
+becomes `exactly.once.source.support`. On Strimzi, put `exactly.once.source.support: enabled` in the `spec.config` of the
+`KafkaConnect` resource. Strimzi rolls the workers when the configuration changes, which gives the two-step upgrade if you
+apply `preparing` first and wait for the rollout to finish.
+
+=== Configuring the connector
+
+.bookshop-oracle-source.json fragment -- requiring exactly-once delivery
+[source,json]
+----
+{
+  "exactly.once.support": "required",
+  "transaction.boundary": "poll"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/eos.html#_source_connector_configuration[Debezium -- Source connector configuration] and https://kafka.apache.org/43/configuration/kafka-connect-configs/#sourceconnectorconfigs_exactly.once.support[Apache Kafka -- exactly.once.support]
+
+* `exactly.once.support=required` makes Connect check, when the connector is created or validated, that the connector can
+  provide exactly-once delivery. If the worker that validates it does not have exactly-once support enabled, creating the
+  connector fails. That is the point: a misconfigured cluster is rejected instead of silently running at least once. The
+  other value, `requested`, does not enforce the check.
+* `transaction.boundary=poll` starts and commits one producer transaction for every batch that a task returns from a
+  poll. It is the default, and the value that the Debezium documentation requires for all Debezium connectors, so the line
+  is only there to document the intent. `interval` and `connector` are not for Debezium.
+
+In the test run, a PostgreSQL connector with `exactly.once.support=required` on a worker with
+`exactly.once.source.support=enabled` was created and ran normally, and `kafka-transactions.sh list` showed the two kinds
+of transactional IDs that Connect uses:
+
+.Transactional IDs listed in the test run (worker group bookshop-connect)
+[source,text]
+----
+TransactionalId                 	Coordinator	ProducerId	TransactionState
+connect-cluster-bookshop-connect	1          	0         	CompleteCommit
+bookshop-connect-lab-pg-source-0	1          	1         	CompleteCommit
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#acl-requirements[Apache Kafka -- Kafka Connect ACL requirements]
+
+The first is the worker's own ID, `connect-cluster-<group.id>`, used to write the config topic. The second is the task's
+ID, `<group.id>-<connector>-<task>`. For Bookshop it would be `bookshop-connect-bookshop-oracle-source-0`. On a secured
+Kafka cluster, these names drive the ACLs.
+
+=== ACLs on a secured cluster
+
+With exactly-once enabled, the worker principal needs `Write` and `Describe` on the transactional ID
+`+connect-cluster-${groupId}+`, and each source connector's principal needs `Write` and `Describe` on
+`+${groupId}-${connector}-${taskId}+` for each task (a prefixed ACL on `+${groupId}-${connector}+` is the convenient form) and
+`Describe` on the offsets topic it uses. These come on top of the usual Connect ACLs on the config, offsets and status
+topics and the destination topics.
+
+.ACLs for the Bookshop worker and the Oracle source connector (same principal)
+[source,shell]
+----
+kafka-acls.sh --bootstrap-server kafka:9093 --command-config admin.properties --add \
+  --allow-principal User:bookshop-connect \
+  --operation Write --operation Describe \
+  --transactional-id connect-cluster-bookshop-connect
+
+kafka-acls.sh --bootstrap-server kafka:9093 --command-config admin.properties --add \
+  --allow-principal User:bookshop-connect \
+  --operation Write --operation Describe \
+  --transactional-id bookshop-connect-bookshop-oracle-source --resource-pattern-type prefixed
+
+kafka-acls.sh --bootstrap-server kafka:9093 --command-config admin.properties --add \
+  --allow-principal User:bookshop-connect \
+  --operation Describe --topic bookshop_connect_offsets
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#acl-requirements[Apache Kafka -- Kafka Connect ACL requirements]
+
+`admin.properties` holds the administrator's client security settings. On Strimzi, the same rules are written as
+`KafkaUser` ACLs. Kafka security in general is covered in xref:backend/messaging/kafka-security.adoc[Kafka Security] and
+xref:database/migration/security-and-data-protection.adoc[Security & Data Protection].
+
+=== Consumers must read committed data
+
+Exactly-once on the source side only helps if consumers ignore records of aborted transactions. Kafka consumers read
+uncommitted data by default (`isolation.level=read_uncommitted`), so a record from a transaction that was aborted (because
+its task crashed) would still be delivered. Set `isolation.level=read_committed` on every consumer of the `+legacy.*+`
+topics:
+
+* The JDBC sink: `"consumer.override.isolation.level": "read_committed"` in `bookshop-pg-mirror-sink`. This needs the worker's
+  `connector.client.config.override.policy` to allow it. The default policy in Kafka 4.3 is `All`, which does.
+  Alternatively, set `consumer.isolation.level=read_committed` on the worker, which applies to all sink connectors.
+* The Spring Boot `bookshop` application: `spring.kafka.consumer.isolation-level=read-committed`, as described in
+  xref:backend/messaging/spring-boot-kafka.adoc[Spring Boot and Kafka].
+
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#exactly-once-support[Apache Kafka -- Kafka Connect exactly-once support] and https://kafka.apache.org/43/configuration/kafka-connect-configs/#connectconfigs_connector.client.config.override.policy[Apache Kafka -- connector.client.config.override.policy]
+
+=== What exactly-once does not give you
+
+Exactly-once source support makes the *write into Kafka* happen once per change. It does not make the whole migration
+exactly once:
+
+* A sink or consumer that crashes after writing to PostgreSQL but before committing its Kafka offset processes the record
+  again. The JDBC sink's upserts and the application's `processed_change` check still matter.
+* Snapshots (initial, incremental, blocking) and any manual offset change re-emit data by design.
+* A `DELETE` of the offsets, a new connector name or a new `topic.prefix` start a new history.
+* The documented caveats about the Kafka transaction protocol apply.
+
+For the Bookshop migration, the recommended set-up is: at-least-once with idempotent consumers as the baseline, plus
+exactly-once source support where the Kafka cluster supports transactions and the operational cost (ACLs, two-step
+enablement, `read_committed` consumers) is acceptable. The guarantees of each Debezium deployment are compared in
+xref:database/migration/debezium-features-and-guarantees.adoc[Features & Delivery Guarantees].
+
+== What goes wrong
+
+[cols="1,2",options="header"]
+|===
+| Symptom | Cause and fix
+
+| `PATCH` or `DELETE` on `/offsets` returns `Connectors must be in the STOPPED state`
+| The connector is running or only paused. Use `PUT /connectors/<name>/stop` and wait for `STOPPED`.
+
+| After a `PATCH`, the connector starts from the old position
+| The partition in the body did not match (for example `+{"server":"Legacy"}+` instead of `+{"server":"legacy"}+`), so a new
+  key was written and the old one is still used. Build the body from the `GET` response.
+
+| After a reset, the Oracle connector fails at start with a schema history error
+| The offsets were deleted but `legacy.schema-history` was kept. Delete the topic too, or restore the offsets.
+
+| The connector cannot start because the offset SCN is not in the available logs
+| The archive logs were deleted while the connector was stopped or behind. Restore them from backup if possible.
+  Otherwise move the offset forward and run an incremental snapshot.
+
+| Creating the connector fails with an error about exactly-once support
+| `exactly.once.support=required` on a worker without `exactly.once.source.support=enabled`, or the connector is not
+  able to provide it. Enable the worker setting on every worker first.
+
+| Workers fail to start with transactional ID authorization errors
+| Exactly-once is enabled but the worker principal lacks the `connect-cluster-<group.id>` ACLs.
+
+| Consumers still see duplicates after enabling exactly-once
+| The consumers use `read_uncommitted`, or the duplicates come from the sink side or from a snapshot.
+
+| Data topics have one replica, or the wrong retention
+| Broker auto-creation created them before Connect did, or the topic creation group did not match. Check
+  `auto.create.topics.enable=false`, `topic.creation.groups` and the include regular expressions.
+
+| `+Failed to flush, timed out while waiting for producer to flush outstanding ... messages+`
+| Kafka cannot absorb the batch in `offset.flush.timeout.ms`. Shorten `offset.flush.interval.ms`, lengthen the timeout,
+  or reduce `max.batch.size` and `max.queue.size`, as the FAQ suggests.
+|===
+Reference: https://debezium.io/documentation/faq/[Debezium FAQ] and https://debezium.io/documentation/reference/stable/configuration/eos.html[Debezium -- Exactly-once delivery]
+
+More failure scenarios are in xref:database/migration/troubleshooting-and-failure-recovery.adoc[Troubleshooting & Failure
+Recovery].
+
+== References
+
+* https://debezium.io/documentation/reference/stable/configuration/storage.html[Debezium -- Store Debezium state]
+* https://debezium.io/documentation/reference/stable/configuration/topic-auto-create-config.html[Debezium -- Customizing topic auto-creation]
+* https://debezium.io/documentation/reference/stable/configuration/eos.html[Debezium -- Exactly-once delivery]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html[Debezium -- Sending signals to Debezium]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-frequently-asked-questions[Debezium -- Oracle connector FAQ]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties]
+* https://debezium.io/documentation/faq/#how_to_remove_committed_offsets_for_a_connector[Debezium FAQ -- How to remove committed offsets for a connector?]
+* https://debezium.io/documentation/faq/#how_to_change_the_offsets_of_the_source_database[Debezium FAQ -- How to change the offsets of the source database?]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka 4.3 -- Kafka Connect REST API]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#exactly-once-support[Apache Kafka 4.3 -- Kafka Connect exactly-once support]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#acl-requirements[Apache Kafka 4.3 -- Kafka Connect ACL requirements]
+* https://kafka.apache.org/43/configuration/kafka-connect-configs/[Apache Kafka 4.3 -- Kafka Connect configs]
+* https://cwiki.apache.org/confluence/display/KAFKA/KIP-875%3A+First-class+offsets+support+in+Kafka+Connect[KIP-875 -- First-class offsets support in Kafka Connect]
+* https://cwiki.apache.org/confluence/display/KAFKA/KIP-618%3A+Exactly-Once+Support+for+Source+Connectors[KIP-618 -- Exactly-Once Support for Source Connectors]
+* https://strimzi.io/docs/operators/latest/deploying.html#proc-listing-connector-offsets-str[Strimzi -- Managing connector offsets]
+
+The REST, topic creation and exactly-once steps on this page were run with Docker on 2026-11-09 against a PostgreSQL test
+connector. The Oracle offset procedure, the Strimzi resources and the ACLs are derived from the official documentation and
+were not run.

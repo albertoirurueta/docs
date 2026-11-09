@@ -1,0 +1,708 @@
+= Migration Strategies: Big Bang, Dual Writes, Batch ETL and CDC
+:description: Compares the six ways of moving data from a legacy database to a new one while the legacy system keeps running (big-bang dump and restore, application dual writes, batch ETL, trigger-based capture, query-based polling capture and log-based change data capture) on consistency, deletes, latency, load on the legacy database, code changes in the legacy application and rollback, explains why log-based CDC sees deletes and intermediate states that polling misses, and ends with a decision table and the strategy chosen for each table of the Bookshop migration.
+:keywords: database migration, migration strategy, big bang migration, dump and restore, dual writes, batch ETL, trigger-based CDC, query-based CDC, polling, log-based CDC, change data capture, Debezium, Oracle, PostgreSQL, strangler fig, deletes, intermediate states, decision table
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A legacy database rarely gets migrated in one go. The Bookshop example used throughout this section keeps its legacy
+Java EE/Struts application writing to the `BOOKSHOP` schema in Oracle while the new Spring Boot `bookshop` application
+grows on PostgreSQL. For months both databases hold overlapping data, and something has to move every committed change
+from one to the other. This page compares the six techniques teams use to do that, judges each one by the same criteria,
+and explains why this section builds on **log-based change data capture (CDC)** with Debezium.
+
+xref:backend/architecture/decisions-and-migrations/migration-overview.adoc[Migration Overview] already argues against the big-bang rewrite in general, and
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_data_synchronisation_during_the_overlap[Migration Path: From a Legacy Stack to a Modern One]
+already names dual writes and CDC as the two ways to keep the databases in sync during the overlap. This page goes one
+level deeper. It looks at the *data* side only, adds the four strategies those pages do not cover (big-bang dump and
+restore, batch ETL, triggers and polling), and shows with concrete Bookshop timelines where each strategy loses data.
+The next page, xref:database/migration/migration-patterns-with-cdc.adoc[Migration Patterns with CDC], takes the chosen
+strategy and turns it into a sequence of migration phases.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, Oracle AI Database 26ai Free (image `gvenzl/oracle-free:23.26.3`,
+PDB `FREEPDB1`) and PostgreSQL 18. The SQL and Java on this page are derived from the official documentation listed
+under <<_references,References>> and were not run. The connector configuration is the canonical `bookshop-oracle-source`
+configuration that was run in the xref:database/migration/worked-example-oracle-to-postgresql.adoc[worked example].
+
+== The criteria every strategy is judged by
+
+A data-migration strategy is the mechanism that answers one question for the whole overlap period: *when a row changes
+in the legacy database, how and when does the new database learn about it?* Six criteria decide whether an answer is
+good enough for a production migration.
+
+[cols="1,3",options="header"]
+|===
+| Criterion | What it asks
+
+| Consistency
+| Does the new database end up with exactly the committed state of the legacy one, with no lost changes, no changes from
+  rolled-back transactions, and changes to the same row applied in commit order?
+
+| Deletes
+| When a row is deleted in the legacy database, does the deletion reach the new database, or does the row live on there
+  forever?
+
+| Latency
+| How long after the legacy commit does the change become visible in the new database? Seconds decide whether the
+  strangler proxy can route reads to the new system while writes still go to the legacy one.
+
+| Load on the legacy database
+| How much extra CPU, I/O, locking and storage does the strategy add to a database that is often already the most
+  fragile part of the legacy estate?
+
+| Code changes in the legacy application
+| Does the legacy application (the Struts WAR, its stored procedures, its batch jobs) have to change? Every change there
+  is tested and deployed on a platform that is on its way out, which
+  xref:backend/architecture/decisions-and-migrations/migration-overview.adoc[Migration Overview] advises to minimise.
+
+| Reversibility
+| Can the strategy run in the other direction after the write cut-over, so that the legacy system can take over again if
+  the new one fails?
+|===
+
+The rest of the page applies these six criteria to each strategy in turn, then collects the verdicts in one decision
+table.
+
+== Strategy 1: big-bang dump and restore
+
+=== How it works
+
+The application is stopped (or switched to read-only), the whole legacy schema is exported, transformed, loaded into
+the new database, checked, and then the new application is started against it. There is no overlap period at all:
+before the cut-over only the legacy database exists, and after it only the new one does. Tools vary (Oracle Data Pump to
+a staging Oracle, a migration tool that reads Oracle and writes PostgreSQL, a set of `COPY` scripts fed from flat-file
+exports), but the shape is always the same: freeze, copy, verify, switch.
+
+=== Where it fits and where it breaks
+
+Big-bang copy is simple and its consistency is perfect: with writes frozen, the copy is a single consistent image. It
+has no deletes problem, needs no change in the legacy code and adds load only during the copy. Its cost is the
+**downtime window**, which grows with the data volume and with every transformation and check that has to run inside
+it. For Bookshop, the `ORDERS` and `ORDER_LINE` tables hold years of history, and the reconciliation queries alone would
+take longer than the business accepts for a shop that sells around the clock.
+
+It also breaks the strangler fig. With a single switch moment, the new application has to take over *every* capability
+at once, which is exactly the big-bang rewrite the architecture pages argue against. If something goes wrong a day
+later, there is no cheap way back: the legacy database stopped receiving writes at the switch, so rolling back means
+either losing a day of orders or writing a second, reverse big-bang migration under pressure.
+
+Big-bang copy still has a place inside an incremental migration:
+
+* For **small, rarely changing reference tables** (currency codes, country lists), a one-off copy during a deployment is
+  cheaper than running a pipeline for them.
+* For **archive data** that nobody writes any more (orders closed ten years ago), a one-off bulk copy avoids pushing
+  millions of historic rows through the change stream.
+* The **initial snapshot** that a CDC connector takes before it starts streaming is itself a bulk copy, but one that
+  does not need a write freeze, as xref:database/migration/initial-snapshots.adoc[Initial Snapshots] explains.
+
+== Strategy 2: application dual writes
+
+=== How it works
+
+The legacy application is changed so that every write goes to both databases: the existing Oracle `UPDATE` and a new
+PostgreSQL `UPDATE`, in the same request. For the price change of a book it looks like this.
+
+.Dual write in the legacy application (anti-pattern)
+[source,java]
+----
+public void changePrice(long bookId, BigDecimal newPrice) {
+    // 1. Legacy write: Oracle, local JTA transaction of the WAR
+    oracleJdbc.update(
+        "UPDATE BOOKSHOP.BOOK SET PRICE = ?, LAST_UPD = SYSDATE WHERE BOOK_ID = ?",
+        newPrice, bookId);
+
+    // 2. New write: PostgreSQL, a second, independent connection
+    postgresJdbc.update(
+        "UPDATE book SET price = ?, updated_at = now() WHERE id = ?",
+        newPrice, bookId);
+    // No transaction spans both databases: a crash, a timeout or a rollback
+    // between or after these two statements leaves them disagreeing.
+}
+----
+Reference: https://microservices.io/patterns/data/transactional-outbox.html[microservices.io -- Transactional outbox (the dual-write problem)]
+
+=== What goes wrong
+
+xref:backend/architecture/architectural-patterns/transactional-outbox.adoc[Transactional Outbox] already states the dual-write problem precisely for a
+database and a broker: commit then crash before the second write, or write the second system and then roll back the
+first. Both failures apply unchanged when the second system is a database. A migration adds three more problems that
+the outbox page does not need to discuss:
+
+* **Concurrent writers apply changes in different orders.** Two requests change the price of book 42 at almost the
+  same time. Request A writes Oracle first, request B writes Oracle second, so Oracle ends with B's price. The
+  PostgreSQL writes race independently, and if A's PostgreSQL write arrives last, PostgreSQL ends with A's price. Both
+  writes "succeeded", both databases are healthy, and they disagree forever. Nothing records which one is right.
+* **Every write path has to be found.** The legacy Bookshop writes to `BOOK` from Struts actions, from the
+  `PRICING_PKG` stored procedures, from the nightly supplier feed and from ad hoc SQL that operators run by hand. A dual
+  write covers only the paths that were found and changed. The ones that were missed fail silently.
+* **The legacy code changes most where it is least safe to change.** Dual writes put new connection pools,
+  configuration and failure handling inside the legacy WAR, on WebLogic, in the code base the migration is trying to
+  retire.
+
+The sequence below shows the most common failure. The legacy transaction commits, the second write times out, and the
+two databases now differ with no record of the gap.
+
+[mermaid]
+....
+sequenceDiagram
+    participant App as Legacy app (Struts WAR)
+    participant Ora as Oracle BOOKSHOP
+    participant Pg as PostgreSQL bookshop
+    App->>Ora: UPDATE BOOK SET PRICE = 12.50 WHERE BOOK_ID = 42
+    Ora-->>App: 1 row updated
+    App->>Ora: COMMIT
+    Ora-->>App: committed
+    App->>Pg: UPDATE book SET price = 12.50 WHERE id = 42
+    Pg--xApp: timeout (network blip)
+    Note over Ora,Pg: Oracle says 12.50, PostgreSQL still says 11.00
+    Note over App: Retry? The request thread has already returned to the user
+....
+
+With log-based CDC the legacy application performs only its own write. The change reaches PostgreSQL because it is in
+the Oracle redo log, and a failure on the way only delays it.
+
+[mermaid]
+....
+sequenceDiagram
+    participant App as Legacy app (Struts WAR)
+    participant Ora as Oracle BOOKSHOP
+    participant Dbz as Debezium Oracle connector
+    participant K as Kafka topic legacy.BOOKSHOP.BOOK
+    participant Pg as PostgreSQL bookshop
+    App->>Ora: UPDATE BOOK SET PRICE = 12.50 WHERE BOOK_ID = 42
+    App->>Ora: COMMIT
+    Ora-->>App: committed (redo record written)
+    Dbz->>Ora: mine redo log from last offset
+    Ora-->>Dbz: committed UPDATE of BOOK_ID 42
+    Dbz->>K: change event op=u, key BOOK_ID=42
+    K-->>Pg: consumer or JDBC sink applies the change
+    Note over Dbz,Pg: If the sink is down, the event waits in Kafka. If the connector is down, it restarts from its stored offset.
+....
+
+=== Verdict
+
+Dual writes are acceptable only where xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_data_synchronisation_during_the_overlap[the legacy migration path]
+already allows them: low-stakes data where a divergence is cheap to detect and fix. For anything that has to be correct,
+they are the strategy this section is written to avoid.
+
+== Strategy 3: batch ETL
+
+=== How it works
+
+A scheduled job (nightly, hourly) extracts rows from the legacy database, transforms them into the new model and loads
+them into the new database. Most teams already run something like this for reporting, so it is a familiar first answer.
+The load step is usually an upsert from a staging table.
+
+.Batch ETL load step: upsert from a staging table into the new model (PostgreSQL)
+[source,sql]
+----
+-- staging_book was filled by the extract step with a full copy of BOOKSHOP.BOOK
+INSERT INTO book (id, isbn, title, price, currency, published_on, active, supplier_id, updated_at)
+SELECT s.book_id,
+       s.isbn,
+       s.title,
+       s.price,
+       s.currency,
+       s.published::date,
+       s.active_flg = 'Y',
+       s.supplier_id,
+       s.last_upd AT TIME ZONE 'Europe/Madrid'
+FROM staging_book s
+ON CONFLICT (id) DO UPDATE
+   SET isbn         = EXCLUDED.isbn,
+       title        = EXCLUDED.title,
+       price        = EXCLUDED.price,
+       currency     = EXCLUDED.currency,
+       published_on = EXCLUDED.published_on,
+       active       = EXCLUDED.active,
+       supplier_id  = EXCLUDED.supplier_id,
+       updated_at   = EXCLUDED.updated_at;
+
+-- Deletes need a separate anti-join, which only works with a FULL extract
+DELETE FROM book b
+WHERE NOT EXISTS (SELECT 1 FROM staging_book s WHERE s.book_id = b.id);
+----
+Reference: https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT[PostgreSQL -- INSERT ... ON CONFLICT]
+
+=== What goes wrong
+
+* **Latency is the batch interval.** With a nightly job, the new database is up to a day behind. The strangler proxy
+  cannot send any read to the new application for data that the legacy one still writes, because users would see
+  yesterday's prices.
+* **Deletes need a full extract.** An incremental extract (only rows changed since the last run) cannot see rows that no
+  longer exist. Detecting deletes means extracting *all* keys every time and anti-joining, as in the example above,
+  which costs a full table scan per run on the legacy side.
+* **The extract is not a consistent image** unless it runs in one read-consistent transaction (an Oracle flashback query
+  at one SCN, for example). A job that extracts `ORDERS` and then `ORDER_LINE` a minute later can load order lines for
+  orders it has not seen.
+* **Load on the legacy database is concentrated.** A full scan of `ORDER_LINE` competes with the night-time batch jobs
+  that the legacy system already runs, and ETL windows tend to grow until they collide.
+
+=== Verdict
+
+Batch ETL is the right tool for reporting copies and for one-off backfills of archive data. It is not a synchronisation
+mechanism for a strangler migration, because its latency rules out any read cut-over while the legacy system still owns
+the writes.
+
+== Strategy 4: trigger-based capture
+
+=== How it works
+
+Database triggers on each legacy table write every change into a change table inside the same transaction. A relay
+process reads the change table, publishes or applies each row, and then deletes it. Because the trigger runs inside the
+legacy transaction, a rolled-back write leaves no change row, and a delete fires the trigger like any other write.
+
+.Trigger-based capture on the legacy BOOK table (Oracle)
+[source,sql]
+----
+CREATE TABLE BOOKSHOP.BOOK_CHANGES (
+    CHANGE_ID   NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    OP          CHAR(1)      NOT NULL,          -- 'I', 'U' or 'D'
+    BOOK_ID     NUMBER(10)   NOT NULL,
+    PRICE       NUMBER(10,2),
+    ACTIVE_FLG  CHAR(1),
+    CHANGED_AT  TIMESTAMP    DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+CREATE OR REPLACE TRIGGER BOOKSHOP.BOOK_CDC_TRG
+AFTER INSERT OR UPDATE OR DELETE ON BOOKSHOP.BOOK
+FOR EACH ROW
+BEGIN
+    IF DELETING THEN
+        INSERT INTO BOOKSHOP.BOOK_CHANGES (OP, BOOK_ID, PRICE, ACTIVE_FLG)
+        VALUES ('D', :OLD.BOOK_ID, :OLD.PRICE, :OLD.ACTIVE_FLG);
+    ELSIF UPDATING THEN
+        INSERT INTO BOOKSHOP.BOOK_CHANGES (OP, BOOK_ID, PRICE, ACTIVE_FLG)
+        VALUES ('U', :NEW.BOOK_ID, :NEW.PRICE, :NEW.ACTIVE_FLG);
+    ELSE
+        INSERT INTO BOOKSHOP.BOOK_CHANGES (OP, BOOK_ID, PRICE, ACTIVE_FLG)
+        VALUES ('I', :NEW.BOOK_ID, :NEW.PRICE, :NEW.ACTIVE_FLG);
+    END IF;
+END;
+/
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/lnpls/CREATE-TRIGGER-statement.html[Oracle Database 23ai -- CREATE TRIGGER statement]
+
+=== What goes wrong
+
+Triggers fix the consistency and delete problems of dual writes and batch ETL, and they do it without touching the
+application code. The price is paid elsewhere:
+
+* **Every legacy write gets slower.** Each `UPDATE` of `BOOK` now performs a second insert, generates more redo and undo,
+  and holds its locks longer. On hot tables such as `ORDERS` this is measurable, and it lands on the production
+  database of the system that the business still depends on.
+* **The legacy schema changes.** New tables, new triggers and new grants have to be reviewed, deployed and maintained
+  in the legacy schema, often by a DBA team that owns that schema and has its own change process. When a column is added
+  to `BOOK`, someone has to remember to change the trigger, or the new column is never captured.
+* **The relay is still a polling publisher.** Something has to read `BOOK_CHANGES`, apply each row and delete it, with
+  all the batching, ordering and at-least-once concerns that
+  xref:backend/architecture/architectural-patterns/transactional-outbox.adoc[Transactional Outbox] describes for the polling publisher. Ordering by
+  `CHANGE_ID` is not commit order when two transactions interleave: the identity value is assigned at insert time, not at
+  commit time.
+* **Bulk operations and some paths bypass row triggers.** Direct-path loads, `TRUNCATE`, and partition exchanges do not
+  fire row-level triggers. Neither does an operator who disables triggers to speed up a data fix.
+
+=== Verdict
+
+Trigger-based capture was the standard answer before log-based tools existed, and it is still the fallback on a database
+for which no log-based connector exists. On Oracle, PostgreSQL, MySQL, SQL Server, Db2 and MongoDB, a log-based
+connector gives the same guarantees without the write overhead and without the schema changes.
+
+== Strategy 5: query-based capture (polling an update timestamp)
+
+=== How it works
+
+A poller runs the same query every few seconds: *give me every row whose last-update column is newer than the last one I
+saw*. The Confluent JDBC source connector implements exactly this pattern with its `timestamp`, `incrementing` and
+`pass:c[timestamp+incrementing]` modes. The legacy `BOOK` table has a `LAST_UPD DATE` column, so the query looks like
+this.
+
+.Query-based capture: polling BOOK by its last-update column (Oracle)
+[source,sql]
+----
+-- :last_seen_upd and :last_seen_id are the high-water mark stored by the poller
+SELECT BOOK_ID, ISBN, TITLE, AUTHOR_ID, PRICE, CURRENCY, PUBLISHED,
+       ACTIVE_FLG, SUPPLIER_ID, LAST_UPD
+FROM   BOOKSHOP.BOOK
+WHERE  LAST_UPD > :last_seen_upd
+   OR (LAST_UPD = :last_seen_upd AND BOOK_ID > :last_seen_id)
+ORDER  BY LAST_UPD, BOOK_ID
+FETCH FIRST 1000 ROWS ONLY;
+----
+Reference: https://docs.confluent.io/kafka-connectors/jdbc/current/source-connector/source_config_options.html[Confluent -- JDBC Source connector configuration (mode, timestamp.column.name, incrementing.column.name)]
+
+=== What goes wrong
+
+Polling is attractive because it needs only a `SELECT` grant. It is also the strategy that loses data most quietly.
+
+* **Deletes are invisible.** A deleted row no longer matches any query. The Confluent documentation says it directly
+  about the `incrementing` mode: it "will not detect modifications or deletions of existing rows". The `timestamp`
+  modes detect modifications, but no mode detects deletes. The usual workaround is a soft delete (`ACTIVE_FLG = 'N'`),
+  which is a change to the legacy application.
+* **Intermediate states are lost.** If book 42 changes three times between two polls, the poller sees only the last
+  state. For a price that may be acceptable. For an order whose `STATUS_CD` went `NW` → `PD` → `CN` (new, paid,
+  cancelled) between polls, the new system never learns that a payment happened and has to be refunded.
+* **The timestamp must be right on every write path.** `LAST_UPD` is set by the Struts code, but not by the
+  `PRICING_PKG` procedure that the supplier feed calls, nor by operators' manual fixes. Every path that forgets to set it
+  produces a change the poller never sees.
+* **Long transactions commit "in the past".** `LAST_UPD = SYSDATE` is evaluated when the statement runs, not when the
+  transaction commits. A batch job that updates book 42 at 10:00:00 and commits at 10:00:20 is invisible to a poll at
+  10:00:10 (not committed yet), and the poll at 10:00:30 has already moved its high-water mark past 10:00:00. The change
+  is skipped permanently. Pollers work around this with a delay (`timestamp.delay.interval.ms` in the Confluent
+  connector), which trades latency for a smaller, but non-zero, risk.
+* **Oracle `DATE` has one-second precision.** Many rows share the same `LAST_UPD`, which is why the query above needs
+  the `BOOK_ID` tie-breaker, and why it still fails when a row with a lower `BOOK_ID` commits later in the same second.
+* **Load grows with the polling frequency.** Every poll is a range query on `LAST_UPD`, which needs an index that the
+  legacy schema may not have. Polling more often lowers latency and raises load. Polling less often does the opposite
+  and widens every window above.
+
+=== Verdict
+
+Query-based capture is acceptable for append-only data, or for read models where the latest state is enough and deletes
+do not happen. It is not acceptable as the synchronisation mechanism of a migration, where the new database has to
+become an exact replacement of the legacy one.
+
+== Strategy 6: log-based change data capture
+
+=== How it works
+
+Every relational database already writes each committed change to a log before it acknowledges the commit: the redo log
+in Oracle, the write-ahead log (WAL) in PostgreSQL, the binary log in MySQL and MariaDB, the transaction log in SQL
+Server (read through its CDC tables), and the oplog behind MongoDB change streams. The database uses this log for crash
+recovery and replication. A log-based CDC tool reads the same log, in commit order, and turns each committed row change
+into an event. microservices.io calls this pattern **transaction log tailing**.
+
+Debezium is a set of such readers, packaged as Kafka Connect source connectors (and as Debezium Server and the Debezium
+Engine, compared on xref:database/migration/debezium-architecture.adoc[Debezium Architecture]). For the legacy Bookshop
+database, the Oracle connector mines the redo log through LogMiner and publishes one Kafka topic per captured table,
+named `<topic.prefix>.<schema>.<table>`.
+
+.Debezium Oracle source connector for the legacy Bookshop schema
+[source,json]
+----
+{
+  "name": "bookshop-oracle-source",
+  "config": {
+    "connector.class": "io.debezium.connector.oracle.OracleConnector",
+    "tasks.max": "1",
+    "database.hostname": "oracle",
+    "database.port": "1521",
+    "database.user": "c##dbzuser",
+    "database.password": "dbz",
+    "database.dbname": "FREE",
+    "database.pdb.name": "FREEPDB1",
+    "topic.prefix": "legacy",
+    "table.include.list": "BOOKSHOP.BOOK,BOOKSHOP.AUTHOR,BOOKSHOP.CUSTOMER,BOOKSHOP.ORDERS,BOOKSHOP.ORDER_LINE,BOOKSHOP.SUPPLIER_CATALOGUE",
+    "log.mining.strategy": "hybrid",
+    "snapshot.mode": "initial",
+    "decimal.handling.mode": "string",
+    "provide.transaction.metadata": "true",
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "legacy.schema-history",
+    "schema.history.internal.store.only.captured.tables.ddl": "false",
+    "signal.enabled.channels": "source,kafka",
+    "signal.data.collection": "FREEPDB1.BOOKSHOP.DEBEZIUM_SIGNAL",
+    "signal.kafka.topic": "legacy.signals",
+    "signal.kafka.bootstrap.servers": "kafka:9092"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-example-configuration[Debezium -- Oracle connector configuration example] and https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties]
+
+A few details of this configuration matter for the comparison:
+
+* `table.include.list` uses the `<schema_name>.<table_name>` format, and `database.pdb.name` points the connector at the
+  pluggable database, because Oracle AI Database 26ai Free runs as a container database (`FREE`) with `FREEPDB1`
+  inside it.
+* `snapshot.mode=initial` (the default) makes the connector copy the current content of each table once, and then
+  stream changes from the log position at which the snapshot was taken. The bulk copy and the change stream join
+  without a gap and without freezing writes.
+* `log.mining.strategy=hybrid` resolves table and column names from the live data dictionary *and* the connector's own
+  schema model, so that DDL on the legacy tables is tracked without writing the dictionary to the redo logs. The default,
+  `online_catalog`, cannot track DDL. `redo_log_catalog` is deprecated.
+* `decimal.handling.mode=string` sends every Oracle `NUMBER` (prices and keys alike) as an exact string, and
+  `provide.transaction.metadata=true` tags each event with its legacy transaction. The signal settings let an operator
+  re-snapshot one table later through the `BOOKSHOP.DEBEZIUM_SIGNAL` table or the `legacy.signals` topic.
+  xref:database/migration/oracle-connector.adoc[Oracle Connector] explains each property.
+* `kafka:9092` is the broker address inside the Docker or Kubernetes network where Kafka Connect runs. Clients on the
+  host use `localhost:9092`.
+
+The full set of prerequisites (archive log mode, supplemental logging, the `C##DBZUSER` common user and its LogMiner
+grants) is on xref:database/migration/oracle-connector.adoc[Oracle Connector].
+
+=== What it gives the migration
+
+The Debezium documentation lists five properties that set log-based CDC apart from polling and dual writes. Each one
+answers a failure described above.
+
+[cols="2,3",options="header"]
+|===
+| Property of log-based CDC | Failure it removes
+
+| All committed changes are captured, in commit order
+| Lost intermediate states (polling), concurrent writers applied in different orders (dual writes), long transactions
+  that commit "in the past" (polling)
+
+| Changes arrive with a very low delay (milliseconds to seconds) without polling queries
+| Batch latency (ETL), the latency/load trade-off of polling
+
+| No change to the data model, such as a last-update column
+| Forgotten `LAST_UPD` on some write paths (polling), triggers and change tables in the legacy schema
+
+| Deletes are captured
+| Rows that live on forever in the new database (polling, incremental ETL)
+
+| Old row state and metadata (transaction ID, source position, and on some databases the user) are available
+| No way to tell which change came from where, which matters for loop prevention in reverse replication
+|===
+
+=== What it costs
+
+Log-based CDC is not free, and the rest of this section is largely about paying these costs well:
+
+* **Database prerequisites.** Oracle needs `ARCHIVELOG` mode and supplemental logging, which increases redo volume.
+  PostgreSQL needs `wal_level=logical` and a replication slot, which retains WAL until the connector confirms it. MySQL
+  needs a row-based binary log. Each source connector page lists them.
+* **Some load on the source is unavoidable.** The Debezium FAQ is explicit that running a connector "may place
+  additional load on the source database". For Oracle, LogMiner sessions use CPU and PGA on the database server. The
+  load is much lower than frequent polling or triggers on every write, but it has to be measured, as
+  xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing] describes.
+* **New infrastructure to operate.** Kafka, Kafka Connect, connector offsets and the schema history topic all need
+  monitoring, backups and upgrades. xref:database/migration/choosing-a-deployment-for-your-migration.adoc[Choosing a Deployment]
+  compares lighter options such as Debezium Server.
+* **At-least-once delivery.** After a crash, the connector restarts from its last stored offset and may emit some events
+  again. Consumers must be idempotent, which the `processed_change` table and the upsert mode of the JDBC sink provide.
+  xref:database/migration/debezium-features-and-guarantees.adoc[Features & Delivery Guarantees] explains the redelivery
+  window.
+* **Row changes are not domain events.** The events describe what happened to `BOOKSHOP.BOOK`, in the legacy model's
+  shape, with `ACTIVE_FLG` and `STATUS_CD` codes. Something on the new side has to translate them, which is the
+  anti-corruption layer described on xref:database/migration/migration-patterns-with-cdc.adoc[Migration Patterns with CDC].
+
+== Why log-based CDC sees what polling misses
+
+The difference is easiest to see on one row. The timeline below shows book 42 in the legacy `BOOK` table between two
+polls of a query-based poller that runs every 60 seconds, and what each strategy delivers to PostgreSQL.
+
+[cols="1,3,2,2",options="header"]
+|===
+| Time | Legacy action (committed) | Poller sees (poll at 10:01:00) | Log-based CDC emits
+
+| 10:00:05
+| `INSERT` book 42, price 11.00, `ACTIVE_FLG = 'Y'`
+| --
+| `op=c`, after: price 11.00
+
+| 10:00:20
+| `UPDATE` price 12.50 (supplier feed via `PRICING_PKG`, which does not set `LAST_UPD`)
+| --
+| `op=u`, before: 11.00, after: 12.50
+
+| 10:00:40
+| `UPDATE` price 9.99 (Struts action, sets `LAST_UPD`)
+| --
+| `op=u`, before: 12.50, after: 9.99
+
+| 10:00:55
+| `DELETE` book 42 (operator removes a duplicate)
+| --
+| `op=d`, before: 9.99, then a tombstone
+
+| 10:01:00
+| --
+| Nothing: the row no longer exists
+| --
+|===
+
+The poller never learns that book 42 existed. Had the delete happened a minute later, the poller would have copied book
+42 with price 9.99, and the row would then have stayed in PostgreSQL forever after the delete. Log-based CDC delivers all
+four committed changes, in order, with the before and after image of each, because all four are in the redo log
+whether or not the application maintained `LAST_UPD`.
+
+Two more effects follow from reading the log instead of the tables:
+
+* **Rolled-back work never appears.** The connector emits only committed transactions. A Struts request that updates
+  `ORDERS` and then rolls back on a validation error produces no event, unlike a dual write that may have already reached
+  the second database.
+* **Downtime does not lose history.** When the connector is stopped for an hour, it resumes from its stored log
+  position and replays every change of that hour, as long as the logs are still available. This is why the archive log
+  retention on the legacy database must be longer than the longest connector outage that the team plans to tolerate.
+  A poller that is down for an hour sees only the final state of each row when it comes back.
+
+== Decision table
+
+The table summarises the six strategies against the criteria from the start of the page.
+
+[cols="2,2,2,2,2,2,2",options="header"]
+|===
+| Strategy | Consistency | Deletes | Latency | Load on legacy DB | Legacy code changes | Reversible after cut-over
+
+| Big-bang dump and restore
+| Perfect, inside a write freeze
+| Yes (full copy)
+| N/A (downtime window)
+| High, once
+| None
+| Only by a second big bang
+
+| Application dual writes
+| Weak: no atomicity, races between writers
+| Only where coded
+| Immediate
+| Low
+| Every write path
+| Yes, but with the same weaknesses
+
+| Batch ETL
+| Weak unless the extract is one consistent read
+| Only with full extracts and anti-joins
+| Hours (batch interval)
+| High, periodic
+| None
+| Yes, with the same latency
+
+| Trigger-based capture
+| Good (in-transaction), relay ordering needs care
+| Yes
+| Seconds (relay interval)
+| Higher on every write
+| Schema changes (triggers, change tables)
+| Yes, with triggers on the new DB
+
+| Query-based polling
+| Weak: misses intermediate states and late commits
+| No
+| Seconds to minutes (poll interval)
+| Medium, grows with frequency
+| Needs a reliable last-update column
+| Partly
+
+| Log-based CDC (Debezium)
+| Strong: every committed change, in commit order, at least once
+| Yes, with before image
+| Milliseconds to seconds
+| Low to medium (log reading)
+| None
+| Yes, with a source connector on the new DB
+|===
+
+A simple way to read the table: any strategy with "No" in the deletes column, or with "Every write path" in the code
+changes column, is unsuitable as the backbone of a strangler migration. Of the remaining ones, batch ETL rules out read
+cut-over because of its latency, and triggers add load where it hurts most. That leaves log-based CDC as the default,
+with a bulk copy for archive data and small reference tables.
+
+The decision flow below captures the same reasoning as a set of questions.
+
+[mermaid]
+....
+flowchart TD
+    q1{"Can the whole system stop for the copy, and is there no need to roll back later?"}
+    q2{"Does a log-based Debezium connector exist for the legacy database?"}
+    q3{"Can triggers and change tables be added to the legacy schema?"}
+    q4{"Is the data append-only, or is losing deletes and intermediate states acceptable?"}
+    bigbang["Big-bang dump and restore"]
+    cdc["Log-based CDC with Debezium"]
+    trig["Trigger-based capture plus a relay"]
+    poll["Query-based polling"]
+    rethink["Rethink: dual writes only for low-stakes, reconcilable data"]
+
+    q1 -- yes --> bigbang
+    q1 -- no --> q2
+    q2 -- yes --> cdc
+    q2 -- no --> q3
+    q3 -- yes --> trig
+    q3 -- no --> q4
+    q4 -- yes --> poll
+    q4 -- no --> rethink
+....
+
+== Combining strategies: the Bookshop choice
+
+Real migrations mix strategies per table. The choice depends on how often a table changes, whether its rows are ever
+deleted, and how large it is. For the legacy Bookshop schema the choice is:
+
+[cols="2,2,4",options="header"]
+|===
+| Legacy table | Strategy | Reason
+
+| `BOOK`, `AUTHOR`
+| Log-based CDC, initial snapshot then streaming
+| The catalogue is the first capability to move to the new application. Prices change many times a day, books are
+  deleted, and the new catalogue pages need second-level latency.
+
+| `CUSTOMER`
+| Log-based CDC
+| Customers are created and deactivated (`STATUS_CD`) continuously. The new model gets a `uuid` key, so the translator
+  keeps the legacy key in `customer.legacy_id`.
+
+| `ORDERS`, `ORDER_LINE` (open and recent orders)
+| Log-based CDC
+| Status transitions (`NW` → `PD` → `SH` or `CN`) must all arrive, in order. Losing the `PD` step would hide a payment.
+
+| `ORDERS`, `ORDER_LINE` (orders closed years ago)
+| One-off bulk copy, then excluded from the snapshot
+| Millions of rows that never change. An incremental snapshot with a filter, or a separate one-off copy, avoids pushing
+  them through the initial snapshot. xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots]
+  shows the filter.
+
+| `SUPPLIER_CATALOGUE`
+| Log-based CDC into a mirror table
+| Written by the nightly supplier feed in large bursts. A 1:1 mirror (`legacy_supplier_catalogue`) through the JDBC sink
+  is enough, because the new application reads it only for price comparisons.
+
+| Currency and country reference data
+| Big-bang copy during a deployment
+| A few hundred rows that change a few times a year.
+|===
+
+None of these choices changes a line of the legacy Struts application or adds an object to the `BOOKSHOP` schema other
+than the signal table `BOOKSHOP.DEBEZIUM_SIGNAL`, which Debezium uses to trigger snapshots at runtime.
+
+== Pitfalls when choosing a strategy
+
+* **Choosing polling because it "only needs a SELECT grant".** The grant is easy. The lost deletes and intermediate
+  states are found months later, during reconciliation, when the data has already been used by the new system.
+* **Underestimating the initial load.** Every strategy that keeps systems in sync starts with a full copy. Measure the
+  time a snapshot of the largest table takes on a copy of production before choosing between an initial snapshot, an
+  incremental snapshot and a separate bulk copy.
+* **Forgetting the reverse direction.** A migration that cannot run backwards after the write cut-over has a big-bang
+  moment hidden inside it. Choose a strategy that also works from the new database to the legacy one, as
+  xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication] shows.
+* **Ignoring cascading deletes and bulk operations.** Even log-based CDC depends on what the log contains. The Debezium
+  FAQ notes that for MySQL, rows removed by `ON DELETE CASCADE` are not in the binary log and therefore produce no delete
+  events. Check each source connector page for the equivalent limitations of the legacy database.
+* **Treating latency as a single number.** Measure it per table and per time of day. The supplier feed at 02:00 can put
+  the `SUPPLIER_CATALOGUE` stream minutes behind while the other tables stay at seconds.
+
+== How to verify the choice
+
+Before committing to a strategy, run a short spike against a copy of the legacy database and check the claims on this
+page with real data:
+
+. Start the candidate pipeline against a production-sized copy and record the time the initial copy takes.
+. Replay a day of production traffic (or run the legacy batch jobs) and count, per table, inserts, updates and deletes
+  on both sides. Any difference in the delete count rules out the strategy.
+. Pick ten rows that change several times a day and compare their full history on both sides, not only their final
+  state.
+. Measure the extra CPU and I/O on the legacy database during peak hours.
+. Stop the pipeline for an hour, restart it, and check that nothing is missing.
+
+xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation] turns these checks into
+queries and dashboards that run for the whole migration.
+
+== References
+
+* https://debezium.io/documentation/reference/stable/features.html[Debezium -- Features (log-based CDC compared with polling and dual writes)]
+* https://debezium.io/blog/2018/07/19/advantages-of-log-based-change-data-capture/[Debezium blog -- Five Advantages of Log-Based Change Data Capture (Gunnar Morling, 2018)]
+* https://debezium.io/documentation/faq/[Debezium -- FAQ] (load on the source database, duplicates after a crash, missing delete events)
+* https://debezium.io/blog/2017/09/25/streaming-to-another-database/[Debezium blog -- Streaming data to a downstream database (Jiri Pechanec, 2017)]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-example-configuration[Debezium -- Oracle connector configuration example]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties]
+* https://microservices.io/patterns/data/transaction-log-tailing.html[microservices.io -- Transaction log tailing]
+* https://microservices.io/patterns/data/transactional-outbox.html[microservices.io -- Transactional outbox]
+* https://microservices.io/patterns/data/polling-publisher.html[microservices.io -- Polling publisher]
+* https://docs.confluent.io/kafka-connectors/jdbc/current/source-connector/source_config_options.html[Confluent -- JDBC Source connector configuration properties]
+* https://docs.oracle.com/en/database/oracle/oracle-database/23/lnpls/CREATE-TRIGGER-statement.html[Oracle Database 23ai -- CREATE TRIGGER statement]
+* https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT[PostgreSQL -- INSERT ... ON CONFLICT]
+* https://martinfowler.com/bliki/StranglerFigApplication.html[Martin Fowler -- StranglerFigApplication]
+
+The SQL, Java and connector configuration on this page were derived from the official documentation above and were not
+run.

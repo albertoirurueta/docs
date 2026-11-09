@@ -1,0 +1,1118 @@
+= JDBC Sink Connector: Replicating into the New Database
+:description: How to use the Debezium JDBC sink connector to copy legacy tables into the new database during a migration without writing code -- consuming native Debezium change events, at-least-once delivery and idempotent upserts, primary key modes, deletes and truncates, schema evolution (none, validate-only, basic), table naming with collection.name.format and naming strategies, quoting and case sensitivity, batching and the reduction buffer, PostgreSQL UNNEST inserts, connection pool and Hibernate pass-through settings, error handling with Kafka Connect dead-letter queues, data type mappings, monitoring, every connector property, the Bookshop Oracle to PostgreSQL mirror sink and the reverse PostgreSQL to Oracle sink.
+:keywords: Debezium JDBC sink connector, JdbcSinkConnector, Kafka Connect sink, upsert, idempotent writes, at-least-once delivery, insert.mode, primary.key.mode, primary.key.fields, delete.enabled, truncate.enabled, schema.evolution, validate-only, collection.name.format, collection.naming.strategy, quote.identifiers, case sensitivity, use.time.zone, batch.size, use.reduction.buffer, UNNEST, IDENTITY_INSERT, Agroal, hibernate passthrough, dead letter queue, errors.tolerance, type mappings, Oracle to PostgreSQL, reverse replication, Bookshop
+
+include::partial$database-migration-disclaimer.adoc[]
+
+The Debezium JDBC sink connector is the tool that turns a stream of change events back into rows. It is a Kafka
+Connect sink connector: it reads the topics that a Debezium source connector fills, and for each event it runs an
+`INSERT`, `UPDATE`, upsert or `DELETE` against a relational database through JDBC. During a migration it covers every
+legacy table that keeps its shape in the new database, or that you want to copy 1:1 into a staging area, with
+configuration only and no application code. Tables whose model changes (a single `AUTHOR_ID` that becomes a
+many-to-many `book_author` table, numeric status codes that become enums, `NUMBER` keys that become `uuid` keys) need
+a translator instead, which is the job of
+xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications].
+
+This page explains how the connector applies events, why upserts make it safe under at-least-once delivery, how it
+names tables and columns, how it handles deletes, schema changes, errors and data types, and documents every property
+of the official property list. The running example is the `bookshop-pg-mirror-sink` connector of the Bookshop
+migration, which copies the legacy Oracle tables `BOOKSHOP.BOOK`, `BOOKSHOP.AUTHOR` and `BOOKSHOP.SUPPLIER_CATALOGUE`
+into the PostgreSQL mirror tables `legacy_book`, `legacy_author` and `legacy_supplier_catalogue`, and the
+`bookshop-oracle-reverse-sink` connector that writes changes back to Oracle after the cut-over.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final (JDBC sink connector plug-in `debezium-connector-jdbc`
+3.7.1.Final, bundled with Hibernate ORM 7.4.10.Final), Apache Kafka 4.3 (Kafka Connect), Oracle AI Database 26ai
+Free (image `gvenzl/oracle-free:23.26.3`) and PostgreSQL 18. The configuration on this page is derived from the
+official documentation, and the connector class names, default values and naming behaviour were checked against the
+classes in the 3.7.1.Final plug-in archive. The connectors on this page were not run as shown here; the
+xref:database/migration/worked-example-oracle-to-postgresql.adoc[Worked Example: Oracle to PostgreSQL] runs the
+complete pipeline with the same mirror sink settings, and the `stringtype=unspecified` and schema requirements below
+come from that run on 2026-11-09.
+
+== Where the JDBC sink fits in the migration
+
+The xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_data_synchronisation_during_the_overlap[legacy migration path]
+explains why change data capture, rather than dual writes, keeps the legacy and the new database in sync while both
+systems run. Inside that pipeline there are two ways to apply a change event to the new database:
+
+* **A sink connector** (this page) copies a table as it is. It is the right choice for reference data and feeds that
+  keep their shape (`AUTHOR`, `SUPPLIER_CATALOGUE`), for a staging copy of a table that the new application reads
+  while its own model is not ready (`BOOK` into `legacy_book`), and for reverse replication after the cut-over.
+* **An application consumer** (the anti-corruption layer) translates the legacy model into the new one. In Bookshop,
+  `LegacyBookTranslator`, `LegacyCustomerTranslator` and `LegacyOrderProjector` do this.
+
+The two are often combined: the sink keeps a faithful mirror of the legacy table in the new database, and the
+translators read from the same topics to build the remodelled tables. A mirror table also helps during
+xref:database/migration/verification-and-reconciliation.adoc[verification], because you can compare the legacy table
+with its mirror using plain SQL in a single database.
+
+[mermaid]
+....
+flowchart LR
+    ORA[(Oracle BOOKSHOP schema)] -->|redo log| SRC[bookshop-oracle-source]
+    SRC --> T1[legacy.BOOKSHOP.BOOK]
+    SRC --> T2[legacy.BOOKSHOP.AUTHOR]
+    SRC --> T3[legacy.BOOKSHOP.SUPPLIER_CATALOGUE]
+    T1 --> SINK[bookshop-pg-mirror-sink - JDBC sink]
+    T2 --> SINK
+    T3 --> SINK
+    SINK -->|upsert or delete by primary key| PG[(PostgreSQL bookshop: legacy_book, legacy_author, legacy_supplier_catalogue)]
+    T1 --> ACL[Spring Boot translators - anti-corruption layer]
+    ACL --> PG2[(PostgreSQL bookshop: book, book_author)]
+....
+
+== How the connector works
+
+The connector runs inside the Kafka Connect runtime (see xref:backend/messaging/kafka-connect.adoc[Kafka Connect]).
+Each task polls the topics it is assigned, groups records into batches, resolves the destination table for each
+record, and writes the batch through a Hibernate-managed JDBC connection pool. The connector supports the CockroachDB,
+Db2, MySQL (and MariaDB), Oracle, PostgreSQL, SingleStore, SQL Server and StarRocks dialects; the 3.7 release page also
+lists Db2 for IBM i among the tested JDBC sink targets.
+
+=== Native Debezium envelopes, no flattening needed
+
+A Debezium source connector produces a hierarchical event with `before`, `after`, `source` and `op` fields (see
+xref:database/migration/change-event-structure.adoc[Anatomy of a Change Event]). Most third-party JDBC sinks need the
+xref:database/migration/event-flattening.adoc[event flattening] SMT (`ExtractNewRecordState`) to turn that envelope into
+a flat row first. The Debezium JDBC sink does not: it recognises the envelope and takes the column values from the
+`after` section of a create, read (snapshot) or update event. For a delete event it does not look at the payload at all;
+it deletes by the primary key that it resolves from the record (see <<_primary_keys>>). It also accepts flat records,
+which is how the reverse sink at the end of this page works.
+
+To recognise the envelope, the sink needs the record schema. With the JSON converter that means
+`key.converter.schemas.enable=true` and `value.converter.schemas.enable=true` on the source connector (the Kafka
+Connect default), or a registry-backed format such as Avro. When the source writes schemaless JSON, the sink stays
+`RUNNING`, writes nothing and logs "Ignore this record because it isn't a Debezium record" for every record. The
+Bookshop source therefore keeps schemas embedded, and the application consumers read the `payload` part (see
+xref:database/migration/consuming-change-events-in-applications.adoc[Listening to Events in Applications]).
+
+Keeping the envelope has two benefits for a migration. The `source` block stays available, so the connector can build
+the table name from `+${source.table}+` (see <<_table_names_and_case_sensitivity>>), and the same topic can feed both the
+sink and the application translators without a second, flattened copy of the stream.
+
+The sink is not designed to read schema change topics. The Oracle source connector writes DDL events to a topic named
+after its `topic.prefix` (`legacy`) when `include.schema.changes` is enabled, so list the data topics explicitly in
+`topics`, or write a `topics.regex` that cannot match the schema change topic, the
+`legacy.schema-history` topic or the heartbeat topics.
+
+=== At-least-once delivery
+
+The connector guarantees that every event in its topics is processed **at least once**. It commits the consumer
+offsets only after the database transaction for a batch has committed, so a crash, a task restart or a consumer group
+rebalance between the database commit and the offset commit makes the connector read some events again. It does not
+offer exactly-once delivery into the database; xref:database/migration/offsets-restarts-and-exactly-once.adoc[Offsets,
+Restarts & Exactly-Once] explains why, and
+xref:backend/messaging/kafka-reliability-and-exactly-once.adoc[Kafka reliability and exactly-once] covers the Kafka
+side.
+
+The answer is to make every write **idempotent**, so that applying the same event twice leaves the same row as
+applying it once:
+
+[mermaid]
+....
+sequenceDiagram
+    participant K as Kafka topic legacy.BOOKSHOP.BOOK
+    participant S as JDBC sink task
+    participant P as PostgreSQL legacy_book
+    K->>S: offset 41 - BOOK_ID 1001, PRICE 24.90
+    S->>P: upsert book_id 1001
+    P-->>S: commit
+    Note over S: worker crashes before the offset commit
+    S->>K: restart, resume from the last committed offset
+    K->>S: offset 41 again - BOOK_ID 1001, PRICE 24.90
+    S->>P: upsert book_id 1001 again
+    P-->>S: commit, same row state as before
+    S->>K: commit offset 42
+....
+
+With `insert.mode=insert` the second write fails with a primary key violation and the task stops (or, with a
+dead-letter queue, the event is diverted although nothing was wrong with it). With `insert.mode=upsert` it is a
+harmless overwrite. Use upsert for every migration sink.
+
+=== Idempotent writes and upsert syntax
+
+An upsert inserts the row when its primary key does not exist and updates it when it does. There is no SQL standard
+for this, so each dialect uses its own statement, and the dialects differ in which constraint triggers the update:
+
+[cols="1,2,2"]
+|===
+| Dialect | Upsert statement | Constraint that triggers the update
+
+| PostgreSQL, CockroachDB
+| `+INSERT ... ON CONFLICT ... DO UPDATE SET ...+`
+| The configured primary key only
+
+| Oracle, SQL Server, Db2
+| `+MERGE ...+`
+| The configured primary key only
+
+| MySQL, MariaDB, SingleStore
+| `+INSERT ... ON DUPLICATE KEY UPDATE ...+`
+| Any unique index
+
+| StarRocks
+| A plain `INSERT` (PRIMARY KEY tables apply inserts as upserts)
+| The table primary key
+|===
+
+Two consequences matter for a migration:
+
+* **Avoid secondary unique constraints on mirror tables.** Kafka orders events only within a partition, and the
+  connector batches and reduces by primary key only. A `UNIQUE (isbn)` on `legacy_book` can then make two valid
+  legacy changes (book 1001 gives up an ISBN, book 1002 takes it) arrive in an order that violates the constraint. On
+  PostgreSQL, Oracle and SQL Server the write fails; on MySQL-family targets it silently updates the wrong row. Keep
+  uniqueness rules in the source database and leave them off the mirror. If you must keep one, route dependent rows
+  through one partition, keep `use.reduction.buffer=false` and set `batch.size=1` when a batch can hold several events
+  for a key that the destination does not define as its primary key.
+* **Upserts make replays safe, not reordering.** Within a partition the events of one row arrive in commit order, and
+  Debezium source connectors key events by the table primary key, so all changes of one row land in one partition. Do
+  not repartition the topics by another field, and do not change the key with an SMT, or the sink can apply an old
+  version of a row after a newer one.
+
+=== Multiple tasks
+
+`tasks.max` sets how many tasks Kafka Connect starts. Tasks share the topic partitions, so more tasks help only when
+there are several topics or several partitions. Ordering is preserved per partition, so parallel tasks do not reorder
+the changes of one row. A legacy topic with one partition is processed by one task whatever `tasks.max` says.
+
+== Installing the connector
+
+The `quay.io/debezium/connect:3.7.1.Final` image already contains the JDBC sink plug-in, so the Compose stacks in this
+section need no extra step. For your own Kafka Connect installation, download the JDBC sink connector plug-in archive
+for 3.7.1.Final from the Debezium releases page, extract it into a directory listed in the worker's `plugin.path`, and
+restart the worker (see xref:database/migration/installation-and-deployment.adoc[Installing Debezium]).
+
+The official deployment procedure says that the Oracle and Db2 JDBC drivers are not included and must be added by
+hand. The 3.7.1.Final plug-in archive checked for this page does contain `ojdbc11-23.26.1.0.0.jar` next to the
+PostgreSQL, MySQL, MariaDB, SQL Server, SingleStore and StarRocks drivers, but no Db2 driver. List the archive you
+deploy before you rely on either statement, and add the driver JAR to the connector directory if it is missing.
+
+.Check that the JDBC sink plug-in is installed
+[source,shell]
+----
+curl -s http://localhost:8083/connector-plugins | jq -r '.[].class' | grep -i jdbc
+# io.debezium.connector.jdbc.JdbcSinkConnector
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-deployment[Debezium -- JDBC connector deployment]
+
+== The Bookshop mirror sink
+
+The `bookshop-pg-mirror-sink` connector reads the three legacy topics and keeps a mirror table for each in the
+PostgreSQL `bookshop` database.
+
+=== Prepare the mirror tables
+
+You can let the connector create the tables (`schema.evolution=basic`), but for a migration it is better to create
+them yourself. You choose the exact column types, the connector never runs DDL in the new database, and the tables
+are part of the new database's versioned schema (see
+xref:database/schema-evolution/index.adoc[Evolving the Database Model]). The columns are the lower-case names of the
+legacy columns, and the types are the ones the legacy values belong in (`bigint` for `NUMBER(10)`, `numeric(10,2)`
+for `NUMBER(10,2)`), not the string type in which `decimal.handling.mode=string` carries them (see
+<<_data_type_mappings>> and <<_numbers_as_strings_and_stringtypeunspecified>>). The DDL is the same as in step 2 of the
+xref:database/migration/worked-example-oracle-to-postgresql.adoc[Worked Example: Oracle to PostgreSQL].
+
+.PostgreSQL mirror tables for the Bookshop legacy tables
+[source,sql]
+----
+CREATE ROLE bookshop_mirror LOGIN PASSWORD 'change-me';
+
+CREATE TABLE legacy_book (
+    book_id      bigint        PRIMARY KEY,   -- NUMBER(10)   -> STRING "7" (decimal.handling.mode=string)
+    isbn         varchar(13),                 -- VARCHAR2(13) -> STRING
+    title        varchar(200),
+    author_id    bigint,                      -- NUMBER(10)   -> STRING
+    price        numeric(10,2),               -- NUMBER(10,2) -> STRING "24.50"
+    currency     char(3),
+    published    timestamp,                   -- DATE         -> io.debezium.time.Timestamp
+    active_flg   char(1),                     -- 'Y' / 'N', kept as in the legacy table
+    supplier_id  bigint,
+    last_upd     timestamp
+);
+
+CREATE TABLE legacy_author (
+    author_id    bigint        PRIMARY KEY,
+    full_name    varchar(200)
+);
+
+CREATE TABLE legacy_supplier_catalogue (
+    supplier_id    bigint,
+    isbn           varchar(13),
+    supplier_price numeric(10,2),
+    feed_ts        timestamp,                 -- TIMESTAMP(6) -> io.debezium.time.MicroTimestamp
+    PRIMARY KEY (supplier_id, isbn)
+);
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON legacy_book, legacy_author, legacy_supplier_catalogue TO bookshop_mirror;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-schema-evolution[Debezium -- JDBC schema evolution]
+
+The mirror keeps the legacy values as they are (`ACTIVE_FLG` stays `'Y'`/`'N'`, `PUBLISHED` stays a timestamp). The
+translation into `book.active boolean` or `published_on date` belongs in the anti-corruption layer, not in the
+mirror. The mirror tables have no foreign keys and no secondary unique constraints, for the reasons given in
+<<_idempotent_writes_and_upsert_syntax>>.
+
+=== Register the connector
+
+.`bookshop-pg-mirror-sink.json`: the Bookshop mirror sink
+[source,json]
+----
+{
+  "name": "bookshop-pg-mirror-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "topics": "legacy.BOOKSHOP.BOOK,legacy.BOOKSHOP.AUTHOR,legacy.BOOKSHOP.SUPPLIER_CATALOGUE",
+
+    "connection.url": "jdbc:postgresql://postgres:5432/bookshop?stringtype=unspecified",
+    "connection.username": "bookshop_mirror",
+    "connection.password": "change-me",
+    "connection.pool.min_size": "1",
+    "connection.pool.max_size": "4",
+    "connection.restart.on.errors": "true",
+
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_key",
+    "delete.enabled": "true",
+    "truncate.enabled": "false",
+    "schema.evolution": "none",
+    "collection.name.format": "legacy_${source.table}",
+    "quote.identifiers": "false",
+    "use.time.zone": "UTC",
+
+    "batch.size": "500",
+    "use.reduction.buffer": "true",
+    "flush.max.retries": "5",
+    "flush.retry.delay.ms": "1000",
+
+    "errors.tolerance": "none",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "false"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-properties[Debezium -- JDBC connector properties]
+
+The host name `postgres` is the PostgreSQL service as the Connect container sees it in the Compose stack; replace it
+with your database host. The password is shown in clear text to keep the example short.
+xref:database/migration/security-and-data-protection.adoc[Security & Data Protection] shows how to load it from a
+Kafka Connect configuration provider instead.
+
+.Register the mirror sink and check its status
+[source,shell]
+----
+curl -s -X POST -H "Content-Type: application/json" \
+     --data @bookshop-pg-mirror-sink.json http://localhost:8083/connectors
+
+curl -s http://localhost:8083/connectors/bookshop-pg-mirror-sink/status | jq
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-configuration[Debezium -- JDBC connector configuration]
+
+What each group of settings does:
+
+* `topics` lists the three data topics explicitly, so the schema change topic and the heartbeat topics are never read.
+* `?stringtype=unspecified` at the end of `connection.url` lets PostgreSQL convert the string-encoded numbers of the
+  Bookshop source into `bigint` and `numeric` columns. Without it the task fails on the first batch, as explained in
+  <<_numbers_as_strings_and_stringtypeunspecified>>.
+* `insert.mode=upsert` with `primary.key.mode=record_key` makes every write idempotent. The Oracle connector keys each
+  event with a struct of the table's primary key columns (`BOOK_ID`, or `SUPPLIER_ID` and `ISBN`), and the connector
+  uses those fields as the primary key, so `primary.key.fields` is not needed.
+* `delete.enabled=true` turns legacy deletes (and their tombstones) into `DELETE` statements. Without it, rows deleted
+  in Oracle stay in the mirror forever and every reconciliation report shows them as drift.
+* `truncate.enabled=false` keeps a `TRUNCATE` in the legacy database from emptying the mirror. Turn it on only when
+  you want the mirror to follow truncates, and when the source connector emits them.
+* `schema.evolution=none` because the tables were created by hand. `validate-only` is not possible here: the connector
+  cannot validate tables at startup when `collection.name.format` contains a `+${source.*}+` placeholder, and it fails
+  to start with that combination.
+* `+collection.name.format=legacy_${source.table}+` with `quote.identifiers=false` gives the lower-case table names, as
+  explained in the next section.
+* `use.reduction.buffer=true` collapses several changes of the same key in one batch into one write, which helps with
+  hot rows such as a frequently repriced `BOOK`. It is safe here because the mirror tables have no secondary unique
+  constraints.
+* `errors.tolerance=none` stops the task on the first record that cannot be written. During a migration that is
+  usually what you want: a stopped sink is visible, while silently skipped rows are not. The dead-letter queue variant
+  is in <<_error_handling_and_dead_letter_queues>>.
+
+=== Numbers as strings and `stringtype=unspecified`
+
+The `bookshop-oracle-source` connector uses `decimal.handling.mode=string`, because the application consumers need
+exact decimals in plain JSON. The Oracle connector applies that mode to every `NUMBER` column, including the
+`NUMBER(10)` keys: `BOOK_ID`, `AUTHOR_ID` and `SUPPLIER_ID` arrive as `"7"`, and `PRICE` as `"24.50"`, all with a
+Kafka Connect `STRING` schema. The sink maps a `STRING` field to `Types.VARCHAR` and binds the value as a
+`character varying` parameter. PostgreSQL does not cast a typed `varchar` parameter to `bigint` or `numeric`
+implicitly, so the first upsert fails with:
+
+.The sink error without stringtype=unspecified
+[source,text]
+----
+ERROR: column "supplier_id" is of type bigint but expression is of type character varying
+----
+Reference: https://jdbc.postgresql.org/documentation/use/[PostgreSQL JDBC driver -- connection parameters]
+
+`stringtype=unspecified` is a PostgreSQL JDBC driver parameter, not a Debezium property. It makes the driver send
+string parameters with an unspecified type, so the server infers the type from the target column and converts `"7"`
+to `bigint` and `"24.50"` to `numeric(10,2)` exactly, as it would for a literal in SQL. Text columns are not affected.
+After the URL is changed, restart the failed task (`+POST /connectors/bookshop-pg-mirror-sink/tasks/0/restart+`); the
+records that failed are read again from the last committed offset.
+
+The alternative is the `precise` default on the source: integer `NUMBER` columns then arrive as `INT64` and decimals
+as Kafka Connect `Decimal`, and the sink binds them with their real types without the URL parameter. That shifts the
+work to the application consumers, which then have to decode Base64 `Decimal` values or use Avro (see
+xref:database/migration/data-types-and-precision.adoc[Data Types & Precision]).
+
+=== Verify the mirror
+
+.Compare the legacy tables with the mirror
+[source,sql]
+----
+-- Oracle (FREEPDB1), as a user that can read BOOKSHOP
+SELECT COUNT(*), SUM(PRICE) FROM BOOKSHOP.BOOK;
+
+-- PostgreSQL (bookshop)
+SELECT COUNT(*), SUM(price) FROM legacy_book;
+
+-- PostgreSQL: the table and column names must be lower case
+SELECT table_name, column_name, data_type
+FROM information_schema.columns
+WHERE table_name LIKE 'legacy\_%'
+ORDER BY table_name, ordinal_position;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-quoting-case-sensitivity[Debezium -- JDBC quoting and case sensitivity]
+
+Run the comparison after the snapshot of the source connector has finished and the sink lag is close to zero.
+xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation] turns these spot checks
+into per-chunk checksums.
+
+== Table names and case sensitivity
+
+=== How the table name is resolved
+
+The default collection naming strategy builds the destination table name from `collection.name.format` (default
+`+${topic}+`) with these rules:
+
+. Every `.` in the topic name is replaced by `_`, and `+${topic}+` is replaced by that sanitised topic name. With the
+  default format, topic `legacy.BOOKSHOP.BOOK` becomes table `legacy_BOOKSHOP_BOOK`.
+. Every `+${source.<field>}+` placeholder is replaced by that field of the event's `source` block, for example
+  `+${source.schema}+` (`BOOKSHOP`) or `+${source.table}+` (`BOOK`). This only works for Debezium envelopes; for a
+  flattened record the connector logs a warning and cannot resolve the name.
+. Literal text in the format is kept as it is. A literal that contains a dot, such as `BOOKSHOP.AUTHOR`, is split
+  into a schema and a table name.
+
+The Bookshop format `+legacy_${source.table}+` therefore produces `legacy_BOOK`, `legacy_AUTHOR` and
+`legacy_SUPPLIER_CATALOGUE`. A prefix or suffix is the usual reason to change the format; the official FAQ uses
+`+jdbc_${topic}+`.
+
+To use the topic name without sanitising it, set `collection.naming.strategy` to
+`io.debezium.sink.naming.PassthroughCollectionNamingStrategy`. It replaces `+${topic}+` with the raw topic name and
+ignores `+${source.*}+` placeholders. For anything else you can implement
+`io.debezium.sink.naming.CollectionNamingStrategy`, put the JAR next to the connector JARs, and set
+`collection.naming.strategy` to the class name. A custom strategy also disables `validate-only` startup validation.
+
+=== Why `legacy_BOOK` becomes `legacy_book` in PostgreSQL
+
+The connector builds its SQL from the resolved table name and the event field names, and by default it does **not**
+put them in double quotes. The official "Quoting and case sensitivity" section states the consequence: the case of
+the destination names then depends entirely on how the target database treats unquoted identifiers, and gives the
+example that a PostgreSQL target turns a topic named `ORDERS` into a table named `orders`. PostgreSQL folds unquoted
+identifiers to lower case (Oracle folds them to upper case), as its own documentation on identifiers says.
+
+So with `quote.identifiers=false`:
+
+* The connector sends `+INSERT INTO legacy_BOOK (BOOK_ID, ISBN, ...) ... ON CONFLICT (BOOK_ID) ...+`. PostgreSQL reads
+  every unquoted name in lower case, so the statement writes to the table `legacy_book` and its columns `book_id`,
+  `isbn`, and so on. The upper-case Oracle column names map to the lower-case mirror columns without any rename.
+* When the connector looks up the table metadata, the PostgreSQL dialect also lower-cases the name before it queries
+  the catalogue (checked in the 3.7.1.Final `PostgresDatabaseDialect`), so the pre-created `legacy_book` is found.
+* With `schema.evolution=basic`, the connector would create `legacy_book` with lower-case columns in the same way.
+
+With `quote.identifiers=true` the connector sends `"legacy_BOOK"` and `"BOOK_ID"`. PostgreSQL then creates or looks
+for a mixed-case table that every later query must quote (`SELECT "BOOK_ID" FROM "legacy_BOOK"`), and a pre-created
+`legacy_book` would not match. Leave quoting off for PostgreSQL targets fed by Oracle. Turn it on only when you must
+keep a mixed-case or reserved name exactly as the source has it.
+
+Some names are quoted even with quoting off, because they would otherwise be invalid. The `+__connect_topic+`,
+`+__connect_partition+` and `+__connect_offset+` columns of `primary.key.mode=kafka` are the usual example, since some
+databases do not accept an unquoted leading underscore.
+
+=== Renaming tables and fields with the naming transformations
+
+The connector ships two SMTs that change the case of names, optionally with a prefix and a suffix:
+`io.debezium.connector.jdbc.transforms.CollectionNameTransformation` (topic names) and
+`io.debezium.connector.jdbc.transforms.FieldNameTransformation` (field names; for a Debezium envelope only the fields
+inside `before` and `after`). The styles are `camel_case`, `snake_case`, `upper_case` and `lower_case`.
+
+[cols="2,1,3"]
+|===
+| Property | Default | Description
+
+| `collection.naming.style` | none | Style applied to the topic name by `CollectionNameTransformation`.
+| `collection.naming.prefix` | empty | Prefix added to the transformed topic name.
+| `collection.naming.suffix` | empty | Suffix added to the transformed topic name.
+| `column.naming.style` | none | Style applied to field names by `FieldNameTransformation`.
+| `column.naming.prefix` | empty | Prefix added to each transformed field name.
+| `column.naming.suffix` | empty | Suffix added to each transformed field name.
+|===
+
+.Lower-case field names explicitly, for a target that does not fold case
+[source,json]
+----
+{
+  "transforms": "lowercase",
+  "transforms.lowercase.type": "io.debezium.connector.jdbc.transforms.FieldNameTransformation",
+  "transforms.lowercase.column.naming.style": "lower_case"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#_naming_transformations[Debezium -- JDBC naming transformations]
+
+For PostgreSQL the transformation is not needed, because unquoted names are already folded. It becomes useful when you
+need quoting (for a reserved word) but still want lower-case names, or when a target database is case-sensitive.
+
+== Primary keys
+
+`primary.key.mode` tells the connector which columns form the primary key. The key is used to build the `ON CONFLICT`
+or `MERGE` condition of an upsert, the `WHERE` clause of an update or delete, and the `PRIMARY KEY` of a table that
+the connector creates.
+
+[cols="1,3,2"]
+|===
+| Mode | Primary key columns | Migration use
+
+| `none` (default)
+| No primary key. Upserts and deletes are impossible.
+| Append-only audit copies with `insert.mode=insert`.
+
+| `kafka`
+| `+__connect_topic+`, `+__connect_partition+` and `+__connect_offset+`, taken from the Kafka coordinates of the record.
+| An event log table, one row per event. Not a mirror of the source rows.
+
+| `record_key`
+| The fields of the record key. A primitive key needs `primary.key.fields` to name the column; a struct key uses its
+fields, or the subset in `primary.key.fields`.
+| The normal choice for Debezium topics, whose key is the source table's primary key.
+
+| `record_value`
+| The fields of the record value, all of them unless `primary.key.fields` names a subset.
+| Topics without a usable key, for example from a source table without a primary key, when the value contains a
+natural key.
+
+| `record_header`
+| The record headers (combined into a struct), all of them unless `primary.key.fields` names a subset.
+| Keys carried in headers by an upstream producer or SMT.
+|===
+
+Watch out for these cases:
+
+* **Legacy tables without a primary key.** The Oracle connector then produces events with a `null` key. Give the
+  table a key on the source side with `message.key.columns` in the source connector (see
+  xref:database/migration/oracle-connector.adoc[Oracle Connector]), or use `record_value` with `primary.key.fields`.
+* **`kafka` mode with `schema.evolution=basic`.** Some dialects map the string `+__connect_topic+` column to an unbounded
+  type (`TEXT`, `CLOB`) that cannot be part of a primary key, and table creation fails. Create the table yourself, or
+  avoid `basic` in that mode.
+* **Key columns of types that cannot be keys.** If a key field maps to a type that the target does not allow in a
+  primary key, list the other fields in `primary.key.fields`.
+
+== Deletes and truncates
+
+By default the connector ignores `DELETE` events and tombstones, so the target keeps rows that the source has
+deleted. Set `delete.enabled=true` to delete them. Deletes are executed by primary key, so the mode must be
+`record_key`, `record_value` or `record_header`. 3.7 allows `record_value` and `record_header` for deletes, where
+earlier versions required `record_key`.
+
+Debezium source connectors emit a delete event followed by a tombstone (when `tombstones.on.delete` is left at its
+default `true`). With `delete.enabled=true` the connector handles both; the second delete of the same key finds no row
+and changes nothing, which is again idempotent.
+
+`truncate.enabled=true` makes the connector truncate the destination table when it receives a truncate event. The
+source must emit them (for example the PostgreSQL connector, unless `truncate` is in its `skipped.operations`). The
+JDBC connector cannot process the standard truncate events of the Db2 connector; for a Db2 source, truncate with
+`ALTER TABLE <table> ACTIVATE NOT LOGGED INITIALLY WITH EMPTY TABLE` instead, which needs `ALTER` privilege on the
+table.
+
+A migration-specific risk is the **soft delete**. Some legacy applications never delete rows but set a flag. The
+mirror follows that faithfully, and it is the translator's job to turn the flag into a real delete or an archived
+state in the new model.
+
+== Schema evolution
+
+`schema.evolution` controls whether the connector runs DDL in the target database.
+
+[cols="1,3"]
+|===
+| Mode | Behaviour
+
+| `none` (default)
+| No DDL. The tables must exist with compatible columns, or the writes fail.
+
+| `validate-only` (new in 3.7)
+| No DDL. At startup, or when Kafka Connect assigns a topic's partitions, the connector checks that each statically
+resolvable destination table **exists**. It does not compare columns, types, keys, nullability or defaults. It can
+resolve a literal `collection.name.format`, or `+${topic}+` with a static `topics` list (or with `topics.regex`, at
+partition assignment) and the default naming strategy. With `+${source.*}+` placeholders or a custom naming strategy it
+cannot validate, and the connector fails to start.
+
+| `basic`
+| The connector creates a missing table from the event's key and value schemas, and adds a column (`+ALTER TABLE ... ADD+`)
+for every field that the table does not have. It never changes a column type, drops or renames a column, or
+changes the primary key.
+|===
+
+What `basic` cannot do is exactly what happens in a legacy schema over a long migration. A widened `TITLE
+VARCHAR2(200)` to `VARCHAR2(400)` is not applied, and the next long title fails with a "value too long" error. A
+renamed column leaves the old column in place and adds a new one, so old rows keep their data in the old column. A new
+`NOT NULL` column without a default cannot be added to a table that already has rows. The nullability and default of
+each new column come from the field schema; if they are not what you want, create the table yourself or adjust the
+schema with an SMT.
+
+The safer approach in a migration is:
+
+* Create the mirror tables yourself, as part of the new database's schema change process, and run the sink with
+  `none` (or with `validate-only` when the names are static).
+* Apply a legacy DDL change to the mirror first (expand), then let the legacy change happen, as described in
+  xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes].
+* If you use `basic` at all, set `column.propagate.source.type` or `datatype.propagate.source.type` in the source
+  connector, so that created columns get the source length, precision and scale instead of generic types (see
+  <<_column_and_data_type_propagation>>).
+
+`basic` is still handy in a lab, or for an audit copy that only ever gains columns.
+
+== Data type mappings
+
+The connector resolves each column type from the field's schema in the event: first the logical type name, if there
+is one, then the primitive Kafka Connect type. It maps that to a JDBC `java.sql.Types` code, and Hibernate turns the
+code into a column type of the target dialect. The mapping matters both when the connector creates columns and when it
+binds values to columns that you created.
+
+=== Kafka Connect primitive types
+
+[cols="1,2"]
+|===
+| Primitive type | JDBC type
+
+| `INT8` | `Types.TINYINT`
+| `INT16` | `Types.SMALLINT`
+| `INT32` | `Types.INTEGER`
+| `INT64` | `Types.BIGINT`
+| `FLOAT32` | `Types.FLOAT`
+| `FLOAT64` | `Types.DOUBLE`
+| `BOOLEAN` | `Types.BOOLEAN` (mapped to a bit type on Oracle; Oracle 23 `BOOLEAN` columns must be created by hand)
+| `STRING` | `Types.CHAR`, `Types.NCHAR`, `Types.VARCHAR` or `Types.NVARCHAR`
+| `BYTES` | `Types.VARBINARY`
+|===
+
+=== Kafka Connect and Debezium logical types
+
+[cols="2,2"]
+|===
+| Logical type | JDBC type
+
+| `org.apache.kafka.connect.data.Decimal` | `Types.DECIMAL`
+| `org.apache.kafka.connect.data.Date`, `io.debezium.time.Date` | `Types.DATE`
+| `org.apache.kafka.connect.data.Time`, `org.apache.kafka.connect.data.Timestamp` | `Types.TIMESTAMP`
+| `io.debezium.time.Time`, `MicroTime`, `NanoTime` | `Types.TIMESTAMP`
+| `io.debezium.time.Timestamp`, `MicroTimestamp`, `NanoTimestamp` | `Types.TIMESTAMP`
+| `io.debezium.time.ZonedTime` | `Types.TIME_WITH_TIMEZONE`
+| `io.debezium.time.ZonedTimestamp` | `Types.TIMESTAMP_WITH_TIMEZONE`
+| `io.debezium.time.StructuredDate`, `StructuredTime`, `StructuredTimestamp` | `Types.DATE`, `Types.TIME`, `Types.TIMESTAMP`
+| `io.debezium.time.StructuredZonedTime`, `StructuredZonedTimestamp` | `Types.TIME_WITH_TIMEZONE`, `Types.TIMESTAMP_WITH_TIMEZONE`
+| `io.debezium.time.StructuredDuration` | `Types.VARCHAR`
+| `io.debezium.data.VariableScaleDecimal` | `Types.DOUBLE`
+|===
+
+When the target has no time or timestamp type with a time zone, the mapping falls back to the type without one.
+Dialect-specific logical types (`io.debezium.data.Json` to `json`/`jsonb`, `Uuid` to `uuid` on PostgreSQL, `Xml`,
+`Bits`, `Enum`, `Ltree`, geometry types, vectors through pgvector, and so on) have their own table in the official
+documentation. A Kafka Connect `STRUCT` without a dedicated type is serialised to JSON and stored in a native JSON
+column (PostgreSQL, MySQL, SingleStore, StarRocks, CockroachDB, Oracle 21c and later) or in a large text column (Db2,
+SQL Server, earlier Oracle).
+
+=== The Bookshop columns end to end
+
+[cols="2,2,2,2"]
+|===
+| Oracle column | Bookshop event schema (`decimal.handling.mode=string`) | Event schema with the `precise` default | PostgreSQL mirror column
+
+| `BOOK_ID NUMBER(10)` | `STRING` (`"7"`) | `INT64` | `book_id bigint`
+| `PRICE NUMBER(10,2)` | `STRING` (`"24.50"`) | `BYTES`, `org.apache.kafka.connect.data.Decimal` (scale 2) | `price numeric(10,2)`
+| `ISBN VARCHAR2(13)`, `CURRENCY CHAR(3)` | `STRING` | `STRING` | `varchar(13)`, `char(3)`
+| `PUBLISHED DATE` | `INT64`, `io.debezium.time.Timestamp` (milliseconds) | the same | `published timestamp`
+| `FEED_TS TIMESTAMP` | `INT64`, `io.debezium.time.MicroTimestamp` | the same | `feed_ts timestamp`
+|===
+
+With the Bookshop settings every `NUMBER` column reaches the sink as a `STRING` and is bound as `VARCHAR`, which is why
+the mirror sink needs `stringtype=unspecified` (see <<_numbers_as_strings_and_stringtypeunspecified>>). With the
+`precise` default, an Oracle `NUMBER(p,0)` becomes `INT8`, `INT16`, `INT32` or `INT64` depending on its precision, and a
+`NUMBER(p,s)` with a positive scale becomes a `Decimal`. A bare `NUMBER` without precision then becomes a
+`VariableScaleDecimal`, which the sink maps to `DOUBLE` and therefore loses exactness; the string mode avoids that too.
+The rules are explained in xref:database/migration/data-types-and-precision.adoc[Data Types & Precision].
+
+=== Time zones
+
+Oracle `DATE` and `TIMESTAMP` carry no time zone. The Oracle connector emits them as the number of milliseconds or
+microseconds since the epoch, treating the wall-clock value as UTC. `use.time.zone` (default `UTC`) is the time zone in
+which the sink binds temporal values. Leave it at `UTC` for `timestamp` (without time zone) mirror columns, so that a
+legacy `PUBLISHED` of `2026-11-09 10:00` arrives as `2026-11-09 10:00`. If the legacy wall-clock values are really in
+local time and the new model uses `timestamptz` (`book.updated_at`), convert them in the translator, where you know
+which time zone the legacy application used. Do not move the conversion into `use.time.zone` of a mirror sink.
+
+=== Values out of range
+
+Some sources hold temporal values that the target cannot store, for example BC-era Oracle timestamps going to a MySQL
+`TIMESTAMP` or a SQL Server `datetime2`. By default such a write fails. `timestamp.clamp.out.of.range.values=true`
+replaces them with the target's minimum or maximum timestamp, the same way that PostgreSQL `infinity` and `-infinity`
+values are handled. Clamping changes the data, so enable it only when downstream consumers accept that.
+
+=== Column and data type propagation
+
+Without extra metadata the sink knows only the Connect type of a field, so `basic` evolution creates generic columns
+(`text` for every string, for example). When the source connector sets `column.propagate.source.type` (a list of
+columns) or `datatype.propagate.source.type` (a list of source types), each field schema carries parameters such as
+`+__debezium.source.column.type+`, `+__debezium.source.column.length+` and `+__debezium.source.column.scale+`, and the sink
+uses them to create, for example, `varchar(13)` instead of `text`. The benefit is largest when source and target are
+the same kind of database; for Oracle to PostgreSQL it mainly preserves lengths, precision and scale.
+
+.Propagate source column types from the Oracle source connector
+[source,json]
+----
+{
+  "datatype.propagate.source.type": ".+\\.NUMBER,.+\\.VARCHAR2,.+\\.CHAR"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#debezium-jdbc-sink-column-and-data-type-propagation[Debezium -- JDBC column and data type propagation]
+
+If a resolved type is still not what you need, create the column yourself with the type you want. The connector never
+changes existing columns.
+
+== Batching, the reduction buffer and dialect options
+
+`batch.size` (default 500) is the number of records the connector tries to write per batch. It is capped by the
+number of records one poll returns: if the worker's `consumer.max.poll.records` is smaller, raise it for this
+connector with `consumer.override.max.poll.records` (which requires a worker `connector.client.config.override.policy`
+that allows it).
+
+`use.reduction.buffer=true` merges all events of one primary key in a batch into a single write of the latest state.
+It reduces the load on the target when the same rows change often. Do not enable it when the target has constraints
+that link rows with different keys (secondary unique constraints), because the intermediate states it removes may be
+needed to satisfy them. For PostgreSQL targets with the reduction buffer, the official documentation recommends adding
+`reWriteBatchedInserts=true` to the JDBC URL so that the driver rewrites the batched statements.
+
+`dialect.postgres.unnest.insert.enabled=true` makes the connector write a whole batch to PostgreSQL or CockroachDB as
+one `+INSERT ... SELECT FROM UNNEST(...)+` statement, in insert and upsert modes. It improves throughput for large
+backfills such as the initial snapshot of `SUPPLIER_CATALOGUE`. A batch that contains two events for the same key
+then fails with "ON CONFLICT command cannot affect row a second time", so enable `use.reduction.buffer` with it.
+
+.Faster initial load of the supplier catalogue into PostgreSQL
+[source,json]
+----
+{
+  "connection.url": "jdbc:postgresql://postgres:5432/bookshop?stringtype=unspecified&reWriteBatchedInserts=true",
+  "batch.size": "2000",
+  "consumer.override.max.poll.records": "2000",
+  "use.reduction.buffer": "true",
+  "dialect.postgres.unnest.insert.enabled": "true"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-property-dialect-postgres-unnest-insert-enabled[Debezium -- dialect.postgres.unnest.insert.enabled]
+
+`dialect.sqlserver.identity.insert=true` wraps inserts and upserts into a SQL Server `IDENTITY` column with `+SET IDENTITY_INSERT ... ON+`
+and `OFF`. Without it, writing an explicit value into an identity column fails, which matters
+when the new database is SQL Server and keeps the legacy keys. `dialect.postgres.postgis.schema` names the schema where
+PostGIS is installed (default `public`), and `dialect.starrocks.catalog.name` selects a StarRocks catalog.
+
+`flush.max.retries` (default 5) and `flush.retry.delay.ms` (default 1000) retry a failed flush on retriable database
+errors. Keep `+flush.retry.delay.ms * flush.max.retries+` below the consumer's `max.poll.interval.ms` (5 minutes by
+default), or the group coordinator considers the task dead and rebalances while it is still retrying.
+
+== Connections
+
+The connector uses Hibernate with the Agroal connection pool. The pool size is per task. `connection.pool.min_size`
+defaults to 5 and `connection.pool.max_size` to 32, which is more than a single-task migration sink needs; size the
+pool against the target's connection limit, counting every task of every sink.
+
+Idle pooled connections can be closed by the database, a proxy or a firewall, and the next write then fails. Set
+`hibernate.agroal.idleValidation` (seconds) so that the pool validates idle connections periodically, and consider
+`connection.restart.on.errors=true`, which treats connection failures (closed sockets, timeouts) as retriable instead
+of failing the task. The official documentation warns that with asynchronous primary-replica failover, retrying can
+write to a node that has not received all earlier changes; for a single PostgreSQL primary this is not a concern.
+
+.Validate idle connections every five minutes
+[source,json]
+----
+{
+  "hibernate.agroal.idleValidation": "300"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connection-idle-timeouts[Debezium -- JDBC connection idle timeouts]
+
+Any other `+hibernate.*+` property is passed to Hibernate unchanged. The common case is `hibernate.dialect`, set to a
+fully qualified dialect class (for example `org.hibernate.dialect.MariaDBDialect`) when Hibernate cannot detect the
+target database or its version.
+
+== Error handling and dead-letter queues
+
+=== Transient and non-transient failures
+
+The connector separates two kinds of write failure:
+
+* **Transient failures**, such as a lost connection or a serialisation conflict, are retried according to
+  `flush.max.retries` and `flush.retry.delay.ms`. If the retries are exhausted, the task fails.
+* **Non-transient failures**, such as a constraint violation, a value that is too long or a missing table, fail the
+  task by default.
+
+Kafka Connect itself also handles failures in the converter (deserialisation) and SMT stages, before the record reaches
+the connector. Those are governed only by the standard `+errors.*+` properties.
+
+=== The Kafka Connect error properties
+
+These are standard sink connector properties of Kafka Connect, set in the connector configuration:
+
+[cols="2,1,3"]
+|===
+| Property | Default | Description
+
+| `errors.retry.timeout` | `0` | Total time in milliseconds to retry a failed converter or transformation operation. `0` means no retries, `-1` retries forever.
+| `errors.retry.delay.max.ms` | `60000` | Maximum delay between consecutive retries.
+| `errors.tolerance` | `none` | `none` fails the task on the first error; `all` skips problem records (or sends them to the dead-letter queue).
+| `errors.log.enable` | `false` | Writes each error, the failed operation and the problem record's coordinates to the Connect log.
+| `errors.log.include.messages` | `false` | Also logs the record key, value and headers. Leave it off when the data is personal.
+| `errors.deadletterqueue.topic.name` | empty | Topic that receives failed records. Empty disables the dead-letter queue.
+| `errors.deadletterqueue.topic.replication.factor` | `3` | Replication factor of the dead-letter topic if Connect creates it. Use `1` on a single-broker lab cluster.
+| `errors.deadletterqueue.context.headers.enable` | `false` | Adds `+__connect.errors.*+` headers with the original topic, partition, offset, exception and message.
+|===
+
+=== Routing failed writes to a dead-letter queue
+
+Since 3.7 the JDBC sink can send records that fail with a non-transient database error to the Kafka Connect errant
+record reporter (KIP-610), and from there to the dead-letter queue, instead of stopping. The official documentation
+ties this to the shared change event sink framework, enabled with `internal.enable.sces=true`; in 3.7.1.Final this
+internal property defaults to `false`. When a batch fails with a non-transient error, the connector retries its records
+one at a time, sends only the failing ones to the reporter, and continues with the rest.
+
+.Dead-letter queue for the Bookshop mirror sink
+[source,json]
+----
+{
+  "internal.enable.sces": "true",
+  "errors.tolerance": "all",
+  "errors.deadletterqueue.topic.name": "bookshop-pg-mirror-sink.dlq",
+  "errors.deadletterqueue.topic.replication.factor": "1",
+  "errors.deadletterqueue.context.headers.enable": "true",
+  "errors.log.enable": "true",
+  "errors.log.include.messages": "false"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-error-handling-and-dead-letter-queues[Debezium -- JDBC error handling and dead letter queues]
+
+Rules to keep in mind:
+
+* `errors.tolerance=none` together with a dead-letter topic is rejected at startup, because that topic could never
+  receive anything.
+* With `errors.tolerance=all`, **every** non-transient failure goes to the dead-letter queue, including failures caused
+  by the environment rather than the record, such as missing privileges for a schema evolution statement. A
+  misconfigured sink can then divert a whole table into the queue while its status stays `RUNNING`. Alert on the
+  `TotalNumberOfErrantRecords` metric and on the size of the dead-letter topic.
+* Use upsert mode with a dead-letter queue. In insert mode, records replayed after a restart fail with duplicate-key
+  errors and fill the queue with records that were already applied.
+* A record in the dead-letter queue is a hole in the mirror. Fix the cause, then replay the records (for example with
+  a small consumer that writes them back to the source topic, or by re-snapshotting the affected rows with an
+  xref:database/migration/incremental-and-blocking-snapshots.adoc[incremental snapshot]).
+
+.Read the dead-letter queue with its error headers
+[source,shell]
+----
+docker compose exec kafka /kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:9092 \
+  --topic bookshop-pg-mirror-sink.dlq --from-beginning \
+  --formatter-property print.headers=true --formatter-property print.key=true
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#error-reporting-in-connect[Apache Kafka -- Error reporting in Connect]
+
+For a migration, start with `errors.tolerance=none`. A stopped sink and a clear error in the task status are easier
+to handle than a slowly growing gap. Add the dead-letter queue once the pipeline is stable, and only with alerting on
+it.
+
+== Monitoring
+
+Besides the standard Kafka Connect sink task metrics (record rates, batch sizes, offset commit times) and the
+consumer lag of the connector's consumer group (`connect-bookshop-pg-mirror-sink`), the connector registers its own
+MBean while a task runs:
+
+.JDBC sink MBean name
+[source,text]
+----
+debezium.jdbc:type=connector-metrics,context=sink,server=bookshop-pg-mirror-sink,task=0
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-monitoring[Debezium -- JDBC sink monitoring]
+
+[cols="2,1,3"]
+|===
+| Attribute | Type | Meaning
+
+| `TotalNumberOfInsertEventsSeen` | long | Inserts applied when `insert.mode=insert`.
+| `TotalNumberOfUpdateEventsSeen` | long | Updates applied when `insert.mode=update`.
+| `TotalNumberOfUpsertEventsSeen` | long | Upserts applied when `insert.mode=upsert` (the counter that grows for the Bookshop sink).
+| `TotalNumberOfDeleteEventsSeen` | long | Deletes applied.
+| `TotalNumberOfTruncateEventsSeen` | long | Truncates applied.
+| `NumberOfFilteredEvents` | long | Records skipped, for example because the table name could not be resolved, deletes or truncates are disabled, or the record is a schema change event.
+| `TotalNumberOfErrantRecords` | long | Records sent to the errant record reporter (dead-letter queue).
+| `TotalNumberOfTablesCreated` | long | Tables created (only with `schema.evolution=basic`).
+| `TotalNumberOfTablesAltered` | long | Tables altered (only with `schema.evolution=basic`).
+| `Connected` | boolean | Whether the task currently has a connection to the target database.
+|===
+
+A rising `NumberOfFilteredEvents` on a mirror sink usually means deletes are arriving while `delete.enabled` is
+`false`, or the table name cannot be resolved. A non-zero `TotalNumberOfTablesCreated` on a sink that should run with
+pre-created tables means `schema.evolution` is not what you think.
+xref:database/migration/monitoring-logging-and-tracing.adoc[Monitoring, Logging & Tracing] shows how to export these
+MBeans to Prometheus.
+
+== Connector properties
+
+The tables below cover every property in the official JDBC connector property list, grouped as the official
+documentation groups them.
+
+=== Kafka consumer properties
+
+[cols="2,1,4"]
+|===
+| Property | Default | Description
+
+| `name` | none | Unique connector name. Registering a second connector with the same name fails.
+| `connector.class` | none | `io.debezium.connector.jdbc.JdbcSinkConnector`.
+| `tasks.max` | `1` | Maximum number of tasks.
+| `topics` | none | Comma-separated list of topics to consume. Do not combine with `topics.regex`.
+| `topics.regex` | none | Regular expression (a `java.util.regex.Pattern`) for the topics to consume. Do not combine with `topics`.
+|===
+
+=== Connection properties
+
+[cols="2,2,4"]
+|===
+| Property | Default | Description
+
+| `connection.provider` | `org.hibernate.agroal.internal.AgroalConnectionProvider` | Connection provider implementation.
+| `connection.url` | none | JDBC URL of the target database.
+| `connection.username` | none | Database user.
+| `connection.password` | none | Password of the database user.
+| `connection.pool.min_size` | `5` | Minimum number of connections in the pool.
+| `connection.pool.max_size` | `32` | Maximum number of concurrent connections in the pool.
+| `connection.pool.timeout` | `1800` | Seconds an unused connection is kept before it is discarded. (3.7.1 fixed a bug that read this value as milliseconds.)
+| `connection.restart.on.errors` | `false` | Treats transient connection errors (closed sockets, timeouts) as retriable instead of failing the task. Can lose data with asynchronous replicas after a failover.
+|===
+
+=== Runtime properties
+
+[cols="2,1,4"]
+|===
+| Property | Default | Description
+
+| `use.time.zone` | `UTC` | Time zone used when binding JDBC temporal values.
+| `delete.enabled` | `false` | Applies `DELETE` events and tombstones as deletes. Requires `primary.key.mode` `record_key`, `record_value` or `record_header`.
+| `truncate.enabled` | `false` | Applies truncate events as `TRUNCATE`. Standard Db2 truncate events are not supported.
+| `insert.mode` | `insert` | `insert`: always `INSERT` (only when no row can be written twice). `update`: always `UPDATE` (only when every row already exists). `upsert`: insert or update by primary key; required for idempotent writes.
+| `primary.key.mode` | `none` | `none`, `kafka`, `record_key`, `record_value` or `record_header` (see <<_primary_keys>>).
+| `primary.key.fields` | none | The column name for a primitive record key, or a comma-separated subset of the key, value or header fields. If unset with a struct key, `record_value` or `record_header`, all fields are used.
+| `quote.identifiers` | `false` | Delimits table and column names with quotes in the generated SQL, preserving their case.
+| `schema.evolution` | `none` | `none`, `validate-only` or `basic` (see <<_schema_evolution>>).
+| `collection.name.format` | `+${topic}+` | Pattern for the destination table name, with `+${topic}+` and `+${source.<field>}+` placeholders, for example `+${source.schema}_${source.table}+`.
+| `dialect.postgres.postgis.schema` | `public` | Schema where the PostGIS extension is installed.
+| `dialect.postgres.unnest.insert.enabled` | `false` | Writes a batch as one `UNNEST`-based statement on PostgreSQL and CockroachDB (insert and upsert modes).
+| `dialect.sqlserver.identity.insert` | `false` | Sets `IDENTITY_INSERT` on and off around inserts and upserts into SQL Server identity columns.
+| `dialect.starrocks.catalog.name` | none | StarRocks catalog to write into (`SET CATALOG` on each new connection).
+| `batch.size` | `500` | Records per batch, capped by the consumer's `max.poll.records`.
+| `use.reduction.buffer` | `false` | Merges the events of one primary key in a batch into a single write of the latest state.
+| `field.include.list` | empty | Comma-separated fields of the event value to include, as `fieldName` or `topicName:fieldName`. Not with `field.exclude.list`.
+| `field.exclude.list` | empty | Comma-separated fields of the event value to exclude, in the same form. Not with `field.include.list`.
+| `flush.max.retries` | `5` | Retries of a failed flush on retriable errors before the task fails.
+| `flush.retry.delay.ms` | `1000` | Delay between flush retries.
+| `timestamp.clamp.out.of.range.values` | `false` | Replaces temporal values that the target cannot store with its minimum or maximum timestamp.
+|===
+
+`field.exclude.list` is the easy way to keep a column out of the mirror, for example a legacy column with personal
+data that the new system must not receive: `legacy.BOOKSHOP.CUSTOMER:EMAIL`. It only filters what the sink writes; the
+value is still in the Kafka topic, so
+xref:database/migration/security-and-data-protection.adoc[Security & Data Protection] shows how to drop or mask it at
+the source.
+
+=== Extendable properties
+
+[cols="2,2,3"]
+|===
+| Property | Default | Description
+
+| `column.naming.strategy` | `io.debezium.connector.jdbc.naming.DefaultColumnNamingStrategy` | `ColumnNamingStrategy` class that turns field names into column names. The default uses the field name unchanged.
+| `collection.naming.strategy` | `io.debezium.sink.naming.DefaultCollectionNamingStrategy` | `CollectionNamingStrategy` class that turns a record into a table name. The default sanitises dots in the topic name and resolves `collection.name.format`. `io.debezium.sink.naming.PassthroughCollectionNamingStrategy` uses the raw topic name.
+|===
+
+The official property table prints the default collection strategy as `+io.debezium.connector.jdbc.nnaming.DefaultCollectionNamingStrategy+`;
+the class in the 3.7.1.Final archive is `io.debezium.sink.naming.DefaultCollectionNamingStrategy`, which matches the
+"Changing how table names are resolved" section.
+
+=== Hibernate pass-through properties
+
+Any property that starts with `+hibernate.+` is passed to Hibernate unchanged. Some Hibernate settings are already
+exposed as connector properties (`connection.url`, `connection.username`, the pool sizes, `use.time.zone`,
+`quote.identifiers`). Use the pass-through for the rest, for example `hibernate.dialect` to force a dialect, or the
+`+hibernate.agroal.*+` settings of the connection pool such as `hibernate.agroal.idleValidation`.
+
+=== Error handling properties
+
+The `+errors.*+` properties are Kafka Connect sink settings (see <<_the_kafka_connect_error_properties>>). The
+internal property `internal.enable.sces` (default `false` in 3.7.1.Final) enables the shared change event sink
+framework that routes failed writes to the dead-letter queue.
+
+== Reverse direction: PostgreSQL back to Oracle
+
+After the write cut-over the new application owns the data, and the legacy database becomes a follower that is kept
+current so that you can roll back and so that legacy reports keep working.
+xref:database/migration/cut-over-and-reverse-replication.adoc[Cut-over & Reverse Replication] describes the whole
+procedure, including loop prevention. The JDBC sink is the code-free way to apply the changes for tables whose shape
+did not change much. `author` is such a table: `author (id, full_name)` in PostgreSQL and `AUTHOR (AUTHOR_ID,
+FULL_NAME)` in Oracle.
+
+The `bookshop-pg-source` connector (topic prefix `modern`) publishes the PostgreSQL changes to `modern.public.author`.
+The reverse sink flattens the event so that it can rename `id` to `AUTHOR_ID` with the Kafka `ReplaceField` SMT, which
+works on flat records only, and writes to the literal table name `BOOKSHOP.AUTHOR`:
+
+.`bookshop-oracle-reverse-sink.json`: PostgreSQL `author` back to Oracle `BOOKSHOP.AUTHOR`
+[source,json]
+----
+{
+  "name": "bookshop-oracle-reverse-sink",
+  "config": {
+    "connector.class": "io.debezium.connector.jdbc.JdbcSinkConnector",
+    "tasks.max": "1",
+    "topics": "modern.public.author",
+
+    "connection.url": "jdbc:oracle:thin:@//oracle:1521/FREEPDB1",
+    "connection.username": "BOOKSHOP_SYNC",
+    "connection.password": "change-me",
+
+    "insert.mode": "upsert",
+    "primary.key.mode": "record_key",
+    "delete.enabled": "true",
+    "schema.evolution": "none",
+    "collection.name.format": "BOOKSHOP.AUTHOR",
+    "quote.identifiers": "false",
+    "use.time.zone": "UTC",
+
+    "transforms": "unwrap,renameKey,renameValue",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.delete.tombstone.handling.mode": "tombstone",
+    "transforms.renameKey.type": "org.apache.kafka.connect.transforms.ReplaceField$Key",
+    "transforms.renameKey.renames": "id:AUTHOR_ID",
+    "transforms.renameValue.type": "org.apache.kafka.connect.transforms.ReplaceField$Value",
+    "transforms.renameValue.renames": "id:AUTHOR_ID,full_name:FULL_NAME"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-properties[Debezium -- JDBC connector properties],
+https://debezium.io/documentation/reference/stable/transformations/event-flattening.html[Debezium -- New record state extraction],
+https://kafka.apache.org/43/kafka-connect/user-guide/#org.apache.kafka.connect.transforms.ReplaceField[Apache Kafka -- ReplaceField]
+
+The points that differ from the forward sink:
+
+* **Flattened records.** After `ExtractNewRecordState` the `source` block is gone, so `+${source.table}+` cannot be
+  resolved. Each reverse sink therefore uses a literal table name and one topic. With
+  `delete.tombstone.handling.mode=tombstone` (the default) a delete arrives as a tombstone, which the sink applies as a
+  delete because `delete.enabled=true`.
+* **Case folding in the other direction.** The literal `BOOKSHOP.AUTHOR` is split into a schema and a table, and with
+  quoting off Oracle resolves unquoted names in upper case, so even an unrenamed `full_name` would match
+  `FULL_NAME`. The rename of `id` is what really matters.
+* **A dedicated Oracle user.** `BOOKSHOP_SYNC` needs only `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables it
+  writes. Because its changes are visible in the redo log under its own name, the `bookshop-oracle-source` connector
+  can ignore them with `log.mining.username.exclude.list`, which is one of the loop-prevention options described on the
+  cut-over page.
+* **The Oracle JDBC driver** must be present in the connector directory (see <<_installing_the_connector>>).
+* Tables whose model changed (`purchase_order` back to `ORDERS`, `book` and `book_author` back to `BOOK.AUTHOR_ID`) need
+  a translating consumer, not a sink, in this direction too.
+
+The `sqlserver-to-oracle` example in the `debezium-examples` repository shows a complete JDBC sink into Oracle, and the
+`unwrap-smt` example shows a sink fed by flattened events.
+
+== Troubleshooting
+
+[cols="2,3,3"]
+|===
+| Symptom | Likely cause | Fix
+
+| Task fails with a duplicate key error after a restart
+| `insert.mode=insert` with at-least-once redelivery
+| Use `insert.mode=upsert` with a primary key mode.
+
+| Rows deleted in the legacy database remain in the mirror
+| `delete.enabled=false` (the default); `NumberOfFilteredEvents` grows
+| Set `delete.enabled=true` and run a reconciliation for the rows already missed.
+
+| The connector creates `legacy_BOOK` with quotes, or cannot find `legacy_book`
+| `quote.identifiers=true` on a PostgreSQL target
+| Set `quote.identifiers=false`, or create the mixed-case table on purpose.
+
+| Startup fails with `schema.evolution=validate-only`
+| `collection.name.format` uses `+${source.*}+`, or a custom naming strategy is set
+| Use `none`, or a static name or `+${topic}+` format.
+
+| "value too long" after a legacy column was widened
+| Schema evolution never changes existing columns
+| Alter the mirror column first; see xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes].
+
+| "ON CONFLICT command cannot affect row a second time"
+| UNNEST inserts with several events for one key in a batch
+| Enable `use.reduction.buffer`, or disable `dialect.postgres.unnest.insert.enabled`.
+
+| The task fails while reading a schema change or heartbeat topic
+| `topics.regex` matches non-data topics
+| List the data topics in `topics`, or tighten the regular expression.
+
+| Rebalances while the database is slow
+| Flush retries longer than `max.poll.interval.ms`
+| Reduce `+flush.max.retries * flush.retry.delay.ms+`, or raise `consumer.override.max.poll.interval.ms`.
+
+| `column "supplier_id" is of type bigint but expression is of type character varying`
+| The source uses `decimal.handling.mode=string`, so `NUMBER` values, keys included, arrive as strings
+| Add `?stringtype=unspecified` to the PostgreSQL `connection.url`, then restart the task.
+
+| The task is `RUNNING`, writes nothing and logs "isn't a Debezium record"
+| The source writes JSON with `schemas.enable=false`, so the sink cannot recognise the envelope
+| Enable `key.converter.schemas.enable` and `value.converter.schemas.enable` on the source, or use Avro.
+
+| Decimal values lose precision
+| With the `precise` mode, bare Oracle `NUMBER` columns arrive as `VariableScaleDecimal` and map to `DOUBLE`
+| Configure the source connector's `decimal.handling.mode` or a converter; see xref:database/migration/data-types-and-precision.adoc[Data Types & Precision].
+|===
+
+xref:database/migration/troubleshooting-and-failure-recovery.adoc[Troubleshooting & Failure Recovery] covers failures
+of the whole pipeline.
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/jdbc.html[Debezium -- Debezium connector for JDBC]
+  (sections https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-consume-complex-debezium-events[consuming complex events],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-at-least-once-delivery[at-least-once delivery],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-primary-key-handling[primary key handling],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-delete-mode[delete mode],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-idempotent-writes[idempotent writes],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#sink-connector-secondary-unique-constraints[secondary unique constraints],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-schema-evolution[schema evolution],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-quoting-case-sensitivity[quoting and case sensitivity],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-error-handling-and-dead-letter-queues[error handling and dead letter queues],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-changing-how-table-names-are-resolved[table name resolution],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-data-and-type-mappings[data and type mappings],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-field-types[data type mappings],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-monitoring[monitoring],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-properties[connector properties],
+  https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-faq[FAQ])
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-data-type-mappings[Debezium -- Oracle connector data type mappings]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-log-mining-username-exclude-list[Debezium -- Oracle `log.mining.username.exclude.list`]
+* https://debezium.io/documentation/reference/stable/transformations/event-flattening.html[Debezium -- New record state extraction]
+* https://debezium.io/releases/3.7/[Debezium -- Release series 3.7 (tested JDBC sink targets, 3.7.1 fixes)]
+* https://github.com/debezium/debezium-examples/tree/main/sqlserver-to-oracle[debezium-examples -- sqlserver-to-oracle] and
+  https://github.com/debezium/debezium-examples/tree/main/unwrap-smt[debezium-examples -- unwrap-smt]
+* https://debezium.io/blog/2017/09/25/streaming-to-another-database/[Debezium blog -- Streaming data to a downstream database]
+* https://kafka.apache.org/43/configuration/kafka-connect-configs/#sink-connector-configs[Apache Kafka -- Sink connector configs (errors.* properties)]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#error-reporting-in-connect[Apache Kafka -- Error reporting in Connect] and
+  https://kafka.apache.org/43/kafka-connect/user-guide/#org.apache.kafka.connect.transforms.ReplaceField[ReplaceField]
+* https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS[PostgreSQL -- Identifiers and key words (case folding)]
+* https://jdbc.postgresql.org/documentation/use/[PostgreSQL JDBC driver -- connection parameters (`stringtype`)]
+
+The configuration on this page was derived from the official documentation and checked against the 3.7.1.Final
+plug-in archive. The mirror sink settings were run in the worked example on 2026-11-09; the reverse sink and the
+tuning fragments were not run.

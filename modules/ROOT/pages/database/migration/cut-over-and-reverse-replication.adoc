@@ -1,0 +1,853 @@
+= Cut-over, Reverse Replication and Rollback
+:description: Runbook for moving a capability from the legacy Oracle database to the new PostgreSQL database with Debezium, covering the read cut-over, the write cut-over (write freeze, draining lag to zero, final reconciliation, switching routing), reverse CDC from PostgreSQL back to Oracle with a PostgreSQL source connector and a JDBC sink or translating consumer, loop prevention in two-way synchronisation (Oracle log.mining.username.exclude.list, PostgreSQL replication origins with slot.stream.params origin=none, an origin marker column with the Filter SMT, separate users per direction), conflicts and a write guard on the legacy tables, rollback, the point of no return, and decommissioning connectors, slots, publications, supplemental logging and topics.
+:keywords: Debezium, cut-over, write cut-over, read cut-over, reverse replication, reverse CDC, rollback, point of no return, two-way synchronisation, bidirectional replication, loop prevention, log.mining.username.exclude.list, source.user_name, replication origin, pg_replication_origin_session_setup, slot.stream.params, origin=none, pgoutput, Filter SMT, Groovy, changed_by, origin marker, REPLICA IDENTITY FULL, InsertField, JDBC sink, write freeze, feature flag, strangler fig, decommission, replication slot, publication, supplemental logging, Oracle, PostgreSQL, Bookshop
+
+include::partial$database-migration-disclaimer.adoc[]
+
+Everything before the write cut-over is reversible at no cost: the legacy Oracle database is still the source of truth,
+and PostgreSQL is a copy that can be dropped and rebuilt. The write cut-over is the step at which the new application
+starts owning data, and the moment from which a mistake can corrupt the system of record. This page is the runbook for
+that step and for what follows it: reverse replication that keeps Oracle current so that a rollback stays possible
+and legacy reports keep working, the mechanisms that stop changes from looping between the two databases, conflicts,
+the point after which rollback is no longer realistic, and the decommissioning of the whole pipeline.
+
+The phases and their exit criteria are defined on
+xref:database/migration/migration-patterns-with-cdc.adoc[Migration Patterns with CDC]: phase 3 is the read cut-over,
+phase 4 the write cut-over with reverse replication, phase 5 the decommission. The routing technique (a strangler proxy
+with feature flags and cohorts) is described on
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_feature_flags_and_cohort_based_cut_over[Migration Path: From a Legacy Stack to a Modern One],
+together with the
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_exit_criteria_for_decommissioning_the_legacy_system[exit criteria for decommissioning the legacy system].
+This page adds the data side: what the connectors, slots and users do at each step. The running example is the
+Bookshop catalogue (`BOOK`, `AUTHOR`), the first capability to move.
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final, Kafka 4.x in KRaft mode, Oracle AI Database 26ai Free (image `gvenzl/oracle-free:23.26.3`, PDB `FREEPDB1`),
+PostgreSQL 18, Spring Boot 4.1 and Java 21. What was run: the Filter SMT condition on this page was executed with
+the `debezium-scripting` 3.7.1.Final archive and Groovy 4.0.17 against hand-built change event records; the image
+extension for Groovy was built from `quay.io/debezium/connect:3.7.1.Final`; the PostgreSQL replication-origin
+mechanism (`pgoutput` with `origin` set to `none`, `pg_replication_origin_session_setup` granted to a non-superuser,
+and a HikariCP pool with it as init SQL) was tested on PostgreSQL 18.6 with `pg_logical_slot_peek_binary_changes`; and
+the Java configuration class was compiled with `javac --release 21`. The connector registrations, the Oracle SQL and
+the runbook commands were derived from the official documentation listed under <<_references,References>> and were not
+run end to end.
+
+== The runbook at a glance
+
+[cols="1,3,3",options="header"]
+|===
+| Step | What changes | Rollback
+
+| Read cut-over (phase 3)
+| The strangler proxy sends reads of the capability to the new application, cohort by cohort. Writes stay on the legacy
+  side, forward CDC keeps PostgreSQL current.
+| Route reads back. Instant, nothing to repair.
+
+| Preparation for the write cut-over
+| Reverse pipeline created in a stopped state, PostgreSQL origin and roles prepared, write guard written, rollback
+  rehearsed on a staging copy.
+| Nothing to roll back.
+
+| Write cut-over (phase 4 begins)
+| Write freeze, drain, final reconciliation, forward capture reconfigured, reverse CDC started, writes routed to the
+  new application.
+| Route writes back to the legacy application after draining the reverse pipeline (see <<_rollback>>).
+
+| Phase 4 steady state
+| PostgreSQL is the source of truth for the catalogue; Oracle follows through reverse CDC.
+| Possible until the <<_the_point_of_no_return,point of no return>>.
+
+| Decommission (phase 5)
+| Connectors, slots, publications, users, supplemental logging and topics removed.
+| Restore from the archive only.
+|===
+
+== The read cut-over
+
+Before any write moves, reads move. The proxy routes catalogue searches and book pages to the new application for an
+internal cohort, then for a growing share of users, while the legacy application keeps taking all writes. The data
+side of this step is small, but it sets three preconditions for the write cut-over:
+
+* **The end-to-end lag objective holds at peak.** Users now read data that crossed the pipeline, so the lag that
+  xref:database/migration/verification-and-reconciliation.adoc#_measuring_lag[Verification & Reconciliation] measures
+  becomes user-visible. A catalogue tolerates seconds; pages that show a user's own just-written data need the
+  read-your-writes handling described on
+  xref:database/migration/migration-patterns-with-cdc.adoc#_the_read_your_writes_problem[Migration Patterns with CDC].
+* **Reconciliation stays clean.** The comparison job keeps running through phase 3 and becomes the evidence that the
+  copy the users now read is correct.
+* **All reads of the capability are on the new side** (100% in the proxy logs) before the write cut-over. Moving reads
+  and writes in the same step doubles the blast radius of a mistake.
+
+== Preparing the write cut-over
+
+=== Users and responsibilities per direction
+
+Two-way synchronisation is much easier to reason about when every writer has its own database identity. The
+identities below are used in the rest of the page.
+
+[cols="2,2,3",options="header"]
+|===
+| Writer or reader | Database user | Purpose
+
+| `bookshop-oracle-source` (forward capture)
+| `C##DBZUSER` (Oracle common user)
+| Reads the redo log through LogMiner. Never writes business tables.
+
+| `bookshop-pg-mirror-sink` (forward mirror)
+| `bookshop_mirror` (PostgreSQL)
+| Writes only the `+legacy_*+` mirror tables, which reverse CDC never captures.
+
+| Forward translators (`bookshop-legacy-sync`)
+| `bookshop_translator` (PostgreSQL)
+| Writes `book`, `book_author`, `customer`, `purchase_order` and `order_line` while a capability is still forward.
+  Marks its sessions with the replication origin `bookshop_legacy_sync`.
+
+| `bookshop-pg-source` (reverse capture)
+| `dbz_reverse` (PostgreSQL, `REPLICATION`)
+| Reads the WAL through the slot `bookshop_reverse` and the publication `bookshop_reverse_pub`.
+
+| `bookshop-oracle-reverse-sink` and the reverse translator
+| `BOOKSHOP_SYNC` (Oracle)
+| The only account allowed to write the moved legacy tables after the cut-over.
+
+| The new application `bookshop`
+| `bookshop_app` (PostgreSQL)
+| The source of truth for moved capabilities.
+|===
+
+Separate users are not only good hygiene. They are what makes loop prevention possible on Oracle, where LogMiner
+records the user of every change, and they make the database audit logs readable during an incident.
+
+=== Preparing PostgreSQL for reverse capture
+
+The reverse connector needs a role with the `REPLICATION` attribute and `SELECT` on the captured tables, and a
+publication. Creating the publication in a Liquibase changeset, as the table owner, keeps the connector role free of
+ownership rights; the connector then runs with `publication.autocreate.mode=disabled`. (The shorter configuration on
+xref:database/migration/migration-patterns-with-cdc.adoc#_phase_4_write_cut_over_with_reverse_replication[Migration Patterns with CDC]
+lets the connector manage the publication with `filtered`, which requires the connector role to own the tables.)
+
+.Reverse-capture role, publication, replica identity and replication origin (PostgreSQL, as the owner of the tables)
+[source,sql]
+----
+-- The role the reverse connector logs in with
+CREATE ROLE dbz_reverse WITH LOGIN REPLICATION PASSWORD 'change-me';
+GRANT CONNECT ON DATABASE bookshop TO dbz_reverse;
+GRANT USAGE ON SCHEMA public TO dbz_reverse;
+GRANT SELECT ON book, book_author, author TO dbz_reverse;
+
+-- The publication: exactly the tables whose source of truth has moved
+CREATE PUBLICATION bookshop_reverse_pub FOR TABLE book, book_author, author;
+
+-- Old values of every column in update and delete events (needed by the origin-marker variant below)
+ALTER TABLE book        REPLICA IDENTITY FULL;
+ALTER TABLE book_author REPLICA IDENTITY FULL;
+ALTER TABLE author      REPLICA IDENTITY FULL;
+
+-- The replication origin that the forward translators set on their sessions
+SELECT pg_replication_origin_create('bookshop_legacy_sync');
+GRANT EXECUTE ON FUNCTION pg_replication_origin_session_setup(text) TO bookshop_translator;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-publication-autocreate-mode[Debezium -- PostgreSQL connector: publication.autocreate.mode], https://www.postgresql.org/docs/current/replication-origins.html[PostgreSQL -- Replication progress tracking (origins)] and https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION[PostgreSQL -- Replication management functions]
+
+The replication origin functions are restricted to superusers by default; the `GRANT EXECUTE` gives the translator
+role exactly the one function it needs (verified on PostgreSQL 18.6). The publication grows by one table list each time
+another capability reaches phase 4 (`+ALTER PUBLICATION bookshop_reverse_pub ADD TABLE purchase_order, order_line+`).
+
+=== Creating the reverse connector stopped
+
+The reverse source connector is registered days before the cut-over, in the `STOPPED` state (the create request accepts an `initial_state`
+field, which every Kafka 4.x Connect worker supports). Its configuration is reviewed and validated, but it does not
+create its replication slot until it is resumed during the cut-over, so the slot starts exactly at the moment the
+source of truth changes.
+
+.bookshop-pg-source.json: reverse capture of the catalogue, with loop prevention
+[source,json]
+----
+{
+  "name": "bookshop-pg-source",
+  "initial_state": "STOPPED",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "tasks.max": "1",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "dbz_reverse",
+    "database.password": "change-me",
+    "database.dbname": "bookshop",
+    "topic.prefix": "modern",
+
+    "plugin.name": "pgoutput",
+    "slot.name": "bookshop_reverse",
+    "publication.name": "bookshop_reverse_pub",
+    "publication.autocreate.mode": "disabled",
+    "table.include.list": "public.book,public.book_author,public.author",
+    "snapshot.mode": "no_data",
+    "slot.stream.params": "origin=none",
+    "tombstones.on.delete": "false",
+    "heartbeat.interval.ms": "10000",
+
+    "transforms": "dropLegacySync",
+    "transforms.dropLegacySync.type": "io.debezium.transforms.Filter",
+    "transforms.dropLegacySync.language": "jsr223.groovy",
+    "transforms.dropLegacySync.topic.regex": "modern\\.public\\..*",
+    "transforms.dropLegacySync.condition": "value.op == 'r' || (value.op == 'd' ? value.before?.changed_by : value.after?.changed_by) != 'legacy-sync'",
+    "transforms.dropLegacySync.null.handling.mode": "keep"
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-connector-properties[Debezium -- PostgreSQL connector properties], https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-slot-stream-params[Debezium -- PostgreSQL connector: slot.stream.params] and https://debezium.io/documentation/reference/stable/transformations/filtering.html#filter-configuration-options[Debezium -- Message filtering: configuration options]
+
+.Register the reverse connector in the STOPPED state
+[source,shell]
+----
+curl -s -X POST -H "Content-Type: application/json" \
+     --data @bookshop-pg-source.json http://localhost:8083/connectors
+
+curl -s http://localhost:8083/connectors/bookshop-pg-source/status
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+
+The settings that matter for the cut-over:
+
+* `snapshot.mode=no_data` skips the data snapshot: at the moment of the cut-over Oracle already holds the same rows,
+  which the final reconciliation proves.
+* `slot.stream.params=origin=none` asks `pgoutput` to send only changes that have no replication origin, which removes
+  everything the forward translators wrote (next section).
+* `tombstones.on.delete=false`, because a tombstone carries no value and so cannot be filtered by origin marker: if
+  the filter drops a delete, its tombstone would still pass. The reverse sink turns delete events into deletes by itself.
+* `heartbeat.interval.ms` keeps the slot's confirmed position moving when the catalogue is quiet, so that PostgreSQL
+  can recycle WAL.
+* The Filter SMT and its Groovy dependency are explained in <<_cut_2_postgresql_to_oracle_and_back>>.
+
+The reverse writer into Oracle is the JDBC sink `bookshop-oracle-reverse-sink` for tables that kept their shape
+(`author` back to `AUTHOR`, configured in full on
+xref:database/migration/jdbc-sink-connector.adoc#_reverse_direction_postgresql_back_to_oracle[JDBC Sink Connector], with the
+Oracle user `BOOKSHOP_SYNC`), and a reverse translator in the `bookshop` application for tables that changed shape
+(`book` plus `book_author` back to `BOOK`). Register the sink stopped in the same way.
+
+=== The reverse translation of BOOK
+
+The new model allows several authors per book; the legacy `BOOK.AUTHOR_ID` holds one. The reverse translator reads
+`modern.public.book` and `modern.public.book_author`, decides which author is the legacy author (the link with the
+smallest `author_id`, a rule the business agreed to), and upserts the legacy row as `BOOKSHOP_SYNC`:
+
+.Upsert of one book into the legacy table, executed by the reverse translator (Oracle, as BOOKSHOP_SYNC)
+[source,sql]
+----
+MERGE INTO BOOKSHOP.BOOK t
+USING (SELECT :book_id     AS BOOK_ID,
+              :isbn        AS ISBN,
+              :title       AS TITLE,
+              :author_id   AS AUTHOR_ID,
+              :price       AS PRICE,
+              :currency    AS CURRENCY,
+              :published   AS PUBLISHED,
+              :active_flg  AS ACTIVE_FLG,
+              :supplier_id AS SUPPLIER_ID
+       FROM   DUAL) s
+ON (t.BOOK_ID = s.BOOK_ID)
+WHEN MATCHED THEN UPDATE SET
+       t.ISBN        = s.ISBN,
+       t.TITLE       = s.TITLE,
+       t.AUTHOR_ID   = s.AUTHOR_ID,
+       t.PRICE       = s.PRICE,
+       t.CURRENCY    = s.CURRENCY,
+       t.PUBLISHED   = s.PUBLISHED,
+       t.ACTIVE_FLG  = s.ACTIVE_FLG,
+       t.SUPPLIER_ID = s.SUPPLIER_ID,
+       t.LAST_UPD    = SYSDATE
+WHEN NOT MATCHED THEN INSERT
+       (BOOK_ID, ISBN, TITLE, AUTHOR_ID, PRICE, CURRENCY, PUBLISHED, ACTIVE_FLG, SUPPLIER_ID, LAST_UPD)
+VALUES (s.BOOK_ID, s.ISBN, s.TITLE, s.AUTHOR_ID, s.PRICE, s.CURRENCY, s.PUBLISHED, s.ACTIVE_FLG, s.SUPPLIER_ID, SYSDATE);
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/MERGE.html[Oracle Database SQL Language Reference -- MERGE] and https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-events[Debezium -- PostgreSQL connector: data change events]
+
+The translator binds `active_flg` as `Y`/`N`, `published` as a `java.time.LocalDate` and `currency` as the three-letter
+code, the reverse of the forward rules in
+xref:database/migration/migration-patterns-with-cdc.adoc#_the_translation_rules[Migration Patterns with CDC]. A
+`MERGE` is idempotent, so redelivered events (at-least-once delivery) are harmless.
+
+=== Rehearsal
+
+Run the whole cut-over and the rollback on a staging copy with production-like data at least once, with the same
+commands and the same people, and time each step. The duration of the write freeze in production is the duration
+measured in the rehearsal plus a margin. A rollback that has never run is not a rollback plan.
+
+== Preventing loops in two-way synchronisation
+
+=== Why loops happen
+
+During phase 4 both directions can be active at once: reverse CDC for the catalogue, and forward CDC for capabilities
+that have not moved yet, or for a legacy batch job that still writes the catalogue. A change written by the reverse
+sink into Oracle is a change like any other in the redo log; if the forward connector captures the same table, it
+publishes it again, the forward translator writes it into PostgreSQL, the reverse connector captures that write, and
+the change circles until something fails. A loop does not need two different changes to start: one update is enough.
+
+The first defence is the rule of
+xref:database/migration/migration-patterns-with-cdc.adoc#_loops_and_ownership[Migration Patterns with CDC]: **one
+direction per table**. If `BOOK` and `AUTHOR` are removed from the forward connector when the reverse one starts, no
+loop is possible. The mechanisms below are for the cases in which that rule cannot hold completely, and they are cheap
+enough to configure always, as a second line of defence.
+
+image::database-migration-reverse-replication.svg["Reverse replication after the write cut-over: PostgreSQL changes flow through bookshop-pg-source, Kafka and the reverse sink into Oracle, while residual legacy changes flow forward; the Oracle source skips changes made by BOOKSHOP_SYNC and the PostgreSQL source skips changes with a replication origin or the legacy-sync marker, so no change returns to where it came from",width=720]
+
+=== Cut 1: Oracle to PostgreSQL and back
+
+On Oracle, filtering by the writing user is direct. LogMiner records the user of each change, and the Oracle connector
+can exclude users in its LogMiner query with `log.mining.username.exclude.list`. Every change that
+`BOOKSHOP_SYNC` makes is then invisible to the forward pipeline, whatever table it touches:
+
+.Exclude the reverse writer from forward capture (Kafka Connect REST, Kafka 3.5 or later)
+[source,shell]
+----
+curl -s -X PATCH -H "Content-Type: application/json" \
+     --data '{"log.mining.username.exclude.list": "BOOKSHOP_SYNC"}' \
+     http://localhost:8083/connectors/bookshop-oracle-source/config
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-log-mining-username-exclude-list[Debezium -- Oracle connector: log.mining.username.exclude.list]
+
+* With `log.mining.query.filter.mode=in` (the Bookshop setting, see
+  xref:database/migration/oracle-connector.adoc#_filtering_by_user_preparing_for_reverse_replication[Oracle Connector]),
+  the exclusion is applied in the LogMiner query itself, so excluded changes do not even leave the database.
+* Oracle stores unquoted user names in upper case; write the name as LogMiner reports it, `BOOKSHOP_SYNC`.
+* The same information is in every event: with the LogMiner adapter, the `source` block of an Oracle change event has a
+  `user_name` field. A consumer, or a Filter SMT with the condition `+value.source.user_name != 'BOOKSHOP_SYNC'+`, can
+  apply the same rule downstream. The connector property is preferable because it avoids publishing the events at all.
+  Note that `user_name` is populated only by the LogMiner adapter, not by OpenLogReplicator or XStream.
+
+=== Cut 2: PostgreSQL to Oracle and back
+
+On PostgreSQL the same idea does not work, and the reason matters. Logical decoding streams row changes with their
+transaction id and LSN, but **not the role that made them**. The `source` block of a PostgreSQL change event has
+`version`, `connector`, `name`, the timestamps, `snapshot`, `db`, `sequence`, `schema`, `table`, `txId`, `lsn` and
+`xmin`; there is no user field, and the connector has no username include or exclude list. Filtering "everything that
+`bookshop_translator` wrote" is therefore not possible from the event. Two mechanisms replace it.
+
+==== Replication origins (preferred)
+
+PostgreSQL has its own loop-prevention device for logical replication: a **replication origin**. A session that calls
+`+pg_replication_origin_session_setup('bookshop_legacy_sync')+` marks every change it commits with that origin. The
+`pgoutput` plug-in accepts an `origin` option; with `origin` set to `none`, it sends only changes without an origin.
+Debezium passes options to `pgoutput` through `slot.stream.params`, and the PostgreSQL connector documentation names
+`origin` as a parameter for exactly this purpose. Hence `"slot.stream.params": "origin=none"` in the reverse connector
+above. The `origin` option of `pgoutput` exists from PostgreSQL 16.
+
+What was verified on PostgreSQL 18.6: with a `pgoutput` slot on a publication, three updates made by a non-superuser
+session after `pg_replication_origin_session_setup` and one update made without an origin were decoded as four changes
+with `origin` set to `any` and as one change with `origin` set to `none`.
+
+Two properties of origins shape how the translator uses them:
+
+* **One session at a time per origin.** A second session that tries to set up an origin that is already active fails
+  with "replication origin ... is already active for PID ...". The translator therefore writes through a dedicated
+  connection pool of size one, or uses one origin per connection (`bookshop_legacy_sync_1`, `bookshop_legacy_sync_2`
+  and so on; `origin=none` drops all of them).
+* **The origin belongs to the session, not to the transaction.** Calling the setup again in the same session fails
+  with "cannot setup replication origin when one is already setup", so the call belongs in the connection
+  initialisation, not in each transaction.
+
+.LegacySyncDataSourceConfig: a connection pool whose sessions carry the replication origin (Java 21, Spring Boot 4.1)
+[source,java]
+----
+package com.example.bookshop.migration;
+
+import javax.sql.DataSource;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
+
+/**
+ * Connections used only by the anti-corruption layer (the forward translators) while reverse replication runs.
+ * Every session marks its changes with the PostgreSQL replication origin "bookshop_legacy_sync", so that the
+ * reverse connector bookshop-pg-source, configured with slot.stream.params=origin=none, does not capture them.
+ */
+@Configuration(proxyBeanMethods = false)
+public class LegacySyncDataSourceConfig {
+
+    static final String ORIGIN_NAME = "bookshop_legacy_sync";
+
+    @Bean(destroyMethod = "close")
+    @Qualifier("legacySync")
+    HikariDataSource legacySyncDataSource(
+            @Value("${bookshop.legacy-sync.datasource.url}") String url,
+            @Value("${bookshop.legacy-sync.datasource.username}") String username,
+            @Value("${bookshop.legacy-sync.datasource.password}") String password) {
+        HikariConfig config = new HikariConfig();
+        config.setPoolName("legacy-sync");
+        config.setJdbcUrl(url);
+        config.setUsername(username);
+        config.setPassword(password);
+        // A replication origin can be active in only one session at a time, hence a single connection.
+        config.setMaximumPoolSize(1);
+        config.setMinimumIdle(1);
+        config.setConnectionInitSql("SELECT pg_replication_origin_session_setup('" + ORIGIN_NAME + "')");
+        return new HikariDataSource(config);
+    }
+
+    @Bean
+    @Qualifier("legacySync")
+    JdbcClient legacySyncJdbcClient(@Qualifier("legacySync") DataSource dataSource) {
+        return JdbcClient.create(dataSource);
+    }
+
+    @Bean
+    @Qualifier("legacySync")
+    TransactionTemplate legacySyncTransactionTemplate(@Qualifier("legacySync") DataSource dataSource) {
+        return new TransactionTemplate(new DataSourceTransactionManager(dataSource));
+    }
+}
+----
+Reference: https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION[PostgreSQL -- Replication management functions] and https://www.postgresql.org/docs/current/protocol-logical-replication.html#PROTOCOL-LOGICAL-REPLICATION-PARAMS[PostgreSQL -- Logical streaming replication parameters (origin)]
+
+The translators (`LegacyBookTranslator`, `LegacyCustomerTranslator`, `LegacyOrderProjector`) inject the
+`legacySync` `JdbcClient` and `TransactionTemplate` instead of the application's main data source, with
+`bookshop.legacy-sync.datasource.username=bookshop_translator`. The application's own writes go through the main pool,
+have no origin, and are captured. A pool of one connection limits the translators to one transaction at a time;
+measure whether that keeps up with the forward change rate at peak, and use several origins with several pools
+otherwise.
+
+The Debezium JDBC sink has no documented setting that runs SQL when it opens a connection, so it cannot set an origin.
+That is not a problem for Bookshop, because the forward JDBC sink writes only the `+legacy_*+` mirror tables, which are
+not in the reverse publication. If a JDBC sink must write a captured table, use the marker below.
+
+==== An origin marker column with the Filter SMT
+
+The portable alternative is to put the origin into the row: a column `changed_by` that every writer sets, and a filter
+in the reverse connector that drops changes whose marker says they came from the forward direction. It works on any
+PostgreSQL version and with any writer that can set a column, but it costs a schema change (an expand step on `book`,
+`book_author` and `author`) and discipline from every writer.
+
+.Expand: the origin marker column (PostgreSQL, Liquibase changeset content)
+[source,sql]
+----
+ALTER TABLE book        ADD COLUMN changed_by text;
+ALTER TABLE book_author ADD COLUMN changed_by text;
+ALTER TABLE author      ADD COLUMN changed_by text;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-replica-identity[Debezium -- PostgreSQL connector: replica identity]
+
+* The forward translators write `+changed_by = 'legacy-sync'+` in every insert and update; the new application writes
+  `+changed_by = 'bookshop-app'+` (or leaves it `NULL`).
+* For inserts and updates, the filter looks at `after.changed_by`. **Deletes carry no new row**, so the filter looks at
+  `before.changed_by`, which is filled only with `REPLICA IDENTITY FULL` (prepared above). A forward delete must
+  therefore mark the row first, in the same transaction: the update is filtered out, and the delete event's `before`
+  carries the marker.
++
+.A forward delete that the reverse filter recognises (PostgreSQL, one transaction)
+[source,sql]
+----
+BEGIN;
+UPDATE book_author SET changed_by = 'legacy-sync' WHERE book_id = 4711;
+DELETE FROM book_author WHERE book_id = 4711;
+COMMIT;
+----
++
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-delete-events[Debezium -- PostgreSQL connector: delete events]
+* Snapshot reads (`op=r`) are always kept (`+value.op == 'r' || ...+` in the condition). Otherwise an incremental
+  snapshot of the reverse connector, run to resynchronise Oracle, would skip every row that the forward translator
+  wrote last.
+* A JDBC sink that writes a captured table can set the marker with Kafka's `InsertField` transformation, after the
+  event has been flattened:
++
+.Setting the marker in a JDBC sink that writes a captured table (fragment)
+[source,json]
+----
+{
+  "transforms": "unwrap,mark",
+  "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+  "transforms.mark.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+  "transforms.mark.static.field": "changed_by",
+  "transforms.mark.static.value": "legacy-sync"
+}
+----
++
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#included-transformations[Apache Kafka -- Kafka Connect transformations (InsertField)]
+
+The Filter SMT (`io.debezium.transforms.Filter`) is not part of the connector archives. It needs the
+`debezium-scripting` archive and a JSR 223 engine on the connector's plug-in path. In the `quay.io/debezium/connect`
+image, the scripting jar is already present under `/kafka/external_libs/debezium-scripting` and is linked into every
+connector directory when the container runs with `ENABLE_DEBEZIUM_SCRIPTING=true`; the Groovy jars must be added to the
+same directory. The Debezium 3.7.1.Final BOM pins Groovy `org.apache.groovy` 4.0.17:
+
+.Dockerfile: the Connect image with Groovy for the Filter SMT
+[source,dockerfile]
+----
+FROM quay.io/debezium/connect:3.7.1.Final
+ARG GROOVY_VERSION=4.0.17
+RUN cd /kafka/external_libs/debezium-scripting \
+ && for artifact in groovy groovy-jsr223 groovy-json; do \
+      curl -sfSL -O "https://repo1.maven.org/maven2/org/apache/groovy/${artifact}/${GROOVY_VERSION}/${artifact}-${GROOVY_VERSION}.jar"; \
+    done
+----
+Reference: https://debezium.io/documentation/reference/stable/transformations/filtering.html#set-up-filter[Debezium -- Message filtering: set up] and https://github.com/debezium/container-images[debezium/container-images (ENABLE_DEBEZIUM_SCRIPTING)]
+
+Run the resulting image with `ENABLE_DEBEZIUM_SCRIPTING=true`. The filtering documentation warns that once the scripting
+SMT is installed, anyone who can create a connector can run scripts in the Connect worker, so secure the Connect REST
+API first (see xref:database/migration/security-and-data-protection.adoc[Security & Data Protection]).
+xref:database/migration/single-message-transformations.adoc#_what_you_must_install_the_scripting_artifact_and_a_language[Debezium Transformations]
+covers the installation and the other scripting transformations in more detail.
+
+What the condition does was checked with the 3.7.1.Final scripting jar and Groovy 4.0.17 on hand-built records:
+updates and deletes marked `legacy-sync` were dropped, an insert by the application, a delete of an application row and
+a snapshot read of a marked row were kept, and tombstones and heartbeat records (outside `topic.regex`) passed through.
+
+==== Which to use
+
+[cols="2,2,2",options="header"]
+|===
+| | Replication origin | Origin marker column
+
+| PostgreSQL version
+| 16 or later
+| Any
+
+| Schema change
+| None
+| A column on every captured table
+
+| Deletes
+| Covered without extra work
+| Need `REPLICA IDENTITY FULL` and a mark-then-delete
+
+| Writers that can use it
+| Sessions that can call a function at connection start (application consumers)
+| Any writer that can set a column (including a JDBC sink with `InsertField`)
+
+| Extra installation
+| None
+| The scripting SMT and Groovy
+|===
+
+Bookshop uses the replication origin for the translators and keeps the marker filter as a second line of defence for
+ad hoc repair scripts, which set `changed_by` by hand. If only one mechanism is wanted, prefer the origin.
+
+== Conflicts
+
+A conflict is two writers changing the same row in different databases before either change has crossed the
+pipeline. With one source of truth per table, conflicts cannot happen by design, which is why the runbook moves
+writes per capability with a freeze in between. They come back through the side doors: a legacy batch job that still
+updates prices, an operator fixing a row in Oracle by hand, a partner integration that writes directly into
+`BOOKSHOP.BOOK`.
+
+The most effective measure is to make the legacy tables refuse writes from anyone but the reverse writer once the
+capability has moved:
+
+.Write guard on a moved legacy table (Oracle, as BOOKSHOP, created during the write cut-over)
+[source,sql]
+----
+CREATE OR REPLACE TRIGGER BOOKSHOP.BOOK_WRITE_GUARD
+BEFORE INSERT OR UPDATE OR DELETE ON BOOKSHOP.BOOK
+BEGIN
+  IF SYS_CONTEXT('USERENV', 'SESSION_USER') <> 'BOOKSHOP_SYNC' THEN
+    RAISE_APPLICATION_ERROR(-20001,
+      'BOOKSHOP.BOOK is owned by the new bookshop application since the write cut-over');
+  END IF;
+END;
+/
+----
+Reference: https://docs.oracle.com/en/database/oracle/oracle-database/23/lnpls/CREATE-TRIGGER-statement.html[Oracle Database PL/SQL Language Reference -- CREATE TRIGGER] and https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SYS_CONTEXT.html[Oracle Database SQL Language Reference -- SYS_CONTEXT]
+
+* Every forgotten writer now fails loudly with `ORA-20001` instead of creating a silent conflict, and the error names
+  the reason. Collect these errors during the first days: each one is a legacy dependency to migrate.
+* A statement-level trigger (no `FOR EACH ROW`) costs one check per statement.
+* The trigger is DDL in the legacy schema. Create it in the rehearsal first and confirm that the forward connector
+  passes it (its `TotalSchemaChangeParseErrorCount` metric stays at zero), as for any legacy DDL on
+  xref:database/migration/schema-changes-during-migration.adoc[Handling Schema Changes].
+* Drop the trigger as the first step of a rollback, so that the legacy application can write again.
+
+If a residual writer cannot be stopped before the cut-over (a supplier price feed that only the legacy system can
+receive), keep its table, or only its columns, in the forward direction, and give the new application no write path
+to them. The rule "one owner per column" is weaker than "one owner per table" but still conflict-free. What is not safe
+is two writers for the same column with "last writer wins": the order in which the two pipelines apply changes is not
+the order in which users made them.
+
+== The write cut-over, step by step
+
+The sequence for the catalogue, with the commands for each step. The overall order matches phase 4 on
+xref:database/migration/migration-patterns-with-cdc.adoc#_phase_4_write_cut_over_with_reverse_replication[Migration Patterns with CDC].
+
+[mermaid]
+....
+sequenceDiagram
+    participant Ops as Operator
+    participant Proxy as Strangler proxy
+    participant Legacy as Legacy application
+    participant Ora as Oracle BOOKSHOP
+    participant Fwd as Forward pipeline
+    participant Pg as PostgreSQL bookshop
+    participant Rev as Reverse pipeline
+    participant App as New application
+    Ops->>Proxy: freeze catalogue writes (flag)
+    Ops->>Fwd: wait until lag is zero
+    Ops->>Ora: final reconciliation at SCN S
+    Ops->>Pg: final reconciliation
+    Ops->>Fwd: exclude BOOKSHOP_SYNC, remove BOOK and AUTHOR
+    Ops->>Ora: create write guard trigger
+    Ops->>Rev: resume bookshop-pg-source and reverse writers
+    Ops->>Proxy: route catalogue writes to the new application
+    Ops->>Proxy: lift the freeze
+    App->>Pg: first catalogue write
+    Pg->>Rev: change captured, no origin
+    Rev->>Ora: written as BOOKSHOP_SYNC
+    Ora-->>Fwd: change skipped (excluded user, table not captured)
+    Ops->>Ora: smoke test: the change is in BOOKSHOP.BOOK
+....
+
+. **Freeze catalogue writes.** Switch the feature flag that puts the legacy catalogue administration into read-only
+  mode, or add a proxy rule that rejects catalogue writes with a maintenance message. Reads continue on the new
+  application. Note the time.
+. **Drain the forward pipeline.** Wait until `MilliSecondsBehindSource` of `bookshop-oracle-source` is near zero and the
+  consumer groups `bookshop-legacy-sync` and `connect-bookshop-pg-mirror-sink` have no lag on `legacy.BOOKSHOP.BOOK` and
+  `legacy.BOOKSHOP.AUTHOR`.
++
+.Check the consumer lag of the forward consumers
+[source,shell]
+----
+/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group bookshop-legacy-sync
+/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group connect-bookshop-pg-mirror-sink
+----
++
+Reference: https://kafka.apache.org/43/operations/basic-kafka-operations/#managing-consumer-groups[Apache Kafka -- Managing consumer groups]
+. **Final reconciliation.** Run the per-chunk checksums of `BOOK` and `AUTHOR` from
+  xref:database/migration/verification-and-reconciliation.adoc[Verification & Reconciliation]. With writes frozen,
+  every chunk must match on the first run. Any difference stops the cut-over: unfreeze, investigate, try another day.
+. **Reconfigure forward capture.** Exclude the reverse writer, and remove the moved tables from the forward connector
+  (the "one direction per table" rule). Kafka Connect's `PATCH` merges the given keys into the existing configuration:
++
+.Forward connector after the cut-over of the catalogue
+[source,shell]
+----
+curl -s -X PATCH -H "Content-Type: application/json" \
+     --data '{
+       "log.mining.username.exclude.list": "BOOKSHOP_SYNC",
+       "table.include.list": "BOOKSHOP.CUSTOMER,BOOKSHOP.ORDERS,BOOKSHOP.ORDER_LINE,BOOKSHOP.SUPPLIER_CATALOGUE,BOOKSHOP.DEBEZIUM_HEARTBEAT"
+     }' \
+     http://localhost:8083/connectors/bookshop-oracle-source/config
+----
++
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-connector-properties[Debezium -- Oracle connector properties]
++
+Keep `schema.history.internal.store.only.captured.tables.ddl=false` (the Bookshop setting), so that the history keeps
+tracking `BOOK` and `AUTHOR` and they can be re-added quickly in a rollback. Remove the catalogue topics from the
+mirror sink's `topics` and stop the translator for them as well.
+. **Create the write guard** on `BOOKSHOP.BOOK` and `BOOKSHOP.AUTHOR` (trigger above).
+. **Start reverse replication.** Resume the reverse source, which creates the slot at the current WAL position, then
+  the reverse writers.
++
+.Start the reverse pipeline
+[source,shell]
+----
+curl -s -X PUT http://localhost:8083/connectors/bookshop-pg-source/resume
+curl -s -X PUT http://localhost:8083/connectors/bookshop-oracle-reverse-sink/resume
+curl -s http://localhost:8083/connectors/bookshop-pg-source/status
+
+psql -h localhost -U postgres -d bookshop -c \
+  "SELECT slot_name, plugin, active, confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = 'bookshop_reverse';"
+----
++
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-slot-name[Debezium -- PostgreSQL connector: slot.name] and https://www.postgresql.org/docs/current/view-pg-replication-slots.html[PostgreSQL -- pg_replication_slots]
+. **Route catalogue writes to the new application**, cohort by cohort if the proxy allows it, then lift the freeze.
+. **Smoke test.** Change one test book in the new application and check that it arrives in `BOOKSHOP.BOOK` within the
+  lag objective, and that no event made by `BOOKSHOP_SYNC` appears on any `+legacy.*+` topic. With the JSON converter:
++
+.Check that no change written by the reverse sink was captured forward (JSON converter with schemas)
+[source,shell]
+----
+/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --include 'legacy\.BOOKSHOP\..*' --from-beginning --timeout-ms 60000 \
+  | jq -c 'select(.payload.source.user_name == "BOOKSHOP_SYNC") | .payload.source' \
+  | head
+----
++
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-change-event-values[Debezium -- Oracle connector: change event values (source.user_name)]
++
+The command must print nothing. With Avro, use the registry's console consumer instead.
+
+The freeze lasts from step 1 to step 7. In the rehearsal of Bookshop's catalogue, most of it is the final
+reconciliation, which is why the reconciliation chunks should be sized to finish in minutes.
+
+== Rollback
+
+Rollback in phase 4 means making the legacy application the writer again without losing what was written in the new
+one. The reverse pipeline is what makes this possible: as long as it is current, Oracle contains every change.
+
+. Freeze catalogue writes in the new application (flag or proxy rule).
+. Drain the reverse pipeline: consumer lag of the reverse writers at zero, `bookshop-pg-source` caught up.
+. Run the reverse reconciliation (PostgreSQL as the reference, see
+  xref:database/migration/verification-and-reconciliation.adoc#_reconciling_the_reverse_direction[Verification & Reconciliation]).
+. Stop the reverse source and writers (`PUT /connectors/bookshop-pg-source/stop`, and the same for the sink).
+. Drop the write guard triggers on `BOOK` and `AUTHOR`.
+. Re-add `BOOKSHOP.BOOK` and `BOOKSHOP.AUTHOR` to the forward `table.include.list` and the mirror sink, restart the
+  translators for them. Because the history kept their structure, no recovery snapshot is needed. PostgreSQL already has
+  the same data, so a backfill is only a safety measure (an incremental snapshot of both tables, during low traffic).
+. Route catalogue writes back to the legacy application and lift the freeze.
+. Decide what happens to the stopped reverse connector. Its slot `bookshop_reverse` keeps WAL for as long as it exists.
+  Either resume the connector within hours (when the cut-over will be retried soon) or drop the slot. A forgotten slot
+  fills the disk of the new production database.
+
+What the rollback cannot restore is anything the legacy model cannot hold, which leads to the point of no return.
+
+== The point of no return
+
+Rollback stays possible for as long as the legacy database can represent everything the new system holds. That stops
+being true at a specific, predictable moment, and the migration should choose that moment instead of discovering it.
+
+Typical triggers, all present in Bookshop:
+
+* **The new model holds more than the old one.** The first book with two authors in `book_author` cannot be written
+  back into `BOOK.AUTHOR_ID` without losing one author. From then on, a rollback loses data.
+* **New values without a legacy code.** A new order status (`RETURNED`, say) that the legacy `STATUS_CD` cannot hold.
+* **New entities without legacy keys.** Customers created only in the new system, with `uuid` keys and no
+  `legacy_id`, unless the reverse translator allocates legacy keys for them.
+* **Retired legacy infrastructure.** The legacy application servers are switched off, so there is nothing to roll back
+  to.
+
+The usual strategy is to hold back the features that cross these lines (multi-author books, new statuses) until the
+capability has been stable in phase 4 for an agreed period, and then cross the line deliberately: a recorded decision,
+signed off by the business owner, after which the reverse pipeline for the capability serves only legacy reports and
+the rollback plan is retired. Until then, the reverse translator should fail loudly (stop and alert) on a change it
+cannot represent, rather than silently dropping information.
+
+== Decommissioning
+
+Once no legacy reader or writer depends on the copied tables (the exit criterion of phase 4), the pipeline is taken
+apart in the reverse order of its construction. Each command below is for the catalogue; repeat per capability, and do
+the global steps (users, database-level supplemental logging) after the last one.
+
+.Remove the connectors and their stored offsets (Kafka Connect 3.6 or later)
+[source,shell]
+----
+for c in bookshop-oracle-reverse-sink bookshop-pg-source bookshop-pg-mirror-sink bookshop-oracle-source; do
+  curl -s -X PUT    "http://localhost:8083/connectors/$c/stop"
+  curl -s -X DELETE "http://localhost:8083/connectors/$c/offsets"
+  curl -s -X DELETE "http://localhost:8083/connectors/$c"
+done
+----
+Reference: https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API (stop, offsets)]
+
+Deleting the offsets before the connector prevents an accidental re-registration under the same name months later from
+resuming at an old position.
+
+.Remove the reverse replication objects (PostgreSQL)
+[source,sql]
+----
+SELECT pg_drop_replication_slot('bookshop_reverse');
+DROP PUBLICATION bookshop_reverse_pub;
+SELECT pg_replication_origin_drop('bookshop_legacy_sync');
+
+ALTER TABLE book        REPLICA IDENTITY DEFAULT;
+ALTER TABLE book_author REPLICA IDENTITY DEFAULT;
+ALTER TABLE author      REPLICA IDENTITY DEFAULT;
+
+DROP TABLE legacy_book, legacy_author, legacy_supplier_catalogue;
+DROP TABLE public.debezium_signal;
+DROP ROLE dbz_reverse;
+DROP ROLE bookshop_mirror;
+----
+Reference: https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION[PostgreSQL -- Replication management functions] and https://www.postgresql.org/docs/current/sql-droppublication.html[PostgreSQL -- DROP PUBLICATION]
+
+Drop the `changed_by` columns in a later contract changeset, after the last translator that wrote them is gone. A
+role can only be dropped once nothing is owned by or granted to it; `REVOKE` the grants (or use `DROP OWNED BY`) first.
+
+.Remove the capture configuration from the legacy database (Oracle)
+[source,sql]
+----
+ALTER SESSION SET CONTAINER = FREEPDB1;
+DROP TRIGGER BOOKSHOP.BOOK_WRITE_GUARD;
+ALTER TABLE BOOKSHOP.BOOK   DROP SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+ALTER TABLE BOOKSHOP.AUTHOR DROP SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+DROP TABLE BOOKSHOP.DEBEZIUM_SIGNAL;
+DROP USER BOOKSHOP_SYNC;
+
+-- After the last capability, in the root container
+ALTER SESSION SET CONTAINER = CDB$ROOT;
+DROP USER C##DBZUSER CASCADE;
+ALTER DATABASE DROP SUPPLEMENTAL LOG DATA;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#_preparing_the_database[Debezium -- Oracle connector: preparing the database (the settings to undo)]
+
+Turn database-level supplemental logging off only if nothing else (a GoldenGate process, a standby used for logical
+replication) relies on it, and only if the legacy database itself is not being archived as a running system. Leave
+`ARCHIVELOG` mode as the DBA team's backup policy requires; the migration did not depend on changing it back.
+
+Finally, the Kafka side:
+
+* **Archive, then delete the topics**: `+legacy.*+`, `+modern.*+`, `legacy.schema-history`, `legacy.signals`,
+  `legacy.notifications`, the topic `legacy` (schema changes), the heartbeat topics and the dead-letter topic
+  `bookshop-pg-mirror-sink.dlq`. The change topics are the audit trail of what moved and when; copy them to long-term
+  storage (an object-storage sink connector is the usual tool) according to the retention policy, then delete them with
+  `kafka-topics.sh --delete`.
+* **Delete the consumer groups** `bookshop-legacy-sync` and the `+connect-*+` groups of the deleted sinks
+  (`+kafka-consumer-groups.sh --delete --group ...+`).
+* **Remove the migration code** from the `bookshop` application: the translators, `LegacySyncDataSourceConfig`, the
+  reverse translator and their configuration.
+
+The decommissioning is complete when the checklist of
+xref:backend/architecture/decisions-and-migrations/migration-path-legacy-to-modern-stack.adoc#_exit_criteria_for_decommissioning_the_legacy_system[Exit criteria for decommissioning the legacy system]
+is checked and no connector, slot, publication, origin, topic, user or grant related to the migration remains.
+
+== What goes wrong
+
+[cols="2,3,3",options="header"]
+|===
+| Symptom | Cause | Fix
+
+| The same row is updated over and over, topics grow quickly
+| A loop: a table is captured in both directions and neither cut works
+| Stop the reverse source at once; check `log.mining.username.exclude.list`, `slot.stream.params` and the translator's
+  origin; then restart.
+
+| Forward events with `source.user_name` `BOOKSHOP_SYNC`
+| The exclusion list is missing, misspelt or not in upper case, or the adapter is not LogMiner
+| Patch the forward connector; on OpenLogReplicator or XStream filter downstream on another marker.
+
+| Reverse events for changes made by the translator
+| The translator writes through the main pool, the origin setup failed, or PostgreSQL is older than 16
+| Check `pg_replication_origin_session_is_setup()` on the translator's connection; use the marker filter otherwise.
+
+| Connector fails to start with a scripting error
+| The scripting jar or the Groovy jars are not on the plug-in path, or `ENABLE_DEBEZIUM_SCRIPTING` is not set
+| Rebuild the image as shown and set the variable.
+
+| The legacy application fails with `ORA-20001`
+| A legacy writer of a moved table was missed
+| Expected; route that writer to the new application or move its table back to the forward direction.
+
+| Disk of the new database fills up after a rollback
+| The stopped reverse connector's slot retains WAL
+| Resume the connector or drop the slot.
+
+| Rollback loses some data
+| The point of no return was crossed without a decision
+| Hold back features that the legacy model cannot represent until the decision is made.
+|===
+
+== References
+
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-connector-properties[Debezium -- PostgreSQL connector properties]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-slot-stream-params[Debezium -- PostgreSQL connector: slot.stream.params (origin)]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-publication-autocreate-mode[Debezium -- PostgreSQL connector: publication.autocreate.mode]
+* https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-replica-identity[Debezium -- PostgreSQL connector: replica identity]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-log-mining-username-exclude-list[Debezium -- Oracle connector: log.mining.username.exclude.list]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-change-event-values[Debezium -- Oracle connector: change event values (source.user_name)]
+* https://debezium.io/documentation/reference/stable/connectors/jdbc.html#jdbc-connector-properties[Debezium -- JDBC sink connector properties]
+* https://debezium.io/documentation/reference/stable/transformations/filtering.html[Debezium -- Message filtering]
+* https://github.com/debezium/container-images[debezium/container-images (GitHub)]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#rest-api[Apache Kafka -- Kafka Connect REST API]
+* https://kafka.apache.org/43/kafka-connect/user-guide/#included-transformations[Apache Kafka -- Kafka Connect transformations]
+* https://www.postgresql.org/docs/current/replication-origins.html[PostgreSQL -- Replication progress tracking]
+* https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION[PostgreSQL -- Replication management functions]
+* https://www.postgresql.org/docs/current/protocol-logical-replication.html#PROTOCOL-LOGICAL-REPLICATION-PARAMS[PostgreSQL -- Logical streaming replication parameters]
+* https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/MERGE.html[Oracle -- MERGE]
+* https://docs.oracle.com/en/database/oracle/oracle-database/23/lnpls/CREATE-TRIGGER-statement.html[Oracle -- CREATE TRIGGER]
+* https://www.confluent.io/events/kafka-summit-americas-2021/dissecting-our-legacy-the-strangler-fig-pattern-with-debezium-apache-kafka/[Kafka Summit Americas 2021 -- "Dissecting our Legacy: The Strangler Fig Pattern with Debezium, Apache Kafka & MongoDB" (Hans-Peter Grahsl, Gunnar Morling)]
+* https://martinfowler.com/bliki/StranglerFigApplication.html[Martin Fowler -- StranglerFigApplication]
+
+What was run for this page is listed in the introduction; the connector registrations, Oracle SQL and runbook commands
+were derived from the official documentation above and were not run end to end.

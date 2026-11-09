@@ -1,0 +1,933 @@
+= Signaling and Notifications
+:description: How to send signals to a running Debezium connector and receive notifications from it during a database migration, covering the signal channels (source signal table, Kafka, JMX, file and custom), the Bookshop Oracle signal table BOOKSHOP.DEBEZIUM_SIGNAL and its PostgreSQL counterpart, the Kafka signal topic legacy.signals, every signal action (log, execute-snapshot incremental and blocking, stop-snapshot, pause-snapshot, resume-snapshot, set-binlog-position, the Oracle drop-transaction and log-pending-transactions signals, custom actions), the notification channels (sink, log, JMX, custom), the notification format and the initial and incremental snapshot notifications on legacy.notifications, and a Java kafka-clients program that blocks a migration runbook until the initial snapshot has completed.
+:keywords: Debezium, signal, signaling, signal.enabled.channels, signal.data.collection, debezium_signal, signal.kafka.topic, signal.kafka.groupId, signal.consumer, JMX signal, file signal, SignalChannelReader, SignalAction, execute-snapshot, stop-snapshot, pause-snapshot, resume-snapshot, log signal, set-binlog-position, drop-transaction, log-pending-transactions, notification, notification.enabled.channels, notification.sink.topic.name, NotificationChannel, Initial Snapshot, Incremental Snapshot, COMPLETED, TABLE_SCAN_COMPLETED, runbook, kafka-clients, database migration, Oracle
+
+include::partial$database-migration-disclaimer.adoc[]
+
+A Debezium connector is mostly configured once and left alone. A migration, though, needs to talk to it while it runs:
+"snapshot this table again", "pause the backfill during the legacy batch window", "stop that snapshot, the filter was
+wrong". And the migration runbook needs to hear back: "the initial snapshot of `BOOKSHOP` has finished, you can start the
+sinks", "the `ORDERS` backfill is at chunk 812 of 1200". **Signals** are the way in, and **notifications** are the way
+out.
+
+This page describes both mechanisms for the Bookshop pipeline: the signal channels and how to set them up on the
+legacy Oracle database and on Kafka, every signal action with its payload, the notification channels and message
+formats, and a complete Java program that a runbook uses to wait for the initial snapshot. How the snapshots themselves
+work is explained on xref:database/migration/initial-snapshots.adoc[Initial Snapshots] and
+xref:database/migration/incremental-and-blocking-snapshots.adoc[Incremental & Blocking Snapshots].
+
+Checked on 2026-11-09 against Debezium 3.7.1.Final (Oracle AI Database 26ai Free, image `gvenzl/oracle-free:23.26.3`, PostgreSQL 18, Kafka 4.x in KRaft mode).
+The Java program on this page was compiled with Maven against kafka-clients 4.4.0 and Jackson 3.3.0 on Java 21, and its
+message handling was exercised with sample notification messages; it was not run against a live connector. The
+connector configuration and SQL are derived from the official documentation and were not run.
+
+== Signals and notifications at a glance
+
+[mermaid]
+....
+flowchart LR
+    OPS[Operator or runbook script] -->|INSERT into BOOKSHOP.DEBEZIUM_SIGNAL| ORA[(Oracle FREEPDB1)]
+    OPS -->|message key legacy| SIG[[Kafka topic legacy.signals]]
+    OPS -->|JMX operation| JMX[Signal MBean]
+    ORA -->|redo log| CON[bookshop-oracle-source]
+    SIG --> CON
+    JMX --> CON
+    CON -->|change events| TOP[[legacy.BOOKSHOP.* topics]]
+    CON -->|sink channel| NOT[[Kafka topic legacy.notifications]]
+    CON -->|log channel| LOG[Connect worker log]
+    NOT --> WAIT[InitialSnapshotWaiter]
+    WAIT -->|exit code| OPS
+....
+
+* **Signals** are commands: a type (`execute-snapshot`, `stop-snapshot`, `log` and so on), an optional JSON `data`
+  payload and, for most channels, an id. They are available for the CockroachDB, Db2, Informix, MariaDB, MongoDB,
+  MySQL, Oracle, PostgreSQL and SQL Server connectors.
+* **Notifications** are status messages: an `aggregate_type` (`Initial Snapshot` or `Incremental Snapshot`), a `type`
+  (`STARTED`, `IN_PROGRESS`, `COMPLETED` and so on), a map of `additional_data` and a timestamp.
+
+Neither mechanism is acknowledged. Apart from the source channel, signal channels do not retry. The way to know that a
+signal worked is to watch the notifications (or the log) that it causes.
+
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-overview[Debezium -- Signaling overview]
+
+== Signal channels
+
+`signal.enabled.channels` lists the channels a connector listens on. The property reference gives `source` as the
+default, and lists `source`, `kafka`, `file` and `jmx` as the built-in channels; a custom channel adds its own name.
+
+[cols="1,4,4",options="header"]
+|===
+| Channel | How a signal is sent | Use in a migration
+
+| `source`
+| `INSERT` a row into a signal table (a "data collection") in the source database. The connector reads it from the
+  transaction log like any other change.
+| Required for incremental snapshots, because the connector also writes its watermark rows to this table. Signals are
+  ordered with the data changes and survive restarts.
+
+| `kafka`
+| Produce a message to a Kafka topic whose key is the connector's `topic.prefix`.
+| Operators and automation can send signals without credentials for the legacy database.
+
+| `jmx`
+| Call the `signal` operation of the connector's signal MBean with an id, a type and a data string.
+| Ad hoc use from JConsole or JDK Mission Control during an incident.
+
+| `file`
+| Append a JSON line to a file that the connector reads (`signal.file`, default `file-signals.txt` at the root of the
+  connector classpath).
+| Mostly Debezium Server and embedded engines, where there is no Kafka topic and no database write access.
+
+| custom
+| Implement `io.debezium.pipeline.signal.channels.SignalChannelReader`.
+| Integrating with an existing control plane (for example an internal job scheduler).
+|===
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-signal-enabled-channels[Debezium -- Oracle connector: signal.enabled.channels]
+
+=== The Bookshop signal table
+
+The signal table has exactly three columns named `id`, `type` and `data`, in that order. The `id` must hold at least 42
+characters because the connector writes watermark rows with ids of the form `<uuid>-close`
+(see xref:database/migration/incremental-and-blocking-snapshots.adoc#_the_snapshot_window[the snapshot window]).
+
+.Create the signal table in the legacy schema (Oracle, as a DBA or the BOOKSHOP owner, connected to FREEPDB1)
+[source,sql]
+----
+CREATE TABLE BOOKSHOP.DEBEZIUM_SIGNAL (
+  ID   VARCHAR2(42)   PRIMARY KEY,
+  TYPE VARCHAR2(32)   NOT NULL,
+  DATA VARCHAR2(2048) NULL
+);
+
+-- the connector reads signals from the redo log, so the table needs the same
+-- supplemental logging as every captured table
+ALTER TABLE BOOKSHOP.DEBEZIUM_SIGNAL ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+
+-- the connector writes watermark rows (and deletes them with insert_delete);
+-- this grant is missing from the official C##DBZUSER list (without it: ORA-41900)
+GRANT INSERT, DELETE ON BOOKSHOP.DEBEZIUM_SIGNAL TO C##DBZUSER;
+
+-- the migration operators may send signals, nothing else
+CREATE ROLE BOOKSHOP_CDC_OPERATOR;
+GRANT INSERT ON BOOKSHOP.DEBEZIUM_SIGNAL TO BOOKSHOP_CDC_OPERATOR;
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-creating-a-signal-data-collection[Debezium -- Creating a signaling data collection]
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#_preparing_the_database[Debezium -- Oracle connector: preparing the database (supplemental logging)]
+
+The `INSERT, DELETE` grant is not in the official list of grants for the connector user, and nothing fails without
+it until the first incremental snapshot. The worked-example run on 2026-11-09 showed the symptom: the `execute-snapshot`
+signal was accepted, and the snapshot then failed with
+`ORA-41900: missing INSERT privilege on "BOOKSHOP"."DEBEZIUM_SIGNAL"`, because the connector writes the watermark rows
+as `+C##DBZUSER+`. `SELECT` is already covered by `SELECT ANY TABLE` in the official grants.
+
+The signal table does **not** have to be in `table.include.list`; the connector captures it anyway. If the connector uses
+`column.include.list`, though, the three signal columns must be included.
+
+.Signal settings of bookshop-oracle-source
+[source,json]
+----
+{
+  "signal.enabled.channels": "source,kafka",
+  "signal.data.collection": "FREEPDB1.BOOKSHOP.DEBEZIUM_SIGNAL",
+  "signal.kafka.topic": "legacy.signals",
+  "signal.kafka.bootstrap.servers": "kafka:9092",
+  "signal.kafka.groupId": "bookshop-oracle-source-signals",
+  "signal.kafka.poll.timeout.ms": "100"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-signal-data-collection[Debezium -- Oracle connector: signal.data.collection]
+
+**The database part of the Oracle names.** The general signaling page gives the Oracle format as
+`<databaseName>.<schemaName>.<tableName>`. For a pluggable database, the `signal.data.collection` property description
+says to use "the name of the root database", while the `snapshot.include.collection.list` description and the event
+examples of the same page use the PDB name. In the 3.7.1 source code, the Oracle connector names every captured table,
+the signal table included, with the PDB name when `database.pdb.name` is set (`OracleConnectorConfig.getCatalogName()`),
+and recognises a signal by an exact table-id match. The Bookshop configuration therefore uses
+`FREEPDB1.BOOKSHOP.DEBEZIUM_SIGNAL` and `FREEPDB1.BOOKSHOP.BOOK` (the same value as `source.db` in the change events),
+not the CDB name `FREE`. The worked-example run on 2026-11-09 confirmed it: with `FREE.BOOKSHOP.DEBEZIUM_SIGNAL`, the
+form that the property description suggests, the connector started and streamed normally but silently ignored every
+signal, with no error or warning. With `FREEPDB1.BOOKSHOP.DEBEZIUM_SIGNAL` the `log` and `execute-snapshot` signals
+worked. Still check a new setup with a `log` signal (below) before you rely on it: if the connector logs nothing for
+the signal, the name does not match.
+
+The same pattern on the new PostgreSQL database, for the reverse-replication connector `bookshop-pg-source`:
+
+.Signal table on the new PostgreSQL bookshop database
+[source,sql]
+----
+CREATE TABLE public.debezium_signal (
+  id   varchar(42)   PRIMARY KEY,
+  type varchar(32)   NOT NULL,
+  data varchar(2048) NULL
+);
+GRANT SELECT, INSERT, DELETE ON public.debezium_signal TO dbz_reverse;
+-- if the publication lists its tables explicitly, add the signal table to it
+ALTER PUBLICATION bookshop_reverse_pub ADD TABLE public.debezium_signal;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-property-signal-data-collection[Debezium -- PostgreSQL connector: signal.data.collection]
+
+For PostgreSQL the fully-qualified name is `<schemaName>.<tableName>`, so `signal.data.collection=public.debezium_signal`.
+`dbz_reverse` is the replication user of the reverse connector, as created on
+xref:database/migration/postgresql-connector.adoc[PostgreSQL Connector].
+
+The name formats per connector:
+
+[cols="1,3",options="header"]
+|===
+| Connector | Format of `signal.data.collection` and of `data-collections` entries
+| Oracle | `<databaseName>.<schemaName>.<tableName>`
+| PostgreSQL | `<schemaName>.<tableName>`
+| MySQL, MariaDB | `<databaseName>.<tableName>`
+| SQL Server, CockroachDB, Informix | `<databaseName>.<schemaName>.<tableName>`
+| Db2 | `<schemaName>.<tableName>`
+| MongoDB | `<databaseName>.<collectionName>`
+|===
+
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#format-for-specifying-fully-qualified-names-for-data-collections[Debezium -- Formats for fully qualified data collection names]
+
+=== The Kafka signal topic
+
+The Kafka channel starts a consumer inside the connector that reads `signal.kafka.topic` (default
+`<topic.prefix>-signal`). The topic **must have one partition**, so that signals stay in order. Create it explicitly:
+
+.Create the signal and notification topics
+[source,shell]
+----
+/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create \
+  --topic legacy.signals --partitions 1 --replication-factor 3
+
+/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create \
+  --topic legacy.notifications --partitions 1 --replication-factor 3 \
+  --config retention.ms=2592000000
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#debezium-oracle-connector-pass-through-kafka-signals-configuration-properties[Debezium -- Oracle connector: Kafka signal configuration properties]
+
+(Use a replication factor of 1 on a single-broker development cluster.) Rules for the messages:
+
+* The **key** is the connector's `topic.prefix`: `legacy`. A message with another key is ignored, which lets several
+  connectors share one signal topic.
+* The **value** is a JSON object with `type` and `data`. There is no id field; the connector generates one.
+* `signal.kafka.groupId` (default `kafka-signal`) is the consumer group of the internal consumer. Give each connector its
+  own group id.
+* Properties with the prefix `signal.consumer.` are passed to that consumer, for example
+  `signal.consumer.security.protocol=SSL` on a secured cluster (see
+  xref:backend/messaging/kafka-security.adoc[Kafka Security]).
+
+=== The JMX and file channels
+
+With `jmx` in `signal.enabled.channels` and JMX enabled on the Connect worker, the connector registers an MBean named
+`debezium.<connector-type>.management.signals.<server>`, which for the Bookshop source is the Oracle connector with the
+server name `legacy`. Its signal operation takes `p0` (the id), `p1` (the type, for example `execute-snapshot`) and `p2`
+(the JSON data).
+
+With `file` in `signal.enabled.channels`, the connector reads JSON lines from `signal.file`:
+
+.A line in the signal file
+[source,json]
+----
+{"id": "backfill-book-2026-11-09", "type": "execute-snapshot", "data": {"data-collections": ["FREEPDB1.BOOKSHOP.BOOK"], "type": "incremental"}}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#_enabling_a_file_signal_channel[Debezium -- Enabling a file signal channel]
+
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-enabling-jmx-signaling-channel[Debezium -- Enabling a JMX signaling channel]
+
+=== Custom signal channels
+
+A custom channel implements the `SignalChannelReader` SPI from `debezium-connector-common`, is declared in
+`META-INF/services/io.debezium.pipeline.signal.channels.SignalChannelReader`, and its JAR is copied into **each**
+connector's plugin directory. Its `name()` is the value to put in `signal.enabled.channels`.
+
+.The SignalChannelReader SPI (io.debezium.pipeline.signal.channels)
+[source,java]
+----
+public interface SignalChannelReader {
+    String name();
+    void init(CommonConnectorConfig connectorConfig);
+    List<SignalRecord> read();
+    void close();
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-enabling-custom-signaling-channel[Debezium -- Provide a custom signaling channel]
+
+== Signal actions
+
+The following table lists every action and where it applies. The JSON goes in the `DATA` column of the signal table, or
+in the `data` field of a Kafka or file signal.
+
+[cols="2,2,5",options="header"]
+|===
+| Type | Connectors | `data` payload
+
+| `log`
+| all with signaling
+| `{"message": "text"}`; a `{}` placeholder in the text is replaced with the current streaming position.
+
+| `execute-snapshot`
+| all with signaling
+| `data-collections` (array of regular expressions, required), `type` (`incremental`, the default, or `blocking`),
+  optional `additional-conditions` (array of `data-collection` and `filter`), optional `surrogate-key` (Oracle `ROWID`
+  and others).
+
+| `stop-snapshot`
+| all with signaling
+| `type` (`incremental`, required), optional `data-collections` to remove only those tables from the running snapshot.
+
+| `pause-snapshot`, `resume-snapshot`
+| all with signaling
+| No data (ignored). Incremental snapshots only.
+
+| `set-binlog-position`
+| MySQL, MariaDB
+| `{"binlog_filename": "mysql-bin.000003", "binlog_position": 1234}` or `+{"gtid_set": "..."}+`; requires
+  `heartbeat.interval.ms` and a connector restart.
+
+| `drop-transaction`
+| Oracle
+| `{"transaction-id": "1a.2b.001f"}`: removes a stuck transaction from the LogMiner buffer.
+
+| `log-pending-transactions`
+| Oracle
+| No data. Logs every transaction pending in the LogMiner buffer.
+
+| custom
+| any
+| Defined by a `SignalAction` implementation.
+|===
+
+=== log
+
+The `log` signal is the simplest way to check that signaling works end to end, and to leave markers in the connector
+log at the start and end of each runbook step.
+
+.Write a marker with the current SCN to the connector log
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('runbook-step-3-start', 'log', '{"message": "Runbook step 3 (BOOK backfill) starts at offset {}"}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-logging[Debezium -- Logging signals]
+
+=== execute-snapshot
+
+.Incremental snapshot of BOOK and AUTHOR (signal table)
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('backfill-book-author-2026-11-09',
+        'execute-snapshot',
+        '{"data-collections": ["FREEPDB1.BOOKSHOP.BOOK", "FREEPDB1.BOOKSHOP.AUTHOR"], "type": "incremental"}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-ad-hoc-incremental-snapshots[Debezium -- Ad hoc snapshot signals]
+
+.Incremental snapshot of the 2024 orders (Kafka signal on legacy.signals, key: legacy)
+[source,json]
+----
+{
+  "type": "execute-snapshot",
+  "data": {
+    "data-collections": ["FREEPDB1.BOOKSHOP.ORDERS"],
+    "type": "INCREMENTAL",
+    "additional-conditions": [
+      {
+        "data-collection": "FREEPDB1.BOOKSHOP.ORDERS",
+        "filter": "ORDER_DT >= DATE '2024-01-01' AND ORDER_DT < DATE '2025-01-01'"
+      }
+    ]
+  }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#_message_format[Debezium -- Kafka signal message format]
+
+.Blocking snapshot of one supplier's catalogue (signal table; the filter is a full SELECT)
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('blocking-supplier-42',
+        'execute-snapshot',
+        '{"type": "blocking", "data-collections": ["FREEPDB1.BOOKSHOP.SUPPLIER_CATALOGUE"], "additional-conditions": [{"data-collection": "FREEPDB1.BOOKSHOP.SUPPLIER_CATALOGUE", "filter": "SELECT * FROM BOOKSHOP.SUPPLIER_CATALOGUE WHERE SUPPLIER_ID = 42"}]}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-ad-hoc-blocking-snapshots[Debezium -- Blocking snapshot signals]
+
+When a filter for an incremental snapshot contains a string literal, double every single quote inside the Oracle SQL
+literal (`+DATE ''2024-01-01''+`); in a Kafka signal no SQL escaping is needed. When a table name contains a dot, a space
+or another non-alphanumeric character, quote it inside the JSON string, for example `"db1.public.\"My.Table\""`.
+
+=== stop-snapshot
+
+.Remove ORDER_LINE from the running incremental snapshot, keep the other tables
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('stop-order-line-2026-11-09',
+        'stop-snapshot',
+        '{"data-collections": ["FREEPDB1.BOOKSHOP.ORDER_LINE"], "type": "incremental"}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-stop-ad-hoc-snapshots[Debezium -- Ad hoc snapshot stop signals]
+
+.Stop the whole incremental snapshot (Kafka signal, key: legacy)
+[source,json]
+----
+{"type": "stop-snapshot", "data": {"type": "INCREMENTAL"}}
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-stopping-an-incremental-snapshot-kafka[Debezium -- Oracle connector: stopping an incremental snapshot with the Kafka channel]
+
+The `type` inside `data` is required for `stop-snapshot`. Without it the snapshot is not stopped.
+
+=== pause-snapshot and resume-snapshot
+
+.Pause and resume the incremental snapshot around the legacy nightly batch
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE) VALUES ('pause-2026-11-09-2200', 'pause-snapshot');
+COMMIT;
+
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE) VALUES ('resume-2026-11-10-0400', 'resume-snapshot');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-resume-incremental-snapshots[Debezium -- Incremental snapshot resume signals]
+
+Pausing does not name tables: the whole incremental snapshot pauses at its current position. The connector emits
+`PAUSED` and `RESUMED` notifications, and the snapshot MBean reports `SnapshotPaused` and
+`SnapshotPausedDurationInSeconds`.
+
+=== Connector-specific actions
+
+`set-binlog-position` (MySQL and MariaDB) repositions the binlog reader. Moving forward skips changes; moving backward
+replays them. In a migration it is a disaster-recovery tool only: every skipped change is a difference between the
+legacy and the new database that must then be repaired with an incremental snapshot.
+
+.Reposition a MySQL connector by GTID set (signal table of a MySQL source)
+[source,sql]
+----
+INSERT INTO debezium_signal (id, type, data) VALUES (
+  'set-gtid-001',
+  'set-binlog-position',
+  '{"gtid_set": "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-100"}'
+);
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/mysql.html#_setting_the_binlog_position_via_a_signal[Debezium -- MySQL connector: setting the binlog position via a signal]
+
+On Oracle, `log-pending-transactions` and `drop-transaction` deal with long-running transactions that hold back the
+LogMiner mining window, a common problem with legacy batch jobs that update millions of rows in one transaction.
+Dropping a transaction discards its changes for good, so use it only after confirming with the legacy team that the
+transaction will never commit or does not matter to the new system.
+
+.List and, if necessary, drop a stuck transaction on the Bookshop source
+[source,sql]
+----
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE) VALUES ('log-tx-2026-11-09-1', 'log-pending-transactions');
+COMMIT;
+
+-- after reading the transaction id from the connector log
+INSERT INTO BOOKSHOP.DEBEZIUM_SIGNAL (ID, TYPE, DATA)
+VALUES ('drop-tx-2026-11-09-1', 'drop-transaction', '{"transaction-id": "1a.2b.001f"}');
+COMMIT;
+----
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-drop-transaction-signal[Debezium -- Oracle connector: dropping a transaction]
+
+Reference: https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-log-pending-transactions-signal[Debezium -- Oracle connector: logging pending transactions]
+
+=== Custom actions
+
+A custom action implements `io.debezium.pipeline.signal.actions.SignalAction` and is registered through a
+`SignalActionProvider`, whose map key becomes the signal type. Like custom channels, the JAR goes into every connector's
+plugin directory, with the provider declared in
+`META-INF/services/io.debezium.pipeline.signal.actions.SignalActionProvider`.
+
+.The SignalAction and SignalActionProvider SPIs
+[source,java]
+----
+@FunctionalInterface
+public interface SignalAction<P extends Partition> {
+    boolean arrived(SignalPayload<P> signalPayload) throws InterruptedException;
+}
+
+public interface SignalActionProvider {
+    <P extends Partition> Map<String, SignalAction<P>> createActions(
+            EventDispatcher<P, ? extends DataCollectionId> dispatcher,
+            CommonConnectorConfig connectorConfig);
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-custom-action[Debezium -- Defining a custom action]
+
+== Notifications
+
+=== Enabling notifications
+
+`notification.enabled.channels` lists the channels (no default, so notifications are off until it is set). The built-in
+channels are:
+
+* `sink`: writes notifications through Kafka Connect to the topic named by `notification.sink.topic.name`, which is
+  required with this channel.
+* `log`: appends them to the connector log.
+* `jmx`: exposes them in the `Notifications` attribute of the MBean `debezium.<connector-type>.management.notifications.<server>`,
+  and as JMX notifications of type `debezium.notification`. The `reset` operation clears the attribute.
+* a custom channel implementing `io.debezium.pipeline.notification.channels.NotificationChannel`.
+
+.Notification settings of bookshop-oracle-source
+[source,json]
+----
+{
+  "notification.enabled.channels": "sink,log",
+  "notification.sink.topic.name": "legacy.notifications"
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#enabling-debezium-notifications[Debezium -- Enabling Debezium notifications]
+
+=== The notification format
+
+[cols="1,4",options="header"]
+|===
+| Field | Content
+
+| `id`
+| A unique id. For incremental snapshots it is the id of the `execute-snapshot` signal; when several incremental
+  snapshots are in progress, the id of the last signal is used for all of them.
+
+| `aggregate_type`
+| What the notification is about: `Initial Snapshot` or `Incremental Snapshot`.
+
+| `type`
+| The status, for example `STARTED`, `IN_PROGRESS`, `TABLE_SCAN_COMPLETED`, `COMPLETED`.
+
+| `additional_data`
+| A map of string keys to string values: `connector_name` (the connector's logical name, that is, its `topic.prefix`)
+  and status-specific fields.
+
+| `timestamp`
+| Creation time in milliseconds since the epoch.
+|===
+
+On the sink topic, each notification is a Kafka Connect record. In 3.7.1 the record key is a struct with the field
+`id`, and the value is a struct with `id`, `type`, `aggregate_type`, `additional_data` (an optional map of strings) and
+`timestamp` (an `int64`). Its serialized form therefore depends on the converter. The Bookshop pipeline uses `JsonConverter` with
+`schemas.enable=true`, so each value is wrapped in `+{"schema": ..., "payload": ...}+`, and the `payload` looks like the
+examples below. With `schemas.enable=false` the value is just that object (the official examples show `timestamp` as a string; the
+converter writes the `int64` as a number). With Avro it is Avro. Consumers should handle the form their pipeline uses.
+
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notification-format[Debezium -- Debezium notification format]
+
+=== Initial snapshot notifications
+
+[cols="2,5",options="header"]
+|===
+| `type` | Meaning and `additional_data`
+
+| `STARTED` | The initial snapshot began. `connector_name`.
+| `IN_PROGRESS` | A table is being read. `data_collections`, `current_collection_in_progress` (the `data_collections` field is not supported by the MongoDB connector).
+| `TABLE_SCAN_COMPLETED` | A table finished. `scanned_collection`, `total_rows_scanned`, `status` = `SUCCEEDED` or `SQL_EXCEPTION`.
+| `COMPLETED` | The whole snapshot finished; streaming follows (unless the mode is `initial_only`).
+| `ABORTED` | The snapshot was interrupted.
+| `SKIPPED` | No snapshot was needed, for example because offsets already existed or the mode is `no_data`.
+|===
+
+.TABLE_SCAN_COMPLETED for the BOOK table
+[source,json]
+----
+{
+  "id": "6d82a3ec-ba86-4b36-9168-7423b0dd5c1d",
+  "aggregate_type": "Initial Snapshot",
+  "type": "TABLE_SCAN_COMPLETED",
+  "additional_data": {
+    "connector_name": "legacy",
+    "data_collection": "FREEPDB1.BOOKSHOP.BOOK, FREEPDB1.BOOKSHOP.AUTHOR",
+    "scanned_collection": "FREEPDB1.BOOKSHOP.BOOK",
+    "total_rows_scanned": "184233",
+    "status": "SUCCEEDED"
+  },
+  "timestamp": 1762680046353
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-status-of-an-initial-snapshot[Debezium -- Notifications about the status of an initial snapshot]
+
+.COMPLETED for the whole initial snapshot
+[source,json]
+----
+{
+  "id": "ff81ba59-15ea-42ae-b5d0-4d74f1f4038f",
+  "aggregate_type": "Initial Snapshot",
+  "type": "COMPLETED",
+  "additional_data": {
+    "connector_name": "legacy"
+  },
+  "timestamp": 1762680112904
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-status-of-an-initial-snapshot[Debezium -- Notifications about the status of an initial snapshot]
+
+The 3.7.1 source code also defines a `TABLE_CHUNK_COMPLETED` status, sent per chunk by chunk-based parallel snapshots
+(with `chunk_index` and `total_chunks`); it is not listed in the notification documentation, so consumers should
+ignore types they do not know rather than fail on them.
+
+=== Incremental snapshot notifications
+
+[cols="2,5",options="header"]
+|===
+| `type` | Meaning and `additional_data`
+
+| `STARTED` | The snapshot began. `data_collections`.
+| `PAUSED`, `RESUMED` | After a `pause-snapshot` or `resume-snapshot` signal. `data_collections`.
+| `IN_PROGRESS` | A chunk is being processed. `data_collections`, `current_collection_in_progress`, `maximum_key`, `last_processed_key`, and, when Debezium can estimate the row count, `total_rows`, `total_chunks` and `chunk_index`.
+| `TABLE_SCAN_COMPLETED` | A table finished. `scanned_collection`, `total_rows_scanned`, `total_rows` (on success, when estimated) and `status`: `SUCCEEDED`, `EMPTY`, `NO_PRIMARY_KEY`, `SKIPPED`, `SQL_EXCEPTION` or `UNKNOWN_SCHEMA`.
+| `ABORTED` | Stopped by a `stop-snapshot` signal.
+| `COMPLETED` | All requested tables are done.
+|===
+
+.Progress of the ORDERS backfill (IN_PROGRESS)
+[source,json]
+----
+{
+  "id": "backfill-orders-2024",
+  "aggregate_type": "Incremental Snapshot",
+  "type": "IN_PROGRESS",
+  "additional_data": {
+    "connector_name": "legacy",
+    "data_collections": "FREEPDB1.BOOKSHOP.ORDERS",
+    "current_collection_in_progress": "FREEPDB1.BOOKSHOP.ORDERS",
+    "maximum_key": "98123456",
+    "last_processed_key": "41877120",
+    "total_rows": "1250000",
+    "total_chunks": "306",
+    "chunk_index": "131"
+  },
+  "timestamp": 1762683900211
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-progress-of-incremental-snapshots[Debezium -- Notifications about the progress of incremental snapshots]
+
+`chunk_index / total_chunks` gives a progress percentage. `total_rows` is a best-effort estimate from database
+statistics, so the ratio is an indication, not a guarantee; the documentation states that the reported progress never
+exceeds 100 %.
+
+=== Custom notification channels
+
+A custom channel implements `NotificationChannel` (`name()`, `init(CommonConnectorConfig)`, `send(Notification)`,
+`close()`), is declared in `META-INF/services/io.debezium.pipeline.notification.channels.NotificationChannel`, and is
+deployed into each connector's plugin directory. A typical migration use is a channel that posts `COMPLETED` and
+`ABORTED` to the team's chat or incident tool.
+
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notification-custom-channel[Debezium -- Custom notification channels]
+
+== Waiting for the initial snapshot in a runbook
+
+A CDC migration runbook has steps that must not start before the initial snapshot has finished: start the JDBC sink
+`bookshop-pg-mirror-sink` with full parallelism, start the `bookshop` consumers in group `bookshop-legacy-sync`, run the
+first reconciliation, switch read traffic for the first strangler slice. Polling the Connect REST API does not help,
+because a connector in the snapshot phase and one in the streaming phase are both `RUNNING`. The `Initial Snapshot`
+notifications on `legacy.notifications` answer the question directly.
+
+[mermaid]
+....
+sequenceDiagram
+    participant R as Runbook script
+    participant C as Kafka Connect REST
+    participant S as bookshop-oracle-source
+    participant N as legacy.notifications
+    participant W as InitialSnapshotWaiter
+    R->>C: POST /connectors (bookshop-oracle-source)
+    R->>W: start with since = registration time
+    W->>N: assign all partitions, seek to beginning
+    S->>N: Initial Snapshot STARTED
+    S->>N: IN_PROGRESS / TABLE_SCAN_COMPLETED per table
+    S->>N: Initial Snapshot COMPLETED
+    N-->>W: COMPLETED for connector_name legacy
+    W-->>R: exit code 0
+    R->>C: POST /connectors (bookshop-pg-mirror-sink)
+....
+
+The program below uses plain `kafka-clients` and Jackson, so that it can run from a runbook without a Spring context.
+It does not join a consumer group: it assigns every partition of the notification topic and reads from the beginning,
+so a notification sent before the program started is not missed. To ignore notifications from an earlier run (for
+example after the connector was deleted and registered again), it takes the registration time as a lower bound for the
+notification timestamp. It accepts both plain JSON values and the `schema`/`payload` envelope.
+
+.pom.xml for the waiter
+[source,xml]
+----
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example.bookshop</groupId>
+    <artifactId>snapshot-waiter</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <kafka.version>4.4.0</kafka.version>
+        <jackson.version>3.3.0</jackson.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.kafka</groupId>
+            <artifactId>kafka-clients</artifactId>
+            <version>${kafka.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+    </dependencies>
+</project>
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notification-format[Debezium -- Debezium notification format]
+
+.InitialSnapshotWaiter.java (src/main/java/com/example/bookshop/migration)
+[source,java]
+----
+package com.example.bookshop.migration;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.TreeMap;
+
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringDeserializer;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+
+/**
+ * Blocks until the Debezium connector reports that its initial snapshot finished.
+ *
+ * <p>Reads the notification topic (notification.sink.topic.name) from the beginning,
+ * ignores notifications older than the given start time or from another connector,
+ * and exits with a status code that a runbook script can test.
+ *
+ * <ul>
+ *   <li>0: the initial snapshot COMPLETED</li>
+ *   <li>2: the initial snapshot was ABORTED or a table scan failed</li>
+ *   <li>3: the snapshot was SKIPPED (offsets already existed, or no snapshot mode)</li>
+ *   <li>4: no final notification arrived before the timeout</li>
+ * </ul>
+ */
+public final class InitialSnapshotWaiter {
+
+    private static final String INITIAL_SNAPSHOT = "Initial Snapshot";
+
+    private static final JsonMapper MAPPER = JsonMapper.builder().build();
+
+    private InitialSnapshotWaiter() {
+    }
+
+    public static void main(String[] args) {
+        String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
+        String topic = args.length > 1 ? args[1] : "legacy.notifications";
+        String connectorName = args.length > 2 ? args[2] : "legacy"; // the topic.prefix
+        long sinceEpochMillis = args.length > 3 ? Long.parseLong(args[3]) : 0L;
+        Duration timeout = args.length > 4 ? Duration.parse(args[4]) : Duration.ofHours(12);
+
+        System.exit(waitForInitialSnapshot(bootstrapServers, topic, connectorName, sinceEpochMillis, timeout));
+    }
+
+    static int waitForInitialSnapshot(String bootstrapServers, String topic, String connectorName,
+                                      long sinceEpochMillis, Duration timeout) {
+        Properties props = new Properties();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
+        props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        props.put(ConsumerConfig.CLIENT_ID_CONFIG, "bookshop-snapshot-waiter");
+
+        Instant deadline = Instant.now().plus(timeout);
+        try (KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props)) {
+            // No consumer group: assign every partition and read the topic from the start,
+            // so that a notification sent before this program started is not missed.
+            List<TopicPartition> partitions = consumer.partitionsFor(topic, Duration.ofSeconds(30)).stream()
+                    .map(info -> new TopicPartition(info.topic(), info.partition()))
+                    .toList();
+            consumer.assign(partitions);
+            consumer.seekToBeginning(partitions);
+
+            while (Instant.now().isBefore(deadline)) {
+                for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofSeconds(5))) {
+                    Integer exitCode = handle(record.value(), connectorName, sinceEpochMillis);
+                    if (exitCode != null) {
+                        return exitCode;
+                    }
+                }
+            }
+        }
+        System.err.println("Timed out waiting for the initial snapshot of connector " + connectorName);
+        return 4;
+    }
+
+    /**
+     * Returns an exit code when the notification ends the wait, or null to keep waiting.
+     */
+    static Integer handle(String json, String connectorName, long sinceEpochMillis) {
+        if (json == null) {
+            return null; // tombstone
+        }
+        JsonNode root = MAPPER.readTree(json);
+        // With JsonConverter and schemas.enable=true the record is wrapped in {"schema":..., "payload":...}
+        JsonNode notification = root.has("payload") ? root.get("payload") : root;
+
+        String aggregateType = notification.path("aggregate_type").asString();
+        String type = notification.path("type").asString();
+        long timestamp = Long.parseLong(notification.path("timestamp").asString("0"));
+        Map<String, String> data = new TreeMap<>();
+        notification.path("additional_data").propertyStream()
+                .forEach(entry -> data.put(entry.getKey(), entry.getValue().asString()));
+
+        if (!INITIAL_SNAPSHOT.equals(aggregateType)
+                || !connectorName.equals(data.get("connector_name"))
+                || timestamp < sinceEpochMillis) {
+            return null;
+        }
+
+        System.out.printf("%s %s %s%n", Instant.ofEpochMilli(timestamp), type, data);
+        return switch (type) {
+            case "COMPLETED" -> 0;
+            case "ABORTED" -> 2;
+            case "SKIPPED" -> 3;
+            case "TABLE_SCAN_COMPLETED" -> "SQL_EXCEPTION".equals(data.get("status")) ? 2 : null;
+            default -> null; // STARTED, IN_PROGRESS, TABLE_CHUNK_COMPLETED
+        };
+    }
+}
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-status-of-an-initial-snapshot[Debezium -- Notifications about the status of an initial snapshot]
+
+Design notes:
+
+* The code uses Jackson 3 (`tools.jackson`), the version Spring Boot 4 uses. With Jackson 2, change the imports to
+  `com.fasterxml.jackson.databind`, call `asText()` instead of `asString()`, iterate with `fields()`, and handle the
+  checked `JsonProcessingException`.
+* `timestamp` is read as a string and parsed, which works whether the converter wrote a number or a string.
+* Exit code 3 (`SKIPPED`) is not treated as success. It usually means the connector found existing offsets (it was
+  registered before, under the same name and `topic.prefix`), so the runbook should stop and let a person decide.
+* On a secured cluster add the client security properties (`security.protocol`, SASL or TLS settings) to `props`; see
+  xref:backend/messaging/kafka-security.adoc[Kafka Security].
+* In a Spring Boot 4.1 service, the same logic fits in a `@KafkaListener` on `legacy.notifications` with a dedicated
+  group id and `auto.offset.reset=earliest`; see xref:backend/messaging/spring-boot-kafka.adoc[Spring Boot and Kafka].
+
+.Runbook step: register the source, wait for the snapshot, then start the sink
+[source,shell]
+----
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONNECT=http://localhost:8083
+START_MS=$(( $(date +%s) * 1000 ))
+
+curl -fsS -X POST -H 'Content-Type: application/json' \
+  --data @bookshop-oracle-source.json "$CONNECT/connectors"
+
+set +e
+java -cp "target/snapshot-waiter-1.0.0.jar:target/dependency/*" \
+  com.example.bookshop.migration.InitialSnapshotWaiter \
+  localhost:9092 legacy.notifications legacy "$START_MS" PT12H
+rc=$?
+set -e
+
+case "$rc" in
+  0) echo "Initial snapshot completed, starting the JDBC sink"
+     curl -fsS -X POST -H 'Content-Type: application/json' \
+       --data @bookshop-pg-mirror-sink.json "$CONNECT/connectors" ;;
+  3) echo "Snapshot skipped: the connector already had offsets. Check before continuing." >&2; exit 3 ;;
+  *) echo "Initial snapshot did not complete (exit code $rc). See the connector log." >&2; exit "$rc" ;;
+esac
+----
+Reference: https://kafka.apache.org/documentation/#connect_rest[Apache Kafka -- Kafka Connect REST API]
+
+The classpath assumes `mvn package dependency:copy-dependencies`, which writes the dependency JARs to
+`target/dependency`.
+
+== Verifying signaling and notifications
+
+Before the production run, check the whole loop once on the rehearsal environment:
+
+. Send a `log` signal through the signal table and look for its message in the connector log. This proves that the
+  signal table name, supplemental logging, the channel list and the commit all work.
+. Send the same `log` signal through `legacy.signals` with the key `legacy`. This proves the Kafka channel.
+. Start an incremental snapshot of the smallest table (`AUTHOR`) and read the notifications with the console consumer
+  shown below.
+. Check that `STARTED`, `TABLE_SCAN_COMPLETED` with `status` `SUCCEEDED`, and `COMPLETED` arrive, and that the
+  watermark rows appear in (or, with `insert_delete`, disappear from) `BOOKSHOP.DEBEZIUM_SIGNAL`.
+
+.Read the notification topic from the beginning
+[source,shell]
+----
+/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 \
+  --topic legacy.notifications --from-beginning --formatter-property print.key=true
+----
+Reference: https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-progress-of-incremental-snapshots[Debezium -- Notifications about the progress of incremental snapshots]
+
+== What goes wrong
+
+[cols="3,5",options="header"]
+|===
+| Symptom | Cause and fix
+
+| A signal row is inserted but the connector does nothing.
+| Not committed; `source` missing from `signal.enabled.channels`; `signal.data.collection` does not match the table id
+  (case, PDB name); no supplemental logging on the signal table; or `column.include.list` excludes the signal columns.
+
+| A Kafka signal is ignored.
+| Wrong message key (must be the `topic.prefix`), signal topic with several partitions, missing
+  `signal.kafka.bootstrap.servers`, or two connectors sharing the default `signal.kafka.groupId`.
+
+| A signal was processed twice after a restart.
+| Kafka signals are read by an internal consumer; a crash between processing and committing can repeat a signal. Make
+  signals idempotent in effect (an incremental snapshot repeated is harmless for upserting consumers) and check the
+  notifications.
+
+| `stop-snapshot` has no effect.
+| The `type` field is missing from `data`.
+
+| No notifications appear on `legacy.notifications`.
+| `sink` not in `notification.enabled.channels`, `notification.sink.topic.name` missing, or topic auto-creation disabled
+  and the topic not created.
+
+| The runbook waiter never finishes.
+| It filters on `connector_name`, which is the `topic.prefix` (`legacy`), not the Connect connector name; or the
+  `since` timestamp is later than the notifications because of clock skew between hosts. Use a margin of a few minutes.
+
+| The notification `id` does not match the signal id.
+| With several incremental snapshots in progress, all notifications carry the id of the last signal. Kafka signals have
+  a generated id. Match on `data_collections` instead.
+|===
+
+== References
+
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html[Debezium -- Sending signals to a Debezium connector]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-enabling-source-signaling-channel[Debezium -- Enabling the source signaling channel]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-enabling-kafka-signaling-channel[Debezium -- Enabling the Kafka signaling channel]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-enabling-jmx-signaling-channel[Debezium -- Enabling a JMX signaling channel]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#_enabling_a_file_signal_channel[Debezium -- Enabling a file signal channel]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-ad-hoc-incremental-snapshots[Debezium -- Ad hoc snapshot signals]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-stop-ad-hoc-snapshots[Debezium -- Ad hoc snapshot stop signals]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-pause-incremental-snapshots[Debezium -- Incremental snapshot pause signals]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-resume-incremental-snapshots[Debezium -- Incremental snapshot resume signals]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-ad-hoc-blocking-snapshots[Debezium -- Blocking snapshot signals]
+* https://debezium.io/documentation/reference/stable/configuration/signalling.html#debezium-signaling-custom-action[Debezium -- Defining a custom action]
+* https://debezium.io/documentation/reference/stable/configuration/notification.html[Debezium -- Receive notifications from Debezium]
+* https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-status-of-an-initial-snapshot[Debezium -- Notifications about the status of an initial snapshot]
+* https://debezium.io/documentation/reference/stable/configuration/notification.html#debezium-notifications-about-the-progress-of-incremental-snapshots[Debezium -- Notifications about the progress of incremental snapshots]
+* https://debezium.io/documentation/reference/stable/configuration/notification.html#enabling-debezium-notifications[Debezium -- Enabling Debezium notifications]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-property-signal-data-collection[Debezium -- Oracle connector: signal.data.collection]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-drop-transaction-signal[Debezium -- Oracle connector: drop-transaction signal]
+* https://debezium.io/documentation/reference/stable/connectors/oracle.html#oracle-log-pending-transactions-signal[Debezium -- Oracle connector: log-pending-transactions signal]
+* https://debezium.io/documentation/reference/stable/connectors/mysql.html#_setting_the_binlog_position_via_a_signal[Debezium -- MySQL connector: set-binlog-position signal]
+* https://github.com/debezium/debezium/blob/v3.7.1.Final/debezium-connector-oracle/src/main/java/io/debezium/connector/oracle/OracleConnectorConfig.java[Debezium source code -- OracleConnectorConfig (3.7.1.Final), catalog name used for table ids]
+* https://kafka.apache.org/documentation/#connect_rest[Apache Kafka -- Kafka Connect REST API]
+* https://docs.spring.io/spring-kafka/reference/[Spring for Apache Kafka reference]
