@@ -1,0 +1,544 @@
+= MySQL Architecture
+:description: How MySQL is built -- connection threads, parser, optimizer, executor and pluggable storage engines, then InnoDB in detail: tablespaces, the clustered index, pages, the buffer pool, undo logs and MVCC, the redo log, the binary log, two-phase commit and crash recovery.
+:keywords: MySQL architecture, InnoDB, buffer pool, clustered index, tablespace, undo log, MVCC, read view, redo log, innodb_redo_log_capacity, binary log, two-phase commit, doublewrite buffer, change buffer, adaptive hash index, crash recovery
+
+include::partial$ai-disclaimer.adoc[]
+
+Knowing how MySQL stores and logs data explains most of its behaviour: why primary-key choice matters, why a
+rollback can be slow, why a long-running read keeps old row versions alive, and why a crash does not lose
+committed work. This page walks from the connection layer down to the files in the data directory. Everything
+shown was observed on MySQL 26.10.0 (`mysql:latest`, Innovation release); defaults quoted below are the values
+that server reported.
+
+== The layers
+
+MySQL is a *layered* server. The upper layers are common to every table; the bottom layer, the *storage
+engine*, is pluggable and is chosen per table.
+
+[mermaid]
+....
+flowchart TB
+  C["Clients: drivers, mysql, tools"] --> CONN["Connection handling: one thread per connection, thread cache, authentication"]
+  CONN --> PARSE["Parser: SQL text to parse tree"]
+  PARSE --> OPT["Optimizer: rewrites, statistics, join order, access paths"]
+  OPT --> EXEC["Executor: runs the plan through the handler API"]
+  EXEC --> SE["Pluggable storage engines"]
+  SE --> INNO["InnoDB (default)"]
+  SE --> OTHER["MEMORY, CSV, ARCHIVE, BLACKHOLE, MyISAM"]
+  EXEC --> BL["Binary log (server layer)"]
+....
+
+* *Connection handling.* The default model, `thread_handling = one-thread-per-connection`, gives every client
+  connection its own server thread. A finished thread is parked in the *thread cache*
+  (`thread_cache_size`, 9 on the test server) and reused by the next connection, which avoids the cost of
+  creating a thread. `max_connections` (151) caps concurrent connections. Authentication, TLS and per-connection
+  state (current database, session variables, open transaction) live here.
+* *Parser and optimizer.* The SQL text is parsed, name-resolved and rewritten, and the cost-based optimizer picks
+  the join order and access paths using index statistics and optional histograms. See
+  xref:database/mysql/query-planning.adoc[Query Planning & EXPLAIN].
+* *Executor.* The executor runs the chosen plan by calling the storage engine through the *handler API*: read
+  the first row of an index, read the next, fetch a row by key, write a row.
+* *Storage engines.* An engine decides how rows are laid out on disk, how they are locked, and whether they
+  survive a crash. Ask the server which ones it has:
+
+[source,sql]
+----
+SELECT engine, support, transactions, xa, savepoints FROM information_schema.engines;
+----
+
+[source,text]
+----
++--------------------+---------+--------------+------+------------+
+| engine             | support | transactions | xa   | savepoints |
++--------------------+---------+--------------+------+------------+
+| ndbcluster         | NO      | NULL         | NULL | NULL       |
+| MEMORY             | YES     | NO           | NO   | NO         |
+| InnoDB             | DEFAULT | YES          | YES  | YES        |
+| PERFORMANCE_SCHEMA | YES     | NO           | NO   | NO         |
+| MyISAM             | YES     | NO           | NO   | NO         |
+| FEDERATED          | NO      | NULL         | NULL | NULL       |
+| ndbinfo            | NO      | NULL         | NULL | NULL       |
+| MRG_MYISAM         | YES     | NO           | NO   | NO         |
+| BLACKHOLE          | YES     | NO           | NO   | NO         |
+| CSV                | YES     | NO           | NO   | NO         |
+| ARCHIVE            | YES     | NO           | NO   | NO         |
++--------------------+---------+--------------+------+------------+
+----
+
+InnoDB is the only engine here with transactions, and it is the `DEFAULT`. *MyISAM* is shown for history: it
+was the default before MySQL 5.5, has no transactions, no crash recovery and only table-level locks, and the
+system schema itself no longer uses it. The Community server includes it for compatibility; new tables should
+always be InnoDB, and the rest of this reference assumes InnoDB. The `ndbcluster` row shows `NO`: NDB Cluster
+is a separate product and is not covered.
+
+The connection layer is visible in `performance_schema.threads`. Four back-to-back client connections raised
+the `Connections` counter from 37 to 41, but `Threads_created` stayed at 1 because the single cached thread
+was reused each time:
+
+[source,sql]
+----
+SHOW GLOBAL STATUS WHERE Variable_name IN ('Connections','Threads_cached','Threads_connected','Threads_created');
+----
+
+[source,text]
+----
++-------------------+-------+
+| Variable_name     | Value |
++-------------------+-------+
+| Connections       | 41    |
+| Threads_cached    | 0     |
+| Threads_connected | 1     |
+| Threads_created   | 1     |
++-------------------+-------+
+----
+
+== InnoDB at a glance
+
+[mermaid]
+....
+flowchart LR
+  subgraph MEM["Memory"]
+    BP["Buffer pool: cached pages"]
+    CB["Change buffer"]
+    AHI["Adaptive hash index (off by default)"]
+    LB["Log buffer"]
+  end
+  subgraph DISK["Disk, in the data directory"]
+    TS["File-per-table tablespaces: schema/table.ibd"]
+    UNDO["Undo tablespaces: undo_001, undo_002"]
+    DW["Doublewrite files: #ib_16384_N.dblwr"]
+    REDO["Redo log: #innodb_redo/#ib_redoN"]
+  end
+  BP -->|"flush dirty pages"| DW --> TS
+  LB -->|"write-ahead"| REDO
+  BP --- UNDO
+....
+
+The rest of the page takes each box in turn.
+
+=== Tablespaces and the data directory
+
+A *tablespace* is a file (or set of files) that holds InnoDB data. With `innodb_file_per_table = ON` (the
+default) every table gets its own `.ibd` file; the *system tablespace* `ibdata1` holds InnoDB's internal
+structures, and the `mysql` system tables live in the general tablespace `mysql.ibd`. A listing of the data
+directory of the test server, trimmed:
+
+[source,text]
+----
+#ib_16384_0.dblwr   #ib_16384_1.dblwr   #innodb_redo/   #innodb_temp/
+auto.cnf            binlog.000001  binlog.000002  binlog.index
+ca.pem  server-cert.pem  server-key.pem   (TLS material generated on first start)
+ibdata1             ibtmp1             mysql.ibd
+mysql/  performance_schema/  sys/  shop/   (one directory per schema)
+undo_001            undo_002
+----
+
+[source,text]
+----
+shop/customers.ibd  shop/order_items.ibd  shop/orders.ibd  shop/products.ibd
+----
+
+The data dictionary exposes the tablespaces. Each `.ibd` is itself a tablespace of type `Single`, rows use the
+`Dynamic` row format and the page size is 16 KiB (`innodb_page_size = 16384`):
+
+[source,sql]
+----
+SELECT name, space_type, row_format, page_size
+FROM information_schema.innodb_tablespaces
+WHERE name IN ('mysql', 'innodb_undo_001', 'shop/orders');
+----
+
+[source,text]
+----
++-----------------+------------+------------+-----------+
+| name            | space_type | row_format | page_size |
++-----------------+------------+------------+-----------+
+| mysql           | General    | Any        |     16384 |
+| innodb_undo_001 | Undo       | Undo       |     16384 |
+| shop/orders     | Single     | Dynamic    |     16384 |
++-----------------+------------+------------+-----------+
+----
+
+=== Pages, extents and segments
+
+Inside a tablespace, space is divided into fixed-size units:
+
+* A *page* (16 KiB by default) is the unit of I/O and of caching. Every table and index is a tree of pages.
+* An *extent* is 64 consecutive pages (1 MiB with 16 KiB pages); InnoDB allocates in extents so that related
+  pages stay close together on disk.
+* A *segment* is a set of extents owned by one index: each B-tree has a *leaf* segment and a *non-leaf*
+  segment.
+
+The buffer pool reports what kinds of pages it currently holds:
+
+[source,sql]
+----
+SELECT page_type, COUNT(*) AS pages FROM information_schema.innodb_buffer_page
+GROUP BY page_type ORDER BY pages DESC LIMIT 6;
+----
+
+[source,text]
+----
++-------------------+-------+
+| page_type         | pages |
++-------------------+-------+
+| UNKNOWN           |  6672 |
+| UNDO_LOG          |   693 |
+| SYSTEM            |   387 |
+| INDEX             |   373 |
+| FILE_SPACE_HEADER |    16 |
+| LOB_DATA          |    15 |
++-------------------+-------+
+----
+
+(`UNKNOWN` covers buffer-pool slots that do not currently hold a classified page; most of the 8192 slots are free.) Table and index data are `INDEX` pages; a clustered index leaf
+page holds the actual rows, so an InnoDB table *is* its primary-key B-tree.
+
+=== The clustered index
+
+InnoDB stores each table as a B+tree ordered by the *primary key*, the *clustered index*, whose leaf pages
+contain the full rows. Every other index is a *secondary index*: a separate B+tree whose leaf entries hold the
+indexed columns plus the primary-key columns, which is how a secondary lookup finds the row. If a table has no
+primary key InnoDB uses the first unique non-null index, and otherwise creates a hidden 6-byte row id. The
+consequences (short primary keys, sequential keys, covering indexes) are developed on
+xref:database/mysql/indexing.adoc[Indexing]. The dictionary lists the indexes of `shop.orders` and the page
+that is the root of each tree:
+
+[source,sql]
+----
+SELECT i.name, i.type, i.n_fields, i.page_no AS root_page, i.space
+FROM information_schema.innodb_indexes i
+JOIN information_schema.innodb_tables t USING (table_id)
+WHERE t.name = 'shop/orders';
+----
+
+[source,text]
+----
++--------------------+------+----------+-----------+-------+
+| name               | type | n_fields | root_page | space |
++--------------------+------+----------+-----------+-------+
+| PRIMARY            |    3 |        6 |         4 |     4 |
+| fk_orders_customer |    0 |        2 |         5 |     4 |
++--------------------+------+----------+-----------+-------+
+----
+
+`n_fields` is 6 for `PRIMARY` because the clustered index holds the four columns plus two hidden system
+columns (the transaction id and the roll pointer used by MVCC, below); `fk_orders_customer`, the index MySQL
+created for the foreign key, has 2 fields: `customer_id` and the primary key `id`.
+
+=== The buffer pool
+
+The *buffer pool* caches pages in memory. Reads go through it, and writes modify pages in it; modified pages are
+*dirty* and are written back later by background threads, so a commit never waits for a data-page write.
+Defaults on the test server: `innodb_buffer_pool_size` 128 MiB (8192 pages of 16 KiB), one instance. It is a
+large LRU list split into a *young* (hot) and an *old* sublist, so a one-off table scan does not evict the hot
+working set. The ratio that matters is logical reads that missed the cache:
+
+[source,sql]
+----
+SHOW GLOBAL STATUS WHERE Variable_name IN
+ ('Innodb_buffer_pool_read_requests', 'Innodb_buffer_pool_reads',
+  'Innodb_buffer_pool_pages_total', 'Innodb_buffer_pool_pages_data');
+----
+
+[source,text]
+----
++----------------------------------+--------+
+| Variable_name                    | Value  |
++----------------------------------+--------+
+| Innodb_buffer_pool_pages_data    | 1608   |
+| Innodb_buffer_pool_pages_total   | 8192   |
+| Innodb_buffer_pool_read_requests | 219926 |
+| Innodb_buffer_pool_reads         | 1375   |
++----------------------------------+--------+
+----
+
+Here 219,926 logical read requests needed only 1,375 reads from disk. Sizing the pool is covered on
+xref:database/mysql/performance-tuning.adoc[Performance Tuning]. At shutdown InnoDB writes a list of the hot page
+ids to `ib_buffer_pool` so the cache can be warmed after a restart.
+
+=== Change buffer
+
+When a secondary-index page is not in the buffer pool, an `INSERT`, `UPDATE` or `DELETE` that must change it
+does not have to read it first: InnoDB records the change in the *change buffer* (the "insert buffer" part of
+`SHOW ENGINE INNODB STATUS`) and merges it when the page is later read. This turns random reads into batched
+work. `innodb_change_buffering` defaults to `all` and `innodb_change_buffer_max_size` limits the buffer to 5% of
+the pool. It does not apply to unique secondary indexes, because uniqueness must be checked immediately.
+
+=== Adaptive hash index
+
+The *adaptive hash index* builds an in-memory hash on top of frequently used B-tree paths to speed up equality
+lookups. It is built automatically and cannot be tuned per index. On this server it is *off by default*:
+
+[source,sql]
+----
+SELECT @@innodb_adaptive_hash_index;
+----
+
+[source,text]
+----
++------------------------------+
+| @@innodb_adaptive_hash_index |
++------------------------------+
+|                            0 |
++------------------------------+
+----
+
+and `SHOW ENGINE INNODB STATUS` reports `0.00 hash searches/s` accordingly. Enable it with
+`innodb_adaptive_hash_index=ON` only after measuring a read-heavy workload; on write-heavy systems it can become
+a contention point.
+
+=== Doublewrite buffer
+
+A 16 KiB page is larger than the 4 KiB unit the file system or disk writes atomically, so a crash in the middle
+of a page write could leave a *torn page* that redo cannot repair (redo records describe changes to an
+intact page). Before flushing dirty pages to their tablespace, InnoDB first writes them to the *doublewrite*
+files (`#ib_16384_0.dblwr`, `#ib_16384_1.dblwr`); on recovery a torn page is restored from the copy. It is
+controlled by `innodb_doublewrite` (`ON` by default) and visible in the status counters
+`Innodb_dblwr_pages_written` and `Innodb_dblwr_writes`.
+
+== Undo logs and MVCC
+
+InnoDB keeps old versions of changed rows in *undo logs*, stored in *undo tablespaces*. The test server has two,
+`undo_001` and `undo_002`, which grow and are automatically truncated when they exceed
+`innodb_max_undo_log_size` (1024 MiB) because `innodb_undo_log_truncate` is on:
+
+[source,sql]
+----
+SELECT name, space_type, file_size/1024/1024 AS mb
+FROM information_schema.innodb_tablespaces WHERE space_type = 'Undo';
+----
+
+[source,text]
+----
++-----------------+------------+-------------+
+| name            | space_type | mb          |
++-----------------+------------+-------------+
+| innodb_undo_001 | Undo       | 48.00000000 |
+| innodb_undo_002 | Undo       | 32.00000000 |
++-----------------+------------+-------------+
+----
+
+Undo serves two purposes.
+
+* *Rollback.* An aborted or failed transaction is undone by applying its undo records in reverse. This is also
+  why rolling back a huge transaction takes about as long as the work it is undoing.
+* *MVCC (multi-version concurrency control).* Every clustered-index row carries a hidden transaction id and a
+  pointer to its previous version in undo. A consistent read does not lock anything: it opens a *read view*
+  (a snapshot recording which transactions were committed at that moment) and, for each row, follows the undo
+  chain until it finds the version that was visible then. Readers never block writers, and writers never block
+  those readers.
+
+[mermaid]
+....
+flowchart LR
+  R["Clustered index row, trx 120"] -->|"roll pointer"| U1["Undo record: version of trx 95"]
+  U1 -->|"roll pointer"| U2["Undo record: version of trx 80"]
+  RV["Read view: sees trx up to 90"] -.->|"walks back until visible"| U2
+....
+
+*Purge.* Old undo records can be discarded only when no read view can still need them. A background *purge*
+thread removes them, and also physically removes rows that were delete-marked. The `History list length` in
+`SHOW ENGINE INNODB STATUS` (18 on the idle test server) is the number of committed transactions whose undo has
+not yet been purged. A transaction that stays open (even idle, after a `SELECT` under `REPEATABLE READ`) pins
+its read view and stops purge from advancing, so the history list and the undo tablespaces grow. This is the
+classic "long transaction" problem; the snapshot behaviour is demonstrated with two sessions on
+xref:database/mysql/transactions-and-locking.adoc[Transactions, Isolation & Locking].
+
+== The redo log
+
+The *redo log* is InnoDB's write-ahead log. Before a dirty page is flushed, the record of the change that made it
+dirty is already in the redo log on disk, so after a crash InnoDB can replay it. A commit only has to make the
+redo records durable, which is a sequential write, instead of writing every changed data page, which would be
+random I/O.
+
+* The log lives in the `#innodb_redo` directory as files named `#ib_redoN`. InnoDB maintains about 32 files, each
+  1/32 of the configured capacity, and keeps spare ones with a `_tmp` suffix ready.
+* *`innodb_redo_log_capacity`* sets the total size and is *dynamic*. The default here is 104857600 bytes (100 MiB).
+  Changing it needs no restart:
+
+[source,sql]
+----
+SET GLOBAL innodb_redo_log_capacity = 209715200;
+SELECT @@innodb_redo_log_capacity;
+SHOW GLOBAL STATUS LIKE 'Innodb_redo_log_capacity_resized';
+SET GLOBAL innodb_redo_log_capacity = 104857600;
+----
+
+[source,text]
+----
++----------------------------+
+| @@innodb_redo_log_capacity |
++----------------------------+
+|                  209715200 |
++----------------------------+
++----------------------------------+-----------+
+| Variable_name                    | Value     |
++----------------------------------+-----------+
+| Innodb_redo_log_capacity_resized | 209715200 |
++----------------------------------+-----------+
+----
+
+(The older `innodb_log_file_size` / `innodb_log_files_in_group` settings are only consulted if the capacity is
+not set.) Position in the log is measured by the *log sequence number (LSN)*, a byte counter. The `LOG` section
+of `SHOW ENGINE INNODB STATUS` shows how far each stage has got:
+
+[source,text]
+----
+Log sequence number          30093686
+Log buffer assigned up to    30093686
+Log written up to            30093686
+Log flushed up to            30093686
+Added dirty pages up to      30093686
+Pages flushed up to          30093676
+Last checkpoint at           30093676
+----
+
+The *checkpoint* is the LSN below which every change is already in the data files, so redo older than that can
+be reused. When the log fills faster than dirty pages can be flushed, writers stall. A bulk load on the test
+server (500,000-row inserts into a 100 MiB log) produced exactly this warning in the error log:
+
+[source,text]
+----
+[Warning] [MY-014089] [InnoDB] Redo log writer is waiting for a new redo log file.
+Consider increasing innodb_redo_log_capacity. The current log capacity is 104857600 bytes. ...
+----
+
+Durability of each commit is governed by `innodb_flush_log_at_trx_commit`: `1` (the default and the value on the
+test server) writes and flushes the log to disk at every commit; `2` writes to the OS cache and flushes about
+once a second; `0` flushes about once a second. Only `1` is fully durable. Tuning of the flush settings is on
+xref:database/mysql/performance-tuning.adoc[Performance Tuning].
+
+== The binary log
+
+The *binary log* (binlog) is a server-level log, independent of any engine. It records every committed data
+change as *events*, in commit order, and is used for *replication* and for *point-in-time recovery*. This is a
+different log from the redo log:
+
+[cols="1,2,2"]
+|===
+| | Redo log | Binary log
+
+| Owner | InnoDB (engine) | MySQL server (all engines)
+| Content | Physical changes to pages | Logical row changes (`binlog_format = ROW`, the default)
+| Purpose | Crash recovery | Replication, point-in-time recovery, CDC
+| Written | At each log flush, circular reuse | Appended to `binlog.NNNNNN` files, kept until expiry
+|===
+
+The test server has the binlog enabled with the defaults `log_bin = 1`, `binlog_format = ROW`, `sync_binlog = 1`,
+`binlog_row_image = FULL`, GTIDs on (`gtid_mode = ON`) and `binlog_expire_logs_seconds = 2592000` (30 days). An
+`+UPDATE products SET stock = stock - 1 WHERE sku = 'B-7'+` shows up as one transaction, bracketed by a GTID and a
+commit marker (`Xid`):
+
+[source,sql]
+----
+SHOW BINLOG EVENTS IN 'binlog.000002';
+----
+
+[source,text]
+----
+| Log_name      | Pos  | Event_type  | Server_id | End_log_pos | Info                                                        |
+| binlog.000002 | 4831 | Gtid        |         1 |        4910 | SET @@SESSION.GTID_NEXT= '5895ec7f-dd39-11f1-8778-ba5fde09695f:16' |
+| binlog.000002 | 4910 | Query       |         1 |        4996 | BEGIN                                                       |
+| binlog.000002 | 4996 | Table_map   |         1 |        5071 | table_id: 87 (shop.products)                                |
+| binlog.000002 | 5071 | Update_rows |         1 |        5305 | table_id: 87 flags: STMT_END_F USE_SQL_FOREIGN_KEY_F        |
+| binlog.000002 | 5305 | Xid         |         1 |        5336 | COMMIT /* xid=70 */                                         |
+----
+
+(Only the last rows of a longer listing are shown and the table is reformatted to fit.) `SHOW BINARY LOG STATUS`
+gives the current file, position and executed GTID set. It replaces `SHOW MASTER STATUS`, which this server rejects with a syntax error.
+Replication is covered in xref:database/mysql/replication-and-ha.adoc[Replication & High Availability] and
+point-in-time recovery in xref:database/mysql/backup-and-restore.adoc[Backup & Restore].
+
+=== How redo and binlog stay consistent: two-phase commit
+
+A transaction that changes InnoDB tables must end up in *both* logs, or neither. If InnoDB committed but the
+binlog did not record it, a replica would miss the change; if the binlog recorded it but InnoDB rolled it back,
+a replica would apply a change the source does not have. MySQL therefore runs an *internal XA two-phase commit*
+between the server and InnoDB:
+
+[mermaid]
+....
+sequenceDiagram
+  participant Client
+  participant Server
+  participant InnoDB
+  participant Binlog
+  Client->>Server: COMMIT
+  Server->>InnoDB: prepare (redo flushed, transaction marked prepared)
+  InnoDB-->>Server: prepared
+  Server->>Binlog: write and flush transaction events
+  Binlog-->>Server: durable
+  Server->>InnoDB: commit (transaction marked committed)
+  InnoDB-->>Server: committed
+  Server-->>Client: OK
+....
+
+The binlog write is the *commit point*. After a crash, recovery examines every InnoDB transaction left in the
+*prepared* state and looks it up in the last binlog: if the binlog contains its commit marker, the transaction is
+committed; if not, it is rolled back. That is the reason `innodb_flush_log_at_trx_commit = 1` together with
+`sync_binlog = 1` is the fully safe pair; weaker values can lose a committed transaction, or let the two logs
+disagree, after an operating-system crash or power loss. Several concurrent commits are grouped so one flush serves many transactions
+(*group commit*).
+
+== Crash recovery
+
+InnoDB needs no manual repair after a crash. On startup it reads the redo log from the latest checkpoint and
+replays every change after it (*roll-forward*), restores any torn page from the doublewrite files, then uses
+undo to roll back every transaction that was not committed (*roll-back*), consulting the binlog for transactions
+that were in the middle of a two-phase commit. The rollback of the uncommitted work continues in the
+background after the server begins accepting connections.
+
+This was tested on the test server. A row was committed, a second row was inserted in a transaction that was
+never committed, and the container was killed with `docker kill` (SIGKILL), then started again:
+
+[source,sql]
+----
+-- before the kill (autocommit): committed row
+INSERT INTO lab.crash_demo VALUES (1, 'committed');
+-- in another session, left open when the server was killed
+SET autocommit = 0;
+INSERT INTO lab.crash_demo VALUES (2, 'uncommitted');
+----
+
+[source,sql]
+----
+SELECT * FROM lab.crash_demo;    -- after the restart
+----
+
+[source,text]
+----
++----+-----------+
+| id | v         |
++----+-----------+
+|  1 | committed |
++----+-----------+
+----
+
+The committed row survived and the uncommitted one is gone. The server logged only the normal initialisation
+lines (InnoDB initialisation started and ended within about a third of a second) and was accepting connections
+less than a second after the restart.
+
+== Where things are, at a glance
+
+[cols="2,3"]
+|===
+| Structure | Where
+
+| Table and index data | `schema/table.ibd` (file-per-table), `ibdata1`, `mysql.ibd`
+| Undo logs | `undo_001`, `undo_002` (undo tablespaces)
+| Redo log | `#innodb_redo/#ib_redoN`
+| Doublewrite buffer on disk | `#ib_16384_N.dblwr`
+| Binary log | `binlog.NNNNNN` and `binlog.index`
+| Temporary tables | `#innodb_temp/temp_N.ibt`, `ibtmp1`
+| Buffer-pool warm-up list | `ib_buffer_pool`
+|===
+
+== Related
+
+* xref:database/mysql/indexing.adoc[Indexing] builds on the clustered-index and page model above.
+* xref:database/mysql/transactions-and-locking.adoc[Transactions, Isolation & Locking] uses undo, read views and
+  InnoDB's row locks.
+* For storage internals of other databases see xref:database/mongodb/storage-and-durability.adoc[WiredTiger,
+  Journaling & Durability] and, for the PostgreSQL equivalent, xref:database/postgresql/index.adoc[PostgreSQL
+  Reference].

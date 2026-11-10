@@ -2,13 +2,44 @@
 :description: How MongoDB change streams deliver an ordered, resumable feed of data-change events -- watch on a collection, database, or deployment; the change-event document shape; resume tokens; and filtering with an aggregation pipeline.
 :keywords: mongodb, change streams, watch, change events, resume token, resumeAfter, startAfter, startAtOperationTime, fullDocument, updateLookup, fullDocumentBeforeChange, oplog
 
-include::partial$mongodb-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 A change stream is an ordered feed of the data changes happening in a collection, a database, or a whole
 deployment. Instead of polling, an application opens the stream and receives a *change-event document* for
 every insert, update, replace, delete, and drop as it is applied. Change streams read from the replica-set
 oplog, so a replica set or sharded cluster is required (see
 xref:database/mongodb/replication.adoc[Replication]).
+
+== How a change stream works
+
+A change stream is not a separate feature bolted onto the database: it is an aggregation pipeline whose first
+stage, `$changeStream`, tails the oplog of the replica set (or, on a sharded cluster, the oplogs of every shard,
+merged by `mongos`). The server turns each oplog entry into a *change event*, runs your extra pipeline stages
+over it, and sends the result down a tailable cursor.
+
+[mermaid]
+....
+flowchart LR
+    W[Writes from applications] --> P[(Primary oplog)]
+    P --> CS["$changeStream stage"]
+    CS --> F[Your pipeline: match, project]
+    F --> C[Cursor held open by the driver]
+    C --> A[Application handler]
+    A -->|saves resume token| T[(Token store)]
+    T -.->|after a restart| C
+    P -->|replicated| S[(Secondary oplogs)]
+....
+
+Three consequences follow from that design:
+
+* *Only majority-committed changes are delivered.* A change stream reads at the majority commit point, so it never
+  reports a write that could still be rolled back. The price is a small delay compared with the primary's own
+  view of the data, and no events at all while the set cannot establish a majority.
+* *Events arrive in the order of the oplog* (a single, total order per shard; `mongos` merges shards by cluster
+  time), and every event has a unique resume token.
+* *History is bounded by the oplog.* A token can only be resumed while the entry it points at is still in the
+  oplog, so size the oplog for the longest outage a consumer must survive (see
+  xref:database/mongodb/replication.adoc[Replica sets & high availability]).
 
 == Opening a stream with watch
 
@@ -38,27 +69,42 @@ Every event is a document with a common shape. The most-used fields:
 * `_id` -- the resume token for this event (see <<Resuming a stream>>).
 * `operationType` -- `insert`, `update`, `replace`, `delete`, `drop`, `rename`, `invalidate`, and others.
 * `clusterTime` -- the oplog timestamp at which the change was applied.
-* `ns` -- the namespace, as `{ db, coll }`.
+* `ns` -- the namespace, as `+{ db, coll }+`.
 * `documentKey` -- the `_id` (plus shard-key fields on a sharded collection) of the affected document.
 * `fullDocument` -- for `insert` and `replace`, the whole new document; for `update`, present only when the
   stream was opened with `fullDocument: "updateLookup"`.
-* `updateDescription` -- for `update` only: `{ updatedFields, removedFields, truncatedArrays }` describing
+* `updateDescription` -- for `update` only: `+{ updatedFields, removedFields, truncatedArrays }+` describing
   exactly what changed.
+
+A real `update` event produced against the running example, by changing one order in `shop.orders`
+(`$set` of `status` and `shippedAt`, `$unset` of `total`) while a plain `watch()` was open:
 
 [source,json]
 ----
 {
-  "_id": { "_data": "8264A1F2C7000000012B022C0100296E5A..." },
+  "_id": { "_data": "826AF32B21000000042B..." },
   "operationType": "update",
-  "clusterTime": { "$timestamp": { "t": 1688472263, "i": 1 } },
+  "clusterTime": { "$timestamp": { "t": 1794321185, "i": 4 } },
+  "wallTime": { "$date": "2026-11-10T14:33:05.377Z" },
   "ns": { "db": "shop", "coll": "orders" },
-  "documentKey": { "_id": { "$oid": "64a1f2c7e3b0a1f2c7e3b0a1" } },
+  "documentKey": { "_id": 1001 },
   "updateDescription": {
-    "updatedFields": { "status": "SHIPPED", "shippedAt": { "$date": "2023-07-04T12:04:23Z" } },
-    "removedFields": [],
+    "updatedFields": { "status": "SHIPPED", "shippedAt": "2026-11-10" },
+    "removedFields": [ "total" ],
     "truncatedArrays": []
   }
 }
+----
+
+Note what is *not* there: without `fullDocument` options the event carries only the delta, not the order as it
+now looks. On a sharded collection the `documentKey` also contains the shard-key fields. Changing a few orders
+spread over the two shards of the cluster from xref:database/mongodb/sharding.adoc[Horizontal scaling with sharded
+clusters] and watching through the `mongos` shows exactly that:
+
+[source,text]
+----
+update {'region': 'EU', 'customerId': 1, '_id': ObjectId('6af3250d05bd2f0bbebba185')} {'points': 91}
+update {'region': 'US', 'customerId': 0, '_id': ObjectId('6af3250d05bd2f0bbebba184')} {'points': 111}
 ----
 
 See https://www.mongodb.com/docs/manual/reference/change-events/[Change Events] for every field of every
@@ -133,8 +179,110 @@ const stream = db.orders.watch([], {
 });
 ----
 
+Pre-images are stored in a hidden collection, `config.system.preimages`, and are kept only for as long as they
+might be needed by a lagging stream. To bound that storage cluster-wide, set an expiry:
+
+[source,javascript]
+----
+db.getSiblingDB("admin").runCommand({
+  setClusterParameter: { changeStreamOptions: { preAndPostImages: { expireAfterSeconds: 3600 } } }
+})
+----
+
 See https://www.mongodb.com/docs/manual/changeStreams/#lookup-full-document-for-update-operations[Lookup Full
 Document for Update Operations].
+
+== A worked consumer with resume
+
+The following PyMongo script is the whole life cycle of a consumer on `shop.orders`: it filters on the server,
+asks for the post-image and pre-image of updates, processes two events, stores the resume token, stops, lets more
+changes happen while it is "down", and resumes from the saved token.
+
+[source,python]
+----
+from pymongo import MongoClient
+
+client = MongoClient("mongodb://localhost:27017/?replicaSet=rs0")
+db = client.shop
+db.orders.drop()
+db.create_collection("orders")
+db.command("collMod", "orders", changeStreamPreAndPostImages={"enabled": True})
+
+pipeline = [{"$match": {"operationType": {"$in": ["insert", "update", "delete"]}}}]
+opts = dict(full_document="updateLookup", full_document_before_change="whenAvailable")
+
+def show(ev):
+    row = {"op": ev["operationType"], "key": ev["documentKey"]["_id"]}
+    if "updateDescription" in ev: row["updated"] = ev["updateDescription"]["updatedFields"]
+    if ev.get("fullDocument"): row["fullDocument"] = ev["fullDocument"]
+    if ev.get("fullDocumentBeforeChange"): row["before"] = ev["fullDocumentBeforeChange"]
+    print(row)
+
+stream = db.orders.watch(pipeline, **opts)
+db.orders.insert_one({"_id": 1001, "customerId": 42, "status": "OPEN", "total": 19.99})
+db.orders.update_one({"_id": 1001}, {"$set": {"status": "SHIPPED"}})
+for _ in range(2):
+    show(next(stream))
+token = stream.resume_token          # persist this somewhere durable
+stream.close()
+print("token saved:", token["_data"][:24] + "...")
+
+# the consumer is offline; more changes happen
+db.orders.delete_one({"_id": 1001})
+db.orders.insert_one({"_id": 1002, "customerId": 7, "status": "OPEN", "total": 5})
+
+# resume exactly after the last processed event
+with db.orders.watch(pipeline, resume_after=token, **opts) as stream2:
+    for _ in range(2):
+        show(next(stream2))
+----
+
+Real output:
+
+[source,text]
+----
+{'op': 'insert', 'key': 1001, 'fullDocument': {'_id': 1001, 'customerId': 42, 'status': 'OPEN', 'total': 19.99}}
+{'op': 'update', 'key': 1001, 'updated': {'status': 'SHIPPED'}, 'fullDocument': {'_id': 1001, 'customerId': 42, 'status': 'SHIPPED', 'total': 19.99}, 'before': {'_id': 1001, 'customerId': 42, 'status': 'OPEN', 'total': 19.99}}
+token saved: 826AF31F52000000052B042C...
+{'op': 'delete', 'key': 1001, 'before': {'_id': 1001, 'customerId': 42, 'status': 'SHIPPED', 'total': 19.99}}
+{'op': 'insert', 'key': 1002, 'fullDocument': {'_id': 1002, 'customerId': 7, 'status': 'OPEN', 'total': 5}}
+----
+
+Read it line by line:
+
+* The `update` event has the delta (`updated`), the current document (`fullDocument`, from `updateLookup`) and the
+  document as it was *before* the change (`before`, from the pre-image). Pre- and post-images exist only because
+  `changeStreamPreAndPostImages` was enabled with `collMod`.
+* After the token was saved the consumer closed its stream. The delete and the second insert happened while no
+  stream was open, yet both are delivered, in order, when the stream is reopened with `resume_after`. Nothing was
+  lost and nothing was delivered twice. A `delete` event has no `fullDocument` (there is no document any more),
+  which is why the pre-image is the only way to see what was removed.
+* `stream.resume_token` is also advanced by *empty* batches (a stream on a quiet collection still moves its
+  token), so an idle consumer does not fall off the end of the oplog window.
+
+Drivers resume automatically from the last token they saw after a transient error such as a failover or a
+network blip, so most applications persist the token only to survive their own restarts.
+
+== Invalidation, drop and startAfter
+
+Some changes end a stream. Dropping or renaming the watched collection produces a `drop` (or `rename`) event
+followed by an `invalidate` event, after which the cursor is closed. The token of the `invalidate` event cannot
+be used with `resumeAfter`, but `startAfter` accepts it:
+
+[source,text]
+----
+insert
+drop
+invalidate | stream alive: False
+resumeAfter(invalidate): 260 InvalidResumeToken
+startAfter(invalidate) -> insert {'_id': 1}
+----
+
+The sequence above is: insert a document, drop the collection (events `insert`, `drop`, `invalidate`), try to
+reopen with `resume_after` the invalidate token (error code 260, `InvalidResumeToken`), then reopen with
+`start_after` and carry on after the collection was recreated. A stream opened on a whole database or the whole
+deployment is not invalidated by a collection drop, so prefer those scopes for long-running consumers that must
+survive schema changes.
 
 == Typical uses
 

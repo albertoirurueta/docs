@@ -2,7 +2,7 @@
 :description: Response vs. output caching, IMemoryCache / IDistributedCache / HybridCache, rate limiting, request timeouts and compression, outbound-call resilience, and an EF Core and runtime best-practices checklist.
 :keywords: ASP.NET Core performance, response caching, output caching, OutputCache, IMemoryCache, IDistributedCache, HybridCache, rate limiting, request timeouts, response compression, IHttpClientFactory, Polly, Native AOT
 
-include::partial$aspnet-core-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 Most ASP.NET Core performance work is caching what is expensive to recompute, limiting abusive load, and being
 async end to end. See
@@ -146,3 +146,125 @@ flowchart TD
     RC -- yes --> PROXY["Client / proxy caches its own copy"]
     RC -- no --> CLIENT["Client receives, does not store"]
 ....
+
+== Deep dive: protecting a hot catalog endpoint
+
+The catalog endpoint is read thousands of times per minute and written a few times per hour, the textbook case for
+caching. Done naively, two problems appear: a *cache stampede* when a popular entry expires and every concurrent
+request recomputes it, and *unbounded clients* that bypass the cache's benefit by hammering unique URLs. The example
+layers a `HybridCache` for the data with a rate limiter in front.
+
+=== Stampede-safe reads with `HybridCache`
+
+With a plain `IMemoryCache`, `GetOrCreateAsync` does not stop two concurrent callers from both running the factory
+(the factory is not locked). `HybridCache` does: for a given key, concurrent callers on one process share a single
+factory execution, and the result is stored in a fast in-process layer (L1) and, if configured, a distributed layer
+(L2) so other servers can reuse it.
+
+[source,csharp]
+----
+using Microsoft.Extensions.Caching.Hybrid;
+
+public sealed class CatalogService(HybridCache cache, ICatalogRepository repo)
+{
+    private static readonly HybridCacheEntryOptions Options = new()
+    {
+        Expiration = TimeSpan.FromMinutes(5),               // L2 lifetime
+        LocalCacheExpiration = TimeSpan.FromMinutes(1),     // L1 lifetime: bounds how stale one server can be
+    };
+
+    public ValueTask<ProductDto?> GetAsync(int id, CancellationToken ct = default)
+        => cache.GetOrCreateAsync(
+            $"product:{id}",
+            async token => await repo.FindAsync(id, token),   // runs once per key, not once per request
+            Options,
+            tags: ["product", $"product:{id}"],
+            cancellationToken: ct);
+
+    public async Task UpdateAsync(int id, ProductDto dto, CancellationToken ct = default)
+    {
+        await repo.SaveAsync(id, dto, ct);
+        await cache.RemoveByTagAsync($"product:{id}", ct);    // next read repopulates
+    }
+}
+
+// Program.cs
+builder.Services.AddHybridCache();
+builder.Services.AddStackExchangeRedisCache(o => o.Configuration = builder.Configuration.GetConnectionString("redis"));
+----
+
+When an `IDistributedCache` implementation such as Redis is registered, `HybridCache` uses it automatically as L2;
+without one it is an in-process cache with stampede protection. The two expirations are a staleness budget: a write
+on server A evicts by tag in both layers, but server B's L1 entry survives until `LocalCacheExpiration`, so keep it
+short when readers must see updates quickly.
+
+[mermaid]
+....
+flowchart TD
+    R["GetAsync(42)"] --> L1{"L1 in-memory<br/>hit?"}
+    L1 -- yes --> OUT["Return"]
+    L1 -- no --> LOCK["One caller per key proceeds,<br/>others await its result"]
+    LOCK --> L2{"L2 Redis<br/>hit?"}
+    L2 -- yes --> FILL1["Fill L1"]
+    L2 -- no --> DB["Run factory: query database"]
+    DB --> FILL2["Fill L2 and L1"]
+    FILL1 --> OUT
+    FILL2 --> OUT
+....
+
+=== A limiter per client, with an honest `Retry-After`
+
+A global fixed window punishes everyone for one client's burst. Partitioning gives each client its own budget:
+
+[source,csharp]
+----
+using System.Globalization;
+using System.Threading.RateLimiting;
+
+builder.Services.AddRateLimiter(o =>
+{
+    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    o.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(ctx =>
+        RateLimitPartition.GetSlidingWindowLimiter(
+            partitionKey: ctx.User.Identity?.Name ?? ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new SlidingWindowRateLimiterOptions
+            {
+                PermitLimit = 120,
+                Window = TimeSpan.FromMinutes(1),
+                SegmentsPerWindow = 6,                 // smooths the edge of a fixed window
+                QueueLimit = 0,
+            }));
+
+    o.OnRejected = (context, _) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+            context.HttpContext.Response.Headers.RetryAfter =
+                ((int)retryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+        return ValueTask.CompletedTask;
+    };
+});
+
+app.UseRateLimiter();         // after UseRouting so endpoint-specific policies are visible
+----
+
+Behind a reverse proxy, `RemoteIpAddress` is the proxy unless forwarded-headers processing is enabled first (see
+xref:web/aspnet/core/hosting-servers-and-environments.adoc[Hosting, Servers, and Environments]); otherwise all
+clients share one partition. The partition table above lives in process memory, so with several instances each
+enforces its own limit. A shared limit needs a gateway or a store-backed limiter.
+
+=== Measure before tuning
+
+Caching hides cost rather than removing it, so confirm the gain. A quick, repeatable check with `curl` shows the
+`Age`/timing difference between a cold and warm request, and `dotnet-counters monitor` shows the hit effect on
+allocation and request rate while a load tool runs:
+
+[source,bash]
+----
+curl -s -o /dev/null -w "cold: %{time_total}s\n" http://localhost:5000/catalog/42
+curl -s -o /dev/null -w "warm: %{time_total}s\n" http://localhost:5000/catalog/42
+dotnet-counters monitor --process-id <pid> --counters Microsoft.AspNetCore.Hosting System.Runtime
+----
+
+Look for a sharp drop in time per request and in `gc-heap-size` growth once the cache is warm. If latency does not
+change, the bottleneck is elsewhere (serialization, a downstream call) and caching the wrong layer will not help.

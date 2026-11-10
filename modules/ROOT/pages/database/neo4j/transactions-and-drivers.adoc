@@ -1,13 +1,18 @@
 = Transactions and drivers
-:description: ACID guarantees, causal consistency and bookmarks across a causal cluster, the Bolt driver family, and the executeWrite/execute_write transaction-function pattern with automatic retry.
-:keywords: neo4j, bolt, driver, transaction, executeWrite, execute_write, acid, causal consistency, bookmark, retry, session, java driver, python driver
+:description: ACID guarantees demonstrated with real transactions, causal consistency and bookmarks across a cluster, the Bolt driver family, the executeWrite/execute_write transaction-function pattern with automatic retry shown on a real deadlock, and timeouts and termination of long-running queries.
+:keywords: neo4j, bolt, driver, transaction, executeWrite, execute_write, acid, causal consistency, bookmark, retry, deadlock, session, java driver, python driver, isolation, terminate transaction, timeout
 
-include::partial$neo4j-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 Every write to Neo4j runs inside a transaction, whether it is issued from `cypher-shell`, Neo4j Browser, or one
 of the official drivers. This page covers what that transaction guarantees, how a cluster keeps reads
 consistent with prior writes, and the driver-level API -- shared by every official language driver -- used to
 run transactions from application code.
+
+Everything shown with output was run against a Neo4j `2026.01` server holding the
+xref:database/neo4j/getting-started.adoc[movie dataset]: scripted sessions in `cypher-shell`, a Python
+`neo4j` 5.28 driver and a Java `neo4j-java-driver` 5.28 client. A single Community Edition instance has no cluster,
+so the cluster behaviour is described rather than measured.
 
 == ACID guarantees
 
@@ -29,6 +34,95 @@ CREATE (m:Movie {title: "The Matrix"})
 CREATE (p)-[:ACTED_IN {roles: ["Agent Smith"]}]->(m);
 ----
 
+=== Atomicity and rollback, observed
+
+Every statement is its own transaction unless a transaction is opened explicitly. In `cypher-shell`, `:begin`,
+`:commit` and `:rollback` open and close an explicit transaction, so several statements can succeed or fail together.
+With a uniqueness constraint on `Person.email` in place:
+
+[source,cypher]
+----
+CREATE CONSTRAINT person_email_unique IF NOT EXISTS FOR (p:Person) REQUIRE p.email IS UNIQUE;
+
+:begin
+CREATE (:Person {name: "Temp A", email: "a@example.com"});
+CREATE (:Person {name: "Temp B", email: "b@example.com"});
+MATCH (p:Person) WHERE p.name STARTS WITH "Temp" RETURN count(p) AS insideTx;
+:rollback
+MATCH (p:Person) WHERE p.name STARTS WITH "Temp" RETURN count(p) AS afterRollback;
+----
+
+[source,console]
+----
++----------+
+| insideTx |
++----------+
+| 2        |
++----------+
+
++---------------+
+| afterRollback |
++---------------+
+| 0             |
++---------------+
+----
+
+The transaction saw its own two uncommitted nodes; after the rollback neither exists. A *single failing statement*
+rolls back everything that statement did, too. Creating `Temp C` and `Temp D` in one statement, where `Temp D`
+reuses an email that already exists, leaves neither of them behind:
+
+[source,cypher]
+----
+CREATE (:Person {name: "Temp C", email: "c@example.com"}), (:Person {name: "Temp D", email: "a@example.com"});
+----
+
+[source,console]
+----
+22N80: data exception - index entry conflict. Index entry conflict: Node(16569) already exists with label `Person` and property `email` = 'a@example.com'.
+----
+
+Afterwards `MATCH (p:Person) WHERE p.name STARTS WITH "Temp"` finds only the earlier, committed `Temp A`; the valid
+`Temp C` that preceded the failing row in the same statement was discarded with it. This is the *consistent* in
+ACID: a constraint is checked before the transaction commits, and a violation aborts the whole unit.
+
+=== Isolation and locking, observed
+
+Neo4j's default isolation is read committed: a transaction never reads another's uncommitted data, but it can see
+data committed after it started. This Python script shows the three observable effects, with a writer, a reader and
+a second writer, each on its own session:
+
+[source,python]
+----
+with driver.session(database="neo4j") as writer, driver.session(database="neo4j") as reader:
+    tx = writer.begin_transaction()
+    tx.run("CREATE (:Person {name: 'Temp One'})")
+    print("writer sees its own write:", tx.run(count).single()["n"])
+    print("other session before commit:", reader.run(count).single()["n"])
+    tx.commit()
+    print("other session after commit:", reader.run(count).single()["n"])
+
+    # a second writer touching the same node waits for the first one's lock
+    tx1 = writer.begin_transaction()
+    tx1.run("MATCH (p:Person {name: 'Tom Hanks'}) SET p.visits = 1")
+    # ... in another thread: SET p.visits = 2 on the same node, timing how long it takes
+    time.sleep(2)
+    tx1.commit()
+----
+
+[source,console]
+----
+writer sees its own write: 1
+other session before commit: 0
+other session after commit: 1
+second writer still blocked after 2 s: True
+second writer waited 2.0 s
+----
+
+Writers take an exclusive lock on every node and relationship they change and hold it until commit, so the second
+writer was *blocked*, not rejected, until the first committed. This is the same mechanism that makes a hub node a
+write bottleneck (see xref:database/neo4j/data-modeling.adoc[Data modeling]) and that, when two transactions wait on
+each other, becomes a deadlock; the next sections show how the drivers deal with it.
+
 == Causal consistency and bookmarks
 
 An Enterprise cluster replicates data from a *primary* to one or more *secondary* members; a secondary can lag
@@ -39,23 +133,59 @@ bookmark into the next session tells the server "do not run this transaction unt
 least this point", giving the application *read-your-writes* consistency across the cluster without pinning
 every read to the primary.
 
+[mermaid]
+....
+sequenceDiagram
+    participant App
+    participant Driver
+    participant Primary
+    participant Secondary
+    App->>Driver: write session executeWrite
+    Driver->>Primary: BEGIN, CREATE, COMMIT
+    Primary-->>Driver: committed, bookmark B1
+    Driver-->>App: lastBookmarks is B1
+    Primary-)Secondary: replicate transaction
+    App->>Driver: read session with bookmark B1
+    Driver->>Secondary: BEGIN after B1
+    Note over Secondary: waits until B1 is applied
+    Secondary-->>Driver: rows that include the write
+    Driver-->>App: result
+....
+
+The Java driver returns the bookmarks of a session as a *set* (`Set<Bookmark>`), and a session is given a set of
+bookmarks to wait for. This program ran against the test server:
+
 [source,java]
 ----
-Bookmark writeBookmark;
+Set<Bookmark> writeBookmarks;
 try (Session writeSession = driver.session(SessionConfig.forDatabase("neo4j"))) {
     writeSession.executeWrite(tx ->
-        tx.run("CREATE (:Person {name: $name})", Map.of("name", "Trinity")));
-    writeBookmark = writeSession.lastBookmarks();
+        tx.run("CREATE (:Person {name: $name})", Map.of("name", "Trinity")).consume());
+    writeBookmarks = writeSession.lastBookmarks();
 }
 
 // A read on another session -- possibly routed to a secondary -- is guaranteed to
-// see the write above once it is chained from that bookmark.
+// see the write above once it is chained from those bookmarks.
 try (Session readSession = driver.session(
-        SessionConfig.builder().withBookmarks(writeBookmark).build())) {
-    readSession.executeRead(tx ->
-        tx.run("MATCH (p:Person {name: $name}) RETURN p", Map.of("name", "Trinity")).list());
+        SessionConfig.builder().withDatabase("neo4j").withBookmarks(writeBookmarks).build())) {
+    long n = readSession.executeRead(tx ->
+        tx.run("MATCH (p:Person {name: $name}) RETURN count(p) AS n",
+               Map.of("name", "Trinity")).single().get("n").asLong());
 }
 ----
+
+[source,console]
+----
+bookmarks returned: 1
+Trinity nodes visible: 1
+----
+
+The Python driver exposes the same token as `session.last_bookmarks()` (printed as
+`+<Bookmarks values={'FB:kcwQTZB7G9IsTqi71cs5xcYkfMkA2JA='}>+`) and accepts `bookmarks=` when opening a session. The HTTP
+Query API returns the same token in its `bookmarks` field. In practice, sessions opened one after another from a single
+driver are *not* chained automatically, which is why the one-shot `executableQuery`/`execute_query` API, which
+manages bookmarks itself through a bookmark manager, is the simplest way to get read-your-writes without
+passing tokens by hand.
 
 Bookmarks matter only across sessions -- a single session already chains its own transactions causally. See
 https://neo4j.com/docs/java-manual/current/transactions/[Java driver: Transactions] for the full bookmark and
@@ -80,6 +210,28 @@ driver.verifyConnectivity();
 // process and close it on shutdown, opening/closing Sessions per unit of work.
 ----
 
+The URI scheme chooses the connection behaviour:
+
+[cols="2,4"]
+|===
+| Scheme | Meaning
+
+| `neo4j://`
+| Fetch a routing table from the server and spread work across members: writes to a primary, reads to any member.
+  Use it for clusters and Aura, and for a single instance in production so the code works unchanged when it grows.
+
+| `neo4j+s://`
+| The same, with TLS and a CA-verified certificate (the Aura default).
+
+| `bolt://`
+| Connect to exactly the one address given, with no routing. Use it for a single instance, or when the advertised
+  routing addresses are not reachable from the client (a container whose port is remapped, as in the test server used
+  for this page, which is why its examples use `bolt://localhost:27687`).
+
+| `bolt+s://`, `bolt+ssc://`
+| Direct connection with TLS, either verified or accepting a self-signed certificate.
+|===
+
 Rather than hand-writing `BEGIN`/`COMMIT`/`ROLLBACK` and retry logic, every driver exposes *transaction
 functions*: `executeWrite`/`executeRead` in Java, .NET and JavaScript, `execute_write`/`execute_read` in
 Python, and their Go equivalents. A transaction function takes a callback that receives a transaction handle,
@@ -89,6 +241,29 @@ callback automatically** on a transient error -- a deadlock with another transac
 during a cluster failover -- with no code in the callback aware that a retry happened. Because of that, a
 transaction-function callback must be free of side effects that should not repeat (do not send an email or
 call an external API from inside it).
+
+Four ways of running Cypher differ in how much of the transaction the driver manages:
+
+[cols="2,3,3"]
+|===
+| API | What it is | Retry on transient errors
+
+| `session.run()` (Java: `session.run`)
+| An *auto-commit* transaction: one statement, committed immediately.
+| No. Required for statements that cannot run in an explicit transaction, such as `+CALL { ... } IN TRANSACTIONS+`.
+
+| `session.beginTransaction()`
+| An explicit transaction you commit or roll back yourself.
+| No. You write the retry loop.
+
+| `executeWrite` / `executeRead`
+| A transaction function: the driver opens, commits, rolls back and retries.
+| Yes, with exponential backoff, until a retry time limit (30 seconds by default).
+
+| `executableQuery` / `execute_query`
+| A single query with parameters in one call, with routing and bookmark management built in.
+| Yes.
+|===
 
 == Writing with the Java driver
 
@@ -119,8 +294,29 @@ public void addActingCredit(Driver driver, String actorName, int bornYear,
 ----
 
 `MERGE` (rather than `CREATE`) makes the whole callback idempotent, which matters once the driver may run it
-more than once as part of its own retry. Reference:
-https://neo4j.com/docs/java-manual/current/transactions/[Java driver: Transactions].
+more than once as part of its own retry. Called with `Hugo Weaving` and a new film `V for Vendetta`, the method
+creates the film and the credit and leaves the existing person alone; the one-shot form of reading the result back is:
+
+[source,java]
+----
+var result = driver.executableQuery("""
+        MATCH (p:Person {name: $n})-[:ACTED_IN]->(m:Movie)
+        RETURN m.title AS title ORDER BY title""")
+    .withParameters(Map.of("n", "Hugo Weaving"))
+    .withConfig(QueryConfig.builder().withDatabase("neo4j").build())
+    .execute();
+result.records().forEach(r -> System.out.println(r.get("title").asString()));
+----
+
+[source,console]
+----
+Cloud Atlas
+The Matrix
+The Matrix Reloaded
+V for Vendetta
+----
+
+Reference: https://neo4j.com/docs/java-manual/current/transactions/[Java driver: Transactions].
 
 === The Python driver's `execute_write`
 
@@ -154,6 +350,130 @@ https://neo4j.com/docs/python-manual/current/connect/[Python driver: Connect]. T
 drivers each expose the equivalent pattern under their own naming convention, all built on the same underlying
 Bolt transaction semantics.
 
+The simplest form needs no session at all. `execute_query` runs one parameterised query, picks the right cluster
+member from `routing_`, and returns the records, a summary with the update counters and the column names:
+
+[source,python]
+----
+import neo4j
+
+records, summary, keys = driver.execute_query(
+    "MATCH (p:Person) WHERE p.born > $year RETURN p.name AS name ORDER BY name LIMIT 3",
+    year=1960, database_="neo4j", routing_=neo4j.RoutingControl.READ)
+print(keys, [r["name"] for r in records])
+----
+
+[source,console]
+----
+['name'] ['Carrie-Anne Moss', 'Keanu Reeves', 'Lana Wachowski']
+----
+
+Using a read transaction function for a write is refused by the server, so a read path cannot modify data by
+accident: `session.execute_read(lambda tx: tx.run("CREATE (:X)").consume())` raises a `ClientError` with code
+`Neo.ClientError.Statement.AccessMode`.
+
+== Automatic retry, observed on a real deadlock
+
+A deadlock needs two transactions that each hold a lock the other wants. The script below makes one deliberately:
+two threads each update a node (`Keanu Reeves` and `Tom Hanks`) in opposite orders, wait for each other at a
+barrier after taking the first lock, and then try for the second. A counter records how many times each transaction
+function body ran.
+
+[source,python]
+----
+def transfer(name, first, second):
+    def work(tx):
+        attempts[name] += 1
+        tx.run("MATCH (p:Person {name: $n}) SET p.touched = coalesce(p.touched, 0) + 1", n=first)
+        if attempts[name] == 1:
+            barrier.wait(timeout=10)   # both transactions now hold one lock each
+        tx.run("MATCH (p:Person {name: $n}) SET p.touched = coalesce(p.touched, 0) + 1", n=second)
+    return work
+
+# thread 1: session.execute_write(transfer("t1", "Keanu Reeves", "Tom Hanks"))
+# thread 2: session.execute_write(transfer("t2", "Tom Hanks", "Keanu Reeves"))
+----
+
+[source,console]
+----
+Transaction failed and will be retried in 0.929802993335168s (ForsetiClient[transactionId=715, clientId=1] can't acquire EXCLUSIVE NODE(16551) because it would form this deadlock wait cycle:
+NODE(16551)-[EXCLUSIVE_OWNER]->(tx:714)-[WAITING_FOR_EXCLUSIVE]->(NODE(16556))-[EXCLUSIVE_OWNER]->(tx:715)-[WAITING_FOR_EXCLUSIVE]->(NODE(16551)))
+callback invocations: {'t1': 1, 't2': 2}
+Keanu Reeves 2
+Tom Hanks 2
+----
+
+The server detected the cycle and aborted one of the two transactions with a transient error. The driver logged
+the failure, waited a fraction of a second (with jitter, so that the two do not collide again) and ran the second
+transaction's callback a *second* time; that run succeeded. Neither application thread saw an exception. Afterwards each person has been touched exactly twice:
+the aborted attempt left nothing behind, which is why the callback must contain nothing that cannot safely be
+repeated.
+
+[mermaid]
+....
+sequenceDiagram
+    participant T1 as Thread 1
+    participant T2 as Thread 2
+    participant DB as Neo4j
+    T1->>DB: lock Keanu Reeves
+    T2->>DB: lock Tom Hanks
+    T1->>DB: lock Tom Hanks, waits
+    T2->>DB: lock Keanu Reeves, waits
+    DB-->>T2: TransientError DeadlockDetected, rolls back T2
+    DB-->>T1: lock acquired, commit
+    Note over T2: driver backs off, then re-runs the whole callback
+    T2->>DB: lock Tom Hanks, then Keanu Reeves
+    DB-->>T2: commit
+....
+
+Not every error is retried. The driver classifies them by the status code prefix: `+Neo.TransientError.*+` (deadlock,
+leader switch) is retried; `+Neo.ClientError.*+` (a syntax error, a constraint violation, a write in a read
+transaction, an explicit termination) is not, because running the same thing again cannot succeed; and
+`+Neo.DatabaseError.*+` is a server-side fault that surfaces to the caller.
+
+== Timeouts and terminating long-running queries
+
+By default a query may run for as long as it needs (`db.transaction.timeout` is `0s`, no limit). A client can set its
+own limit per transaction, and an operator can see and terminate what is running. In Python the limit is set with the
+`unit_of_work` decorator (in Java, `+TransactionConfig.builder().withTimeout(...)+`); a query that counts three hundred
+million generated values is far slower than one second:
+
+[source,python]
+----
+@unit_of_work(timeout=1)
+def bounded(tx):
+    return tx.run("UNWIND range(1, 300000000) AS x RETURN count(x) AS n").single()["n"]
+
+session.execute_read(bounded)
+----
+
+[source,console]
+----
+timeout: ClientError Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration
+----
+
+The same query can be stopped from outside. `SHOW TRANSACTIONS` lists the running transactions with their current
+query, and `TERMINATE TRANSACTION` aborts one by id. Run from a second session while the first is still computing:
+
+[source,cypher]
+----
+SHOW TRANSACTIONS YIELD transactionId, currentQuery, status
+WHERE currentQuery CONTAINS 'range(1, 300000000)' AND NOT currentQuery STARTS WITH 'SHOW'
+RETURN transactionId, status;
+
+TERMINATE TRANSACTION $id YIELD transactionId, message RETURN transactionId, message;
+----
+
+[source,console]
+----
+found: neo4j-transaction-729 Running
+terminate: neo4j-transaction-729 Transaction terminated.
+client saw: ('ClientError', 'Neo.ClientError.Transaction.Terminated')
+----
+
+The terminated client receives a `ClientError`, so a transaction function does not retry it. Set a client-side
+timeout on every user-facing query, and use `db.transaction.timeout` as a server-wide backstop.
+
 == Where Spring Data Neo4j fits
 
 xref:backend/springboot/spring-data-neo4j.adoc[Spring Data Neo4j] does not bypass any of this -- its
@@ -170,5 +490,7 @@ application, or inside one when a unit of work needs transaction-function retry 
 * xref:backend/springboot/spring-data-neo4j.adoc[] -- `@Transactional`, `Neo4jTransactionManager`, and
   `Neo4jClient` built on top of the driver layer described here.
 * xref:database/neo4j/cypher-advanced-querying.adoc[] -- the Cypher run inside these transactions, in depth.
+* xref:database/neo4j/importing-data.adoc[] -- `CALL \{ \} IN TRANSACTIONS`, the server-side batching that
+  complements the client-side transaction functions.
 * https://neo4j.com/docs/java-manual/current/concurrency/[Java driver: Concurrency] -- how concurrent
   transactions and locks interact under read-committed isolation.

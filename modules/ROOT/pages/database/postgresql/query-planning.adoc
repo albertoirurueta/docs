@@ -1,0 +1,840 @@
+= Query Planning & EXPLAIN
+:description: How the PostgreSQL planner turns SQL into an execution plan: planner stages, table statistics and extended statistics, reading EXPLAIN output (scan, join and aggregate nodes), the cost model, plan switches, prepared statements, parallel query and partition pruning.
+:keywords: PostgreSQL planner, EXPLAIN, EXPLAIN ANALYZE, BUFFERS, pg_stats, ANALYZE, default_statistics_target, extended statistics, CREATE STATISTICS, nested loop, hash join, merge join, random_page_cost, enable_seqscan, generic plan, custom plan, plan_cache_mode, parallel query, partition pruning
+
+include::partial$ai-disclaimer.adoc[]
+
+PostgreSQL is a *declarative* database: an SQL statement says what rows are wanted, and the *planner* (optimizer)
+decides how to fetch them, choosing among access paths and join orders by estimating the cost of each. `EXPLAIN`
+shows the chosen plan. Almost every performance problem is either a bad plan caused by bad estimates or a plan that is
+correct but has no good index to use, so reading plans is the central skill. This page covers the machinery;
+the indexes the planner chooses between are in xref:database/postgresql/indexing.adoc[Indexing] and the general
+workflow for a slow query is in xref:database/diagnosing-slow-queries.adoc[Diagnosing Slow Queries].
+
+All plans were produced on *PostgreSQL 18.6* using the generated `big_orders` table from
+xref:database/postgresql/indexing.adoc[Indexing] (500,000 rows, seeded with `setseed(0.42)`; the stale-statistics example below adds 100,000 more), in a scratch schema
+named `lab`. Where a statement adds data or changes a setting, the change is part of the shown code.
+
+== From SQL text to rows
+
+A statement passes through four stages:
+
+[mermaid]
+....
+flowchart LR
+  Q["SQL text"] --> P["Parser: syntax tree"]
+  P --> R["Analyzer and rewriter: resolve names, expand views, apply rules"]
+  R --> PL["Planner: enumerate paths, estimate costs, pick the cheapest"]
+  PL --> E["Executor: run the plan tree and return rows"]
+  ST[("pg_statistic and cost settings")] --> PL
+....
+
+The *parser* checks syntax; the *analyzer* resolves tables, columns and functions against the catalogs; the *rewriter*
+expands views and rules; the *planner* generates candidate plans (for each table, a sequential scan and every usable
+index; for joins, different orders and algorithms) and costs them from the statistics in `pg_statistic` and the cost
+parameters; the *executor* runs the winning *plan tree*, in which every node pulls rows from its children. For queries
+with many joins the planner switches from exhaustive search to the genetic optimizer (`geqo_threshold`, 12 tables).
+Planning happens per execution unless a prepared statement caches the plan, described below.
+
+== Statistics
+
+Cost depends on row estimates, and row estimates come from statistics collected by `ANALYZE` (run by autovacuum, or by
+hand) into `pg_class` (page and row counts) and `pg_statistic`, readable through the `pg_stats` view. For each column
+it stores the null fraction, average width, number of distinct values, the *most common values* with their
+frequencies, a *histogram* of the remaining values, and the physical-order *correlation*:
+
+[source,sql]
+----
+DROP TABLE IF EXISTS big_orders;
+SELECT setseed(0.42);
+CREATE TABLE big_orders (
+  id          bigint PRIMARY KEY,
+  customer_id int NOT NULL,
+  status      text NOT NULL,
+  amount      numeric(10,2) NOT NULL,
+  created_at  timestamptz NOT NULL,
+  email       text NOT NULL,
+  tags        text[] NOT NULL,
+  doc         jsonb NOT NULL,
+  note        text NOT NULL
+);
+INSERT INTO big_orders
+SELECT g,
+       1 + (random() * 20000)::int,
+       CASE WHEN random() < 0.02 THEN 'open' WHEN random() < 0.05 THEN 'cancelled' ELSE 'shipped' END,
+       round((random() * 500)::numeric, 2),
+       timestamptz '2025-01-01 00:00:00+00' + g * interval '1 minute',
+       'User' || (1 + (random() * 20000)::int) || '@Example.com',
+       ARRAY(SELECT (ARRAY['office','ergonomic','sale','led','usb','display','gift','new'])[1 + (random()*7)::int] FROM generate_series(1, 1 + (g % 3)::int) AS k WHERE g > 0),
+       jsonb_build_object('channel', (ARRAY['web','mobile','store'])[1 + (random()*2)::int], 'items', 1 + (random()*5)::int, 'gift', random() < 0.1),
+       (SELECT string_agg((ARRAY['fast','delivery','broken','chair','desk','lamp','refund','late','gift','monitor','cable','thanks'])[1 + (random()*11)::int], ' ') FROM generate_series(1, 6) AS w WHERE g > 0)
+FROM generate_series(1, 500000) AS g;
+ANALYZE big_orders;
+----
+
+[source,sql]
+----
+SELECT attname, n_distinct, null_frac, avg_width, correlation, most_common_vals::text AS mcv, most_common_freqs::text AS mcf
+FROM pg_stats WHERE tablename = 'big_orders' AND attname IN ('status', 'customer_id', 'created_at');
+SELECT relpages, reltuples::bigint FROM pg_class WHERE relname = 'big_orders';
+----
+
+[source,text]
+----
+   attname   | n_distinct | null_frac | avg_width |  correlation  |           mcv            |                 mcf
+-------------+------------+-----------+-----------+---------------+--------------------------+--------------------------------------
+ customer_id |      19569 |         0 |         4 | -0.0045510386 | {6123,12178,16717}       | {0.0003,0.00026666667,0.00026666667}
+ status      |          3 |         0 |         8 |     0.8647745 | {shipped,cancelled,open} | {0.93023336,0.049733333,0.020033333}
+ created_at  |         -1 |         0 |         8 |             1 |                          |
+(3 rows)
+
+ relpages | reltuples
+----------+-----------
+    14282 |    500000
+(1 row)
+----
+
+`status` has three values, all listed with their frequencies; `customer_id` has about 20,000 distinct values and no
+common ones, so a histogram describes it; `created_at` has a correlation of 1 because it was inserted in order
+(`n_distinct = -1` means "every value distinct", a negative number being a fraction of the row count). The estimate for
+`+WHERE status = 'open'+` is simply `reltuples` times the frequency of `open`:
+
+[source,sql]
+----
+EXPLAIN SELECT * FROM big_orders WHERE status = 'open';
+EXPLAIN SELECT * FROM big_orders WHERE status = 'shipped';
+----
+
+[source,text]
+----
+                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Gather  (cost=1000.00..18887.87 rows=10017 width=190)
+   Workers Planned: 2
+   ->  Parallel Seq Scan on big_orders  (cost=0.00..16886.17 rows=4174 width=190)
+         Filter: (status = 'open'::text)
+(4 rows)
+
+                             QUERY PLAN
+---------------------------------------------------------------------
+ Seq Scan on big_orders  (cost=0.00..20532.00 rows=465117 width=190)
+   Filter: (status = 'shipped'::text)
+(2 rows)
+----
+
+Two details: the planner expected roughly 10,000 `open` rows (within a few percent of the true count, because the statistics
+come from a sample of 30,000 rows) and chose a parallel sequential scan, and for 93% of the table it chose a plain `Seq Scan`
+because reading the whole table is cheaper than visiting an index for most rows.
+
+=== Stale statistics
+
+Statistics are a sample taken at one moment. If the data changes a lot and `ANALYZE` has not run yet, estimates go
+wrong, and so can the plan. Adding 100,000 rows with a new status value shows `rows=1` against 100,000 actual rows until
+the next `ANALYZE`:
+
+[source,sql]
+----
+INSERT INTO big_orders SELECT 600000 + g, 1, 'held', 10, now(), 'x@y', '{}', '{}', 'bulk' FROM generate_series(1, 100000) AS g;
+EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT * FROM big_orders WHERE status = 'held';
+ANALYZE big_orders;
+EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT * FROM big_orders WHERE status = 'held';
+----
+
+[source,text]
+----
+                                                  QUERY PLAN
+--------------------------------------------------------------------------------------------------------------
+ Gather  (cost=1000.00..19203.39 rows=1 width=190) (actual rows=100000.00 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   ->  Parallel Seq Scan on big_orders  (cost=0.00..18203.29 rows=1 width=190) (actual rows=33333.33 loops=3)
+         Filter: (status = 'held'::text)
+         Rows Removed by Filter: 166667
+(6 rows)
+
+                                             QUERY PLAN
+----------------------------------------------------------------------------------------------------
+ Seq Scan on big_orders  (cost=0.00..22896.00 rows=99640 width=168) (actual rows=100000.00 loops=1)
+   Filter: (status = 'held'::text)
+   Rows Removed by Filter: 500000
+(3 rows)
+----
+
+Autovacuum normally runs `ANALYZE` after about 10% of a table has changed, so this window is short on a healthy
+system, but after a bulk load or a large `DELETE` run `ANALYZE` yourself. A large gap between the estimated and the
+`actual rows` of a node is the single most useful symptom in a plan.
+
+=== Statistics detail and default_statistics_target
+
+`default_statistics_target` (100) sets the size of the histogram and the most-common-value list, and the sample is 300
+times that many rows. A higher value gives better estimates for skewed or very wide-ranging columns at the price of a
+slower `ANALYZE` and slightly slower planning. It can be set per column:
+
+[source,sql]
+----
+SELECT array_length(histogram_bounds::text::int[], 1) AS bounds_at_default FROM pg_stats WHERE tablename = 'big_orders' AND attname = 'customer_id';
+ALTER TABLE big_orders ALTER COLUMN customer_id SET STATISTICS 500;
+ANALYZE big_orders;
+SELECT array_length(histogram_bounds::text::int[], 1) AS bounds_at_500 FROM pg_stats WHERE tablename = 'big_orders' AND attname = 'customer_id';
+ALTER TABLE big_orders ALTER COLUMN customer_id SET STATISTICS -1;
+ANALYZE big_orders;
+----
+
+[source,text]
+----
+ bounds_at_default
+-------------------
+               101
+(1 row)
+
+ bounds_at_500
+---------------
+           501
+(1 row)
+----
+
+=== Extended statistics
+
+Per-column statistics assume columns are independent, so the planner multiplies selectivities. When columns are
+correlated, as city and postal code are, it underestimates badly. `CREATE STATISTICS` teaches it about the dependency
+(`dependencies`), the combined number of distinct values (`ndistinct`) or the joint most-common values (`mcv`):
+
+[source,sql]
+----
+CREATE TABLE addresses AS SELECT g AS id, 'city' || (g % 100) AS city, 'zip' || (g % 100) AS zip FROM generate_series(1, 100000) AS g;
+ANALYZE addresses;
+EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT * FROM addresses WHERE city = 'city7' AND zip = 'zip7';
+CREATE STATISTICS addresses_city_zip (dependencies, ndistinct, mcv) ON city, zip FROM addresses;
+ANALYZE addresses;
+EXPLAIN (ANALYZE, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT * FROM addresses WHERE city = 'city7' AND zip = 'zip7';
+----
+
+[source,text]
+----
+                                         QUERY PLAN
+--------------------------------------------------------------------------------------------
+ Seq Scan on addresses  (cost=0.00..2140.00 rows=11 width=15) (actual rows=1000.00 loops=1)
+   Filter: ((city = 'city7'::text) AND (zip = 'zip7'::text))
+   Rows Removed by Filter: 99000
+(3 rows)
+
+                                          QUERY PLAN
+----------------------------------------------------------------------------------------------
+ Seq Scan on addresses  (cost=0.00..2140.00 rows=1080 width=15) (actual rows=1000.00 loops=1)
+   Filter: ((city = 'city7'::text) AND (zip = 'zip7'::text))
+   Rows Removed by Filter: 99000
+(3 rows)
+----
+
+Every `city7` row has `zip7`, so the true answer is 1,000. The planner multiplied 1% by 1% and expected about ten rows; with the
+extended statistics it expects about a thousand. Here both plans are a sequential scan, but with joins on top, a 100-fold
+underestimate typically picks a nested loop that runs forever. `\dX` lists extended statistics objects.
+
+== Reading EXPLAIN
+
+`EXPLAIN` prints the plan without running the statement. `EXPLAIN ANALYZE` executes it and adds *actual* rows, time and
+loop counts next to the estimates (and, since it really runs, it really modifies data: wrap `INSERT`, `UPDATE` and
+`DELETE` in a transaction and roll back). Useful options:
+
+[cols="2,5"]
+|===
+|Option |Effect
+
+|`ANALYZE`
+|Run the query and show actual time, rows and loops per node.
+
+|`BUFFERS`
+|Show shared buffers `hit` (cache), `read` (from disk or OS cache), `dirtied` and `written`. Since PostgreSQL 18 it is on
+by default with `ANALYZE`.
+
+|`VERBOSE`
+|Show the output column list of each node, schema-qualified names and more.
+
+|`COSTS OFF`, `TIMING OFF`, `SUMMARY OFF`
+|Remove noise (costs, per-node timing, planning/execution time) when sharing or diffing plans.
+
+|`SETTINGS`
+|List non-default planner settings that influenced the plan.
+
+|`FORMAT JSON` (also `YAML`, `XML`)
+|Machine-readable output for tools such as plan visualisers.
+|===
+
+Each node is printed as `NodeType (cost=startup..total rows=estimate width=bytes)` followed, with `ANALYZE`, by
+`(actual time=first..last rows=n loops=n)`. *Cost* is in arbitrary units (by default, one sequential page read is 1.0).
+*Startup* cost is the work before the first row; *total* is the work for all rows. The tree is read from the innermost,
+most-indented node outwards: leaves are scans, and each parent consumes its children's rows. With `loops` greater than one,
+the reported time and rows are per loop, so multiply to compare with the estimate (the parallel plans below show averages per
+worker). `rows` and `actual rows` both mean *per loop*.
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM big_orders WHERE id = 12345;
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id, amount FROM big_orders WHERE id = 5;
+EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM big_orders WHERE id = 5;
+----
+
+[source,text]
+----
+                                                           QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using big_orders_pkey on big_orders  (cost=0.42..8.44 rows=1 width=168) (actual time=0.021..0.021 rows=1.00 loops=1)
+   Index Cond: (id = 12345)
+   Index Searches: 1
+   Buffers: shared hit=5 read=2
+ Planning:
+   Buffers: shared hit=119
+ Planning Time: 0.145 ms
+ Execution Time: 0.041 ms
+(8 rows)
+
+                     QUERY PLAN
+----------------------------------------------------
+ Index Scan using big_orders_pkey on lab.big_orders
+   Output: id, amount
+   Index Cond: (big_orders.id = 5)
+(3 rows)
+
+               QUERY PLAN
+----------------------------------------
+ [                                     +
+   {                                   +
+     "Plan": {                         +
+       "Node Type": "Index Scan",      +
+       "Parallel Aware": false,        +
+       "Async Capable": false,         +
+       "Scan Direction": "Forward",    +
+       "Index Name": "big_orders_pkey",+
+       "Relation Name": "big_orders",  +
+       "Alias": "big_orders",          +
+       "Disabled": false,              +
+       "Index Cond": "(id = 5)"        +
+     }                                 +
+   }                                   +
+ ]
+(1 row)
+----
+
+== Scan nodes
+
+[cols="2,5"]
+|===
+|Node |Meaning
+
+|`Seq Scan`
+|Reads the whole table, applying the filter to each row. The right plan when most rows are needed.
+
+|`Index Scan`
+|Walks the index in order and fetches each matching heap row; good for few rows and for sorted output.
+
+|`Index Only Scan`
+|Answers from the index alone where the visibility map allows (`Heap Fetches` counts the exceptions).
+
+|`Bitmap Index Scan` + `Bitmap Heap Scan`
+|Builds a bitmap of matching pages from one or more indexes (combining with `BitmapAnd` or `BitmapOr`), then reads those
+pages in physical order. The middle ground between index scan and sequential scan.
+
+|`Parallel Seq Scan` etc.
+|The same, split among parallel workers under a `Gather` node.
+|===
+
+With the indexes of the previous page in place, one table and three different predicates give three different scans, chosen
+by the estimated fraction of rows:
+
+[source,sql]
+----
+CREATE INDEX ON big_orders (created_at);
+CREATE INDEX ON big_orders (customer_id);
+CREATE INDEX ON big_orders (status);
+ANALYZE big_orders;
+EXPLAIN SELECT * FROM big_orders WHERE id = 12345;
+EXPLAIN SELECT * FROM big_orders WHERE customer_id < 400;
+EXPLAIN SELECT * FROM big_orders WHERE created_at < '2025-02-15';
+EXPLAIN SELECT * FROM big_orders WHERE amount > 10;
+----
+
+[source,text]
+----
+                                     QUERY PLAN
+------------------------------------------------------------------------------------
+ Index Scan using big_orders_pkey on big_orders  (cost=0.42..8.44 rows=1 width=168)
+   Index Cond: (id = 12345)
+(2 rows)
+
+                                           QUERY PLAN
+-------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders  (cost=1278.25..18064.29 rows=111203 width=168)
+   Recheck Cond: (customer_id < 400)
+   ->  Bitmap Index Scan on big_orders_customer_id_idx  (cost=0.00..1250.45 rows=111203 width=0)
+         Index Cond: (customer_id < 400)
+(4 rows)
+
+                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------
+ Index Scan using big_orders_created_at_idx on big_orders  (cost=0.42..3505.60 rows=65923 width=168)
+   Index Cond: (created_at < '2025-02-15 00:00:00+00'::timestamp with time zone)
+(2 rows)
+
+                             QUERY PLAN
+---------------------------------------------------------------------
+ Seq Scan on big_orders  (cost=0.00..22896.00 rows=488669 width=168)
+   Filter: (amount > '10'::numeric)
+(2 rows)
+----
+
+A primary-key lookup is an `Index Scan`; a wide range on an uncorrelated column becomes a `Bitmap Heap Scan`; a range on
+the perfectly correlated `created_at` is an `Index Scan` because the matching rows are physically adjacent; and a condition
+true for nearly every row is a `Seq Scan`, since an index there would only add work.
+
+== Join nodes
+
+PostgreSQL has three join algorithms.
+
+* *Nested loop*: for each row of the outer input, probe the inner input (ideally an index lookup). Best when the outer side
+  is small. Cost grows with outer rows times inner cost.
+* *Hash join*: build an in-memory hash table from the smaller input and stream the larger one through it. Best for large
+  unsorted inputs and equality joins; it spills to disk in `Batches` when it exceeds `work_mem`.
+* *Merge join*: merge two inputs that are sorted on the join key (by an index or a `Sort` node). Best when both sides are
+  large and already sorted. Supports full outer joins.
+
+[mermaid]
+....
+flowchart TD
+  AGG["Aggregate"] --> J["Hash Join: o.customer_id = c.id"]
+  J --> S1["Seq Scan on big_orders (probe side)"]
+  J --> H["Hash"]
+  H --> S2["Seq Scan on customers_big (build side)"]
+....
+
+The same join, with one row on one side and then with all rows, is a nested loop and a hash join. Parallel plans are turned
+off in these examples to keep the trees short:
+
+[source,sql]
+----
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE customers_big AS SELECT g AS id, 'Customer ' || g AS name, (ARRAY['pro','free','enterprise'])[1 + g % 3] AS tier FROM generate_series(1, 20000) AS g;
+ALTER TABLE customers_big ADD PRIMARY KEY (id);
+ANALYZE customers_big;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT c.name, o.amount FROM big_orders o JOIN customers_big c ON c.id = o.customer_id WHERE o.id = 12345;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT c.tier, count(*), sum(o.amount) FROM big_orders o JOIN customers_big c ON c.id = o.customer_id GROUP BY c.tier;
+----
+
+[source,text]
+----
+                                       QUERY PLAN
+-----------------------------------------------------------------------------------------
+ Nested Loop (actual rows=1.00 loops=1)
+   ->  Index Scan using big_orders_pkey on big_orders o (actual rows=1.00 loops=1)
+         Index Cond: (id = 12345)
+         Index Searches: 1
+   ->  Index Scan using customers_big_pkey on customers_big c (actual rows=1.00 loops=1)
+         Index Cond: (id = o.customer_id)
+         Index Searches: 1
+(7 rows)
+
+                                  QUERY PLAN
+------------------------------------------------------------------------------
+ HashAggregate (actual rows=3.00 loops=1)
+   Group Key: c.tier
+   Batches: 1  Memory Usage: 32kB
+   ->  Hash Join (actual rows=599990.00 loops=1)
+         Hash Cond: (o.customer_id = c.id)
+         ->  Seq Scan on big_orders o (actual rows=600000.00 loops=1)
+         ->  Hash (actual rows=20000.00 loops=1)
+               Buckets: 32768  Batches: 1  Memory Usage: 1116kB
+               ->  Seq Scan on customers_big c (actual rows=20000.00 loops=1)
+(9 rows)
+----
+
+The first query found one `big_orders` row through the primary key and looked up its customer by index (`Nested Loop`). The
+second needs every order, so the planner built a hash table of the 20,000 customers (`+Buckets: 32768 ... Memory Usage: 1116kB+`) and streamed all orders through it, then aggregated with a `HashAggregate` (the other aggregate strategy,
+`GroupAggregate`, requires sorted input, and `Sort` nodes report their method: `quicksort` in memory or `external merge` on
+disk).
+
+To see a merge join the inputs must be sorted. Joining two tables on their primary keys provides that for free; the planner
+usually still prefers a hash join, so the next run turns hash joins off as a diagnostic:
+
+[source,sql]
+----
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE order_flags AS SELECT g AS order_id, (g % 7 = 0) AS flagged FROM generate_series(1, 500000) AS g;
+ALTER TABLE order_flags ADD PRIMARY KEY (order_id);
+ANALYZE order_flags;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT count(*) FROM big_orders o JOIN order_flags f ON f.order_id = o.id;
+SET enable_hashjoin = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT count(*) FROM big_orders o JOIN order_flags f ON f.order_id = o.id;
+----
+
+[source,text]
+----
+                                 QUERY PLAN
+-----------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Hash Join (actual rows=500000.00 loops=1)
+         Hash Cond: (o.id = f.order_id)
+         ->  Seq Scan on big_orders o (actual rows=600000.00 loops=1)
+         ->  Hash (actual rows=500000.00 loops=1)
+               Buckets: 262144  Batches: 4  Memory Usage: 6440kB
+               ->  Seq Scan on order_flags f (actual rows=500000.00 loops=1)
+(7 rows)
+
+                                             QUERY PLAN
+-----------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Merge Join (actual rows=500000.00 loops=1)
+         Merge Cond: (o.id = f.order_id)
+         ->  Index Only Scan using big_orders_pkey on big_orders o (actual rows=500001.00 loops=1)
+               Heap Fetches: 500001
+               Index Searches: 1
+         ->  Index Only Scan using order_flags_pkey on order_flags f (actual rows=500000.00 loops=1)
+               Heap Fetches: 500000
+               Index Searches: 1
+(9 rows)
+----
+
+Without the switch the plan was a `Hash Join` whose build side needed several `Batches` (it did not fit in the default
+`work_mem` of 4 MB); with hash joins disabled the planner merged two ordered index scans. `Heap Fetches` is high in the
+index-only scans because the new tables have not been vacuumed, so the visibility map is empty (see
+xref:database/postgresql/indexing.adoc[Indexing]).
+
+== Aggregate nodes and sorting
+
+`HashAggregate` groups with a hash table (fast, unordered, memory-bound), `GroupAggregate` consumes sorted input (cheap
+when an index delivers the order, and required for `ORDER BY` inside aggregates), and `MixedAggregate` handles grouping
+sets. A `Sort` node uses `quicksort` in memory when the data fits in `work_mem`, `top-N heapsort` for `+ORDER BY ... LIMIT+`
+and `external merge` on disk otherwise; `Incremental Sort` exploits a partially sorted input. A disk sort in `EXPLAIN
+(ANALYZE)` output is the classic sign that `work_mem` is too small for the query (raise it per session or per role, not
+globally, since it is allocated per sort per node). See xref:database/postgresql/performance-tuning.adoc[Performance Tuning].
+
+== The cost model
+
+The planner's costs are built from a few parameters. Their defaults describe a spinning disk, and the main thing to know
+is the ratio of random to sequential page cost:
+
+[source,sql]
+----
+SELECT name, setting, short_desc FROM pg_settings
+WHERE name IN ('seq_page_cost', 'random_page_cost', 'cpu_tuple_cost', 'cpu_index_tuple_cost', 'cpu_operator_cost', 'effective_cache_size', 'work_mem', 'default_statistics_target')
+ORDER BY name;
+----
+
+[source,text]
+----
+           name            | setting |                                          short_desc
+---------------------------+---------+----------------------------------------------------------------------------------------------
+ cpu_index_tuple_cost      | 0.005   | Sets the planner's estimate of the cost of processing each index entry during an index scan.
+ cpu_operator_cost         | 0.0025  | Sets the planner's estimate of the cost of processing each operator or function call.
+ cpu_tuple_cost            | 0.01    | Sets the planner's estimate of the cost of processing each tuple (row).
+ default_statistics_target | 100     | Sets the default statistics target.
+ effective_cache_size      | 524288  | Sets the planner's assumption about the total size of the data caches.
+ random_page_cost          | 4       | Sets the planner's estimate of the cost of a nonsequentially fetched disk page.
+ seq_page_cost             | 1       | Sets the planner's estimate of the cost of a sequentially fetched disk page.
+ work_mem                  | 4096    | Sets the maximum memory to be used for query workspaces.
+(8 rows)
+----
+
+`random_page_cost` (4.0) is the cost of fetching a non-sequential page relative to `seq_page_cost` (1.0). On SSD or a
+well-cached database a value around 1.1 to 2.0 is usual, and it makes the planner more willing to use indexes. Lowering it
+switches the plan of an uncorrelated range query from a bitmap scan to a plain index scan:
+
+[source,sql]
+----
+EXPLAIN SELECT * FROM big_orders WHERE customer_id < 400;
+SET random_page_cost = 1.1;
+EXPLAIN SELECT * FROM big_orders WHERE customer_id < 400;
+----
+
+[source,text]
+----
+                                           QUERY PLAN
+-------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders  (cost=1278.25..18064.29 rows=111203 width=168)
+   Recheck Cond: (customer_id < 400)
+   ->  Bitmap Index Scan on big_orders_customer_id_idx  (cost=0.00..1250.45 rows=111203 width=0)
+         Index Cond: (customer_id < 400)
+(4 rows)
+
+                                               QUERY PLAN
+--------------------------------------------------------------------------------------------------------
+ Index Scan using big_orders_customer_id_idx on big_orders  (cost=0.42..16622.96 rows=111203 width=168)
+   Index Cond: (customer_id < 400)
+(2 rows)
+----
+
+`effective_cache_size` (524288 pages of 8 kB, which is 4 GB; `pg_settings` reports memory settings in their base unit) does not allocate anything: it tells the planner how much of the data it may expect to
+find cached by PostgreSQL and the operating system, which lowers the estimated cost of repeated index access. The others
+set the per-row CPU charges. Changing a cost parameter affects every query in the workload, so test on realistic data and
+change it in `postgresql.conf` (see xref:database/postgresql/administration.adoc[Administration]) or per tablespace, not
+per query.
+
+== Switches for diagnosis only
+
+The `enable_seqscan`, `enable_indexscan`, `enable_bitmapscan`, `enable_hashjoin`, `enable_mergejoin`, `enable_nestloop`
+and `enable_sort` parameters do not forbid a plan type; they add a huge cost to it (and since PostgreSQL 18 a node
+planned despite being disabled prints `Disabled: true`). They exist to *test hypotheses* in one session: "would an index scan
+be faster? is the estimate wrong, or is the planner right?"
+
+[source,sql]
+----
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT * FROM big_orders WHERE customer_id < 400;
+SET enable_bitmapscan = off;
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF) SELECT * FROM big_orders WHERE customer_id < 400;
+----
+
+[source,text]
+----
+                                               QUERY PLAN
+---------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders (actual time=2.187..16.783 rows=110039.00 loops=1)
+   Recheck Cond: (customer_id < 400)
+   Heap Blocks: exact=9248
+   ->  Bitmap Index Scan on big_orders_customer_id_idx (actual time=1.553..1.554 rows=110039.00 loops=1)
+         Index Cond: (customer_id < 400)
+         Index Searches: 1
+ Planning Time: 0.164 ms
+ Execution Time: 18.685 ms
+(8 rows)
+
+                                QUERY PLAN
+---------------------------------------------------------------------------
+ Seq Scan on big_orders (actual time=0.008..26.627 rows=110039.00 loops=1)
+   Filter: (customer_id < 400)
+   Rows Removed by Filter: 489961
+ Planning Time: 0.034 ms
+ Execution Time: 28.458 ms
+(5 rows)
+----
+
+Disabling bitmap scans forced the plain index scan, and comparing the `Execution Time` of the two runs says which plan was
+really faster on this machine. Here the default bitmap plan was the faster of the two, so the planner's choice was right; if
+the forced plan had won by a wide margin, the cost model or the statistics would need attention. Because enabling a switch that has no alternative does nothing useful, the planner marks a disabled node it had to
+use anyway:
+
+[source,sql]
+----
+SET max_parallel_workers_per_gather = 0;
+SET enable_seqscan = off;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT count(*) FROM big_orders WHERE amount > 400;
+----
+
+[source,text]
+----
+                          QUERY PLAN
+--------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Seq Scan on big_orders (actual rows=100082.00 loops=1)
+         Disabled: true
+         Filter: (amount > '400'::numeric)
+         Rows Removed by Filter: 499918
+(5 rows)
+----
+
+With no index on `amount`, turning sequential scans off cannot produce another plan, so the planner still chose a `Seq Scan`
+and marked it `Disabled: true`. Never ship `+SET enable_...+` into application code or `postgresql.conf` as a
+fix; correct the statistics, add the index, or rewrite the query, so that the planner chooses correctly by itself.
+
+== Prepared statements: generic versus custom plans
+
+A prepared statement (`PREPARE`, or the extended-protocol parameters that every driver uses) is parsed once and
+executed many times. For each execution the planner may build a *custom plan* using the actual parameter values,
+or reuse a parameter-independent *generic plan*. The default `plan_cache_mode = auto` plans the first five executions
+with custom plans and then uses a generic one if it is not estimated to cost more than the average custom plan.
+`pg_prepared_statements` records both counts, and `EXPLAIN EXECUTE` shows `$1` in a generic plan:
+
+[source,sql]
+----
+RESET max_parallel_workers_per_gather;
+PREPARE by_status(text) AS SELECT count(*), sum(amount) FROM big_orders WHERE status = $1;
+EXPLAIN (COSTS OFF) EXECUTE by_status('open');
+EXPLAIN (COSTS OFF) EXECUTE by_status('shipped');
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE by_status('open');
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;
+----
+
+[source,text]
+----
+                       QUERY PLAN
+--------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on big_orders
+         Recheck Cond: (status = 'open'::text)
+         ->  Bitmap Index Scan on big_orders_status_idx
+               Index Cond: (status = 'open'::text)
+(5 rows)
+
+                       QUERY PLAN
+--------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Seq Scan on big_orders
+                     Filter: (status = 'shipped'::text)
+(6 rows)
+
+                             QUERY PLAN
+--------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 2
+         ->  Partial Aggregate
+               ->  Parallel Bitmap Heap Scan on big_orders
+                     Recheck Cond: (status = $1)
+                     ->  Bitmap Index Scan on big_orders_status_idx
+                           Index Cond: (status = $1)
+(8 rows)
+
+   name    | generic_plans | custom_plans
+-----------+---------------+--------------
+ by_status |             1 |            2
+(1 row)
+----
+
+With the actual value, the rare status `open` uses the status index and the common `shipped` scans the table. The generic
+plan has to serve any value: it was costed with the *average* selectivity of a status value and picked a bitmap scan.
+Because it was forced here the mismatch is visible; with the default `auto` setting the switch to a generic plan can hurt
+columns with very skewed distributions, and `plan_cache_mode = force_custom_plan` restores per-value planning at the cost
+of planning time. This also explains why a query is fast in `psql` with a literal and slow from the application:
+the application's parameterized statement was planned generically. Connection poolers in transaction mode and
+prepared statements interact, covered in xref:database/postgresql/replication-and-ha.adoc[Replication & High Availability].
+
+== Parallel query
+
+A plan may contain a `Gather` (or `Gather Merge`) node: the leader process starts *parallel workers* that each scan a share of
+the table, aggregate their share (`Partial Aggregate`) and send the partial results up to a `Finalize Aggregate`. It helps
+large scans, joins and aggregates and never helps small or index-driven queries. The same query with and without it:
+
+[source,sql]
+----
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF) SELECT count(*), avg(amount) FROM big_orders WHERE amount > 400;
+RESET max_parallel_workers_per_gather;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF) SELECT count(*), avg(amount) FROM big_orders WHERE amount > 400;
+SELECT name, setting FROM pg_settings WHERE name IN ('max_parallel_workers_per_gather', 'max_parallel_workers', 'max_worker_processes', 'min_parallel_table_scan_size') ORDER BY name;
+----
+
+[source,text]
+----
+                          QUERY PLAN
+--------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Seq Scan on big_orders (actual rows=100082.00 loops=1)
+         Filter: (amount > '400'::numeric)
+         Rows Removed by Filter: 499918
+ Planning Time: 0.131 ms
+ Execution Time: 36.720 ms
+(6 rows)
+
+                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Seq Scan on big_orders (actual rows=33360.67 loops=3)
+                     Filter: (amount > '400'::numeric)
+                     Rows Removed by Filter: 166639
+ Planning Time: 0.050 ms
+ Execution Time: 17.109 ms
+(10 rows)
+
+              name               | setting
+---------------------------------+---------
+ max_parallel_workers            | 8
+ max_parallel_workers_per_gather | 2
+ max_worker_processes            | 8
+ min_parallel_table_scan_size    | 1024
+(4 rows)
+----
+
+Two workers plus the leader (`loops=3`, with `rows` shown per process) finished the same work in a fraction of the serial time, as the two `Execution Time` lines show. The pool is bounded by
+`max_parallel_workers_per_gather`, `max_parallel_workers` and `max_worker_processes`; the planner only parallelizes tables above
+`min_parallel_table_scan_size` (1024 pages, which is 8 MB). Parallel query is not used for the data-modifying part of
+`INSERT`, `UPDATE` and `DELETE` (their source query can be parallel), in queries with `FOR UPDATE`, or when a function marked
+`PARALLEL UNSAFE` is involved.
+
+== Partition pruning
+
+With declarative partitioning (see xref:database/postgresql/performance-tuning.adoc[Performance Tuning]) the planner
+discards partitions that cannot contain matching rows, provided the query filters on the partition key.
+
+[source,sql]
+----
+CREATE TABLE events (id bigint GENERATED ALWAYS AS IDENTITY, happened_at timestamptz NOT NULL, kind text NOT NULL) PARTITION BY RANGE (happened_at);
+CREATE TABLE events_2026_01 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE events_2026_02 PARTITION OF events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE events_2026_03 PARTITION OF events FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+INSERT INTO events (happened_at, kind) SELECT timestamptz '2026-01-01' + g * interval '1 minute', 'click' FROM generate_series(1, 100000) AS g;
+ANALYZE events;
+EXPLAIN (COSTS OFF) SELECT * FROM events WHERE happened_at >= '2026-02-10' AND happened_at < '2026-02-11';
+SET enable_partition_pruning = off;
+EXPLAIN (COSTS OFF) SELECT * FROM events WHERE happened_at >= '2026-02-10' AND happened_at < '2026-02-11';
+RESET enable_partition_pruning;
+----
+
+[source,text]
+----
+                                                                       QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ Seq Scan on events_2026_02 events
+   Filter: ((happened_at >= '2026-02-10 00:00:00+00'::timestamp with time zone) AND (happened_at < '2026-02-11 00:00:00+00'::timestamp with time zone))
+(2 rows)
+
+                                                                          QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Append
+   ->  Seq Scan on events_2026_01 events_1
+         Filter: ((happened_at >= '2026-02-10 00:00:00+00'::timestamp with time zone) AND (happened_at < '2026-02-11 00:00:00+00'::timestamp with time zone))
+   ->  Seq Scan on events_2026_02 events_2
+         Filter: ((happened_at >= '2026-02-10 00:00:00+00'::timestamp with time zone) AND (happened_at < '2026-02-11 00:00:00+00'::timestamp with time zone))
+   ->  Seq Scan on events_2026_03 events_3
+         Filter: ((happened_at >= '2026-02-10 00:00:00+00'::timestamp with time zone) AND (happened_at < '2026-02-11 00:00:00+00'::timestamp with time zone))
+(7 rows)
+----
+
+Only `events_2026_02` appears in the first plan; with pruning disabled all three partitions are scanned. Pruning also works
+when the value is known only at execution time, as with a prepared statement's generic plan; the plan then shows how many
+partitions were removed at startup:
+
+[source,sql]
+----
+PREPARE ev(timestamptz) AS SELECT count(*) FROM events WHERE happened_at >= $1 AND happened_at < $1 + interval '1 day';
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) EXECUTE ev('2026-02-10');
+----
+
+[source,text]
+----
+                                        QUERY PLAN
+------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Append (actual rows=1440.00 loops=1)
+         Subplans Removed: 2
+         ->  Seq Scan on events_2026_02 events_1 (actual rows=1440.00 loops=1)
+               Filter: ((happened_at >= $1) AND (happened_at < ($1 + '1 day'::interval)))
+               Rows Removed by Filter: 38880
+(6 rows)
+----
+
+`Subplans Removed: 2` is the executor pruning two of the three partitions when the parameter value arrived. A filter on a
+column that is not part of the partition key (`kind`) cannot prune.
+
+== Finding bad plans in production
+
+Reading `EXPLAIN` needs a slow query to start from. `pg_stat_statements` ranks statements by total time and calls (see
+xref:database/postgresql/extensions.adoc[Extensions]), the `auto_explain` module logs the plan of any statement slower than
+a threshold (`auto_explain.log_min_duration`, with `log_analyze` to include actual rows; it is shown here as configuration
+and not executed), and `log_min_duration_statement` logs slow statements by text. Compare estimated and actual rows,
+look for sequential scans on large tables, nested loops with a huge `loops` count, disk sorts and hashes with many
+`Batches`, and `Rows Removed by Filter` far larger than the rows returned. Then fix statistics, indexes or the query, and
+re-run `EXPLAIN (ANALYZE, BUFFERS)` to confirm.
+
+The SQL-standard behaviour of joins and subqueries is in xref:database/sql/dml-queries.adoc[queries]; pagination
+patterns whose plans matter are in xref:database/pagination-strategies.adoc[Pagination Strategies]. Index choices are in
+xref:database/postgresql/indexing.adoc[Indexing], lock waits and long transactions that look like slow queries are in
+xref:database/postgresql/transactions-and-mvcc.adoc[Transactions, Isolation & MVCC], and the same process for other
+engines is in xref:database/diagnosing-slow-queries.adoc[Diagnosing Slow Queries].
+

@@ -2,7 +2,7 @@
 :description: Contract-first RPC with gRPC on ASP.NET Core -- .proto contracts, the four call types, interceptors, gRPC-Web, JSON transcoding, deadlines and cancellation, the client factory, and gRPC vs. REST.
 :keywords: gRPC, protobuf, .proto, MapGrpcService, unary call, server streaming, client streaming, bidirectional streaming, Interceptor, gRPC-Web, JSON transcoding, GrpcClientFactory, deadline, CallOptions
 
-include::partial$aspnet-core-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 gRPC is a contract-first, high-performance RPC framework for service-to-service calls. It defines services in a
 `.proto` file and generates typed client and server code, over HTTP/2 and Protocol Buffers.
@@ -174,3 +174,160 @@ a single .NET solution, at the cost of the `.proto` file other, non-.NET consume
 
 JSON transcoding narrows this trade-off by exposing one gRPC implementation both ways. See
 https://learn.microsoft.com/en-us/aspnet/core/grpc/comparison[gRPC compared to HTTP APIs with JSON].
+
+== Deep dive: tracking an order with a server stream
+
+Streaming is where gRPC pays for itself: one HTTP/2 stream carries many messages, in order, without the polling
+or reconnection logic a REST client would need. The example lets a client watch an order's status changes, with an
+explicit contract, error codes, a deadline, and a retry policy on the channel.
+
+=== The contract and how it evolves
+
+[source,protobuf]
+----
+// order_tracker.proto
+syntax = "proto3";
+
+option csharp_namespace = "Shop.Tracking";
+
+service OrderTracker {
+    rpc WatchOrder (OrderRequest) returns (stream OrderUpdate);
+}
+
+message OrderRequest { string order_id = 1; }
+
+message OrderUpdate {
+    string order_id = 1;
+    OrderStatus status = 2;
+    string note     = 3;
+    reserved 4;                  // removed field: never reuse its number
+    reserved "carrier_code";     // and never reuse its name
+}
+
+enum OrderStatus {
+    ORDER_STATUS_UNSPECIFIED = 0;   // proto3 requires a zero value; treat it as "unknown"
+    ORDER_STATUS_PLACED = 1;
+    ORDER_STATUS_PACKED = 2;
+    ORDER_STATUS_SHIPPED = 3;
+    ORDER_STATUS_DELIVERED = 4;
+}
+----
+
+On the wire, a field is identified by its *number*, not its name. That is why adding fields with new numbers is a
+compatible change (old readers skip them), while changing a number or the type of an existing field breaks every
+deployed client. Mark removed fields `reserved` so nobody reuses them by accident.
+
+=== Server: write updates until the caller leaves
+
+[source,csharp]
+----
+using Grpc.Core;
+
+public sealed class OrderTrackerService(IOrderEvents events) : OrderTracker.OrderTrackerBase
+{
+    public override async Task WatchOrder(
+        OrderRequest request, IServerStreamWriter<OrderUpdate> responseStream, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.OrderId))
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "order_id is required"));
+
+        // context.CancellationToken fires on client cancel, deadline expiry, or server shutdown.
+        await foreach (var update in events.SubscribeAsync(request.OrderId, context.CancellationToken))
+        {
+            await responseStream.WriteAsync(update);
+            if (update.Status == OrderStatus.Delivered) break;   // complete the stream
+        }
+    }
+}
+----
+
+The generated enum drops the `ORDER_STATUS_` prefix, so the value is `OrderStatus.Delivered` in C#. Throwing
+`RpcException` is the normal way to fail a call; an unhandled exception is reported to the client as
+`StatusCode.Unknown` with no detail unless `GrpcServiceOptions.EnableDetailedErrors` is on, which keeps internals
+out of production responses.
+
+=== Client: deadline, cancellation and a retry policy
+
+[source,csharp]
+----
+using Grpc.Core;
+using Grpc.Net.Client.Configuration;
+
+builder.Services.AddGrpcClient<OrderTracker.OrderTrackerClient>(o => o.Address = new Uri("https://tracking.internal"))
+    .ConfigureChannel(o => o.ServiceConfig = new ServiceConfig
+    {
+        MethodConfigs =
+        {
+            new MethodConfig
+            {
+                Names = { MethodName.Default },
+                RetryPolicy = new RetryPolicy
+                {
+                    MaxAttempts = 3,
+                    InitialBackoff = TimeSpan.FromMilliseconds(500),
+                    MaxBackoff = TimeSpan.FromSeconds(5),
+                    BackoffMultiplier = 2,
+                    RetryableStatusCodes = { StatusCode.Unavailable },   // only "server not reachable"
+                },
+            },
+        },
+    });
+
+public sealed class OrderWatcher(OrderTracker.OrderTrackerClient client, ILogger<OrderWatcher> logger)
+{
+    public async Task WatchAsync(string orderId, CancellationToken ct)
+    {
+        using var call = client.WatchOrder(
+            new OrderRequest { OrderId = orderId }, deadline: DateTime.UtcNow.AddMinutes(10), cancellationToken: ct);
+        try
+        {
+            await foreach (var update in call.ResponseStream.ReadAllAsync(ct))
+                logger.LogInformation("{Order}: {Status} {Note}", update.OrderId, update.Status, update.Note);
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.DeadlineExceeded)
+        {
+            logger.LogWarning("Stopped watching {Order}: deadline reached", orderId);
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+        {
+            // the caller cancelled; nothing to report
+        }
+    }
+}
+----
+
+Retry only the status codes that mean the request never started processing (`Unavailable`); retrying `DeadlineExceeded`
+or `Internal` can repeat work the server already did. Retries apply to the *start* of a call: once a streaming
+response has begun delivering messages, the framework does not replay it.
+
+[mermaid]
+....
+sequenceDiagram
+    participant C as OrderWatcher
+    participant S as OrderTrackerService
+    participant E as IOrderEvents
+    C->>S: WatchOrder(order_id) + deadline
+    S->>E: SubscribeAsync(order_id)
+    E-->>S: PLACED
+    S-->>C: OrderUpdate PLACED
+    E-->>S: SHIPPED
+    S-->>C: OrderUpdate SHIPPED
+    E-->>S: DELIVERED
+    S-->>C: OrderUpdate DELIVERED
+    S-->>C: trailers: status OK, stream completes
+    Note over C,S: cancel or deadline: CancellationToken fires, both sides stop
+....
+
+=== Status codes at a glance
+
+[cols="1,3",options="header"]
+|===
+| Code | Use it for
+
+| `InvalidArgument` | The request is malformed regardless of server state (the REST analogue is `400`).
+| `NotFound` | The addressed entity does not exist (`404`).
+| `PermissionDenied` / `Unauthenticated` | Authorization versus missing credentials (`403` / `401`).
+| `FailedPrecondition` | The state forbids the operation, such as shipping an already-delivered order (`409`/`412`).
+| `Unavailable` | Transient; the client may retry (`503`).
+| `DeadlineExceeded` | The deadline passed before the call finished (`504`).
+|===

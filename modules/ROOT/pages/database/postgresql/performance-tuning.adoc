@@ -1,0 +1,480 @@
+= Performance Tuning
+:description: A practical PostgreSQL tuning guide -- memory and WAL settings, connection limits and pooling, autovacuum, finding the worst queries with pg_stat_statements, HOT updates and fillfactor, declarative partitioning with pruning, bulk loading with COPY and unlogged tables, parallel query, and a repeatable tuning workflow.
+:keywords: postgresql, performance tuning, shared_buffers, work_mem, maintenance_work_mem, effective_cache_size, checkpoint, max_wal_size, pg_stat_statements, HOT update, fillfactor, partitioning, partition pruning, COPY, unlogged table, parallel query, autovacuum tuning
+
+include::partial$ai-disclaimer.adoc[]
+
+Tuning PostgreSQL is mostly about three things: giving the server sensible memory settings, keeping the write path
+(WAL, checkpoints, vacuum) healthy, and finding the few queries that matter and fixing their plans. This page works
+through each on PostgreSQL 18.6 (`postgres:latest`, container `pg-b`, started with 10 CPUs and about 8 GB visible to the
+container) using the `shop` schema from xref:database/postgresql/getting-started.adoc[Getting Started] plus generated
+tables where volume is needed. Timings come from a laptop container and are only meaningful relative to each other.
+Long plans are trimmed where stated. For general slow-query technique see
+xref:database/diagnosing-slow-queries.adoc[Diagnosing Slow Queries].
+
+[mermaid]
+....
+flowchart LR
+  M["Measure: pg_stat_statements, logs"] --> F["Find the top queries"]
+  F --> E["EXPLAIN (ANALYZE, BUFFERS)"]
+  E --> C["Change: index, query, setting"]
+  C --> V["Verify against the baseline"]
+  V --> M
+....
+
+== Start from the defaults you actually have
+
+The defaults are conservative so that PostgreSQL starts on a small machine. These are the values of the main settings on
+this server (the official image does not tune anything):
+
+[source,sql]
+----
+SELECT name, setting, unit FROM pg_settings
+WHERE name IN ('shared_buffers','work_mem','maintenance_work_mem','effective_cache_size','wal_buffers',
+               'max_wal_size','min_wal_size','checkpoint_timeout','checkpoint_completion_target',
+               'random_page_cost','effective_io_concurrency','max_connections','io_method') ORDER BY 1;
+----
+
+----
+               name               | setting | unit
+----------------------------------+---------+------
+ checkpoint_completion_target     | 0.9     |
+ checkpoint_timeout               | 300     | s
+ effective_cache_size             | 524288  | 8kB
+ effective_io_concurrency         | 16      |
+ io_method                        | worker  |
+ maintenance_work_mem             | 65536   | kB
+ max_connections                  | 100     |
+ max_wal_size                     | 1024    | MB
+ min_wal_size                     | 80      | MB
+ random_page_cost                 | 4       |
+ shared_buffers                   | 16384   | 8kB
+ wal_buffers                      | 512     | 8kB
+ work_mem                         | 4096    | kB
+----
+
+Page-based settings are in 8 kB units: `shared_buffers = 16384` is 128 MB and `effective_cache_size = 524288` is 4 GB.
+
+== Memory
+
+[cols="1,1,3",options="header"]
+|===
+|Setting |Starting point |What it does
+
+|`shared_buffers` |About 25% of RAM (restart required) |PostgreSQL's own page cache; the rest of the memory is used by the operating system's cache
+|`effective_cache_size` |50-75% of RAM |A planner hint only: how much data the OS and PostgreSQL caches together probably hold, which makes index scans look cheaper; allocates nothing
+|`work_mem` |4 MB default; raise carefully |Memory for *each* sort, hash or aggregate node of a query, not per connection
+|`maintenance_work_mem` |256 MB to 1 GB |Memory for `VACUUM`, `CREATE INDEX`, `ALTER TABLE ADD FOREIGN KEY`
+|`autovacuum_work_mem` |defaults to `maintenance_work_mem` |Per autovacuum worker, which is why a large global value multiplies
+|===
+
+`work_mem` is the setting with the sharpest edge. The limit applies per plan node, per parallel worker, per query, so a
+single query with several hashes and sorts across 200 connections can use many multiples of the value. The effect on a
+query is dramatic. Sorting a 500,000-row table (45 MB, columns `amount`, `note`) with a small 1 MB spills to temporary
+files; with 256 MB it sorts in memory:
+
+[source,sql]
+----
+SET work_mem = '1MB';
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) SELECT * FROM sales ORDER BY amount, note;
+----
+
+----
+ Gather Merge (actual rows=500000.00 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   ->  Sort (actual rows=166666.67 loops=3)
+         Sort Key: amount, note
+         Sort Method: external merge  Disk: 11864kB
+         Worker 0:  Sort Method: external merge  Disk: 11232kB
+         Worker 1:  Sort Method: external merge  Disk: 9728kB
+         ->  Parallel Seq Scan on sales (actual rows=166666.67 loops=3)
+----
+
+----
+ Sort (actual rows=500000.00 loops=1)
+   Sort Key: amount, note
+   Sort Method: quicksort  Memory: 51351kB
+   ->  Seq Scan on sales (actual rows=500000.00 loops=1)
+----
+
+(The second plan is the same query with `+SET work_mem = '256MB'+`.) Look for `Sort Method: external merge  Disk:` and
+`Batches: N` greater than 1 on hash nodes: those mark a `work_mem` that is too small for that query. The safest
+approach is a modest global default plus `SET LOCAL work_mem` for a known reporting transaction, or a per-role setting
+(`+ALTER ROLE reporting SET work_mem = '128MB'+`).
+
+PostgreSQL 18 also adds asynchronous I/O, controlled by `io_method` (`worker` by default, also `io_uring` on Linux and
+`sync`), which is the reason `pg_stat_activity` shows `io worker` backends (see
+xref:database/postgresql/administration.adoc[Administration]). Raising `effective_io_concurrency` helps SSD and cloud
+volumes; the default of 16 on this build is already tuned for flash storage. On SSD, also lower `random_page_cost` from
+4 to about 1.1 so the planner stops overestimating the cost of index scans.
+
+== WAL and checkpoints
+
+Every change is written to the WAL, and a *checkpoint* flushes dirty buffers so older WAL can be recycled. Two things
+trigger one: `checkpoint_timeout` (5 minutes by default) and WAL growth beyond `max_wal_size` (1 GB). Frequent
+requested checkpoints under write load hurt, because each checkpoint is followed by a burst of full-page images in the
+WAL. `pg_stat_checkpointer` shows which trigger fires:
+
+[source,sql]
+----
+SELECT num_timed AS checkpoints_timed, num_requested AS checkpoints_req, buffers_written
+FROM pg_stat_checkpointer;
+----
+
+----
+ checkpoints_timed | checkpoints_req | buffers_written
+-------------------+-----------------+-----------------
+                 0 |               1 |               0
+----
+
+If `num_requested`
+climbs faster than `num_timed`, raise `max_wal_size` (several GB is normal for busy servers) and keep
+`checkpoint_completion_target` at 0.9 so writes are spread across the interval. The cost of a larger `max_wal_size` is a
+longer crash recovery. `log_checkpoints` is on by default in current versions, so each checkpoint appears in the log with
+the number of buffers written and the time taken.
+
+[cols="1,3",options="header"]
+|===
+|Setting |Guidance
+
+|`wal_compression` |Compresses full-page images; cheap CPU for less WAL (try `lz4` or `zstd`)
+|`wal_buffers` |Automatic (-1) sizes it from `shared_buffers`; rarely needs a change
+|`synchronous_commit = off` |Per transaction or per role for data you can afford to lose a fraction of a second of
+|`full_page_writes` |Keep `on`; turning it off risks corruption after a crash
+|`wal_level = minimal` |Lets some bulk operations skip WAL, but disables replication and archiving
+|===
+
+== Connections and pooling
+
+`max_connections` defaults to 100, and each connection is an operating-system process with its own memory. More
+connections do not mean more throughput: past roughly two to four times the CPU cores, throughput levels off while
+contention and memory grow. Keep `max_connections` modest, size the application pools to a total the server can run in
+parallel, and place a pooler (PgBouncer) in front when there are many short-lived clients. Pool configuration, the pool
+modes and their trade-offs are in xref:database/postgresql/replication-and-ha.adoc[Replication & High Availability].
+Add `idle_in_transaction_session_timeout` so abandoned transactions do not hold locks and block vacuum.
+
+== Autovacuum tuning
+
+The cleanup mechanics are explained in xref:database/postgresql/administration.adoc[Administration]; the tuning levers are:
+
+* *Lower the scale factors* on big tables (per table, `+ALTER TABLE ... SET (autovacuum_vacuum_scale_factor = 0.02)+`),
+  because the default 0.2 waits for 20% of rows to be dead.
+* *Raise the throughput*: autovacuum is throttled by `autovacuum_vacuum_cost_delay` (2 ms) and
+  `autovacuum_vacuum_cost_limit` (-1 means it inherits `vacuum_cost_limit`, 200). On fast storage raise the limit to
+  1000 or more so workers can keep up.
+* *Add workers* (`autovacuum_max_workers`, 3 by default) when many tables are busy.
+* *Fix what blocks cleanup*: long-running transactions, abandoned replication slots and prepared transactions.
+* Watch `n_dead_tup`, `last_autovacuum` and `autovacuum_count` in `pg_stat_user_tables`, and turn on
+  `log_autovacuum_min_duration = 0` for a while to see each run.
+
+== Finding the worst queries with pg_stat_statements
+
+`pg_stat_statements` normalises every statement (constants become `$1`) and accumulates calls, time, rows and buffer
+use. It needs `+shared_preload_libraries = 'pg_stat_statements'+` (restart) and then `CREATE EXTENSION pg_stat_statements`;
+installation and the view's columns are covered in xref:database/postgresql/extensions.adoc[Extensions]. After running a
+mixed workload:
+
+[source,sql]
+----
+SELECT calls, round(total_exec_time::numeric,1) AS total_ms, round(mean_exec_time::numeric,2) AS mean_ms,
+       rows, shared_blks_hit + shared_blks_read AS blks, left(query, 60) AS query
+FROM pg_stat_statements WHERE query NOT LIKE '%pg_stat_statements%'
+ORDER BY total_exec_time DESC LIMIT 5;
+----
+
+----
+ calls | total_ms | mean_ms | rows | blks  |                            query
+-------+----------+---------+------+-------+--------------------------------------------------------------
+     1 |     12.5 |   12.46 |    3 |  5713 | SELECT cust, sum(amount) FROM sales GROUP BY cust ORDER BY 2
+     2 |     12.1 |    6.05 |    2 | 11392 | SELECT count(*) FROM sales WHERE cust = $1
+     3 |      0.0 |    0.00 |    3 |     6 | SELECT * FROM orders WHERE id = $1
+----
+
+The three `orders` lookups with different ids collapse into one row with `calls = 3`, the same normalisation that makes the
+view usable on a busy server. Sort by `total_exec_time` to find where the server spends time, by `mean_exec_time` for
+slow individual statements, and by `shared_blks_read` for I/O hogs. Then take the statement to
+`EXPLAIN (ANALYZE, BUFFERS)` (see xref:database/postgresql/query-planning.adoc[Query Planning & EXPLAIN]). Here the
+`+count(*) ... WHERE cust = $1+` touches 11,392 buffers for two calls, a clue that `sales.cust` has no index.
+
+== HOT updates and fillfactor
+
+An update normally writes a new row version and a new entry in every index. A *heap-only tuple (HOT) update* skips the
+index entries when two conditions hold: no indexed column changed, and the new version fits on the same page as the old
+one. HOT updates are cheaper, produce less WAL and are cleaned up by page pruning without waiting for vacuum.
+
+The page-fit condition depends on free space. `fillfactor` (default 100 for tables) leaves part of each page empty for
+future versions. Two identical 50,000-row tables, one at fillfactor 100 and one at 70, then updated entirely once:
+
+[source,sql]
+----
+CREATE TABLE hot_ff100 (id int PRIMARY KEY, counter int, pad text) WITH (fillfactor=100);
+CREATE TABLE hot_ff70  (id int PRIMARY KEY, counter int, pad text) WITH (fillfactor=70);
+-- ... 50,000 rows inserted into each ...
+UPDATE hot_ff100 SET counter = counter + 1;
+UPDATE hot_ff70  SET counter = counter + 1;
+SELECT relname, n_tup_upd, n_tup_hot_upd, round(100.0*n_tup_hot_upd/n_tup_upd,1) AS hot_pct
+FROM pg_stat_user_tables WHERE relname LIKE 'hot_ff%' ORDER BY relname;
+----
+
+----
+  relname  | n_tup_upd | n_tup_hot_upd | hot_pct
+-----------+-----------+---------------+---------
+ hot_ff100 |     50000 |             0 |     0.0
+ hot_ff70  |     50000 |         20982 |    42.0
+----
+
+The initial sizes were 4,552 kB at fillfactor 100 and 6,456 kB at 70: free space is paid for in disk and cache. A single
+mass update fills the free space quickly; a steady stream of single-row updates, with page pruning making room between
+them, achieves a higher HOT ratio. Next, an index on the updated column `counter` was added to `hot_ff70` and the table
+updated again: all 50,000 further updates were non-HOT (`n_tup_hot_upd` stayed at 20,982), because changing an indexed
+column forces new index entries. The practical rules: keep frequently updated columns out of indexes where you can, and
+use a fillfactor of 70-90 on tables that are updated heavily. A later `+ALTER TABLE ... SET (fillfactor = 80)+` only affects
+newly written pages.
+
+== Declarative partitioning
+
+Partitioning splits one logical table into several physical ones by a key. It helps when queries filter on that key (the
+planner skips partitions), when old data must be dropped quickly (`DROP` a partition instead of a huge `DELETE`), and when
+maintenance should run per partition. It does not make an unfiltered query faster. A range-partitioned table:
+
+[source,sql]
+----
+CREATE TABLE measurements (
+  id bigint GENERATED ALWAYS AS IDENTITY, sensor int NOT NULL, region text NOT NULL,
+  taken_at date NOT NULL, value numeric
+) PARTITION BY RANGE (taken_at);
+CREATE TABLE measurements_2026_01 PARTITION OF measurements FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE measurements_2026_02 PARTITION OF measurements FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE measurements_2026_03 PARTITION OF measurements FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE measurements_default PARTITION OF measurements DEFAULT;
+INSERT INTO measurements (sensor, region, taken_at, value)
+SELECT g % 100, (ARRAY['eu','us','apac'])[1+g%3], DATE '2026-01-01' + (g % 90), random()*100
+FROM generate_series(1,300000) g;
+CREATE INDEX ON measurements (sensor);
+----
+
+`pass:c[\d+ measurements]` lists the partitions, and rows are distributed by `taken_at`:
+
+----
+Partition key: RANGE (taken_at)
+Indexes:
+    "measurements_sensor_idx" btree (sensor)
+Partitions: measurements_2026_01 FOR VALUES FROM ('2026-01-01') TO ('2026-02-01'),
+            measurements_2026_02 FOR VALUES FROM ('2026-02-01') TO ('2026-03-01'),
+            measurements_2026_03 FOR VALUES FROM ('2026-03-01') TO ('2026-04-01'),
+            measurements_default DEFAULT
+
+      partition       | count
+----------------------+--------
+ measurements_2026_01 | 103353
+ measurements_2026_02 |  93324
+ measurements_2026_03 | 103323
+----
+
+A query that filters on the partition key is pruned to one partition at plan time:
+
+[source,sql]
+----
+EXPLAIN (COSTS OFF) SELECT avg(value) FROM measurements WHERE taken_at >= '2026-02-10' AND taken_at < '2026-02-20';
+----
+
+----
+ Aggregate
+   ->  Seq Scan on measurements_2026_02 measurements
+         Filter: ((taken_at >= '2026-02-10'::date) AND (taken_at < '2026-02-20'::date))
+----
+
+With `SET enable_partition_pruning = off`, the same query scans all four partitions in a `Parallel Append`:
+
+----
+ Finalize Aggregate
+   ->  Gather
+         ->  Partial Aggregate
+               ->  Parallel Append
+                     ->  Parallel Seq Scan on measurements_2026_03 measurements_3
+                     ->  Parallel Seq Scan on measurements_2026_01 measurements_1
+                     ->  Parallel Seq Scan on measurements_2026_02 measurements_2
+                     ->  Parallel Seq Scan on measurements_default measurements_4
+----
+
+(Filters omitted for brevity.) Pruning also happens at execution time when the value is only known then, for example from
+a subquery. `EXPLAIN (ANALYZE)` shows pruned partitions as `never executed`:
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT avg(value) FROM measurements WHERE taken_at = (SELECT DATE '2026-02-15');
+----
+
+----
+               ->  Parallel Append (actual rows=1111.00 loops=3)
+                     ->  Parallel Seq Scan on measurements_2026_03 measurements_2 (never executed)
+                     ->  Parallel Seq Scan on measurements_2026_02 measurements_1 (actual rows=1111.00 loops=3)
+                           Rows Removed by Filter: 29997
+                     ->  Parallel Seq Scan on measurements_default measurements_3 (never executed)
+----
+
+A query that does not filter on the key must visit every partition and each partition's index:
+
+----
+ Aggregate
+   ->  Append
+         ->  Bitmap Heap Scan on measurements_2026_01 measurements_1
+               ->  Bitmap Index Scan on measurements_2026_01_sensor_idx
+         ... (one scan per partition, including measurements_default)
+----
+
+That is the cost of too many partitions: planning time and per-query overhead grow with their number, so keep the count in
+the tens or low hundreds.
+
+=== List and hash partitioning
+
+*List* partitioning assigns discrete values to partitions; *hash* spreads rows evenly by a modulus when there is no natural
+range:
+
+[source,sql]
+----
+CREATE TABLE stores (id int, region text) PARTITION BY LIST (region);
+CREATE TABLE stores_eu PARTITION OF stores FOR VALUES IN ('eu');
+CREATE TABLE stores_us PARTITION OF stores FOR VALUES IN ('us', 'ca');
+CREATE TABLE logins (user_id int, at timestamptz) PARTITION BY HASH (user_id);
+CREATE TABLE logins_0 PARTITION OF logins FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+-- ... logins_1, logins_2, logins_3 likewise
+EXPLAIN (COSTS OFF) SELECT * FROM logins WHERE user_id = 42;
+----
+
+----
+ Seq Scan on logins_2 logins
+   Filter: (user_id = 42)
+----
+
+1,000 inserted rows were distributed 259, 234, 276 and 231 across the four hash partitions.
+
+=== Maintaining partitions
+
+`DETACH PARTITION` turns a partition back into a standalone table in constant time; dropping it removes old data without the
+bloat a large `DELETE` leaves. A row outside every range lands in the `DEFAULT` partition (or errors if none exists):
+
+[source,sql]
+----
+ALTER TABLE measurements DETACH PARTITION measurements_2026_01;
+SELECT count(*) FROM measurements;      -- 196647
+DROP TABLE measurements_2026_01;
+INSERT INTO measurements (sensor,region,taken_at,value) VALUES (1,'eu','2027-01-01',1);
+SELECT tableoid::regclass, count(*) FROM measurements WHERE taken_at >= '2027-01-01' GROUP BY 1;
+----
+
+----
+       tableoid       | count
+----------------------+-------
+ measurements_default |     1
+----
+
+Automate creation of future partitions (a scheduled job, or the `pg_partman` extension) so the default partition does not
+silently grow. Primary keys and unique indexes on a partitioned table must include the partition key.
+
+== Bulk loading
+
+Row-by-row `INSERT` pays per-statement overhead; `COPY` streams rows and is the fastest way to load. These timings loaded
+CSV data from a 500,000-row file into three tables (the insert loop used a `DO` block on the server, so it has no network
+round trips and understates how much slower a client-side loop would be):
+
+[source,sql]
+----
+\timing on
+COPY load_copy FROM '/tmp/load.csv' CSV;            -- COPY 500000   Time: 141.237 ms
+COPY load_unlogged FROM '/tmp/load.csv' CSV;        -- COPY 500000   Time: 94.268 ms  (UNLOGGED table)
+DO $$ BEGIN FOR i IN 1..50000 LOOP INSERT INTO load_insert VALUES (i, md5(i::text)); END LOOP; END $$;   -- 72.522 ms
+----
+
+COPY loaded ten times as many rows in about twice the time of the insert loop, roughly five times faster per row, and the
+`UNLOGGED` target was faster still. The difference is WAL volume, measured with `pg_wal_lsn_diff`:
+
+----
+ wal_logged        22 MB
+ wal_unlogged      1792 bytes
+ wal_copy_freeze   23 MB
+----
+
+An `UNLOGGED` table writes no WAL, so it is faster to load, but it is truncated after a crash and is not replicated; use
+it only for data that can be rebuilt (staging tables, caches). `+COPY ... FREEZE+` produced no WAL savings here because
+`wal_level` is `replica`; it only avoids WAL with `wal_level = minimal`. A bulk-load checklist:
+
+* Use `COPY` (or `\copy` from `psql`) in large batches, or multi-row `INSERT` if `COPY` is not available.
+* Load first, then create indexes and add foreign keys, with a raised `maintenance_work_mem` and
+  `max_parallel_maintenance_workers`.
+* Run `ANALYZE` afterwards so the planner has statistics.
+* Convert an `UNLOGGED` table to a durable one with `+ALTER TABLE ... SET LOGGED+` once the load is validated.
+
+== Parallel query
+
+The planner can split a scan, join or aggregate across worker processes, with a `Gather` or `Gather Merge` node above the
+parallel part. Running the same aggregate over the 500,000-row `sales` table with parallelism disabled and enabled:
+
+[source,sql]
+----
+SET max_parallel_workers_per_gather = 0;
+EXPLAIN (ANALYZE, COSTS OFF, SUMMARY ON, BUFFERS OFF) SELECT cust, sum(amount) FROM sales GROUP BY cust;
+----
+
+----
+ HashAggregate (actual time=53.621..53.669 rows=1000.00 loops=1)
+   Group Key: cust
+   ->  Seq Scan on sales (actual time=0.075..21.675 rows=500000.00 loops=1)
+ Execution Time: 53.756 ms
+----
+
+With the default `max_parallel_workers_per_gather = 2`, the plan uses two workers and runs in 20.7 ms:
+
+----
+ Finalize GroupAggregate (actual time=19.510..20.622 rows=1000.00 loops=1)
+   ->  Gather Merge (actual time=19.505..20.423 rows=3000.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Sort ... ->  Partial HashAggregate ...
+               ->  Parallel Seq Scan on sales (actual time=0.062..5.981 rows=166666.67 loops=3)
+ Execution Time: 20.670 ms
+----
+
+Raising the setting to 4 still plans only two workers, because the number of workers the planner considers worthwhile
+grows with table size (`min_parallel_table_scan_size` is 8 MB, tripled for each extra worker); the 45 MB table
+justifies two. The controls:
+
+[cols="1,1,3",options="header"]
+|===
+|Setting |Default |Notes
+
+|`max_worker_processes` |8 |Total background workers; restart required
+|`max_parallel_workers` |8 |Workers available to parallel queries across the server
+|`max_parallel_workers_per_gather` |2 |Per query node; raise for analytics, keep low for OLTP
+|`parallel_setup_cost`, `parallel_tuple_cost` |1000, 0.1 |Raise to make the planner choose parallel plans less often
+|`max_parallel_maintenance_workers` |2 |Parallel `CREATE INDEX` and `VACUUM`
+|===
+
+Parallel query helps big scans and aggregates, not short OLTP lookups; on a server with many concurrent clients each
+parallel query competes for the same cores.
+
+== A tuning workflow
+
+. *Define the goal*: a latency target for specific queries, or throughput under a given concurrency.
+. *Baseline*: record `pg_stat_statements`, cache hit ratio, checkpoint counts, and the plan of the target query.
+. *Fix the biggest cost first*: the top statements by `total_exec_time` usually dominate. Add or fix indexes (see
+  xref:database/postgresql/indexing.adoc[Indexing]), rewrite queries, update statistics (`ANALYZE`, `CREATE STATISTICS`).
+. *Then settings*: memory, WAL and autovacuum, one change at a time, using `pg_settings` and `ALTER SYSTEM` so changes are
+  recorded and reversible.
+. *Verify* with the same workload and compare against the baseline; reset `pg_stat_statements_reset()` between runs.
+. *Re-check regularly*: data grows, plans change.
+
+Settings recommended by a "tuning calculator" are a starting point, not a result. The numbers in this page exist to show
+which counter to look at and what a change does.
+
+== Related pages
+
+* xref:database/postgresql/indexing.adoc[Indexing]
+* xref:database/postgresql/query-planning.adoc[Query Planning & EXPLAIN]
+* xref:database/postgresql/administration.adoc[Administration]
+* xref:database/postgresql/extensions.adoc[Extensions]
+* xref:database/postgresql/cheat-sheet.adoc[Cheat Sheet]
+* xref:database/diagnosing-slow-queries.adoc[Diagnosing Slow Queries]
+* xref:database/pagination-strategies.adoc[Pagination Strategies]
