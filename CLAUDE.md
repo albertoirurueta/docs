@@ -20,6 +20,17 @@ npx antora --fetch antora-playbook.yml   # same, but first fetch latest branches
 
 There is no lint/test suite — the only meaningful verification is that the Antora build completes without
 `xref`/AsciiDoc errors and that `build/site` renders correctly. `build/` is gitignored (generated output only).
+The helper scripts below are plain Node scripts (no build step) that audit or generate content under `modules/`:
+
+```bash
+npm run audit:index-template   # check the `==` heading order of every section/subsection index.adoc (0 violations)
+npm run cards                  # regenerate card-*/ide-*/download SVGs, restyle home cards, refresh grids and buttons
+npm run test:cards             # card structure, palette, up-to-date, orphan, IDE-grid and download-button checks
+npm run cheat-sheets [name]    # render one-page cheat-sheet PDFs from scripts/cheat-sheet-pdfs/sheets/
+npm run validate:mermaid       # needs a one-off `npm i --no-save mermaid@11 jsdom` (see Mermaid diagrams)
+node scripts/cards/insert-grids.mjs        # insert/refresh the card grid of every section index (part of npm run cards)
+node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see Disclaimer below)
+```
 
 ## Architecture
 
@@ -44,6 +55,17 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   delimited by `++++`. Bare `\( \)` / `\[ \]` in the AsciiDoc source are not converted and render as raw LaTeX, and the
   Antora build reports nothing. Braces inside LaTeX that look like `{name}` attributes trigger "missing attribute"
   warnings, so check the build output and the rendered page.
+- **The nav panel renders its top-level groups expanded by default** through a UI override: `antora-playbook.yml`
+  `ui.supplemental_files` maps `partials/nav-tree.hbs` to `ui-overrides/partials/nav-tree.hbs`, a copy of the
+  bundle's `nav-tree` partial (extracted from `ui-bundle.zip`, which stays unmodified) with two additions: an item is
+  rendered with `is-active` when it is at depth 0 or its parent asked for open children, and the children of an
+  untitled list wrapper and of the "Open Source Projects" group are open. The bundle's `site.js` toggles and the
+  "toggle all" button only flip `is-active`, so they keep working. Keep the override in step with the bundle's own
+  partial when the bundle is rebuilt (issue #255 will fold it into the bundle source). Nav entries must follow the
+  same order and the same titles as the section index's text list. **Nav entries never link to a `#fragment`**: on
+  the target page that link renders as `href="#..."`, which makes the bundle's `site.js` hash handler strip every
+  `is-active` class and collapse the default-open groups. The override also matches the top-level entry text
+  `Open Source Projects` exactly, so renaming it needs the same change in the override. `npm run test:cards` checks both.
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
   `modules/ROOT/nav.adoc`. This is the site's landing/root component — its pages don't describe this repo, they
   describe the overall site and link out to each remote component.
@@ -58,6 +80,87 @@ There is no lint/test suite — the only meaningful verification is that the Ant
   antora-playbook.yml`, then deploy `build/site` to the `gh-pages` branch via `crazy-max/ghaction-github-pages`.
   Because the remote content sources track release branches, a fresh build can pick up newly published releases
   from any of the dependent repos without any change in this repo.
+
+## Disclaimer, index templates and cards
+
+- **One shared disclaimer.** Every page except the home page (`modules/ROOT/pages/index.adoc`) includes
+  `include::partial$ai-disclaimer.adoc[]` directly after its header, and no per-topic disclaimer partials exist any
+  more (`modules/ROOT/partials/ai-disclaimer.adoc` is the only `*disclaimer*` partial). Anything a topic-specific
+  disclaimer used to say (legacy status, versions, "not legal advice", ...) lives in the page body or in the
+  subsection index's `== Version baseline`, never in a new partial. New pages copy the include line from a sibling.
+  `scripts/disclaimers/` holds the one-off consolidation tooling: `inventory.mjs` (lists disclaimer partials, their
+  non-AI content and including pages), `relocate.mjs` (moved that content and switched pages to the shared include,
+  writing `relocation-map.json`) and `traceability.mjs` (fails when a relocated version or caveat sentence has no
+  destination; `--ref <git-rev>` also checks that every partial present at that revision is in the map).
+  `relocate.mjs` refuses to run now that the per-topic partials are gone, so the committed map is the record. When a
+  relocated sentence is later rewritten on purpose (for example a version baseline that moves to a newer release),
+  update its `text` in `relocation-map.json` and keep the old wording in a `superseded` field.
+- **Index templates.** Every `index.adoc` of a section (`<section>/index.adoc`) and of a subsection
+  (`<section>/<subsection>/index.adoc`) uses a fixed `==` heading order, audited by `npm run audit:index-template`
+  (`scripts/index-template/audit.mjs`, `--list`/`--json` for details; it must report 0 with violations). Nested
+  indexes one level deeper (`<section>/<subsection>/<topic>/index.adoc`) are outside the template: the audit lists
+  them as warnings only (`--strict` makes them fail). Section
+  index: `Sections`, `Related material on this site`, `Bibliography`, `References` (optional ones may be absent, the order
+  never changes). Subsection index: `Version baseline`, `What's covered`, `Reading path`, `Running example`, `Related
+  material on this site`, `Bibliography`, `References`. Use these exact names (no "Reading order", "Learning path"
+  and the like) and update `#_anchor` xrefs when a heading is renamed. Long conceptual content of a section index
+  (what the area is, targeted versions, learning path, concept-to-page map) goes in a sibling `<section>/overview.adoc`
+  (beside any `comparison.adoc`), linked from the index intro and as the first nav entry of the section; the index
+  keeps only the intro, the card grid and the template sections.
+- **Section cards.** Each section index shows a three-column card grid (the home page's table/card pattern) with one
+  `image::card-<section>-<subsection>.svg[...]` per subsection, in the same order and with the same titles as the
+  index's `== Sections` text list and the nav. Cards are 600x600 SVG files in `modules/ROOT/images/` generated by
+  `scripts/cards/`, never drawn by hand: `manifest.mjs` (one entry per subsection or comparison page, section
+  gradients, logo key), `extract-logos.mjs` (reads logo path data into `logos.json` from the Simple Icons and Devicon
+  npm packages, treated as untrusted input), `generate-cards.mjs` (`npm run cards`; also rewrites `LOGO-SOURCES.md`),
+  `insert-grids.mjs` (inserts/refreshes each section's grid between the intro and `== Sections`) and
+  `generate-cards.test.mjs` (`npm run test:cards`). Logos are white monochrome marks from Simple Icons (CC0-1.0, key
+  `si:<slug>`) or Devicon (MIT, `dv:<slug>`); where neither has the mark, or the owner is not represented (Java,
+  AWS, Microsoft products), a drawn white-line glyph (`gl:<name>`) is used and no trademark is redrawn.
+  `LOGO-SOURCES.md` lists the source and licence of every card and the home page carries the trademark notice.
+  **Adding a subsection means a manifest entry, then `npm run cards` and `npm run test:cards`**, plus the nav entry
+  and the `== Sections` text entry.
+- **One palette for every card-like SVG.** `scripts/cards/palette.mjs` derives all colours from the UI bundle's
+  animated top bar (`--navbar-background1/2/3`: `#ff6ec4`, `#7873f5`, `#4ade80`, the green one step deeper at a
+  gradient's end so white text stays legible). It defines six diagonal three-stop variants and assigns one per
+  section (`sectionVariant`) and per non-section group (`otherVariant`: Java projects, AI catalog, auth server, IDE
+  cards). All cards share one template in `generate-cards.mjs`: gradient, soft highlight, dark lower scrim, a
+  translucent logo disc, and a white pill button with indigo text ("Explore", or "Visit" for external links). Never
+  hand-pick a colour in an SVG: change the palette and run `npm run cards`. The 30 hand-made home page cards
+  (`home-cards.mjs`) keep their hand-drawn logo and text layout. `npm run cards` only re-applies the palette to them
+  (`restyle()`), so a new home card must keep the house structure: logo at (300,170), the button `rect` at
+  `y="44x"` followed by its `text`.
+- **IDE cards.** Every product link on an `ides-and-tools.adoc` page (`* https://...[*<name>*] -- description`)
+  also shows as a card. Each `==` group gets a three-column grid, inserted before its list by
+  `scripts/cards/insert-ide-grids.mjs`, with cells `image::ide-<slug>.svg["<name>",link="<url>"]`. The text list
+  stays. Cards come from `ide-manifest.mjs`, one per product, with aliases for name variants on different pages.
+  Microsoft products get a glyph, and a VS Code extension shows the logo of the language it supports, never the
+  editor's. **A new product link means a manifest entry (and its logo in `logos.json` via `extract-logos.mjs`),
+  then `npm run cards`.** The tests fail on a link without a card and on an unused card.
+- **Cheat-sheet download button.** `download-cheat-sheet-pdf.svg` is the one download button for every
+  `cheat-sheet*.adoc` page. `scripts/cards/insert-download-buttons.mjs` moves the page's main PDF
+  (`xref:attachment$<x>.pdf[Download ...]`) to a block button right after the introduction, written as
+  `image::download-cheat-sheet-pdf.svg["<label>",width=320,xref=attachment$<x>.pdf]`. It also turns any other
+  standalone "Download ..." line into a button in place, turns a table cell holding only a download link into an
+  inline `image:` button, and removes a `== Download` section left empty. Links in running text stay as text. A
+  new cheat sheet with a PDF gets the button from `npm run cards`. A cheat sheet without a PDF in
+  `modules/ROOT/attachments/` gets none, and the script lists those pages.
+- **Cheat-sheet PDFs.** A cheat sheet's printable PDF is a single A4 page in the house layout: title, subtitle with
+  the version baseline and "AI-generated summary — verify against …", a three-column grid of tinted boxes, and a
+  footer. Older PDFs were rendered by hand, so their sources are not in the repository. New ones are rendered by
+  `scripts/cheat-sheet-pdfs/render.mjs` (`npm run cheat-sheets [name]`) from a content module in
+  `scripts/cheat-sheet-pdfs/sheets/<name>.mjs` (`file`, `title`, `subtitle`, `footer`, 6–12 `boxes` of
+  `{ title, color, items: [{ label, code | text }] }`, code lines ≤ 44 characters, the column width) through headless Chrome. The run
+  fails if a sheet spills onto a second page. The content condenses the cheat-sheet page, so it is never written
+  from memory. Link the PDF from the page with `xref:attachment$<file>[Download the <Name> Cheat Sheet (PDF)]`, then
+  run `npm run cards` to turn the link into the top button. Check with `npm run test:cheat-sheets`.
+- **Nav titles and order.** The nav (`modules/ROOT/nav.adoc` and the `partials/nav-<name>.adoc` includes) uses bare
+  product or topic names ("Java", "JavaScript", "Spring Boot", "MongoDB"; no "Reference"/"Development" suffix, no
+  "Python " prefix, no parenthetical expansion such as "AWS (Amazon Web Services)"), and the nav entry, the card
+  title and the index link text are the same string (`npm run test:cards` checks it; a title too long for one line is
+  drawn on two lines, never abbreviated). Nav order equals
+  the card order equals the order of the section's text list; the home page lists "Guides & References" before
+  "Open Source Projects", with "About me" last.
 
 ## Images and figures
 

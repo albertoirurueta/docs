@@ -1,0 +1,852 @@
+= Indexing
+:description: PostgreSQL index types and when to use each: B-tree (multicolumn, covering, partial, expression), hash, GIN, GiST, SP-GiST, BRIN, unique and exclusion constraints, concurrent builds, index-only scans, maintenance and bloat, and full-text search basics.
+:keywords: PostgreSQL indexes, B-tree, multicolumn index, INCLUDE, covering index, partial index, expression index, hash index, GIN, GiST, SP-GiST, BRIN, bloom, exclusion constraint, CREATE INDEX CONCURRENTLY, index-only scan, visibility map, REINDEX, bloat, full-text search, tsvector, tsquery, websearch_to_tsquery, ts_rank, pgstattuple
+
+include::partial$ai-disclaimer.adoc[]
+
+An index is a separate data structure that lets the planner find rows without reading the whole table. PostgreSQL
+ships six index access methods (B-tree, hash, GIN, GiST, SP-GiST and BRIN), each suited to different operators, and an
+extension mechanism for more. Choosing the right one, and knowing what an index costs, is most of practical query
+tuning. This page shows each method on generated data with `EXPLAIN` evidence; reading the plans themselves is the
+subject of xref:database/postgresql/query-planning.adoc[Query Planning & EXPLAIN], and the general method for
+a slow query is in xref:database/diagnosing-slow-queries.adoc[Diagnosing Slow Queries].
+
+Everything ran on *PostgreSQL 18.6*. The shop tables are too small for an index to matter, so the demos use a
+generated table, `big_orders`, of 500,000 rows with a seeded `random()` (`setseed(0.42)`). It lives in a scratch
+schema, `lab`; timings are from an arm64 laptop in a container and will differ on your hardware, but the plan shapes
+will not. Each `EXPLAIN` below uses `ANALYZE` so the plans show real row counts.
+
+== The test data
+
+[source,sql]
+----
+DROP TABLE IF EXISTS big_orders;
+SELECT setseed(0.42);
+CREATE TABLE big_orders (
+  id          bigint PRIMARY KEY,
+  customer_id int NOT NULL,
+  status      text NOT NULL,
+  amount      numeric(10,2) NOT NULL,
+  created_at  timestamptz NOT NULL,
+  email       text NOT NULL,
+  tags        text[] NOT NULL,
+  doc         jsonb NOT NULL,
+  note        text NOT NULL
+);
+INSERT INTO big_orders
+SELECT g,
+       1 + (random() * 20000)::int,
+       CASE WHEN random() < 0.02 THEN 'open' WHEN random() < 0.05 THEN 'cancelled' ELSE 'shipped' END,
+       round((random() * 500)::numeric, 2),
+       timestamptz '2025-01-01 00:00:00+00' + g * interval '1 minute',
+       'User' || (1 + (random() * 20000)::int) || '@Example.com',
+       ARRAY(SELECT (ARRAY['office','ergonomic','sale','led','usb','display','gift','new'])[1 + (random()*7)::int] FROM generate_series(1, 1 + (g % 3)::int) AS k WHERE g > 0),
+       jsonb_build_object('channel', (ARRAY['web','mobile','store'])[1 + (random()*2)::int], 'items', 1 + (random()*5)::int, 'gift', random() < 0.1),
+       (SELECT string_agg((ARRAY['fast','delivery','broken','chair','desk','lamp','refund','late','gift','monitor','cable','thanks'])[1 + (random()*11)::int], ' ') FROM generate_series(1, 6) AS w WHERE g > 0)
+FROM generate_series(1, 500000) AS g;
+ANALYZE big_orders;
+----
+
+The table is about 110 MB with only its primary-key index. `created_at` grows monotonically with `id`
+(physically ordered, which matters for BRIN), `customer_id` has 20,000 distinct values, `status` is skewed (about
+2% `open`, 5% `cancelled`, the rest `shipped`), and `tags`, `doc` and `note` are an array, a `jsonb` document and a
+sentence of random words for the GIN and full-text demos.
+
+== How an index changes a plan
+
+Without an index, a selective filter forces a *sequential scan* of every page of the table, about 14,000 buffers here (split over parallel workers):
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM big_orders WHERE customer_id = 4242;
+----
+
+[source,text]
+----
+                                                          QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------
+ Gather  (cost=1000.00..17888.77 rows=26 width=189) (actual time=0.447..7.642 rows=32.00 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=14282
+   ->  Parallel Seq Scan on big_orders  (cost=0.00..16886.17 rows=11 width=189) (actual time=0.510..5.714 rows=10.67 loops=3)
+         Filter: (customer_id = 4242)
+         Rows Removed by Filter: 166656
+         Buffers: shared hit=14282
+ Planning:
+   Buffers: shared hit=116
+ Planning Time: 0.136 ms
+ Execution Time: 7.667 ms
+(12 rows)
+----
+
+After a B-tree index on the filtered column the planner reads three index pages and about thirty table pages instead
+(a *bitmap heap scan*; with fewer matching rows it would choose a plain *index scan*):
+
+[source,sql]
+----
+CREATE INDEX big_orders_customer_idx ON big_orders (customer_id);
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM big_orders WHERE customer_id = 4242;
+----
+
+[source,text]
+----
+                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders  (cost=4.62..105.62 rows=26 width=189) (actual time=0.011..0.033 rows=32.00 loops=1)
+   Recheck Cond: (customer_id = 4242)
+   Heap Blocks: exact=31
+   Buffers: shared hit=31 read=3
+   ->  Bitmap Index Scan on big_orders_customer_idx  (cost=0.00..4.62 rows=26 width=0) (actual time=0.006..0.006 rows=32.00 loops=1)
+         Index Cond: (customer_id = 4242)
+         Index Searches: 1
+         Buffers: shared read=3
+ Planning:
+   Buffers: shared hit=94 read=1
+ Planning Time: 0.127 ms
+ Execution Time: 0.049 ms
+(12 rows)
+----
+
+Execution time dropped from several milliseconds (and some 14,000 buffers) to well under a millisecond. An index is not free: every
+`INSERT`, and every `UPDATE` that changes an indexed column or cannot be a HOT update, must maintain it, it takes disk
+space and memory, and it adds work to `VACUUM`. Index what queries actually filter, join and sort on.
+
+== B-tree
+
+The default `CREATE INDEX` builds a B-tree, which supports `<`, `+<=+`, `=`, `>=`, `>` and `BETWEEN`, `IN`, `IS NULL`,
+sorting (`ORDER BY` without a sort step), and `+LIKE 'prefix%'+` under a suitable collation or `text_pattern_ops`. It
+is the right choice unless an operator needs something else.
+
+=== Multicolumn indexes
+
+An index on `(customer_id, created_at DESC)` serves equality on the leading column and a sort on the next, so
+"the three newest orders of a customer" becomes a few index entries with no sort and no extra table pages:
+
+[source,sql]
+----
+DROP INDEX big_orders_customer_idx;
+CREATE INDEX big_orders_cust_date_idx ON big_orders (customer_id, created_at DESC);
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM big_orders WHERE customer_id = 4242 ORDER BY created_at DESC LIMIT 3;
+----
+
+[source,text]
+----
+                                                                    QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.42..12.94 rows=3 width=189) (actual time=0.007..0.010 rows=3.00 loops=1)
+   Buffers: shared hit=2 read=3
+   ->  Index Scan using big_orders_cust_date_idx on big_orders  (cost=0.42..108.87 rows=26 width=189) (actual time=0.007..0.009 rows=3.00 loops=1)
+         Index Cond: (customer_id = 4242)
+         Index Searches: 1
+         Buffers: shared hit=2 read=3
+ Planning:
+   Buffers: shared hit=131 read=1
+ Planning Time: 0.156 ms
+ Execution Time: 0.021 ms
+(10 rows)
+----
+
+The rule of thumb is to put equality columns first and the range or sort column last; the index also serves queries
+on the leading column alone, so it replaced the single-column index above. A condition on a non-leading column alone
+used to be a poor fit. PostgreSQL 18 adds *skip scan*: when the leading column has few distinct values, the executor
+probes each value in turn. With `status` (three values) first:
+
+[source,sql]
+----
+CREATE INDEX big_orders_status_created_idx ON big_orders (status, created_at);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT id FROM big_orders WHERE created_at = '2025-03-01 00:00:00+00';
+----
+
+[source,text]
+----
+                                       QUERY PLAN
+-----------------------------------------------------------------------------------------
+ Index Scan using big_orders_status_created_idx on big_orders (actual rows=1.00 loops=1)
+   Index Cond: (created_at = '2025-03-01 00:00:00+00'::timestamp with time zone)
+   Index Searches: 7
+ Planning Time: 0.118 ms
+ Execution Time: 0.054 ms
+(5 rows)
+----
+
+`Index Searches: 7` shows the skip scan at work: the executor probed the index several times, jumping between the
+`status` values, instead of reading the whole index. With 20,000 distinct customers the same trick would not pay, so
+a condition on `created_at` alone needs an index of its own. Check `Index Searches` in `EXPLAIN (ANALYZE)` output.
+
+=== Covering indexes, index-only scans and the visibility map
+
+`INCLUDE` appends non-key columns to the leaf pages so that a query needing only those columns can be answered from
+the index alone (an *index-only scan*). Because MVCC visibility lives in the table (see
+xref:database/postgresql/architecture.adoc[Architecture]), the scan must still check that each row is visible; it
+avoids visiting the table page only for pages marked *all-visible* in the *visibility map*, which `VACUUM` maintains.
+
+[source,sql]
+----
+DROP INDEX big_orders_cust_date_idx;
+CREATE INDEX big_orders_cust_date_idx ON big_orders (customer_id, created_at DESC) INCLUDE (amount);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT customer_id, created_at, amount FROM big_orders WHERE customer_id = 4242;
+VACUUM (ANALYZE) big_orders;
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT customer_id, created_at, amount FROM big_orders WHERE customer_id = 4242;
+----
+
+[source,text]
+----
+                                   QUERY PLAN
+---------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders (actual rows=32.00 loops=1)
+   Recheck Cond: (customer_id = 4242)
+   Heap Blocks: exact=31
+   ->  Bitmap Index Scan on big_orders_cust_date_idx (actual rows=32.00 loops=1)
+         Index Cond: (customer_id = 4242)
+         Index Searches: 1
+ Planning Time: 0.142 ms
+ Execution Time: 0.049 ms
+(8 rows)
+
+                                        QUERY PLAN
+------------------------------------------------------------------------------------------
+ Index Only Scan using big_orders_cust_date_idx on big_orders (actual rows=32.00 loops=1)
+   Index Cond: (customer_id = 4242)
+   Heap Fetches: 0
+   Index Searches: 1
+ Planning Time: 0.038 ms
+ Execution Time: 0.009 ms
+(6 rows)
+----
+
+Before the `VACUUM` the visibility map was empty, so the planner knew an index-only scan would need heap visits and
+chose a bitmap scan. Afterwards it picked an *Index Only Scan*. Updating rows clears the all-visible bit of their pages,
+and `Heap Fetches` shows how often the scan had to go to the table anyway:
+
+[source,sql]
+----
+UPDATE big_orders SET amount = amount + 1 WHERE customer_id = 4242 AND id % 2 = 0;
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT customer_id, created_at, amount FROM big_orders WHERE customer_id = 4242;
+----
+
+[source,text]
+----
+                                        QUERY PLAN
+------------------------------------------------------------------------------------------
+ Index Only Scan using big_orders_cust_date_idx on big_orders (actual rows=32.00 loops=1)
+   Index Cond: (customer_id = 4242)
+   Heap Fetches: 31
+   Index Searches: 1
+ Planning Time: 0.021 ms
+ Execution Time: 0.032 ms
+(6 rows)
+----
+
+A table that is updated constantly gets little benefit from index-only scans until autovacuum catches up. `INCLUDE`
+columns are not searchable and not part of uniqueness; use them for the few columns that a hot query selects.
+
+=== Partial indexes
+
+A partial index covers only the rows matching a `WHERE` predicate. It is much smaller and cheaper to maintain, and ideal
+for a small, frequently queried subset such as open orders or unprocessed jobs. The query's own `WHERE` must imply the
+index predicate.
+
+[source,sql]
+----
+CREATE INDEX big_orders_open_idx ON big_orders (created_at) WHERE status = 'open';
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT id, amount FROM big_orders WHERE status = 'open' AND created_at > '2025-12-01';
+SELECT pg_size_pretty(pg_relation_size('big_orders_open_idx')) AS partial_index,
+       pg_size_pretty(pg_relation_size('big_orders_status_created_idx')) AS full_index;
+----
+
+[source,text]
+----
+                                   QUERY PLAN
+---------------------------------------------------------------------------------
+ Index Scan using big_orders_open_idx on big_orders (actual rows=392.00 loops=1)
+   Index Cond: (created_at > '2025-12-01 00:00:00+00'::timestamp with time zone)
+   Index Searches: 1
+ Planning Time: 0.128 ms
+ Execution Time: 0.089 ms
+(5 rows)
+
+ partial_index | full_index
+---------------+------------
+ 240 kB        | 15 MB
+(1 row)
+----
+
+The partial index is under 2% of the size of the full one. The same technique makes a *partial unique index*:
+`+CREATE UNIQUE INDEX ... ON t (email) WHERE deleted_at IS NULL+` enforces uniqueness among live rows only.
+
+=== Expression indexes
+
+An index can be built on an expression, which is the fix for a function call that makes a plain index unusable. The
+query must repeat the same expression:
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT id FROM big_orders WHERE lower(email) = 'user77@example.com';
+CREATE INDEX big_orders_email_lower_idx ON big_orders (lower(email));
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT id FROM big_orders WHERE lower(email) = 'user77@example.com';
+----
+
+[source,text]
+----
+                            QUERY PLAN
+------------------------------------------------------------------
+ Gather (actual rows=24.00 loops=1)
+   Workers Planned: 2
+   Workers Launched: 2
+   ->  Parallel Seq Scan on big_orders (actual rows=8.00 loops=3)
+         Filter: (lower(email) = 'user77@example.com'::text)
+         Rows Removed by Filter: 166659
+ Planning Time: 0.130 ms
+ Execution Time: 30.313 ms
+(8 rows)
+
+                                    QUERY PLAN
+-----------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders (actual rows=24.00 loops=1)
+   Recheck Cond: (lower(email) = 'user77@example.com'::text)
+   Heap Blocks: exact=24
+   ->  Bitmap Index Scan on big_orders_email_lower_idx (actual rows=24.00 loops=1)
+         Index Cond: (lower(email) = 'user77@example.com'::text)
+         Index Searches: 1
+ Planning Time: 0.068 ms
+ Execution Time: 0.038 ms
+(8 rows)
+----
+
+== Hash indexes
+
+A hash index supports only equality. Since PostgreSQL 10 it is crash-safe and WAL-logged, so it is a legitimate choice,
+but it cannot enforce uniqueness, cannot serve ranges or sorting, and is rarely smaller than a B-tree, because B-trees
+deduplicate repeated keys (since PostgreSQL 13). In this data set, with many rows per e-mail address:
+
+[source,sql]
+----
+CREATE INDEX big_orders_email_hash ON big_orders USING hash (email);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT id FROM big_orders WHERE email = 'User77@Example.com';
+SELECT pg_size_pretty(pg_relation_size('big_orders_email_hash')) AS hash_size,
+       pg_size_pretty(pg_relation_size('big_orders_email_lower_idx')) AS btree_size;
+----
+
+[source,text]
+----
+                                  QUERY PLAN
+------------------------------------------------------------------------------
+ Bitmap Heap Scan on big_orders (actual rows=24.00 loops=1)
+   Recheck Cond: (email = 'User77@Example.com'::text)
+   Heap Blocks: exact=24
+   ->  Bitmap Index Scan on big_orders_email_hash (actual rows=24.00 loops=1)
+         Index Cond: (email = 'User77@Example.com'::text)
+         Index Searches: 1
+ Planning Time: 0.192 ms
+ Execution Time: 0.144 ms
+(8 rows)
+
+ hash_size | btree_size
+-----------+------------
+ 16 MB     | 4144 kB
+(1 row)
+----
+
+The hash index is about four times larger than the B-tree on the same column and no faster for this lookup, so a
+B-tree is the default recommendation even for equality, unless the keys are very long.
+
+== GIN: arrays, jsonb and full-text search
+
+A *Generalized Inverted Index* maps each element (array member, `jsonb` key or value, lexeme) to the rows that contain
+it. It accelerates containment and overlap operators on composite values: `@>`, `<@`, `&&` on arrays, `@>`, `?` and
+`@@` on `jsonb`, and `@@` on `tsvector`. Reads are fast; writes are slower, which GIN softens with a *pending list* that
+is merged lazily.
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM big_orders WHERE tags @> ARRAY['gift','new'];
+CREATE INDEX big_orders_tags_gin ON big_orders USING gin (tags);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM big_orders WHERE tags @> ARRAY['gift','new'];
+----
+
+[source,text]
+----
+                                   QUERY PLAN
+---------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Seq Scan on big_orders (actual rows=4220.67 loops=3)
+                     Filter: (tags @> '{gift,new}'::text[])
+                     Rows Removed by Filter: 162446
+ Planning Time: 0.397 ms
+ Execution Time: 15.952 ms
+(10 rows)
+
+                                     QUERY PLAN
+-------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Bitmap Heap Scan on big_orders (actual rows=12662.00 loops=1)
+         Recheck Cond: (tags @> '{gift,new}'::text[])
+         Heap Blocks: exact=8513
+         ->  Bitmap Index Scan on big_orders_tags_gin (actual rows=12662.00 loops=1)
+               Index Cond: (tags @> '{gift,new}'::text[])
+               Index Searches: 1
+ Planning Time: 0.078 ms
+ Execution Time: 7.393 ms
+(9 rows)
+----
+
+For `jsonb` the default operator class supports `@>`, `?`, `?|` and `?&`; `jsonb_path_ops` supports only `@>` and the
+`jsonpath` operators but produces a smaller, faster index. See xref:database/postgresql/json.adoc[JSON & JSONB] for the
+operators themselves.
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM big_orders WHERE doc @> '{"channel":"store","gift":true}';
+CREATE INDEX big_orders_doc_gin ON big_orders USING gin (doc jsonb_path_ops);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM big_orders WHERE doc @> '{"channel":"store","gift":true}';
+SELECT pg_size_pretty(pg_relation_size('big_orders_tags_gin')) AS tags_gin, pg_size_pretty(pg_relation_size('big_orders_doc_gin')) AS doc_gin;
+----
+
+[source,text]
+----
+                                    QUERY PLAN
+----------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Seq Scan on big_orders (actual rows=4124.33 loops=3)
+                     Filter: (doc @> '{"gift": true, "channel": "store"}'::jsonb)
+                     Rows Removed by Filter: 162542
+ Planning Time: 0.184 ms
+ Execution Time: 17.119 ms
+(10 rows)
+
+                                     QUERY PLAN
+------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Bitmap Heap Scan on big_orders (actual rows=12373.00 loops=1)
+         Recheck Cond: (doc @> '{"gift": true, "channel": "store"}'::jsonb)
+         Heap Blocks: exact=8378
+         ->  Bitmap Index Scan on big_orders_doc_gin (actual rows=12373.00 loops=1)
+               Index Cond: (doc @> '{"gift": true, "channel": "store"}'::jsonb)
+               Index Searches: 1
+ Planning Time: 0.113 ms
+ Execution Time: 10.074 ms
+(9 rows)
+
+ tags_gin | doc_gin
+----------+---------
+ 1168 kB  | 1864 kB
+(1 row)
+----
+
+== Full-text search basics
+
+Full-text search finds documents that match a query by *meaning of words*, not by substring: text is parsed into
+*lexemes* (normalized words with stop words removed and stemming applied for a configured language), compared with
+the `@@` operator, and ranked. The two types are:
+
+* `tsvector`: a sorted list of lexemes with positions, produced by `to_tsvector(config, text)`.
+* `tsquery`: a boolean query of lexemes with `&` (and), `|` (or), `!` (not) and `+<->+` (followed by), produced by
+  `to_tsquery`, `plainto_tsquery`, `phraseto_tsquery` or, for user input, `websearch_to_tsquery`.
+
+[source,sql]
+----
+SELECT to_tsvector('english', 'The quick brown foxes jumped over the lazy dogs');
+SELECT websearch_to_tsquery('english', '"fast delivery" refund -late');
+SELECT to_tsvector('english', 'fast delivery of the refund') @@ websearch_to_tsquery('english', '"fast delivery" refund -late') AS matches;
+----
+
+[source,text]
+----
+                      to_tsvector
+-------------------------------------------------------
+ 'brown':3 'dog':9 'fox':4 'jump':5 'lazi':8 'quick':2
+(1 row)
+
+            websearch_to_tsquery
+--------------------------------------------
+ 'fast' <-> 'deliveri' & 'refund' & !'late'
+(1 row)
+
+ matches
+---------
+ t
+(1 row)
+----
+
+`websearch_to_tsquery` accepts the syntax users know from web search engines (quoted phrases, `or`, a leading `-`) and
+never raises a syntax error, so it is safe on raw input. Stop words (`the`, `of`) are dropped and `foxes` becomes `fox`.
+Computing `to_tsvector` for every row on every query is slow, as the unindexed query shows. The standard remedy is a
+stored `tsvector` column, kept in sync by a generated column, with a GIN index:
+
+[source,sql]
+----
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM big_orders WHERE to_tsvector('english', note) @@ websearch_to_tsquery('english', 'refund -late');
+ALTER TABLE big_orders ADD COLUMN note_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', note)) STORED;
+CREATE INDEX big_orders_note_fts ON big_orders USING gin (note_tsv);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM big_orders WHERE note_tsv @@ websearch_to_tsquery('english', 'refund -late');
+----
+
+[source,text]
+----
+                                                 QUERY PLAN
+------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1.00 loops=1)
+   ->  Gather (actual rows=3.00 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         ->  Partial Aggregate (actual rows=1.00 loops=3)
+               ->  Parallel Seq Scan on big_orders (actual rows=44136.33 loops=3)
+                     Filter: (to_tsvector('english'::regconfig, note) @@ '''refund'' & !''late'''::tsquery)
+                     Rows Removed by Filter: 122530
+ Planning Time: 0.851 ms
+ Execution Time: 380.211 ms
+(10 rows)
+
+                                      QUERY PLAN
+--------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Bitmap Heap Scan on big_orders (actual rows=132409.00 loops=1)
+         Recheck Cond: (note_tsv @@ '''refund'' & !''late'''::tsquery)
+         Heap Blocks: exact=18735
+         ->  Bitmap Index Scan on big_orders_note_fts (actual rows=132409.00 loops=1)
+               Index Cond: (note_tsv @@ '''refund'' & !''late'''::tsquery)
+               Index Searches: 1
+ Planning Time: 0.133 ms
+ Execution Time: 32.886 ms
+(9 rows)
+----
+
+`ts_rank` (or `ts_rank_cd`, which accounts for proximity) scores matches for ordering, and `ts_headline` marks the
+matching words in the original text:
+
+[source,sql]
+----
+SELECT id, note, round(ts_rank(note_tsv, q)::numeric, 4) AS rank
+FROM big_orders, websearch_to_tsquery('english', 'refund monitor') AS q
+WHERE note_tsv @@ q ORDER BY rank DESC, id LIMIT 3;
+SELECT ts_headline('english', note, websearch_to_tsquery('english', 'refund monitor'), 'StartSel=[, StopSel=]') AS snippet
+FROM big_orders WHERE id = 3;
+----
+
+[source,text]
+----
+   id   |                     note                     |  rank
+--------+----------------------------------------------+--------
+ 174902 | refund monitor refund monitor monitor refund | 0.6044
+ 250820 | monitor refund monitor refund refund monitor | 0.6044
+ 164558 | monitor refund refund refund monitor monitor | 0.6043
+(3 rows)
+
+                 snippet
+-----------------------------------------
+ chair late cable fast delivery delivery
+(1 row)
+----
+
+Ranking has to evaluate the rank for every matching row, which is why it is expensive when a query matches a large
+fraction of the table (here about 132,000 rows matched `refund -late`): limit the candidate set before ranking, or use more
+selective terms. Weights (`setweight`, labels `A` to `D`) let a title outweigh a body, `unaccent` and the `pg_trgm`
+extension add accent-insensitive and typo-tolerant matching (see xref:database/postgresql/extensions.adoc[Extensions]),
+and a dedicated search engine (see xref:database/elasticsearch/index.adoc[Elasticsearch]) takes over when you need
+facets, relevance tuning or very large corpora.
+
+== GiST, SP-GiST and exclusion constraints
+
+A *GiST* (Generalized Search Tree) index is a framework for balanced trees over data that has no total order: ranges,
+geometric types, `inet`, trigram similarity, and PostGIS geometries. It answers overlap, containment, nearest-neighbour
+(`+ORDER BY a <-> b+`) and "does this region intersect" questions. An *exclusion constraint* generalizes a unique
+constraint: no two rows may satisfy the given operators against each other, enforced by a GiST (or SP-GiST)
+index. The classic use is "no overlapping bookings for the same room"; equality on a scalar column needs the
+`btree_gist` extension.
+
+[source,sql]
+----
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+CREATE TABLE room_reservations (
+  room   text NOT NULL,
+  during tstzrange NOT NULL,
+  EXCLUDE USING gist (room WITH =, during WITH &&)
+);
+INSERT INTO room_reservations VALUES ('blue', '[2026-05-01 09:00+00, 2026-05-01 11:00+00)');
+INSERT INTO room_reservations VALUES ('blue', '[2026-05-01 10:00+00, 2026-05-01 12:00+00)');
+INSERT INTO room_reservations VALUES ('blue', '[2026-05-01 11:00+00, 2026-05-01 12:00+00)');
+INSERT INTO room_reservations VALUES ('green', '[2026-05-01 10:00+00, 2026-05-01 12:00+00)');
+SELECT room, during FROM room_reservations ORDER BY room, lower(during);
+----
+
+[source,text]
+----
+ERROR:  conflicting key value violates exclusion constraint "room_reservations_room_during_excl"
+DETAIL:  Key (room, during)=(blue, ["2026-05-01 10:00:00+00","2026-05-01 12:00:00+00")) conflicts with existing key (room, during)=(blue, ["2026-05-01 09:00:00+00","2026-05-01 11:00:00+00")).
+ room  |                       during
+-------+-----------------------------------------------------
+ blue  | ["2026-05-01 09:00:00+00","2026-05-01 11:00:00+00")
+ blue  | ["2026-05-01 11:00:00+00","2026-05-01 12:00:00+00")
+ green | ["2026-05-01 10:00:00+00","2026-05-01 12:00:00+00")
+(3 rows)
+----
+
+The second insert overlaps the first for the same room and was rejected; the third only touches it (the upper bound is
+exclusive) and the fourth is another room. The database enforces what application code could not do race-free.
+
+*SP-GiST* (space-partitioned GiST) supports non-balanced partitioning trees such as radix trees for text and
+IP prefixes, quad-trees and k-d trees for points. It is useful for data with natural clustering, like IP networks:
+
+[source,sql]
+----
+CREATE TABLE sensor_log AS
+SELECT g AS id,
+       ('10.' || (g % 256) || '.' || ((g / 256) % 256) || '.' || (g % 200))::inet AS addr,
+       timestamptz '2025-01-01 00:00:00+00' + g * interval '1 second' AS ts,
+       (random() * 100)::int AS v
+FROM generate_series(1, 300000) AS g;
+ANALYZE sensor_log;
+CREATE INDEX sensor_log_addr_spgist ON sensor_log USING spgist (addr);
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM sensor_log WHERE addr << inet '10.5.0.0/16';
+----
+
+[source,text]
+----
+                                      QUERY PLAN
+---------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Bitmap Heap Scan on sensor_log (actual rows=1172.00 loops=1)
+         Recheck Cond: (addr << '10.5.0.0/16'::inet)
+         Heap Blocks: exact=1172
+         ->  Bitmap Index Scan on sensor_log_addr_spgist (actual rows=1172.00 loops=1)
+               Index Cond: (addr << '10.5.0.0/16'::inet)
+               Index Searches: 1
+ Planning Time: 0.057 ms
+ Execution Time: 0.566 ms
+(9 rows)
+----
+
+== BRIN
+
+A *Block Range Index* stores only the minimum and maximum of a column for each range of table pages (128 pages by
+default). It is tiny and nearly free to maintain, and it works when the column's values correlate with physical row
+order, as an append-only `created_at`, an increasing id or a serial number does. `pg_stats.correlation` close to 1 or
+-1 is the signal.
+
+[source,sql]
+----
+CREATE INDEX sensor_log_ts_btree ON sensor_log (ts);
+CREATE INDEX sensor_log_ts_brin ON sensor_log USING brin (ts) WITH (pages_per_range = 32);
+SELECT pg_size_pretty(pg_relation_size('sensor_log')) AS table_size,
+       pg_size_pretty(pg_relation_size('sensor_log_ts_btree')) AS btree,
+       pg_size_pretty(pg_relation_size('sensor_log_ts_brin')) AS brin;
+SELECT correlation FROM pg_stats WHERE tablename = 'sensor_log' AND attname = 'ts';
+DROP INDEX sensor_log_ts_btree;
+EXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF, TIMING OFF) SELECT count(*) FROM sensor_log WHERE ts >= '2025-01-02 00:00:00+00' AND ts < '2025-01-02 01:00:00+00';
+----
+
+[source,text]
+----
+ table_size |  btree  | brin
+------------+---------+-------
+ 18 MB      | 6600 kB | 24 kB
+(1 row)
+
+ correlation
+-------------
+           1
+(1 row)
+
+                                                                      QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Bitmap Heap Scan on sensor_log (actual rows=3600.00 loops=1)
+         Recheck Cond: ((ts >= '2025-01-02 00:00:00+00'::timestamp with time zone) AND (ts < '2025-01-02 01:00:00+00'::timestamp with time zone))
+         Rows Removed by Index Recheck: 5104
+         Heap Blocks: lossy=64
+         ->  Bitmap Index Scan on sensor_log_ts_brin (actual rows=640.00 loops=1)
+               Index Cond: ((ts >= '2025-01-02 00:00:00+00'::timestamp with time zone) AND (ts < '2025-01-02 01:00:00+00'::timestamp with time zone))
+               Index Searches: 1
+ Planning Time: 0.053 ms
+ Execution Time: 0.284 ms
+(10 rows)
+----
+
+The BRIN index is a few hundred times smaller than the B-tree (24 kB against 6.6 MB) yet answers the range query
+from 64 candidate pages, with `Rows Removed by Index Recheck` showing the price of its coarseness: it returns whole page
+ranges and the executor filters them (a *lossy* bitmap). On randomly ordered data a BRIN index is useless.
+
+The `bloom` extension offers a *Bloom filter* index for equality tests across many columns at once, when a
+multicolumn B-tree is impractical; it is lossy and only worth it for wide, ad-hoc `WHERE` combinations. It is mentioned
+here rather than demonstrated. Other extension-provided index types include `pg_trgm` GIN/GiST operator classes for
+`+LIKE '%text%'+` and similarity, and `vector` indexes (HNSW, IVFFlat), covered in
+xref:database/vector-rag/index.adoc[Vector Databases & RAG] and xref:database/postgresql/extensions.adoc[Extensions].
+
+== Choosing an index type
+
+[mermaid]
+....
+flowchart TD
+  Q["what does the query ask?"] --> E{"equality, range or ordering on a scalar?"}
+  E -->|yes| BT["B-tree (default)"]
+  BT --> BR{"huge table in physical order?"}
+  BR -->|yes| BRIN["BRIN"]
+  E -->|no| C{"search inside a composite value?"}
+  C -->|"array, jsonb, tsvector"| GIN["GIN"]
+  C -->|"range, geometry, nearest neighbour"| GIST["GiST"]
+  C -->|"IP prefix, point, text prefix"| SPGIST["SP-GiST"]
+....
+
+[cols="1,3,3"]
+|===
+|Method |Good for |Operators
+
+|B-tree
+|Default: equality, ranges, sorting, `+LIKE 'abc%'+`, uniqueness
+|`<` `+<=+` `=` `>=` `>` `BETWEEN` `IN`
+
+|Hash
+|Equality only, with long keys
+|`=`
+
+|GIN
+|Values containing many elements: arrays, `jsonb`, `tsvector`, trigrams
+|`@>` `<@` `&&` `@@` `?`
+
+|GiST
+|Ranges, geometry, nearest neighbour, exclusion constraints
+|`&&` `@>` `+<->+` `<<`
+
+|SP-GiST
+|Clustered or hierarchical data: IP prefixes, points, text prefixes
+|`<<` `>>` `+~=+` `+^@+`
+
+|BRIN
+|Very large, physically ordered tables
+|`<` `=` `>`
+|===
+
+== Unique constraints and exclusion constraints
+
+A `UNIQUE` or `PRIMARY KEY` constraint is implemented by a unique B-tree index created for you; `NULL` values are distinct
+unless the constraint says `NULLS NOT DISTINCT` (PostgreSQL 15). A foreign key does *not* create an index on the
+referencing column: add one yourself when the child table is joined or when parent rows are deleted, otherwise each
+delete scans the child table. The shop's `orders(customer_id)` is such a column.
+
+== Building and maintaining indexes
+
+=== CREATE INDEX CONCURRENTLY
+
+A plain `CREATE INDEX` blocks writes to the table for the whole build. `CREATE INDEX CONCURRENTLY` takes longer (two
+table scans) and cannot run inside a transaction block, but lets reads and writes continue, so it is the form to use on a
+live table. If it fails, for example on a unique violation, it leaves an *invalid* index behind that must be dropped:
+
+[source,sql]
+----
+CREATE UNIQUE INDEX CONCURRENTLY big_orders_email_uq ON big_orders (email);
+SELECT indexrelid::regclass AS index, indisvalid, indisready FROM pg_index WHERE indrelid = 'big_orders'::regclass AND NOT indisvalid;
+DROP INDEX CONCURRENTLY big_orders_email_uq;
+CREATE INDEX CONCURRENTLY big_orders_amount_idx ON big_orders (amount);
+SELECT indexrelid::regclass AS index, indisvalid FROM pg_index WHERE indexrelid = 'big_orders_amount_idx'::regclass;
+----
+
+[source,text]
+----
+ERROR:  could not create unique index "big_orders_email_uq"
+DETAIL:  Key (email)=(User4349@Example.com) is duplicated.
+        index        | indisvalid | indisready
+---------------------+------------+------------
+ big_orders_email_uq | f          | f
+(1 row)
+
+         index         | indisvalid
+-----------------------+------------
+ big_orders_amount_idx | t
+(1 row)
+----
+
+The unique build failed because e-mail addresses repeat in the generated data, and the half-built index showed
+`indisvalid = f` (and `INVALID` in `\d`) until it was dropped. `DROP INDEX CONCURRENTLY` likewise avoids a long lock.
+
+=== Bloat and REINDEX
+
+B-tree pages are reused after `VACUUM`, but the index file never shrinks by itself, and an index on a column that churns
+heavily can accumulate nearly empty pages (*bloat*). The `pgstattuple` extension measures it:
+`pgstatindex` reports the density of the leaf pages and `pgstattuple` the dead and free space of a table.
+Deleting half the rows, vacuuming, and then rebuilding the index shows the effect:
+
+[source,sql]
+----
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+SELECT pg_size_pretty(pg_relation_size('big_orders_amount_idx')) AS size, avg_leaf_density FROM pgstatindex('big_orders_amount_idx');
+DELETE FROM big_orders WHERE amount < 250;
+VACUUM big_orders;
+SELECT pg_size_pretty(pg_relation_size('big_orders_amount_idx')) AS size_after_delete_and_vacuum, avg_leaf_density FROM pgstatindex('big_orders_amount_idx');
+REINDEX INDEX CONCURRENTLY big_orders_amount_idx;
+SELECT pg_size_pretty(pg_relation_size('big_orders_amount_idx')) AS size_after_reindex, avg_leaf_density FROM pgstatindex('big_orders_amount_idx');
+SELECT dead_tuple_percent, free_percent FROM pgstattuple('big_orders');
+----
+
+[source,text]
+----
+ size  | avg_leaf_density
+-------+------------------
+ 11 MB |            90.07
+(1 row)
+
+ size_after_delete_and_vacuum | avg_leaf_density
+------------------------------+------------------
+ 11 MB                        |            89.95
+(1 row)
+
+ size_after_reindex | avg_leaf_density
+--------------------+------------------
+ 5512 kB            |            90.08
+(1 row)
+
+ dead_tuple_percent | free_percent
+--------------------+--------------
+                  0 |        50.04
+(1 row)
+----
+
+The index stayed at 11 MB after the delete and vacuum and fell to about half after `+REINDEX ... CONCURRENTLY+`, which
+builds a new copy alongside the old and swaps them without blocking writes (PostgreSQL 12 and later). The table
+itself shows 49.9% free space: `VACUUM` made it reusable but did not return it to the operating system, and only
+`VACUUM FULL` (an exclusive-lock rewrite) or extensions such as `pg_repack` shrink the file. Routine vacuuming
+is covered in xref:database/postgresql/administration.adoc[Administration].
+
+=== Finding unused and missing indexes
+
+`pg_stat_user_indexes` counts how often each index was scanned since the statistics were last reset. An index with
+`idx_scan = 0` over a representative period is a candidate to drop (check it does not back a constraint, and that the
+period includes month-end jobs):
+
+[source,sql]
+----
+SELECT indexrelname, idx_scan, pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes WHERE relname = 'big_orders' ORDER BY idx_scan, indexrelname;
+----
+
+[source,text]
+----
+         indexrelname          | idx_scan |  size
+-------------------------------+----------+---------
+ big_orders_amount_idx         |        0 | 5512 kB
+ big_orders_doc_gin            |        1 | 1904 kB
+ big_orders_email_hash         |        1 | 16 MB
+ big_orders_email_lower_idx    |        1 | 4144 kB
+ big_orders_open_idx           |        1 | 240 kB
+ big_orders_pkey               |        1 | 11 MB
+ big_orders_tags_gin           |        1 | 1232 kB
+ big_orders_note_fts           |        2 | 2896 kB
+ big_orders_cust_date_idx      |        4 | 19 MB
+ big_orders_status_created_idx |        7 | 15 MB
+(10 rows)
+----
+
+Conversely, a table with a high `seq_scan` count and many rows read per scan in `pg_stat_user_tables`, or a slow query
+in `pg_stat_statements`, points to a missing index; see xref:database/postgresql/performance-tuning.adoc[Performance Tuning].
+Index design for pagination is in xref:database/pagination-strategies.adoc[Pagination Strategies], and schema
+changes that add indexes safely are covered in xref:database/schema-evolution/index.adoc[Evolving the Database Model].
+The SQL-standard `CREATE INDEX` is in xref:database/sql/ddl.adoc[DDL].
+

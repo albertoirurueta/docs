@@ -1,0 +1,549 @@
+= Architecture
+:description: How a PostgreSQL server is built: the postmaster and its backend processes, background workers, shared buffers, the on-disk layout of a cluster, heap pages and TOAST, MVCC tuple versions, the write-ahead log, checkpoints and crash recovery.
+:keywords: PostgreSQL architecture, postmaster, backend process, shared_buffers, WAL, checkpoint, crash recovery, MVCC, xmin, xmax, TOAST, heap page, PGDATA, pageinspect, pg_walinspect, autovacuum, checkpointer, background writer
+
+include::partial$ai-disclaimer.adoc[]
+
+Knowing how PostgreSQL is put together explains most of its behaviour: why a connection is expensive, why an
+`UPDATE` leaves dead rows behind, why `VACUUM` exists, why a crash does not lose committed data and why
+checkpoints show up in performance graphs. This page follows a statement from the socket to the disk.
+
+The outputs were produced on *PostgreSQL 18.6* in the `postgres:latest` container with the shop seed from
+xref:database/postgresql/getting-started.adoc[Getting Started]. Object identifiers (OIDs) and transaction ids
+are specific to that run and will differ on yours.
+
+== Processes: the postmaster and its backends
+
+PostgreSQL uses a *process-per-connection* model rather than threads. A single supervisor process, the
+*postmaster* (PID 1 in the container), listens on the TCP port and the Unix socket. For every accepted
+connection it forks a dedicated *backend* process, which authenticates the client and then runs its queries until
+it disconnects. It also starts and supervises a fixed set of *background processes*.
+
+[mermaid]
+....
+flowchart TD
+  PM["postmaster (listener and supervisor)"]
+  PM --> B1["client backend (one per connection)"]
+  PM --> B2["client backend"]
+  PM --> CP["checkpointer"]
+  PM --> BW["background writer"]
+  PM --> WW["walwriter"]
+  PM --> AV["autovacuum launcher"]
+  PM --> IO["io workers (18)"]
+  PM --> LR["logical replication launcher"]
+  AV -.->|starts| AW["autovacuum workers"]
+  C1((client)) --> B1
+  C2((client)) --> B2
+....
+
+`pg_stat_activity` lists every process, ordinary connections and background processes alike, through its
+`backend_type` column:
+
+[source,sql]
+----
+SELECT pid, backend_type, state FROM pg_stat_activity ORDER BY backend_type, pid;
+----
+
+[source,text]
+----
+ pid |         backend_type         | state  
+-----+------------------------------+--------
+  82 | autovacuum launcher          | 
+  79 | background writer            | 
+  78 | checkpointer                 | 
+ 187 | client backend               | active
+  75 | io worker                    | 
+  76 | io worker                    | 
+  77 | io worker                    | 
+  83 | logical replication launcher | 
+  81 | walwriter                    | 
+(9 rows)
+----
+
+What each one does:
+
+* *Client backend.* Parses, plans and executes the statements of one session. Its memory is private
+  (`work_mem` for sorts and hashes, `maintenance_work_mem` for index builds and vacuum, `temp_buffers` for
+  temporary tables) plus a cache of catalog data.
+* *Checkpointer.* Periodically writes all modified shared buffers to disk and records a *checkpoint* in the WAL,
+  described below.
+* *Background writer.* Trickles dirty buffers out between checkpoints so that backends rarely have to write a
+  page themselves when they need a free buffer.
+* *WAL writer.* Flushes the WAL buffers to disk for asynchronous commits and when they fill up.
+* *Autovacuum launcher and workers.* The launcher wakes periodically and starts workers that `VACUUM` and
+  `ANALYZE` tables whose dead-row or change counts passed thresholds. See
+  xref:database/postgresql/administration.adoc[Administration].
+* *I/O workers.* New in PostgreSQL 18: with the default `io_method = worker`, backends hand read requests to a
+  pool of these processes, which is the first step towards asynchronous I/O.
+* *Logical replication launcher.* Starts the workers of logical subscriptions; idle when there are none. See
+  xref:database/postgresql/replication-and-ha.adoc[Replication & High Availability].
+
+The statistics are no longer collected by a separate process: since PostgreSQL 15 the cumulative statistics
+live in shared memory and are flushed to `pg_stat` on shutdown.
+
+Because every connection is a process with its own memory, thousands of idle connections are costly and a
+connection pooler is normal in front of a busy server; the configuration is in
+xref:database/postgresql/performance-tuning.adoc[Performance Tuning]. `max_connections` (100 by default) is a hard limit.
+
+== Shared buffers and the operating-system cache
+
+All backends share one region of memory, *shared buffers* (`shared_buffers`, 128 MB in this container's default
+configuration), divided into 8 kB buffers, each holding one page of a table or index file. A backend that needs
+a page looks it up in shared buffers; on a miss it reads the page from the file, via the operating system's own
+page cache, into a free buffer (evicting an unused one, writing it first if dirty).
+
+[mermaid]
+....
+flowchart LR
+  B["backend"] -->|"read and modify pages"| SB["shared buffers (8 kB pages)"]
+  B -->|"WAL record, then commit"| WB["WAL buffers"]
+  WB -->|"fsync at commit"| WAL[("pg_wal segments")]
+  SB -->|"checkpointer and bgwriter"| OS["OS page cache"]
+  OS --> DATA[("data files in base/")]
+  DATA -->|"read on miss"| OS
+  OS --> SB
+....
+
+Two caches therefore sit between a query and the disk: PostgreSQL's own and the kernel's. This double buffering is
+why `shared_buffers` is usually set to a modest fraction of RAM (around a quarter is a common starting point)
+and `effective_cache_size`, which only informs the planner, to the total memory expected to be caching data. See
+xref:database/postgresql/performance-tuning.adoc[Performance Tuning].
+
+A page changed in shared buffers is not written to its data file at once. It is marked *dirty*, and the change
+is described first in the write-ahead log. Data files are brought up to date later by the background writer and
+the checkpointer.
+
+== Logical and physical layout
+
+Logically, one server process tree manages one *cluster*: a collection of databases sharing a data directory,
+roles and tablespaces. A cluster contains databases, a database contains schemas, a schema contains tables,
+indexes, views, sequences and other objects. Roles are cluster-wide; a connection is always to exactly one
+database and cannot query another database directly.
+
+[mermaid]
+....
+flowchart TD
+  CL["cluster (one PGDATA, one postmaster)"] --> D1["database postgres"]
+  CL --> D2["database template1"]
+  CL --> D3["database template0"]
+  D1 --> S1["schema shop"]
+  D1 --> S2["schema public"]
+  S1 --> T1["tables customers, products, orders, order_items"]
+  S1 --> I1["indexes, sequences, constraints"]
+  CL --> R["roles (cluster-wide)"]
+....
+
+Physically, the cluster is a directory, `PGDATA`. In the official image its location is
+`/var/lib/postgresql/18/docker`. The top level:
+
+[source,bash]
+----
+docker exec pg-a bash -c 'cd $PGDATA; ls; cat PG_VERSION; ls base; du -sh base pg_wal'
+----
+
+[source,text]
+----
+base
+global
+pg_commit_ts
+pg_dynshmem
+pg_hba.conf
+pg_ident.conf
+pg_logical
+pg_multixact
+pg_notify
+pg_replslot
+pg_serial
+pg_snapshots
+pg_stat
+pg_stat_tmp
+pg_subtrans
+pg_tblspc
+pg_twophase
+PG_VERSION
+pg_wal
+pg_xact
+postgresql.auto.conf
+postgresql.conf
+postmaster.opts
+postmaster.pid
+18
+1
+4
+5
+23M	base
+17M	pg_wal
+----
+
+The directories that matter day to day:
+
+[cols="2,5"]
+|===
+|Path |Contents
+
+|`base/`
+|One subdirectory per database, named by the database OID (`1` is `template1`, `4` is `template0`, `5` is `postgres`).
+Inside, one or more files per table and index.
+
+|`global/`
+|Cluster-wide catalogs (roles, the list of databases) and `pg_control`, the file that records the latest
+checkpoint.
+
+|`pg_wal/`
+|The write-ahead log, in 16 MB segment files.
+
+|`pg_xact/`
+|Commit status (committed, aborted, in progress) of every transaction id.
+
+|`pg_tblspc/`
+|Symbolic links to additional tablespaces.
+
+|`postgresql.conf`, `postgresql.auto.conf`, `pg_hba.conf`, `pg_ident.conf`
+|Configuration and client authentication; see xref:database/postgresql/administration.adoc[Administration].
+
+|`postmaster.pid`
+|Lock file holding the postmaster's PID, data directory and port; it is removed on a clean shutdown and prevents a second server from starting on the same directory.
+|===
+
+Each relation is stored in a file named after its *filenode*, which usually equals its OID until a rewrite
+(`VACUUM FULL`, `TRUNCATE`, `CLUSTER`) assigns a new one. Files are split into 1 GB segments. The catalog tells you
+where a table lives:
+
+[source,sql]
+----
+SELECT pg_relation_filepath('shop.orders');
+----
+
+[source,text]
+----
+ pg_relation_filepath 
+----------------------
+ base/5/16419
+(1 row)
+----
+
+== Heap pages and TOAST
+
+A table's file (the *heap*) is a sequence of 8 kB *pages* (`SHOW block_size`). A page begins with a header, followed by
+an array of *line pointers* growing downwards, and the row versions (*tuples*) filling the page from the end
+upwards; the free space lies between. A tuple is addressed by its `ctid`, the pair `(page number, line pointer number)`.
+
+[mermaid]
+....
+flowchart TB
+  subgraph PAGE["8 kB heap page"]
+    direction TB
+    H["page header (lower, upper, special)"]
+    LP["line pointers: 1, 2, 3, ..."]
+    FREE["free space"]
+    T["tuples: header (xmin, xmax, ctid) + column data"]
+    H --- LP --- FREE --- T
+  end
+....
+
+`pageinspect` is a contrib extension that reads pages directly. `page_header` shows the free space boundaries of
+the `orders` heap:
+
+[source,sql]
+----
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+SELECT lower, upper, special, pagesize FROM page_header(get_raw_page('shop.orders', 0));
+----
+
+[source,text]
+----
+ lower | upper | special | pagesize 
+-------+-------+---------+----------
+    60 |  7752 |    8192 |     8192
+(1 row)
+----
+
+A row may not span pages, and PostgreSQL wants at least a few tuples per page, so a value larger than about 2 kB is
+handled by *TOAST* (The Oversized-Attribute Storage Technique). Large values of variable-length types (`text`,
+`jsonb`, `bytea`, arrays) are first compressed (with `pglz`, or `lz4` if configured) and, if still large, moved
+out of line into a hidden `pg_toast` table of 2 kB-or-so *chunks*; the main row holds a small pointer. Each
+column has a storage strategy (`plain`, `main`, `external`, `extended`; `extended` is the default for `text`):
+
+[source,sql]
+----
+CREATE TABLE toast_demo (id int, body text);
+INSERT INTO toast_demo SELECT 1, (SELECT string_agg(md5(g::text), '') FROM generate_series(1,2000) g);
+INSERT INTO toast_demo SELECT 2, repeat('PostgreSQL ', 6000);
+INSERT INTO toast_demo SELECT 3, 'short';
+SELECT id, octet_length(body) AS raw_bytes, pg_column_size(body) AS stored_bytes,
+       pg_column_compression(body) AS compression
+FROM toast_demo ORDER BY id;
+----
+
+[source,text]
+----
+ id | raw_bytes | stored_bytes | compression 
+----+-----------+--------------+-------------
+  1 |     64000 |        64000 | 
+  2 |     66000 |          777 | pglz
+  3 |         5 |            6 | 
+(3 rows)
+----
+
+Row 2 compressed from 66,000 to 777 bytes because it is repetitive. Row 1 is random hexadecimal text that `pglz`
+cannot shrink, so it is stored uncompressed but still out of line: reading its toast table shows 33 chunks holding
+exactly 64,000 bytes.
+
+[source,sql]
+----
+SELECT reltoastrelid::regclass AS toast_table FROM pg_class WHERE relname = 'toast_demo' \gset
+SELECT chunk_id, count(*) AS chunks, sum(length(chunk_data)) AS bytes FROM :toast_table GROUP BY chunk_id;
+----
+
+[source,text]
+----
+ chunk_id | chunks | bytes 
+----------+--------+-------
+    16544 |     33 | 64000
+(1 row)
+----
+
+TOAST is transparent to queries but has a performance consequence: `SELECT *` on a table with large columns
+fetches and decompresses them even if the caller ignores them, and an `UPDATE` that does not touch a TOASTed
+column does not rewrite it.
+
+== MVCC: row versions
+
+PostgreSQL implements *multiversion concurrency control* by never updating a row in place. An `UPDATE` marks the
+old tuple as ended and inserts a *new tuple*; a `DELETE` just marks the tuple as ended. Every tuple header carries:
+
+* `xmin`: the id of the transaction that created this version.
+* `xmax`: the id of the transaction that deleted or updated it (0 while it is still current), or of a transaction
+  that merely locked it.
+* `ctid`: the location of the newest version in the update chain.
+
+Each statement (or transaction, depending on isolation level) works from a *snapshot*; a tuple is visible if its
+`xmin` committed before the snapshot and its `xmax` did not. Readers therefore never block writers. The
+hidden system columns `xmin`, `xmax` and `ctid` are readable like any other:
+
+[source,sql]
+----
+CREATE TABLE mvcc_demo (id int PRIMARY KEY, note text);
+INSERT INTO mvcc_demo VALUES (1, 'first');
+SELECT ctid, xmin, xmax, * FROM mvcc_demo;
+BEGIN;
+SELECT txid_current() AS my_xid;
+UPDATE mvcc_demo SET note = 'second' WHERE id = 1;
+SELECT ctid, xmin, xmax, * FROM mvcc_demo;
+COMMIT;
+----
+
+[source,text]
+----
+ ctid  | xmin | xmax | id | note  
+-------+------+------+----+-------
+ (0,1) |  781 |    0 |  1 | first
+(1 row)
+
+ my_xid 
+--------
+    782
+(1 row)
+
+ ctid  | xmin | xmax | id |  note  
+-------+------+------+----+--------
+ (0,2) |  782 |    0 |  1 | second
+(1 row)
+----
+
+The update moved the row from `(0,1)` to `(0,2)` and the new version carries the updating transaction's id as
+`xmin`. The old version is still in the page. `heap_page_items` shows both:
+
+[source,sql]
+----
+SELECT lp, t_xmin, t_xmax, t_ctid, (t_infomask2 & 16384) > 0 AS hot_updated
+FROM heap_page_items(get_raw_page('mvcc_demo', 0));
+----
+
+[source,text]
+----
+ lp | t_xmin | t_xmax | t_ctid | hot_updated 
+----+--------+--------+--------+-------------
+  1 |    781 |    782 | (0,2)  | t
+  2 |    782 |      0 | (0,2)  | f
+(2 rows)
+----
+
+The first tuple (`lp` 1) has `t_xmax = 782`: it was ended by the update, and its `t_ctid` points to the new
+version. Because the indexed column did not change, the update was a *HOT* (heap-only tuple) update: no new index
+entry was needed, the old line pointer will redirect to the new tuple. The dead version is not removed by the
+update; `VACUUM` removes it when no snapshot can still see it:
+
+[source,sql]
+----
+VACUUM mvcc_demo;
+SELECT lp, lp_flags, lp_off, t_xmin, t_xmax FROM heap_page_items(get_raw_page('mvcc_demo', 0));
+----
+
+[source,text]
+----
+ lp | lp_flags | lp_off | t_xmin | t_xmax 
+----+----------+--------+--------+--------
+  1 |        2 |      2 |        |       
+  2 |        1 |   8152 |    782 |      0
+(2 rows)
+----
+
+`lp_flags = 2` means the first line pointer is now a *redirect* to line pointer 2; its tuple body was reclaimed
+and the space can be reused by later inserts in the same page. Dead rows that are never vacuumed are *bloat*:
+tables and indexes keep growing and scans read pages of garbage. Isolation levels, locking and the visibility rules
+are covered in xref:database/postgresql/transactions-and-mvcc.adoc[Transactions, Isolation & MVCC]; routine vacuuming
+in xref:database/postgresql/administration.adoc[Administration].
+
+Transaction ids are 32-bit and compared in a circular space, so every row eventually needs to be *frozen* (marked as
+visible to everyone) by vacuum before the counter wraps around; the autovacuum launcher also starts anti-wraparound
+vacuums for this reason.
+
+== Write-ahead logging
+
+The *write-ahead log* (WAL) is PostgreSQL's durability mechanism: before a change to a data page may reach disk,
+a record describing the change must already be in the WAL on disk. At commit, the backend writes a *commit record*
+and flushes the WAL (with `fsync`) up to that point, and only then reports success. Data files can then be written
+lazily, because after a crash the WAL contains everything needed to redo the changes.
+
+[mermaid]
+....
+sequenceDiagram
+  participant App as client
+  participant BE as backend
+  participant SB as shared buffers
+  participant W as WAL on disk
+  participant D as data files
+  App->>BE: INSERT, then COMMIT
+  BE->>SB: modify page (dirty)
+  BE->>W: append WAL records
+  BE->>W: flush up to commit record
+  BE-->>App: COMMIT OK
+  Note over SB,D: later, checkpointer or bgwriter
+  SB->>D: write dirty page
+....
+
+The log is a stream of records addressed by a *log sequence number* (LSN), stored in 16 MB segment files in `pg_wal`.
+`pg_current_wal_lsn()` gives the current position, `pg_walfile_name()` the segment that holds it, and the
+`pg_walinspect` extension decodes the records. One single-row insert into `mvcc_demo` with its primary-key index
+wrote 184 bytes, as three records:
+
+[source,sql]
+----
+SELECT pg_current_wal_lsn() AS before_lsn \gset
+INSERT INTO mvcc_demo VALUES (3, 'wal demo');
+CREATE EXTENSION IF NOT EXISTS pg_walinspect;
+SELECT start_lsn, resource_manager, record_type, record_length
+FROM pg_get_wal_records_info(:'before_lsn', pg_current_wal_lsn());
+----
+
+[source,text]
+----
+ start_lsn | resource_manager | record_type | record_length 
+-----------+------------------+-------------+---------------
+ 0/18CAD08 | Heap             | INSERT      |           214
+ 0/18CADE0 | Btree            | INSERT_LEAF |           153
+ 0/18CAE80 | Transaction      | COMMIT      |            34
+(3 rows)
+----
+
+One record for the heap tuple, one for the B-tree entry of the primary key and one for the commit. The record sizes
+vary between runs: the first change to a page after a checkpoint also logs a *full-page image* of that page
+(`full_page_writes = on`) to protect against torn writes, which is why a repeat insert later logged smaller records
+of 61 and 64 bytes with no image. Querying the `fpi_length` column of `pg_get_wal_records_info` right after a
+`CHECKPOINT` showed 320 bytes of page image on the heap record and 180 on the index record, and 0 once the pages
+had been imaged.
+
+Settings that govern durability and WAL volume are `fsync` (never turn it off on data you care about),
+`synchronous_commit` (`on` by default; `off` trades the last few milliseconds of commits for latency, without
+risking corruption), `wal_level` (`replica` by default; `logical` adds the information logical decoding needs) and
+`max_wal_size`. The same WAL stream feeds replicas and archives, which is the subject of
+xref:database/postgresql/backup-and-restore.adoc[Backup & Restore] and
+xref:database/postgresql/replication-and-ha.adoc[Replication & High Availability].
+
+== Checkpoints
+
+A *checkpoint* is a point at which all changes logged before it are guaranteed to be in the data files. The
+checkpointer starts one every `checkpoint_timeout` (5 minutes by default) or when the WAL written since the last
+checkpoint approaches `max_wal_size` (1 GB), whichever comes first, writes all dirty buffers (spread over
+`checkpoint_completion_target` of the interval to avoid I/O spikes), flushes them, writes a checkpoint record and
+updates `pg_control`. WAL older than the previous checkpoint's *redo point* is no longer needed for crash recovery
+and can be recycled.
+
+[source,sql]
+----
+SELECT checkpoint_lsn, redo_lsn, timeline_id, next_xid, checkpoint_time FROM pg_control_checkpoint();
+CHECKPOINT;
+SELECT checkpoint_lsn, redo_lsn, checkpoint_time FROM pg_control_checkpoint();
+SELECT num_timed, num_requested, write_time, sync_time, buffers_written FROM pg_stat_checkpointer;
+----
+
+[source,text]
+----
+ checkpoint_lsn | redo_lsn  | timeline_id | next_xid |    checkpoint_time     
+----------------+-----------+-------------+----------+------------------------
+ 0/1761920      | 0/1761920 |           1 | 0:753    | 2026-11-10 19:03:05+00
+(1 row)
+
+ checkpoint_lsn | redo_lsn  |    checkpoint_time     
+----------------+-----------+------------------------
+ 0/1898E70      | 0/1898E18 | 2026-11-10 19:04:54+00
+(1 row)
+
+ num_timed | num_requested | write_time | sync_time | buffers_written 
+-----------+---------------+------------+-----------+-----------------
+         0 |             2 |          7 |         8 |             197
+(1 row)
+----
+
+`CHECKPOINT` forced a new checkpoint, so the checkpoint LSN moved forward and `num_requested` counted it (the view
+`pg_stat_checkpointer` exists from PostgreSQL 17; earlier versions used `pg_stat_bgwriter`). A healthy system shows
+mostly *timed* checkpoints; a high count of requested ones means `max_wal_size` is too small for the write rate. Tuning
+is in xref:database/postgresql/performance-tuning.adoc[Performance Tuning].
+
+== Crash recovery
+
+After an unclean shutdown the postmaster notices that `pg_control` was not marked "shut down" and starts *recovery*:
+it reads the WAL from the *redo point* of the last checkpoint and re-applies every record whose page is older than the
+record, then performs an end-of-recovery checkpoint and opens for connections. Uncommitted transactions need no undo
+work: their tuples simply stay invisible, because the commit status in `pg_xact` never says "committed", and vacuum
+removes them later. This is the payoff of MVCC plus WAL.
+
+To see it, the server in this container was killed with `docker kill` (a `SIGKILL`: no shutdown checkpoint) right
+after an insert that followed a `CHECKPOINT`, and restarted. The server log:
+
+[source,text]
+----
+LOG:  database system was interrupted; last known up at 2026-11-10 19:05:13 UTC
+LOG:  database system was not properly shut down; automatic recovery in progress
+LOG:  redo starts at 0/18F67C8
+LOG:  invalid record length at 0/18F6AF0: expected at least 24, got 0
+LOG:  redo done at 0/18F6AC8 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 0.00 s
+LOG:  checkpoint starting: end-of-recovery immediate wait
+LOG:  checkpoint complete: wrote 2 buffers (0.0%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; ...
+LOG:  database system is ready to accept connections
+----
+
+(The `+invalid record length ... got 0+` line is the normal end-of-log marker, not an error.) The row inserted after
+the checkpoint, which had never been written to the data file, was still there:
+
+[source,sql]
+----
+SELECT id, note FROM mvcc_demo ORDER BY id;
+----
+
+[source,text]
+----
+ id |       note       
+----+------------------
+  1 | second
+  2 | wal demo
+  3 | wal demo
+  4 | x
+  5 | y
+  6 | after checkpoint
+(6 rows)
+----
+
+The recovery time is bounded by the WAL generated since the last checkpoint, which is the trade-off behind
+`checkpoint_timeout` and `max_wal_size`: longer intervals mean fewer, cheaper checkpoints but a longer crash recovery.

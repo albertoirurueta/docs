@@ -2,7 +2,7 @@
 :description: Running Spring Batch in a cloud environment -- the twelve-factor lens applied to a batch application, externalized configuration with Spring Cloud Config, guarding a remote call in a step with a circuit breaker, Spring Cloud Task and how it complements Spring Batch, orchestration with Spring Cloud Data Flow, and running batch on Kubernetes as a Job or CronJob including the DeployerPartitionHandler.
 :keywords: cloud-native batch, twelve-factor, externalized configuration, Spring Cloud Config, circuit breaker, Resilience4j, Spring Cloud Task, EnableTask, task execution metadata, exit codes, Spring Cloud Data Flow, composed task runner, Kubernetes Job, Kubernetes CronJob, DeployerPartitionHandler, ephemeral filesystem, object storage, graceful shutdown
 
-include::partial$spring-batch-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 A batch job in a container is still a batch job -- but the environment changes some assumptions: the
 filesystem is ephemeral, the process may be evicted, configuration arrives from outside, and something else
@@ -77,6 +77,179 @@ Whether the fallback is acceptable is a business decision -- for a valuation run
 than a failed job. The Spring Cloud CircuitBreaker abstraction used here is covered in
 xref:backend/resilience/spring-cloud-circuitbreaker.adoc[Spring Cloud CircuitBreaker].
 
+== Worked example: the settlement job as a one-shot container
+
+The running example of this section is the 1000-trade settlement job, packaged as a Spring Boot jar and started as a
+disposable container -- what a Kubernetes `Job` pod does -- against a PostgreSQL job repository. Every setting
+comes from the environment (Spring Boot maps `SPRING_BATCH_JOB_NAME` to `spring.batch.job.name`, and so on), and the
+only business input is a `JobParameters` argument:
+
+[source,bash]
+----
+docker run --rm -v "$PWD/settlement.jar:/app.jar:ro" \
+  -e SPRING_DATASOURCE_URL=jdbc:postgresql://db.internal:5432/batch \
+  -e SPRING_BATCH_JOB_ENABLED=true \
+  -e SPRING_BATCH_JOB_NAME=partitionedJob \
+  eclipse-temurin:17-jre \
+  java -jar /app.jar run.id=13
+----
+
+The process exit code is the contract with the platform, and in Spring Boot it must be asked for: `SpringApplication.run`
+alone returns normally and the JVM exits with 0 even when the job failed. Boot registers a
+`JobExecutionExitCodeGenerator` for batch applications, and `+SpringApplication.exit(...)+` turns it into a code:
+
+[source,java]
+----
+public static void main(String[] args) {
+    System.exit(SpringApplication.exit(SpringApplication.run(SettlementApplication.class, args)));
+}
+----
+
+With that `main`, a run in which trade 600 makes one partition fail ends with exit code 5, and rerunning the *same
+command* restarts the failed instance (Spring Boot's `JobLauncherApplicationRunner` restarts a failed instance whose
+parameters are unchanged) and ends with exit code 0:
+
+[source,text]
+----
+first run, fault injected:            exit code 5
+same command, fault removed:          exit code 0
+
+ id | j |       step_name       |  status   |  r  |  w
+----+---+-----------------------+-----------+-----+-----
+ 24 | 8 | partitionedLoadStep   | FAILED    | 850 | 800
+ 25 | 8 | workerStep:partition3 | COMPLETED | 250 | 250
+ 26 | 8 | workerStep:partition2 | FAILED    | 100 |  50
+ 27 | 8 | workerStep:partition1 | COMPLETED | 250 | 250
+ 28 | 8 | workerStep:partition0 | COMPLETED | 250 | 250
+ 29 | 9 | partitionedLoadStep   | COMPLETED | 200 | 200
+ 30 | 9 | workerStep:partition2 | COMPLETED | 200 | 200
+----
+
+The metadata lives in the database, not in the pod, so a *different* pod picks up exactly where the first one stopped:
+job execution 9 runs only `workerStep:partition2`, reads the remaining 200 trades, and the final table holds 1000
+rows. That is why the twelve-factor table above says to keep the only durable state in the `JobRepository` -- and why
+`backoffLimit: 0` plus a deliberate re-run (below) is better than letting the platform start a replacement blindly.
+
+[mermaid]
+....
+sequenceDiagram
+    participant K as Kubernetes or docker run
+    participant P as Pod (Spring Boot)
+    participant DB as JobRepository (PostgreSQL)
+    K->>P: start container, env SPRING_BATCH_JOB_NAME, args run.id=13
+    P->>DB: create JobInstance and JobExecution
+    P->>P: run partitions
+    P->>DB: step and job status updated per chunk
+    alt job COMPLETED
+        P-->>K: exit code 0, pod Succeeded
+    else job FAILED
+        P-->>K: exit code 5, pod Failed
+        K->>P: a new pod with the same arguments
+        P->>DB: restart the same JobInstance
+        P->>P: rerun only the unfinished partitions
+        P-->>K: exit code 0
+    end
+....
+
+== SIGTERM, graceful stop and stranded executions
+
+Kubernetes ends a pod with `SIGTERM`, then `SIGKILL` after `terminationGracePeriodSeconds`. A Spring Batch job does not
+react to the signal by itself. With 60 ms of simulated latency per trade (about 15 s of work per partition) and
+`docker stop` after six seconds, the plain application behaved as follows: the job kept running to completion -- all four
+steps ended `COMPLETED` with 1000 rows -- while the JVM's shutdown hook closed the context and the connection pool
+as soon as the steps had ended, before the *job* execution could record its own end. It stayed `STARTED` with exit code `UNKNOWN`,
+a stranded execution that blocks the next run of the same instance until it is recovered.
+
+Spring Batch has the right primitive, `+JobOperator.stop(...)+`, which asks the running steps to finish the current chunk
+and stop. Wiring it to the shutdown is a small listener that remembers the running execution and, when the context
+starts closing, stops it and waits for the status to be saved before the datasource is closed:
+
+[source,java]
+----
+@Component
+public class GracefulShutdown implements JobExecutionListener, ApplicationListener<ContextClosedEvent> {
+
+    private final JobOperator jobOperator;
+    private final AtomicReference<JobExecution> running = new AtomicReference<>();
+    private volatile CountDownLatch finished = new CountDownLatch(0);
+
+    public GracefulShutdown(@Lazy JobOperator jobOperator) {
+        this.jobOperator = jobOperator;
+    }
+
+    @Override
+    public void beforeJob(JobExecution jobExecution) {
+        finished = new CountDownLatch(1);
+        running.set(jobExecution);
+    }
+
+    @Override
+    public void afterJob(JobExecution jobExecution) {
+        running.set(null);
+        finished.countDown();
+    }
+
+    @Override
+    public void onApplicationEvent(ContextClosedEvent event) {
+        JobExecution execution = running.get();
+        if (execution == null) {
+            return;
+        }
+        try {
+            jobOperator.stop(execution);
+            finished.await(60, TimeUnit.SECONDS);     // keep the context open until the status is saved
+        }
+        catch (Exception e) {
+            // log and let the shutdown proceed
+        }
+    }
+}
+----
+
+registered on the job with `+new JobBuilder(...).listener(gracefulShutdown)+`. Under the same `docker stop`, the job
+stopped within two seconds at a chunk boundary, with every status recorded as `STOPPED`:
+
+[source,text]
+----
+docker stop took 2s
+ id | status  | exit_code
+----+---------+-----------
+ 13 | STOPPED | STOPPED
+
+       step_name       | status  |  r  |  w
+-----------------------+---------+-----+-----
+ partitionedLoadStep   | STOPPED | 400 | 400
+ workerStep:partition0 | STOPPED | 100 | 100
+ workerStep:partition1 | STOPPED | 100 | 100
+ workerStep:partition2 | STOPPED | 100 | 100
+ workerStep:partition3 | STOPPED | 100 | 100
+----
+
+and re-running the command resumed the instance: execution 14 ran 150 more trades in each partition, ended
+`COMPLETED`, and the table held 1000 rows. The grace period must be longer than one chunk of the slowest step, because
+the stop takes effect at the chunk boundary -- exactly the `terminationGracePeriodSeconds` advice in the Kubernetes
+section below.
+
+[mermaid]
+....
+flowchart TD
+    A["SIGTERM"] --> B["Spring closes the context: ContextClosedEvent"]
+    B --> C["GracefulShutdown: JobOperator.stop(execution)"]
+    C --> D["Steps finish the current chunk and commit"]
+    D --> E["Job and step status saved as STOPPED"]
+    E --> F["Listener releases, datasource closes, JVM exits"]
+    F --> G["Next run restarts the same instance"]
+    A -. "no listener" .-> H["Job keeps running while the pool closes"]
+    H --> I["Execution stays STARTED, exit UNKNOWN"]
+    I --> J["JobOperator.recover(execution) before the next run"]
+....
+
+If a pod *is* killed hard (`SIGKILL`, an out-of-memory kill, a node failure), stranded executions are what remains. On
+startup, `JobRepository.findRunningJobExecutions(jobName)` lists them and `JobOperator.recover(execution)` settles
+them; recovered executions in the lab ended `FAILED` with exit code `UNKNOWN`, after which the instance is restartable
+(see xref:backend/spring-batch/stopping-restart-and-recovery.adoc[Stopping, restart & recovery]). Run the
+recovery before launching a new job, not concurrently with a live one.
+
 == Spring Cloud Task
 
 Spring Cloud Task is the companion project for *short-lived* applications. It records that a task ran -- start
@@ -98,7 +271,62 @@ The division of labour: Spring Batch knows about *steps, chunks and restart*; Sp
 *process lifecycle and exit codes*, which is what an orchestrator actually schedules. A batch application that
 is launched as a container per run is naturally both.
 
-This is *linked, not documented in depth* here -- see https://spring.io/projects/spring-cloud-task[Spring
+=== Spring Cloud Task in practice
+
+Added to the same settlement application (`spring-cloud-starter-task` and `spring-cloud-task-batch` 5.0.2 -- built against
+Spring Boot 4.0 -- running on Spring Boot 4.1.2 and Spring Batch 6.0.6, with `@EnableTask`), a run of the job creates the Spring Cloud Task tables
+(`TASK_EXECUTION`, `TASK_EXECUTION_PARAMS`, `TASK_LOCK` and the link table `TASK_TASK_BATCH`) next to the batch ones and
+records the process as a task execution that points at the job execution it launched:
+
+[source,text]
+----
+ task_execution_id |  task_name  | exit_code | ...
+-------------------+-------------+-----------+----
+                 1 | application |         0 |
+
+ task_execution_id | job_execution_id
+-------------------+------------------
+                 1 |               15
+----
+
+Three practical points came out of that run:
+
+* *Two transaction managers.* Spring Cloud Task registers its own `springCloudTaskTransactionManager` next to Spring
+  Boot's `transactionManager`, so every step builder that injects a bare `PlatformTransactionManager` fails with "required
+  a single bean, but 2 were found". Mark the business one `@Primary` (a `JdbcTransactionManager` bean on the
+  `DataSource`) or inject it by qualifier.
+* *The task exit code does not follow the job by default.* A run in which the job *failed* was still recorded as
+  `exit_code 0` (the JVM exit code, with the `main` above, was 5). Setting
+  `spring.cloud.task.batch.fail-on-job-failure=true` makes the task fail with a
+  `+TaskException: The following Jobs have failed: ...+` and records `exit_code 1`; with this library and Spring Boot
+  combination the property also required a `JobRegistry` bean (a `MapJobRegistry` was enough) for Spring Cloud Task's own job-launcher runner to start.
+* *Identity is one-to-one.* The `TASK_TASK_BATCH` row is the only join between the two metadata models, so "which task
+  ran job execution 15?" is a single query -- the reason to use Spring Cloud Task when an orchestrator schedules the
+  processes.
+
+[mermaid]
+....
+erDiagram
+    TASK_EXECUTION ||--o{ TASK_TASK_BATCH : "launched"
+    TASK_TASK_BATCH }o--|| BATCH_JOB_EXECUTION : "points at"
+    BATCH_JOB_EXECUTION ||--o{ BATCH_STEP_EXECUTION : "has"
+    TASK_EXECUTION {
+        bigint TASK_EXECUTION_ID
+        varchar TASK_NAME
+        integer EXIT_CODE
+        varchar ERROR_MESSAGE
+    }
+    TASK_TASK_BATCH {
+        bigint TASK_EXECUTION_ID
+        bigint JOB_EXECUTION_ID
+    }
+    BATCH_JOB_EXECUTION {
+        bigint JOB_EXECUTION_ID
+        varchar STATUS
+    }
+....
+
+This is otherwise *linked, not documented in depth* here -- see https://spring.io/projects/spring-cloud-task[Spring
 Cloud Task].
 
 == Spring Cloud Data Flow
@@ -158,11 +386,46 @@ Four details matter in practice:
 * `concurrencyPolicy: Forbid` prevents an overrunning job from being launched twice -- Spring Batch would
   refuse the duplicate instance anyway, but failing at the platform level is clearer;
 * `backoffLimit: 0` stops Kubernetes from blindly restarting a failed pod; a restart should be a deliberate
-  `JobOperator.restart(...)` so that completed steps are skipped;
+  `+JobOperator.restart(...)+` so that completed steps are skipped;
 * `terminationGracePeriodSeconds` must exceed one chunk, so a `SIGTERM` can stop the job cleanly rather than
-  killing it mid-transaction;
-* the exit code should reflect the outcome (`SpringApplication.exit(...)`), so the platform can distinguish
+  killing it mid-transaction -- and the application must turn the signal into `+JobOperator.stop(...)+` itself, as in
+  the graceful-shutdown listener above, or the execution is left `STARTED`;
+* the exit code should reflect the outcome (`+SpringApplication.exit(...)+`), so the platform can distinguish
   success from failure.
+
+A one-off run of the same image, for a re-run of a failed night or a manual back-fill, is a plain `Job` with the
+settings from the container example above -- environment from a secret, the business parameter as an argument,
+the platform restart disabled:
+
+[source,yaml]
+----
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: settle-trades-20260131
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400      # keep the finished pod for a day, then let Kubernetes delete it
+  template:
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: batch
+          image: example/settle-trades:1.0.0
+          args: ["run.date=2026-01-31"]
+          env:
+            - name: SPRING_BATCH_JOB_ENABLED
+              value: "true"
+            - name: SPRING_BATCH_JOB_NAME
+              value: partitionedJob
+            - name: SPRING_DATASOURCE_URL
+              valueFrom:
+                secretKeyRef: { name: batch-db, key: url }
+----
+
+The restart after a failure is then a *second* `Job` with identical arguments (or the same `Job` recreated), which Spring
+Batch recognises as the same instance and resumes -- the sequence in the diagram above.
 
 The *`DeployerPartitionHandler`* (from Spring Cloud Task) extends partitioning to this world: instead of
 threads or long-running workers, each partition is launched as its *own* pod, which then exits. It suits

@@ -2,7 +2,7 @@
 :description: How MongoDB groups writes across documents and collections into a single ACID transaction -- client sessions, withTransaction versus explicit start/commit/abort, read and write concern, and the limits that keep transactions short.
 :keywords: mongodb, transactions, acid, client session, withTransaction, startTransaction, commitTransaction, abortTransaction, readConcern snapshot, writeConcern majority, distributed transactions
 
-include::partial$mongodb-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 A write to a single document in MongoDB is always atomic on its own, even when it touches many fields or
 several elements of an array. A multi-document transaction is the tool you reach for only when a correctness
@@ -41,6 +41,18 @@ the note that single-document operations are already atomic.
 * *Durability* -- with `writeConcern: "majority"` a committed transaction is acknowledged only once the commit
   is persisted on a majority of replica-set members.
 
+Isolation is implemented with WiredTiger's multi-version concurrency control (see
+xref:database/mongodb/storage-and-durability.adoc[WiredTiger, journaling & durability]). When the first operation of
+a transaction runs, the server pins a snapshot of the data; every later read in that transaction sees that
+snapshot plus the transaction's own writes. Writes are optimistic: two transactions (or a transaction and a
+plain write) that touch the same document do not queue behind a lock for seconds. The second one to touch the
+document fails immediately with a *write conflict*, labelled `TransientTransactionError`, and the application is
+expected to retry (see <<Write conflicts and the retry labels>>).
+
+NOTE: Transactions need a replica set or a sharded cluster. A standalone `mongod` has no oplog to carry the
+commit, so the first operation of a transaction against it fails with "Transaction numbers are only allowed on a replica set member or mongos". The running example below therefore uses the three-member set
+`rs0` from xref:database/mongodb/replication.adoc[Replica sets & high availability].
+
 == Client sessions
 
 A transaction always runs inside a *client session* -- an object the driver uses to associate a sequence of
@@ -60,6 +72,21 @@ try {
 
 See https://www.mongodb.com/docs/manual/reference/method/Mongo.startSession/[`Mongo.startSession()`].
 
+Under the hood a session is a *logical session id* (`lsid`) that the driver sends with every command, plus, inside
+a transaction, an increasing *transaction number* (`txnNumber`) and an `autocommit: false` flag. The `lsid` and
+`txnNumber` also appear in the oplog entries a write produces (see the oplog sample in
+xref:database/mongodb/replication.adoc[Replica sets & high availability]), which is how retryable writes and
+transaction recovery find their way after a failover.
+
+[WARNING]
+====
+In `mongosh`, run the operations of a transaction through the *session's own* database handle,
+`session.getDatabase("bank")`, and do **not** also pass `+{ session }+` as an option. The handle already carries
+the session, and passing the shell's session wrapper as an option makes the shell fail with
+`i?.inTransaction is not a function`. Language drivers do the opposite: they take the session as an explicit
+argument on every call (`session=session` in PyMongo, `+{ session }+` in Node.js).
+====
+
 == withTransaction: the recommended entry point
 
 `session.withTransaction(fn)` runs the callback inside a transaction and handles the retry logic for you: if
@@ -74,11 +101,11 @@ try {
   session.withTransaction(() => {
     const accounts = session.getDatabase("bank").accounts;
 
-    accounts.updateOne({ _id: "A" }, { $inc: { balance: -100 } }, { session });
-    accounts.updateOne({ _id: "B" }, { $inc: { balance:  100 } }, { session });
+    accounts.updateOne({ _id: "A" }, { $inc: { balance: -100 } });
+    accounts.updateOne({ _id: "B" }, { $inc: { balance:  100 } });
 
     // Throwing here aborts the transaction; the throw propagates out of withTransaction.
-    const from = accounts.findOne({ _id: "A" }, { session });
+    const from = accounts.findOne({ _id: "A" });
     if (from.balance < 0) {
       throw new Error("insufficient funds");
     }
@@ -93,6 +120,26 @@ try {
 
 See https://www.mongodb.com/docs/manual/core/transactions/#transactions-api[the Transactions API] and
 https://www.mongodb.com/docs/manual/core/transactions-in-applications/[Transactions and retry logic].
+
+The loop the driver runs on your behalf is worth knowing, because it explains why the callback must be
+idempotent and free of side effects such as sending an e-mail:
+
+[mermaid]
+....
+flowchart TD
+    S[startTransaction] --> CB[run the callback]
+    CB -->|callback throws| AB[abortTransaction]
+    AB --> L1{labelled TransientTransactionError?}
+    L1 -->|yes, and under 120 s| S
+    L1 -->|no| ERR[rethrow to the caller]
+    CB -->|callback returns| CM[commitTransaction]
+    CM -->|ok| DONE[return result]
+    CM -->|UnknownTransactionCommitResult| CM
+    CM -->|TransientTransactionError| L1
+....
+
+The driver stops retrying after a fixed time budget (120 seconds in the official drivers) and rethrows the last
+error, so a callback that always conflicts does not spin forever.
 
 == Explicit start, commit, and abort
 
@@ -109,8 +156,8 @@ session.startTransaction({
 });
 try {
   const accounts = session.getDatabase("bank").accounts;
-  accounts.updateOne({ _id: "A" }, { $inc: { balance: -100 } }, { session });
-  accounts.updateOne({ _id: "B" }, { $inc: { balance:  100 } }, { session });
+  accounts.updateOne({ _id: "A" }, { $inc: { balance: -100 } });
+  accounts.updateOne({ _id: "B" }, { $inc: { balance:  100 } });
   session.commitTransaction();
 } catch (e) {
   session.abortTransaction();
@@ -127,15 +174,166 @@ https://www.mongodb.com/docs/manual/reference/method/Session.commitTransaction/[
 and
 https://www.mongodb.com/docs/manual/reference/method/Session.abortTransaction/[`Session.abortTransaction()`].
 
+== A worked example: moving money between two accounts
+
+The invariant is the classic one: the money taken from account `A` must arrive in account `B`, and neither
+balance may go negative. Both accounts are separate documents in `bank.accounts`, so a single-document write
+cannot guarantee it. The example uses PyMongo against the replica set `rs0` (the same code shape works in every
+driver, see xref:database/mongodb/drivers-and-tooling.adoc[Connecting from an application & the tooling]).
+
+[source,python]
+----
+from pymongo import MongoClient, WriteConcern
+from pymongo.read_concern import ReadConcern
+
+client = MongoClient("mongodb://localhost:27017/?replicaSet=rs0")
+accounts = client.bank.accounts
+accounts.drop()
+accounts.insert_many([{"_id": "A", "balance": 500}, {"_id": "B", "balance": 100}])
+
+def transfer(session, src, dst, amount):
+    coll = session.client.bank.accounts
+    coll.update_one({"_id": src}, {"$inc": {"balance": -amount}}, session=session)
+    coll.update_one({"_id": dst}, {"$inc": {"balance": amount}}, session=session)
+    if coll.find_one({"_id": src}, session=session)["balance"] < 0:
+        raise ValueError("insufficient funds")      # aborts the transaction
+
+def show(label):
+    print(label, {d["_id"]: d["balance"] for d in accounts.find().sort("_id")})
+
+show("before")
+with client.start_session() as s:
+    s.with_transaction(lambda s: transfer(s, "A", "B", 200),
+                       read_concern=ReadConcern("snapshot"),
+                       write_concern=WriteConcern("majority"))
+show("after commit")
+try:
+    with client.start_session() as s:
+        s.with_transaction(lambda s: transfer(s, "A", "B", 1000))
+except ValueError as e:
+    print("aborted:", e)
+show("after abort")
+----
+
+Running it against the three-member set prints:
+
+[source,text]
+----
+before {'A': 500, 'B': 100}
+after commit {'A': 300, 'B': 300}
+aborted: insufficient funds
+after abort {'A': 300, 'B': 300}
+----
+
+The second transfer wrote `-700` into `A` and `+1300` into `B` inside the transaction, then the callback raised.
+`with_transaction` aborted, the exception propagated to the caller unchanged, and neither balance moved: that is
+atomicity.
+
+The same flow in `mongosh` (note the absence of `+{ session }+` on the individual calls) behaves identically and
+also shows the visibility rules of an open transaction:
+
+[source,javascript]
+----
+const s = db.getMongo().startSession();
+s.startTransaction();
+s.getDatabase("bank").accounts.updateOne({ _id: "A" }, { $inc: { balance: -10 } });
+
+print("inside tx  A =", s.getDatabase("bank").accounts.findOne({ _id: "A" }).balance);   // 240
+print("outside tx A =", db.getSiblingDB("bank").accounts.findOne({ _id: "A" }).balance); // 250
+s.abortTransaction();
+s.endSession();
+----
+
+Other clients keep seeing `250` until the transaction commits (and forever if it aborts). A read inside the
+transaction sees the transaction's own uncommitted write, `240`.
+
+== Snapshot isolation in action
+
+A transaction started with `readConcern: "snapshot"` keeps reading the same data even when other clients commit
+changes in the meantime. This is the same script style as above, with a plain write sneaking in between two
+reads of the same transaction:
+
+[source,python]
+----
+s = client.start_session()
+s.start_transaction(read_concern=ReadConcern("snapshot"))
+print("tx read 1:", accounts.find_one({"_id": "B"}, session=s)["balance"])
+accounts.update_one({"_id": "B"}, {"$inc": {"balance": 1}})          # outside the transaction
+print("tx read 2:", accounts.find_one({"_id": "B"}, session=s)["balance"])
+print("outside read:", accounts.find_one({"_id": "B"})["balance"])
+s.abort_transaction()
+----
+
+[source,text]
+----
+tx read 1: 300
+tx read 2: 300
+outside read: 301
+----
+
+The transaction keeps its point-in-time view (`300`) while the rest of the world already sees `301`. If the
+transaction then tried to write to `B`, it would hit the write conflict described next.
+
+== Write conflicts and the retry labels
+
+MongoDB does not block a transaction behind another transaction's lock. If a transaction tries to modify a
+document that another in-flight transaction has already modified, the later one fails at once:
+
+[source,python]
+----
+from pymongo.errors import OperationFailure
+
+s1 = client.start_session(); s2 = client.start_session()
+s1.start_transaction(); s2.start_transaction()
+accounts.update_one({"_id": "A"}, {"$inc": {"balance": -10}}, session=s1)
+try:
+    accounts.update_one({"_id": "A"}, {"$inc": {"balance": -20}}, session=s2)
+except OperationFailure as e:
+    print("code", e.code, e.details["codeName"], "labels", e.details["errorLabels"])
+s1.commit_transaction()
+----
+
+[source,text]
+----
+code 112 WriteConflict labels ['TransientTransactionError']
+----
+
+[mermaid]
+....
+sequenceDiagram
+    participant T1 as Transaction 1
+    participant M as mongod
+    participant T2 as Transaction 2
+    T1->>M: update A (balance minus 10)
+    M-->>T1: ok, A is now modified in T1's snapshot
+    T2->>M: update A (balance minus 20)
+    M-->>T2: WriteConflict, TransientTransactionError
+    Note over T2: abort and retry the whole transaction
+    T1->>M: commit
+    M-->>T1: committed
+    T2->>M: retry from the start on a fresh snapshot
+    M-->>T2: ok
+....
+
+Two error labels drive the retry logic, and every driver exposes them:
+
+* `TransientTransactionError` -- the transaction was aborted by something that is not the application's fault
+  (a write conflict, a failover, a lock timeout). Retry the *whole* transaction from the first operation.
+* `UnknownTransactionCommitResult` -- the commit was sent but the outcome is unknown (network error, failover
+  during commit). Retry only `commitTransaction()`; commits are idempotent.
+
+`withTransaction` / `with_transaction` / `WithTransaction` implements exactly this decision table, which is the
+main reason to prefer it over the hand-written loop.
+
 == Read and write concern inside a transaction
 
 Read and write concern are set on the transaction as a whole, not per operation -- individual operations
 inside the transaction ignore their own concern settings.
 
-* `readConcern: { level: "snapshot" }` gives every read in the transaction a consistent view as of a single
+* `+readConcern: { level: "snapshot" }+` gives every read in the transaction a consistent view as of a single
   cluster time, and (on commit with `w: "majority"`) that snapshot is guaranteed to be from majority-committed
   data.
-* `writeConcern: { w: "majority" }` applies to the commit: the transaction is durable once a majority of
+* `+writeConcern: { w: "majority" }+` applies to the commit: the transaction is durable once a majority of
   members have the commit.
 
 [source,javascript]
@@ -153,12 +351,27 @@ set.
 
 == Limits: keep transactions short
 
-* A transaction has a *60-second* default runtime limit (`transactionLifetimeLimitSeconds`); it is aborted by
-  the server once it exceeds that, whether or not it is still doing work.
-* The commit produces oplog entries subject to the *16 MB* BSON document limit; a transaction that modifies
-  too much data cannot be committed. Very large bulk changes belong outside a transaction.
-* Locks a transaction holds block other writers. By default an operation waits only `maxTransactionLockRequestTimeoutMillis`
-  (5 ms) to acquire a lock before yielding to the transaction.
+* A transaction has a *60-second* default runtime limit (`transactionLifetimeLimitSeconds`); the server aborts
+  it once it exceeds that, whether or not it is still doing work. The abort is done by a periodic cleanup, so it
+  can land a few seconds after the limit. The next operation on the dead transaction fails with
+  `NoSuchTransaction` and the `TransientTransactionError` label:
++
+[source,text]
+----
+after 16 s with a 5 s limit: NoSuchTransaction ["TransientTransactionError"]
+commit: NoSuchTransaction
+----
+* There is no hard 16 MB cap on a whole transaction any more. Since MongoDB 4.2 a large transaction is split
+  into several oplog entries (each one still bound by the 16 MB BSON limit), so a single transaction that
+  inserted thirty 1 MB documents committed without trouble on the example set. The practical limit is the
+  memory and cache pressure of keeping a large snapshot and uncommitted changes in WiredTiger, which is what
+  the 60-second limit protects.
+* A transaction waits only `maxTransactionLockRequestTimeoutMillis` (default 5 ms) for a lock it needs. If the
+  lock is not available it aborts with a `TransientTransactionError` instead of queueing, which is why heavy
+  contention shows up as retries rather than as waiting.
+* Collections can be created inside a transaction (the implicit creation of `bank.ledger` by the first insert
+  committed together with the rest of the example transaction). Even so, create collections and indexes ahead
+  of time: schema changes inside a transaction take stronger locks and are a poor fit for short, hot paths.
 
 The practical guidance is to touch a small number of documents, do no slow application work between the first
 read and the commit, and split large jobs into many small transactions. See
@@ -173,6 +386,48 @@ network round trips and coordinator state -- so a data model that keeps each tra
 single shard (for example by choosing a shard key that co-locates related documents) performs markedly better.
 See https://www.mongodb.com/docs/manual/core/transactions/#transactions-and-sharding[Transactions and
 Sharding].
+
+[mermaid]
+....
+sequenceDiagram
+    participant App as Application
+    participant R as mongos
+    participant S1 as Shard 1 (coordinator)
+    participant S2 as Shard 2
+    App->>R: update on a document owned by shard 1
+    R->>S1: update inside the transaction
+    App->>R: update on a document owned by shard 2
+    R->>S2: update inside the transaction
+    App->>R: commitTransaction
+    R->>S1: coordinateCommit with participant list
+    S1->>S2: prepare
+    S2-->>S1: prepared
+    S1->>S1: prepare and write the commit decision
+    S1->>S2: commit
+    S1-->>R: committed
+    R-->>App: ok
+....
+
+On the two-shard cluster built for xref:database/mongodb/sharding.adoc[Horizontal scaling with sharded clusters],
+a transaction that touches one EU customer (stored on shard 1) and one US customer (stored on shard 2) through the
+`mongos` needs no special code:
+
+[source,python]
+----
+client = MongoClient("mongodb://localhost:27017")          # the mongos
+customers = client.shop.customers
+
+def adjust_points(session):
+    customers.update_one({"region": "EU", "customerId": 1}, {"$set": {"points": 90}}, session=session)
+    customers.update_one({"region": "US", "customerId": 0}, {"$set": {"points": 110}}, session=session)
+
+with client.start_session() as s:
+    s.with_transaction(adjust_points)
+----
+
+It commits through the coordinator as drawn, and both documents show their new values afterwards (`90` and
+`110`). The only visible difference from the single replica set is latency: a cross-shard commit pays for the extra
+round trips of the prepare phase.
 
 == Transaction lifecycle
 

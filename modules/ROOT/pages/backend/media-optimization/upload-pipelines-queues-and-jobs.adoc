@@ -2,7 +2,7 @@
 :description: The reference architecture for media processing: never transcode inside the HTTP request, upload straight to object storage with a pre-signed URL, trigger work from a storage event or API call, queue jobs, run idempotent workers with retries, backoff and dead-letter queues, track status, and notify clients; linked to the messaging, scheduling, batch, Docker and Kubernetes pages.
 :keywords: upload pipeline, pre-signed URL, direct upload, queue, job, worker, idempotency, retry, backoff, dead-letter queue, status, webhook, Kubernetes Job, Spring Batch, messaging, media processing architecture
 
-include::partial$media-optimization-backend-disclaimer.adoc[]
+include::partial$ai-disclaimer.adoc[]
 
 Baseline date: 2026-10-07. Image resizing takes tens of milliseconds to seconds, AVIF encoding takes seconds and video
 transcoding takes minutes to hours. None of it can happen in the request that receives the upload. The request would
@@ -33,12 +33,40 @@ flowchart LR
 
 === Direct upload with a pre-signed URL
 
-The client asks the API for an upload slot. The API creates a database row in the state `awaiting_upload`, signs a short-lived PUT URL for a specific key, content type and
-maximum length, and returns the URL and the media id. The client then uploads straight to object storage, and the
+The client asks the API for an upload slot. The API creates a database row in the state `awaiting_upload`, signs a short-lived URL for a specific key and content type, and returns the URL and the media id. The client then uploads straight to object storage, and the
 bytes never pass through your servers. For files above a few tens of megabytes, use multipart or resumable uploads
 (S3 multipart upload, Google Cloud Storage resumable upload, Azure Blob block upload). The details per cloud are in
 xref:cloud/aws/s3-object-storage.adoc[S3], xref:cloud/google-cloud/cloud-storage.adoc[Cloud Storage] and
 xref:cloud/azure/blob-storage.adoc[Blob Storage].
+
+A presigned PUT cannot express "at most 10 MB". The signature binds the headers that were signed, so signing `Content-Length` fixes the exact number of bytes the client must send, and a client that does not know the size in advance
+cannot use it. A size range needs a presigned POST with a `content-length-range` condition in its policy, or a size check after the upload (the API call that completes the upload, or the worker, compares the stored size with the limit and deletes
+the object when it is over). With boto3, offline (the signing needs no network), the two look like this:
+
+[source,python]
+----
+import boto3
+from botocore.config import Config
+
+s3 = boto3.client("s3", region_name="eu-west-1", config=Config(signature_version="s3v4"))
+
+# Exact length: the signature covers content-length, content-type and host.
+put_url = s3.generate_presigned_url(
+    "put_object",
+    Params={"Bucket": "media", "Key": "uploads/b81f/original", "ContentType": "image/jpeg", "ContentLength": 948703},
+    ExpiresIn=300)
+
+# A range: the cap lives in the POST policy that the client must satisfy.
+post = s3.generate_presigned_post(
+    "media", "uploads/b81f/original",
+    Fields={"Content-Type": "image/jpeg"},
+    Conditions=[["content-length-range", 1, 10 * 1024 * 1024], {"Content-Type": "image/jpeg"}],
+    ExpiresIn=300)
+----
+
+With dummy credentials, the PUT URL carried `X-Amz-SignedHeaders=content-length;content-type;host` and `X-Amz-Expires=300` (without `ContentLength` it was `content-type;host`), and the decoded POST policy contained
+`+["content-length-range", 1, 10485760]+`, `+{"Content-Type": "image/jpeg"}+`, the bucket, the key and the signing fields. What the storage service does with an oversized body is described in the AWS documentation (a POST policy violation is rejected, a signed
+`Content-Length` that does not match fails the signature); the test above checked what is signed, not the server's rejection. Add `ContentType` to the signed parameters either way, so a client cannot upload an HTML file with a `.jpg` key.
 
 Upload to a *private* `uploads/` prefix that no CDN serves, and write results to a different prefix (or bucket). That
 separation means an unprocessed or malicious file is never public.
@@ -126,6 +154,177 @@ longest job, or extend it with a heartbeat, so that a running job is not deliver
 Separate queues::
 Keep images and videos on different queues, so a backlog of long transcodes cannot delay thumbnails.
 
+== Worked example: a queue with retries, backoff and a dead-letter queue
+
+The patterns above fit in about 80 lines of Python, with SQLite standing in for the broker so that nothing has to be installed. A `media` table holds the status, the attempt count and the recipe version, a `jobs` table holds
+what the broker would hold (the due time, the lease, a dead flag), and `handle` is the worker. The job body is the `process` function of the cover job on
+xref:backend/media-optimization/python-image-and-video-libraries.adoc[the Python page], so the work is real. Four uploads are published at time 0: the phone cover `m1`, the same cover `m2` with a storage that fails twice,
+a corrupt file `m3`, and the cover `m4` with a storage that never recovers.
+
+[source,python]
+----
+# queue_sim.py: a job table with retries, backoff, dead-lettering and idempotent workers (SQLite stands in for the queue)
+import json, random, sqlite3
+from media_pipeline import Rejected, process
+
+class Transient(Exception):          # storage timeout, busy encoder: worth retrying
+    pass
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE media (id TEXT PRIMARY KEY, status TEXT, attempts INT DEFAULT 0, reason TEXT, recipe INT, result TEXT);
+CREATE TABLE jobs  (media_id TEXT PRIMARY KEY, run_at REAL, lease_until REAL DEFAULT 0, dead INT DEFAULT 0);
+""")
+STORAGE = {}                         # key -> bytes, the "uploads/" prefix
+FLAKY = {"m2": 2, "m4": 99}          # media id -> number of storage calls that fail
+RECIPE, MAX_ATTEMPTS, BASE, LEASE = 3, 4, 2.0, 30.0
+log = []
+
+def say(now, text): log.append(f"t={now:5.1f}  {text}")
+
+def enqueue(mid, data, now):
+    STORAGE[f"uploads/{mid}"] = data
+    db.execute("INSERT INTO media(id, status, recipe) VALUES (?, 'uploaded', ?)", (mid, RECIPE))
+    db.execute("INSERT INTO jobs(media_id, run_at) VALUES (?, ?)", (mid, now))
+
+def fetch(mid):
+    if FLAKY.get(mid, 0) > 0:
+        FLAKY[mid] -= 1
+        raise Transient("storage timeout")
+    return STORAGE[f"uploads/{mid}"]
+
+def poll(now):
+    """Lease one due job. Another worker cannot see it until lease_until passes (the visibility timeout)."""
+    row = db.execute("SELECT media_id FROM jobs WHERE dead = 0 AND run_at <= ? AND lease_until <= ? ORDER BY run_at LIMIT 1", (now, now)).fetchone()
+    if row:
+        db.execute("UPDATE jobs SET lease_until = ? WHERE media_id = ?", (now + LEASE, row[0]))
+    return row and row[0]
+
+def handle(mid, now):
+    status, done_recipe = db.execute("SELECT status, recipe FROM media WHERE id = ?", (mid,)).fetchone()
+    if status == "ready" and done_recipe == RECIPE:                  # idempotency: a duplicate delivery is a no-op
+        db.execute("DELETE FROM jobs WHERE media_id = ?", (mid,)); say(now, f"{mid}: already ready, skipped"); return
+    db.execute("UPDATE media SET status = 'processing', attempts = attempts + 1 WHERE id = ?", (mid,))
+    attempts = db.execute("SELECT attempts FROM media WHERE id = ?", (mid,)).fetchone()[0]
+    try:
+        record = process(fetch(mid))
+        db.execute("UPDATE media SET status = 'ready', result = ? WHERE id = ?", (json.dumps(record["blurhash"]), mid))  # status last
+        db.execute("DELETE FROM jobs WHERE media_id = ?", (mid,))
+        say(now, f"{mid}: ready after {attempts} attempt(s), blurhash {record['blurhash']}")
+    except Rejected as exc:                                          # permanent: do not retry
+        db.execute("UPDATE media SET status = 'failed', reason = ? WHERE id = ?", (str(exc)[:40], mid))
+        db.execute("DELETE FROM jobs WHERE media_id = ?", (mid,)); say(now, f"{mid}: failed, {str(exc)[:40]}")
+    except Transient as exc:
+        if attempts >= MAX_ATTEMPTS:
+            db.execute("UPDATE jobs SET dead = 1 WHERE media_id = ?", (mid,))
+            db.execute("UPDATE media SET status = 'failed', reason = 'retries exhausted' WHERE id = ?", (mid,))
+            say(now, f"{mid}: moved to the dead-letter queue after {attempts} attempts")
+        else:
+            delay = random.uniform(0, BASE * 2 ** (attempts - 1))    # exponential backoff with full jitter
+            db.execute("UPDATE jobs SET run_at = ?, lease_until = 0 WHERE media_id = ?", (now + delay, mid))
+            db.execute("UPDATE media SET status = 'queued' WHERE id = ?", (mid,))
+            say(now, f"{mid}: {exc}, retry in {delay:.1f} s (attempt {attempts})")
+
+random.seed(11)
+good, corrupt = open("work/phone.jpg", "rb").read(), b"not an image" * 10
+for mid, data in (("m1", good), ("m2", good), ("m3", corrupt), ("m4", good)):
+    enqueue(mid, data, 0.0)
+now = 0.0
+while now < 30:
+    if now == 10:                                    # the storage event for m1 is delivered a second time
+        db.execute("INSERT INTO jobs(media_id, run_at) VALUES ('m1', 10)")
+    while (mid := poll(now)):
+        handle(mid, now)
+    now += 0.5
+print("\n".join(log))
+print()
+for row in db.execute("SELECT id, status, attempts, reason FROM media ORDER BY id"): print(row)
+print("dead letters:", [r[0] for r in db.execute("SELECT media_id FROM jobs WHERE dead = 1")])
+----
+
+The output is:
+
+[source,text]
+----
+t=  0.0  m1: ready after 1 attempt(s), blurhash TKAeBpR,9GiXf8WC0Lt6?GN1j[t6
+t=  0.0  m2: storage timeout, retry in 0.9 s (attempt 1)
+t=  0.0  m3: failed, not a decodable image: cannot identify i
+t=  0.0  m4: storage timeout, retry in 1.1 s (attempt 1)
+t=  1.0  m2: storage timeout, retry in 3.7 s (attempt 2)
+t=  1.5  m4: storage timeout, retry in 1.9 s (attempt 2)
+t=  3.5  m4: storage timeout, retry in 4.1 s (attempt 3)
+t=  5.0  m2: ready after 3 attempt(s), blurhash TKAeBpR,9GiXf8WC0Lt6?GN1j[t6
+t=  8.0  m4: moved to the dead-letter queue after 4 attempts
+t= 10.0  m1: already ready, skipped
+
+('m1', 'ready', 1, None)
+('m2', 'ready', 3, None)
+('m3', 'failed', 1, 'not a decodable image: cannot identify i')
+('m4', 'failed', 4, 'retries exhausted')
+dead letters: ['m4']
+----
+
+Each line shows one rule from the worker design list in action:
+
+* `m1` is delivered a second time at t = 10 (a storage event delivered twice) and is skipped because its row is `ready` for recipe 3: the duplicate costs one row read.
+* `m2` fails on a transient error twice, waits a random delay each time and succeeds on the third attempt. The delays are drawn between 0 and `+BASE * 2 ** (attempt - 1)+` seconds (full jitter), so they were 0.9 s, 3.7 s, and the cap on
+  the third draw would have been 8 s: waiting is spread out, so that a thousand jobs that failed together do not all come back in the same second.
+* `m3` is a corrupt file. It is a permanent failure, so it is marked `failed` at once with a reason and is never retried: retrying a file that cannot be decoded only delays the user's error message.
+* `m4` is a transient failure that does not go away. After four attempts the job is marked dead and remains in the table for a human, which is the dead-letter queue, and its media row is `failed` with `retries exhausted`.
+* `poll` sets `lease_until` when it hands a job out, so a second worker cannot take the same job until the lease expires. The lease (30 s here) is the visibility timeout, and it must be longer than the longest job or be extended by a heartbeat.
+  The status is written last, after the variants, so a crash in the middle leaves a job that will be redone from scratch to the same keys.
+
+[mermaid]
+....
+flowchart TD
+    P["poll: lease one due job"] --> R{"Row already ready for this recipe?"}
+    R -- "yes" --> K["Delete the job, skip"]
+    R -- "no" --> W["Mark processing, count the attempt, run the work"]
+    W --> O{"Outcome"}
+    O -- "success" --> D["Write status ready last, delete the job"]
+    O -- "permanent: rejected file" --> F["Mark failed with the reason"]
+    O -- "transient" --> A{"Attempts left?"}
+    A -- "yes" --> B["Reschedule with exponential backoff and jitter"]
+    A -- "no" --> L["Mark dead: dead-letter queue"]
+....
+
+== Event payloads
+
+Storage events arrive in the provider's shape, and the first thing the consumer does is turn them into the small job message. Two details cause most of the bugs: one notification can carry several records, and object keys are
+URL-encoded with `+` for spaces. The function below handles both and ignores keys that are not under the upload layout instead of failing the whole batch:
+
+[source,python]
+----
+import json
+from urllib.parse import unquote_plus
+
+def jobs_from_s3_event(body: str, recipe: int = 3) -> list[dict]:
+    """One S3 notification can carry several records. Keys arrive URL-encoded, with + for spaces."""
+    jobs = []
+    for record in json.loads(body).get("Records", []):
+        if not record["eventName"].startswith("ObjectCreated:"):
+            continue
+        key = unquote_plus(record["s3"]["object"]["key"])
+        parts = key.split("/")                      # uploads/<media id>/original
+        if len(parts) != 3 or parts[0] != "uploads" or parts[2] != "original":
+            continue                                # not ours: ignore, do not fail the batch
+        jobs.append({"mediaId": parts[1], "key": key, "size": record["s3"]["object"]["size"], "recipe": recipe})
+    return jobs
+----
+
+Given a notification with five records (a `Put` of `uploads/b81f/original`, a multipart completion of 52,428,800 bytes, a delete, a key encoded as `uploads/my+cover+%281%29/original`, and an object under `tmp/`), it returned three jobs: `b81f`, `c0de`,
+and a media id decoded to `my cover (1)`. The delete and the `tmp/` object produced nothing. Note that the large file arrives as a different event name (`CompleteMultipartUpload`), so test on the `ObjectCreated:` prefix, not on `Put`. Because
+delivery is at least once, the job message is only the identifiers, and the idempotency of the worker does the rest.
+
+== Sizing the workers
+
+The number of workers follows from the arrival rate and the service time, which is Little's law: the average number of busy workers equals jobs per second times seconds per job. The measured service times of this section are
+about 0.45 s for the three-width, three-format cover job in Python (435 ms) and about 1.4 s for the two-format Java job (1,440 ms with JIT warm-up), on one laptop. Assuming 10,000 image uploads per hour (2.8 per second), that is 1.2 busy
+Python workers or 4 Java ones, so run two and four with room for peaks, and scale on the age of the oldest message. For video, a 10 second 1080p clip took 1.9 seconds to transcode to 720p with `-preset slow` on a 10-core Docker VM
+(5 times real time). One hundred three-minute videos per hour is 18,000 seconds of video, 3,600 seconds of encoding, one fully busy 10-core worker, and four if bursts are four times the average.
+These are arithmetic on assumed rates and one machine's timings: measure your own service time per recipe and per input size, as the monitoring section of
+xref:backend/media-optimization/security-and-operations.adoc[security and operations] describes, and let the autoscaler follow queue age.
+
 == Status and notifications
 
 [mermaid]
@@ -161,4 +360,5 @@ xref:backend/media-optimization/blurhash-algorithm.adoc[BlurHash].
 
 * xref:backend/media-optimization/security-and-operations.adoc[]
 * xref:backend/media-optimization/spring-boot-and-quarkus-pipeline.adoc[]
+* xref:backend/messaging/rabbitmq-reliability-dead-lettering-and-ttl.adoc[RabbitMQ reliability, dead-lettering and TTL] and xref:backend/messaging/delivery-guarantees.adoc[delivery guarantees]
 * xref:backend/media-optimization/video-streaming.adoc[]
