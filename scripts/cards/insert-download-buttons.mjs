@@ -44,7 +44,7 @@ function introEnd(lines) {
 
 // A "== Download" section left without content once its link moved to the top button is removed.
 export const dropEmptyDownloadSections = (text) =>
-  text.replace(/\n==+ Download[^\n]*\n+(?=(==+ |$))/g, '\n').replace(/\n+$/, '\n');
+  text.replace(/\n(==+) Download[^\n]*\n+(?=(\1 |=(?!=)|$))/g, '\n').replace(/\n+$/, '\n');
 
 export function withDownloadButtons(text) {
   // Earlier runs put the full button in table cells; those become the compact one.

@@ -14,6 +14,10 @@ const MUST_KNOW = /(legacy|not legal advice|This is not ASP\.NET Core|frozen|sec
 
 const MAP_ONLY = process.argv.includes('--map-only') // rebuild the map from git HEAD without touching pages
 const inv = inventory(MAP_ONLY ? 'HEAD' : null).filter(e => e.name !== 'ai-disclaimer.adoc')
+if (!inv.length) {
+  console.error('No per-topic disclaimer partials left: the relocation already ran and relocation-map.json is the record. Refusing to overwrite it.')
+  process.exit(1)
+}
 const map = []
 
 function admonition (sentences) {

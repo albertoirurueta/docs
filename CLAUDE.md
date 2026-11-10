@@ -62,7 +62,10 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   untitled list wrapper and of the "Open Source Projects" group are open. The bundle's `site.js` toggles and the
   "toggle all" button only flip `is-active`, so they keep working. Keep the override in step with the bundle's own
   partial when the bundle is rebuilt (issue #255 will fold it into the bundle source). Nav entries must follow the
-  same order and the same titles as the section index's text list.
+  same order and the same titles as the section index's text list. **Nav entries never link to a `#fragment`**: on
+  the target page that link renders as `href="#..."`, which makes the bundle's `site.js` hash handler strip every
+  `is-active` class and collapse the default-open groups. The override also matches the top-level entry text
+  `Open Source Projects` exactly, so renaming it needs the same change in the override. `npm run test:cards` checks both.
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
   `modules/ROOT/nav.adoc`. This is the site's landing/root component — its pages don't describe this repo, they
   describe the overall site and link out to each remote component.
@@ -89,9 +92,14 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   non-AI content and including pages), `relocate.mjs` (moved that content and switched pages to the shared include,
   writing `relocation-map.json`) and `traceability.mjs` (fails when a relocated version or caveat sentence has no
   destination; `--ref <git-rev>` also checks that every partial present at that revision is in the map).
+  `relocate.mjs` refuses to run now that the per-topic partials are gone, so the committed map is the record. When a
+  relocated sentence is later rewritten on purpose (for example a version baseline that moves to a newer release),
+  update its `text` in `relocation-map.json` and keep the old wording in a `superseded` field.
 - **Index templates.** Every `index.adoc` of a section (`<section>/index.adoc`) and of a subsection
   (`<section>/<subsection>/index.adoc`) uses a fixed `==` heading order, audited by `npm run audit:index-template`
-  (`scripts/index-template/audit.mjs`, `--list`/`--json` for details; it must report 0 with violations). Section
+  (`scripts/index-template/audit.mjs`, `--list`/`--json` for details; it must report 0 with violations). Nested
+  indexes one level deeper (`<section>/<subsection>/<topic>/index.adoc`) are outside the template: the audit lists
+  them as warnings only (`--strict` makes them fail). Section
   index: `Sections`, `Related material on this site`, `Bibliography`, `References` (optional ones may be absent, the order
   never changes). Subsection index: `Version baseline`, `What's covered`, `Reading path`, `Running example`, `Related
   material on this site`, `Bibliography`, `References`. Use these exact names (no "Reading order", "Learning path"
@@ -148,7 +156,9 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   run `npm run cards` to turn the link into the top button. Check with `npm run test:cheat-sheets`.
 - **Nav titles and order.** The nav (`modules/ROOT/nav.adoc` and the `partials/nav-<name>.adoc` includes) uses bare
   product or topic names ("Java", "JavaScript", "Spring Boot", "MongoDB"; no "Reference"/"Development" suffix, no
-  "Python " prefix), and the nav entry, the card title and the index link text are the same string. Nav order equals
+  "Python " prefix, no parenthetical expansion such as "AWS (Amazon Web Services)"), and the nav entry, the card
+  title and the index link text are the same string (`npm run test:cards` checks it; a title too long for one line is
+  drawn on two lines, never abbreviated). Nav order equals
   the card order equals the order of the section's text list; the home page lists "Guides & References" before
   "Open Source Projects", with "About me" last.
 

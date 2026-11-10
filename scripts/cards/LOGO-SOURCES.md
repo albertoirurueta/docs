@@ -29,43 +29,43 @@ Logos are trademarks of their respective owners, used for identification only.
 | card-programming-languages-swift.svg | Swift | swift | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/swift.svg |
 | card-programming-languages-typescript.svg | TypeScript | typescript | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/typescript.svg |
 | card-programming-languages-visual-basic.svg | Visual Basic | drawn glyph "code" | own drawing | n/a | n/a |
-| card-programming-languages-comparative.svg | Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
+| card-programming-languages-comparative.svg | Programming Languages Comparative | drawn glyph "chart" | own drawing | n/a | n/a |
 | card-database-couchbase.svg | Couchbase | couchbase | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/couchbase.svg |
 | card-database-elasticsearch.svg | Elasticsearch | elasticsearch | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/elasticsearch.svg |
-| card-database-lucene.svg | Lucene | apachelucene | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apachelucene.svg |
-| card-database-migration.svg | Migration | drawn glyph "pipe" | own drawing | n/a | n/a |
+| card-database-lucene.svg | Apache Lucene | apachelucene | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apachelucene.svg |
+| card-database-migration.svg | Database Migration | drawn glyph "pipe" | own drawing | n/a | n/a |
 | card-database-mongodb.svg | MongoDB | mongodb | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/mongodb.svg |
 | card-database-mysql.svg | MySQL | mysql | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/mysql.svg |
 | card-database-neo4j.svg | Neo4j | neo4j | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/neo4j.svg |
 | card-database-postgresql.svg | PostgreSQL | postgresql | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/postgresql.svg |
-| card-database-prometheus.svg | Prometheus | prometheus | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/prometheus.svg |
+| card-database-prometheus.svg | Prometheus & Monitoring | prometheus | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/prometheus.svg |
 | card-database-qdrant.svg | Qdrant | qdrant | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/qdrant.svg |
 | card-database-redis.svg | Redis | redis | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/redis.svg |
-| card-database-schema-evolution.svg | Schema Evolution | drawn glyph "layers" | own drawing | n/a | n/a |
-| card-database-solr.svg | Solr | apachesolr | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apachesolr.svg |
+| card-database-schema-evolution.svg | Evolving the Database Model | drawn glyph "layers" | own drawing | n/a | n/a |
+| card-database-solr.svg | Apache Solr | apachesolr | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apachesolr.svg |
 | card-database-sql.svg | SQL | drawn glyph "database" | own drawing | n/a | n/a |
-| card-database-vector-rag.svg | Vector & RAG | drawn glyph "search" | own drawing | n/a | n/a |
+| card-database-vector-rag.svg | Vector Databases & RAG | drawn glyph "search" | own drawing | n/a | n/a |
 | card-web-angular.svg | Angular | angular | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/angular.svg |
 | card-web-aspnet.svg | ASP.NET | dotnet | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/dotnet.svg |
 | card-web-bootstrap.svg | Bootstrap | bootstrap | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/bootstrap.svg |
 | card-web-django.svg | Django | django | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/django.svg |
-| card-web-e2e-testing.svg | E2E Testing | drawn glyph "play" | own drawing | n/a | n/a |
+| card-web-e2e-testing.svg | E2E Testing in the Browser | drawn glyph "play" | own drawing | n/a | n/a |
 | card-web-gwt.svg | GWT | drawn glyph "code" | own drawing | n/a | n/a |
 | card-web-html-css.svg | HTML & CSS | html5 | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/html5.svg |
 | card-web-jquery.svg | jQuery | jquery | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/jquery.svg |
 | card-web-jsf.svg | JSF | drawn glyph "grid" | own drawing | n/a | n/a |
 | card-web-jsp-struts.svg | JSP & Struts | drawn glyph "doc" | own drawing | n/a | n/a |
-| card-web-media-optimization.svg | Web Media | drawn glyph "image" | own drawing | n/a | n/a |
+| card-web-media-optimization.svg | Media Optimization | drawn glyph "image" | own drawing | n/a | n/a |
 | card-web-nextjs.svg | Next.js | nextdotjs | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/nextdotjs.svg |
-| card-web-php-laravel.svg | PHP & Laravel | laravel | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/laravel.svg |
+| card-web-php-laravel.svg | PHP and Laravel | laravel | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/laravel.svg |
 | card-web-react.svg | React | react | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/react.svg |
 | card-web-sass.svg | Sass | sass | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/sass.svg |
-| card-web-tailwind.svg | Tailwind CSS | tailwindcss | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/tailwindcss.svg |
+| card-web-tailwind.svg | Tailwind | tailwindcss | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/tailwindcss.svg |
 | card-web-thymeleaf.svg | Thymeleaf | thymeleaf | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/thymeleaf.svg |
 | card-web-vaadin.svg | Vaadin | vaadin | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/vaadin.svg |
 | card-web-vue.svg | Vue.js | vuedotjs | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/vuedotjs.svg |
 | card-web-webrtc-websockets.svg | WebRTC & WebSockets | webrtc | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/webrtc.svg |
-| card-web-frameworks-comparison.svg | Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
+| card-web-frameworks-comparison.svg | Web Frameworks Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
 | card-backend-apache-tika.svg | Apache Tika | drawn glyph "doc" | own drawing | n/a | n/a |
 | card-backend-architecture.svg | Architecture | drawn glyph "layers" | own drawing | n/a | n/a |
 | card-backend-axum.svg | Axum | drawn glyph "server" | own drawing | n/a | n/a |
@@ -77,9 +77,9 @@ Logos are trademarks of their respective owners, used for identification only.
 | card-backend-hibernate.svg | Hibernate | hibernate | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/hibernate.svg |
 | card-backend-jmeter.svg | JMeter | apachejmeter | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apachejmeter.svg |
 | card-backend-kubernetes.svg | Kubernetes | kubernetes | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/kubernetes.svg |
-| card-backend-media-optimization.svg | Media | drawn glyph "image" | own drawing | n/a | n/a |
+| card-backend-media-optimization.svg | Media Optimization | drawn glyph "image" | own drawing | n/a | n/a |
 | card-backend-messaging.svg | Messaging | apachekafka | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apachekafka.svg |
-| card-backend-monitoring-alerting.svg | Monitoring | grafana | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/grafana.svg |
+| card-backend-monitoring-alerting.svg | Monitoring & Alerting | grafana | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/grafana.svg |
 | card-backend-nestjs.svg | NestJS | nestjs | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/nestjs.svg |
 | card-backend-nodejs.svg | Node.js | nodedotjs | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/nodedotjs.svg |
 | card-backend-oauth.svg | OAuth | drawn glyph "lock" | own drawing | n/a | n/a |
@@ -94,32 +94,32 @@ Logos are trademarks of their respective owners, used for identification only.
 | card-backend-terraform.svg | Terraform | terraform | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/terraform.svg |
 | card-backend-tornado.svg | Tornado | drawn glyph "server" | own drawing | n/a | n/a |
 | card-backend-vapor.svg | Vapor | vapor | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/vapor.svg |
-| card-backend-frameworks-comparison.svg | Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
+| card-backend-frameworks-comparison.svg | Backend Frameworks Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
 | card-apps-android.svg | Android | android | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/android.svg |
-| card-apps-apple.svg | Apple | apple | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apple.svg |
+| card-apps-apple.svg | Apple Platforms | apple | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/apple.svg |
 | card-apps-cli.svg | CLI | drawn glyph "terminal" | own drawing | n/a | n/a |
 | card-apps-hybrid.svg | Hybrid Apps | flutter | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/flutter.svg |
 | card-apps-kotlin-multiplatform.svg | Kotlin Multiplatform | kotlin | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/kotlin.svg |
-| card-apps-media-optimization.svg | App Media | drawn glyph "image" | own drawing | n/a | n/a |
+| card-apps-media-optimization.svg | Media Optimization | drawn glyph "image" | own drawing | n/a | n/a |
 | card-apps-react-native.svg | React Native | react | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/react.svg |
-| card-apps-windows.svg | Windows | drawn glyph "window" | own drawing | n/a | n/a |
+| card-apps-windows.svg | Windows Apps | drawn glyph "window" | own drawing | n/a | n/a |
 | card-cloud-aws.svg | AWS | drawn glyph "cloud" | own drawing | n/a | n/a |
 | card-cloud-azure.svg | Azure | drawn glyph "cloud" | own drawing | n/a | n/a |
 | card-cloud-google-cloud.svg | Google Cloud | googlecloud | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/googlecloud.svg |
-| card-cloud-comparing-cloud-providers.svg | Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
+| card-cloud-comparing-cloud-providers.svg | Comparing Cloud Providers | drawn glyph "chart" | own drawing | n/a | n/a |
 | card-ai-agents.svg | AI Agents | drawn glyph "chip" | own drawing | n/a | n/a |
-| card-ai-ai-assisted-development.svg | AI-Assisted Dev | drawn glyph "code" | own drawing | n/a | n/a |
-| card-ai-cli-for-agents.svg | CLIs for Agents | drawn glyph "terminal" | own drawing | n/a | n/a |
-| card-ai-conversational-channels.svg | Channels | drawn glyph "chat" | own drawing | n/a | n/a |
-| card-ai-customizing-ai-workflows.svg | AI Workflows | drawn glyph "gear" | own drawing | n/a | n/a |
-| card-ai-hugging-face.svg | Hugging Face | huggingface | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/huggingface.svg |
+| card-ai-ai-assisted-development.svg | AI-Assisted Development | drawn glyph "code" | own drawing | n/a | n/a |
+| card-ai-cli-for-agents.svg | Building CLIs for AI Agents | drawn glyph "terminal" | own drawing | n/a | n/a |
+| card-ai-conversational-channels.svg | Conversational Channels | drawn glyph "chat" | own drawing | n/a | n/a |
+| card-ai-customizing-ai-workflows.svg | Customizing AI Workflows | drawn glyph "gear" | own drawing | n/a | n/a |
+| card-ai-hugging-face.svg | Hugging Face & On-Device Models | huggingface | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/huggingface.svg |
 | card-ai-langchain.svg | LangChain | langchain | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/langchain.svg |
-| card-ai-llm-foundations.svg | LLM Foundations | drawn glyph "book" | own drawing | n/a | n/a |
-| card-ai-llmops.svg | LLMOps | drawn glyph "chart" | own drawing | n/a | n/a |
-| card-ai-local-llms.svg | Local LLMs | drawn glyph "server" | own drawing | n/a | n/a |
-| card-ai-mcp.svg | MCP | modelcontextprotocol | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/modelcontextprotocol.svg |
-| card-ai-rag-systems.svg | RAG Systems | drawn glyph "search" | own drawing | n/a | n/a |
-| card-ai-security.svg | AI Security | drawn glyph "shield" | own drawing | n/a | n/a |
+| card-ai-llm-foundations.svg | LLM Foundations & Prompting | drawn glyph "book" | own drawing | n/a | n/a |
+| card-ai-llmops.svg | LLMOps & Evaluation | drawn glyph "chart" | own drawing | n/a | n/a |
+| card-ai-local-llms.svg | Running LLMs Locally | drawn glyph "server" | own drawing | n/a | n/a |
+| card-ai-mcp.svg | Model Context Protocol (MCP) | modelcontextprotocol | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/modelcontextprotocol.svg |
+| card-ai-rag-systems.svg | RAG Systems in Production | drawn glyph "search" | own drawing | n/a | n/a |
+| card-ai-security.svg | AI Security & Responsible AI | drawn glyph "shield" | own drawing | n/a | n/a |
 | card-ai-spring-ai.svg | Spring AI | spring | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/spring.svg |
 | card-ai-voice-agents.svg | Voice Agents | drawn glyph "mic" | own drawing | n/a | n/a |
 | card-documentation-tools-antora.svg | Antora | drawn glyph "book" | own drawing | n/a | n/a |
@@ -175,6 +175,10 @@ Logos are trademarks of their respective owners, used for identification only.
 | ide-expo-dev-client.svg | Expo Dev Client | expo | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/expo.svg |
 | ide-expo-go.svg | Expo Go | expo | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/expo.svg |
 | ide-firefox-devtools.svg | Firefox DevTools | firefoxbrowser | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/firefoxbrowser.svg |
+| ide-flutter-android-studio.svg | Flutter for Android Studio | flutter | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/flutter.svg |
+| ide-flutter-devtools.svg | Flutter DevTools | flutter | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/flutter.svg |
+| ide-flutter-sdk.svg | Flutter SDK | flutter | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/flutter.svg |
+| ide-flutter-vscode.svg | Flutter for VS Code | flutter | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/flutter.svg |
 | ide-fpm.svg | fpm | fortran | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/fortran.svg |
 | ide-gnucobol.svg | GnuCOBOL | gnu | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/gnu.svg |
 | ide-goland.svg | GoLand | goland | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/goland.svg |

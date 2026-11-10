@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // Audits the `==` headings of all index pages (the 15 section indexes and every subsection index)
-// against the WP4 index templates. Usage: node scripts/index-template/audit.mjs [--list] [--json]
+// against the WP4 index templates. Usage: node scripts/index-template/audit.mjs [--list] [--json] [--strict]
+// Nested indexes (<section>/<subsection>/<topic>/index.adoc) are outside the WP4 template: they are audited and
+// reported as warnings only, unless --strict is passed.
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -43,9 +45,9 @@ export function collectIndexes(dir = pagesDir) {
     for (const name of readdirSync(d).sort()) {
       const p = join(d, name)
       if (statSync(p).isDirectory()) {
-        if (depth < 2) visit(p, depth + 1)
+        visit(p, depth + 1)
       } else if (name === 'index.adoc' && depth >= 1) {
-        out.push({ path: p, kind: depth === 1 ? 'section' : 'subsection' })
+        out.push({ path: p, kind: depth === 1 ? 'section' : depth === 2 ? 'subsection' : 'nested' })
       }
     }
   }
@@ -92,19 +94,29 @@ export function audit(entry) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const root = fileURLToPath(new URL('../../', import.meta.url))
+  const strict = process.argv.includes('--strict')
   const entries = collectIndexes()
-  let bad = 0
-  for (const e of entries) {
-    const { found, problems } = audit(e)
-    const rel = relative(root, e.path).split(sep).join('/')
-    if (process.argv.includes('--list')) console.log(`${rel}: ${found.join(' | ')}`)
-    if (problems.length) {
-      bad++
-      console.log(`${rel}`)
-      for (const p of problems) console.log(`  - ${p}`)
+  const results = entries.map((e) => ({ path: relative(root, e.path).split(sep).join('/'), kind: e.kind, ...audit(e) }))
+  if (process.argv.includes('--json')) {
+    console.log(JSON.stringify(results, null, 2))
+  } else {
+    for (const r of results) {
+      if (process.argv.includes('--list')) console.log(`${r.path}: ${r.found.join(' | ')}`)
+      if (r.problems.length && (r.kind !== 'nested' || strict)) {
+        console.log(r.path)
+        for (const p of r.problems) console.log(`  - ${p}`)
+      }
     }
   }
-  const sec = entries.filter((e) => e.kind === 'section').length
-  console.log(`\n${entries.length} index pages audited (${sec} section, ${entries.length - sec} subsection): ${bad} with violations`)
+  const gated = results.filter((r) => r.kind !== 'nested' || strict)
+  const bad = gated.filter((r) => r.problems.length).length
+  const nested = results.filter((r) => r.kind === 'nested')
+  const nestedBad = nested.filter((r) => r.problems.length).length
+  const sec = results.filter((r) => r.kind === 'section').length
+  const sub = results.filter((r) => r.kind === 'subsection').length
+  if (!process.argv.includes('--json')) {
+    console.log(`\n${sec + sub} index pages audited (${sec} section, ${sub} subsection): ${bad} with violations`)
+    console.log(`${nested.length} nested index pages (outside the template${strict ? ', checked with --strict' : ''}): ${nestedBad} not following it`)
+  }
   process.exit(bad ? 1 : 0)
 }

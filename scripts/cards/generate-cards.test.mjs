@@ -12,6 +12,7 @@ import {
   DOWNLOAD_BUTTON, DOWNLOAD_BUTTON_COMPACT, generate, renderCompactDownloadButton, glyphs, ideCard, renderDownloadButton, restyle, sectionCard,
 } from './generate-cards.mjs';
 import { idePages, withIdeGrids } from './insert-ide-grids.mjs';
+import { withGrid } from './insert-grids.mjs';
 import { cheatSheetPages, withDownloadButtons } from './insert-download-buttons.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -117,4 +118,36 @@ test('cheat-sheet pages that link a PDF show the download button (insert-downloa
       assert.ok(shown, `${p} links a PDF but shows no download button`);
     }
   }
+});
+
+const navText = () => [join(pagesDir, '../nav.adoc'),
+  ...readdirSync(join(pagesDir, '../partials')).filter((f) => f.startsWith('nav-')).map((f) => join(pagesDir, '../partials', f))]
+  .map(read).join('\n');
+const normTitle = (t) => t.replace(/\{cpp\}/g, 'C++');
+
+test('section indexes show an up-to-date card grid (insert-grids.mjs is a no-op)', () => {
+  for (const section of Object.keys(gradients)) {
+    const file = join(pagesDir, section, 'index.adoc');
+    assert.equal(withGrid(read(file), section), read(file), `${section}: run npm run cards`);
+  }
+});
+
+test('every section card is in its index == Sections list, with the same title there and in the nav', () => {
+  const nav = new Map([...navText().matchAll(/xref:([^[\s]+)\[([^\]]+)\]/g)].map((m) => [m[1], normTitle(m[2])]));
+  for (const c of cards) {
+    const index = read(join(pagesDir, c.section, 'index.adoc'));
+    const list = index.slice(index.indexOf('\n== Sections'));
+    const m = list.match(new RegExp(`xref:${c.page.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\[([^\\]]+)\\]`));
+    assert.ok(m, `${c.page} is not in ${c.section}/index.adoc == Sections`);
+    assert.equal(normTitle(m[1]), c.title, `${c.file}: card title differs from the index link text`);
+    assert.equal(nav.get(c.page), c.title, `${c.file}: card title differs from the nav entry`);
+  }
+});
+
+test('the nav has no fragment links and keeps the group the nav-tree override opens', () => {
+  // A same-page #fragment link makes the UI bundle's site.js collapse the default-open groups (WP2).
+  assert.deepEqual([...navText().matchAll(/xref:[^[\s]*#[^[\s]*\[/g)].map((m) => m[0]), []);
+  // ui-overrides/partials/nav-tree.hbs opens the children of the entry titled exactly this.
+  assert.match(read(join(pagesDir, '../nav.adoc')), /^\* Open Source Projects$/m);
+  assert.ok(read(join(here, '../../ui-overrides/partials/nav-tree.hbs')).includes("'Open Source Projects'"));
 });

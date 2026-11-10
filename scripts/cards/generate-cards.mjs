@@ -108,8 +108,28 @@ const button = (label) => `<rect x="215" y="440" width="170" height="54" rx="27"
           font-family="Arial, Helvetica, sans-serif" font-weight="700"
           font-size="25" fill="${brand.buttonText}">${esc(label)}</text>`;
 
+// The card shows the exact nav/index title. A title too long for one line at 36px or more is split into two
+// balanced lines at a space, so long titles stay legible without being abbreviated.
+export function titleMarkup(title) {
+  const attrs = 'text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-weight="800" fill="#FFFFFF"';
+  const single = fit(title, 52, 30, 0.62, 520);
+  const spaces = [...title.matchAll(/ /g)].map((m) => m.index);
+  if (single >= 36 || !spaces.length) {
+    return `<text x="300" y="290" ${attrs}
+          font-size="${single}">${esc(title)}</text>`;
+  }
+  const at = spaces.reduce((best, i) => (Math.abs(i - title.length / 2) < Math.abs(best - title.length / 2) ? i : best));
+  const lines = [title.slice(0, at), title.slice(at + 1)];
+  // At most 40px so the first line clears the logo disc (bottom at y=228); the second baseline sits above the rule.
+  const size = Math.min(...lines.map((l) => fit(l, 40, 26, 0.62, 520)));
+  const y2 = 306;
+  return `<text x="300" y="${y2 - Math.round(size * 1.12)}" ${attrs}
+          font-size="${size}">${esc(lines[0])}</text>
+    <text x="300" y="${y2}" ${attrs}
+          font-size="${size}">${esc(lines[1])}</text>`;
+}
+
 export function renderCard({ colors, logo, title, subtitle, button: label = 'Explore' }) {
-  const titleSize = fit(title, 52, 30, 0.62, 520);
   const subSize = fit(subtitle, 25, 17, 0.5, 520);
   return `<svg width="600" height="600" viewBox="0 0 600 600" xmlns="http://www.w3.org/2000/svg">
   ${defs(colors)}
@@ -122,9 +142,7 @@ export function renderCard({ colors, logo, title, subtitle, button: label = 'Exp
       ${logoMarkup(logo)}
     </g>
 
-    <text x="300" y="290" text-anchor="middle"
-          font-family="Arial, Helvetica, sans-serif" font-weight="800"
-          font-size="${titleSize}" fill="#FFFFFF">${esc(title)}</text>
+    ${titleMarkup(title)}
 
     <line x1="220" y1="322" x2="380" y2="322" stroke="#FFFFFF" stroke-width="2" opacity="0.6"/>
 

@@ -15,9 +15,9 @@ export function renderGrid(sectionCards) {
   return `[cols="1,1,1",frame=none,grid=none]\n|===\n${cells.join('\n')}\n|===\n`;
 }
 
-export function insertGrid(section) {
-  const file = join(pagesDir, section, 'index.adoc');
-  let text = readFileSync(file, 'utf8').replace(GRID, '\n');
+// Returns the section index text with its card grid refreshed (pure, so the tests can check it is a no-op).
+export function withGrid(text, section) {
+  text = text.replace(GRID, '\n');
   const marker = text.indexOf('\n== Sections');
   if (marker < 0) throw new Error(`${section}: no == Sections heading`);
   const list = text.slice(marker);
@@ -26,9 +26,14 @@ export function insertGrid(section) {
     return i < 0 ? Number.MAX_SAFE_INTEGER : i;
   };
   const sectionCards = cards.filter((c) => c.section === section).sort((a, b) => rank(a) - rank(b));
-  text = `${text.slice(0, marker).replace(/\n+$/, '')}\n\n${renderGrid(sectionCards)}${text.slice(marker)}`;
+  return `${text.slice(0, marker).replace(/\n+$/, '')}\n\n${renderGrid(sectionCards)}${text.slice(marker)}`;
+}
+
+export function insertGrid(section) {
+  const file = join(pagesDir, section, 'index.adoc');
+  const text = withGrid(readFileSync(file, 'utf8'), section);
   writeFileSync(file, text);
-  return sectionCards.length;
+  return cards.filter((c) => c.section === section).length;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

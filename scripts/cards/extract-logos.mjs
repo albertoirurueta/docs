@@ -5,7 +5,7 @@
 //   mkdir /tmp/icons && cd /tmp/icons && npm i --ignore-scripts simple-icons@16.37.0 devicon@2.18.0
 //   node scripts/cards/extract-logos.mjs /tmp/icons/node_modules
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cards } from './manifest.mjs';
 import { ideCards } from './ide-manifest.mjs';
@@ -43,7 +43,7 @@ for (const key of new Set([...cards, ...ideCards].map((c) => c.logo).filter((l) 
     file = join(root, 'devicon', 'icons', slug, `${slug}-${variant}.svg`);
     meta = { source: 'Devicon', license: 'MIT', version: version('devicon'), viewBox: 128 };
   }
-  logos[key] = { ...meta, file: file.slice(root.length + 1), paths: paths(readFileSync(file, 'utf8')) };
+  logos[key] = { ...meta, file: relative(root, file), paths: paths(readFileSync(file, 'utf8')) };
 }
 writeFileSync(join(here, 'logos.json'), JSON.stringify(logos, null, 1) + '\n');
 console.log(`wrote ${Object.keys(logos).length} logos`);

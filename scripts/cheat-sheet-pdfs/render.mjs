@@ -5,7 +5,7 @@
 //   node scripts/cheat-sheet-pdfs/render.mjs --html <sheet>  (writes the HTML only, to stdout)
 // A sheet that does not fit on one page fails the run.
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -96,10 +96,15 @@ export function renderPdf(sheet, outFile) {
   const dir = mkdtempSync(join(tmpdir(), 'cheat-'));
   const html = join(dir, 'sheet.html');
   const pdf = join(dir, 'sheet.pdf');
-  writeFileSync(html, renderHtml(sheet));
-  execFileSync(CHROME, ['--headless', '--disable-gpu', '--no-pdf-header-footer', `--print-to-pdf=${pdf}`,
-    pathToFileURL(html).href], { stdio: 'ignore' });
-  const bytes = readFileSync(pdf);
+  let bytes;
+  try {
+    writeFileSync(html, renderHtml(sheet));
+    execFileSync(CHROME, ['--headless', '--disable-gpu', '--no-pdf-header-footer', `--print-to-pdf=${pdf}`,
+      pathToFileURL(html).href], { stdio: 'ignore' });
+    bytes = readFileSync(pdf);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
   const pages = pageCount(bytes);
   if (pages !== 1) throw new Error(`${sheet.file}: renders on ${pages} pages, must fit on one`);
   writeFileSync(outFile, bytes);
