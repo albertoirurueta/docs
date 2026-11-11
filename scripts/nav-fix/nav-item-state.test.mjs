@@ -125,3 +125,79 @@ test('nav-tree: the top-level groups are open', () => {
   const html = render(site, '/none.html')
   assert.match(html, /nav-item is-active" data-depth="1">\s*<button class="nav-item-toggle"><\/button>\s*<span class="nav-text">Guides & References</)
 })
+
+// Text-only group headings (an entry with children and no url, e.g. `***** Getting started`) have no page, so the
+// override never prunes them: pruned, they were dead ends with no children and no toggle (#394).
+const heading = { content: 'Getting started', items: [page('getting-a'), page('getting-b')] }
+
+test('navItemState: a text-only group heading off the current path expands collapsed, with a toggle', () => {
+  const s = navItemState(heading, 5, false, '/other.html')
+  assert.deepEqual([s.heading, s.expand, s.toggle, s.active, s.onPath], [true, true, true, false, false])
+})
+
+test('navItemState: a text-only group heading on the current path is open', () => {
+  const s = navItemState(heading, 5, false, '/getting-b.html')
+  assert.deepEqual([s.heading, s.expand, s.toggle, s.active], [true, true, true, true])
+})
+
+test('navItemState: a linked entry or an empty heading is not a group heading', () => {
+  assert.equal(navItemState({ content: 'Linked', url: '/l.html', items: [page('x')] }, 5, false, '/o.html').heading, false)
+  assert.equal(navItemState({ content: 'Linked', url: '/l.html', items: [page('x')] }, 5, false, '/o.html').expand, false)
+  const empty = navItemState({ content: 'Empty' }, 5, false, '/o.html')
+  assert.deepEqual([empty.heading, empty.expand, empty.toggle], [false, false, false])
+})
+
+const grouped = [
+  {
+    items: [
+      {
+        content: 'Guides & References',
+        items: [
+          {
+            content: 'Backend',
+            url: '/backend.html',
+            urlType: 'internal',
+            items: [
+              {
+                content: 'Grafana',
+                url: '/grafana.html',
+                urlType: 'internal',
+                items: [
+                  { content: 'Getting started', items: [page('architecture'), page('installation')] },
+                  {
+                    content: 'Step-by-step guides',
+                    items: [
+                      page('guide-first-steps'),
+                      { content: 'Nested group', items: [page('nested-a')] },
+                      { content: 'Linked', url: '/linked.html', urlType: 'internal', items: [page('linked-child')] },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  },
+]
+
+test('nav-tree: text-only groups outside the current branch emit their children and a toggle', () => {
+  const html = render(grouped, '/grafana.html')
+  for (const name of ['Getting started', 'Step-by-step guides']) {
+    assert.match(html, new RegExp(`nav-item" data-depth="4">\\s*<button class="nav-item-toggle"></button>\\s*<span class="nav-text">${name}<`),
+      `${name} is collapsed and has a toggle`)
+  }
+  for (const name of ['architecture', 'installation', 'guide-first-steps', 'Nested group', 'nested-a', 'Linked']) {
+    assert.ok(html.includes(`>${name}<`), `${name} should be rendered`)
+  }
+  assert.ok(!html.includes('linked-child'), 'a linked entry outside the current branch is still pruned')
+})
+
+test('nav-tree: no rendered text-only heading is a dead end', () => {
+  for (const url of ['/grafana.html', '/installation.html', '/nested-a.html', '/backend.html']) {
+    const html = render(grouped, url)
+    const dead = [...html.matchAll(/<span class="nav-text">([^<]*)<\/span>\s*<\/li>/g)].map((m) => m[1])
+    assert.deepEqual(dead, [], `dead-end headings on ${url}`)
+  }
+})
