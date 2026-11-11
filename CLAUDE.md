@@ -60,6 +60,10 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   `page.component.latest.version`), with a hidden component filter. The search box lives in the navbar (`#search`)
   and stays hidden until the deferred script adds `is-ready`. Search only works over HTTP (not from `file://`).
   Pagefind and Antora never delete stale output, so `rm -rf build/site` before measuring a local build.
+  Pagefind indexes `meta.image` relative to the indexed page. Pagefind UI 1.6.0 resolves it only in its plain result
+  component, not in the sub-results one that `showSubResults: true` uses, so `footer-scripts.hbs` resolves it against
+  `meta.url || url` in `processResult` (#396). Keep that hook until Pagefind UI resolves images there too, and after a
+  search change check a search from the home page and from a deep page.
 - **The published site must stay under GitHub Pages' 1 GB limit.** Both workflows check `du -sk build/site` after
   indexing: a warning above 900,000 KiB, a failure above 960,000 KiB. `node scripts/site-metrics/measure.mjs
   build/site` reports HTML size, sample page sizes and nav sizes.
