@@ -248,3 +248,19 @@ Logos are trademarks of their respective owners, used for identification only.
 | ide-xcode-cloud.svg | Xcode Cloud | xcode | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/xcode.svg |
 | ide-zed.svg | Zed | zedindustries | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/zedindustries.svg |
 | ide-zowe-explorer.svg | Zowe Explorer | drawn glyph "server" | own drawing | n/a | n/a |
+
+== Logos of the monitoring guide figures
+
+The figures of `scripts/monitoring-guides/` draw these marks in the product's real colour (the `colour` field of
+`logos.json`, set in `guide-logos.mjs`). Same path data and licences as above; Tempo is the vendor's own asset.
+
+| Logo | Colour | Source | Licence | Source file |
+|---|---|---|---|---|
+| Grafana | #F46800 | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/grafana.svg |
+| Elastic | #0B64DD | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/elastic.svg |
+| Kibana | #F04E98 | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/kibana.svg |
+| Elasticsearch | #FEC514 | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/elasticsearch.svg |
+| Prometheus | #E6522C | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/prometheus.svg |
+| PostgreSQL | #4169E1 | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/postgresql.svg |
+| Loki | #F68D2E | Devicon 2.18.0 | MIT | devicon/icons/grafanaloki/grafanaloki-plain.svg |
+| Tempo | #F05A28 | Grafana Labs (tempo_logo.svg bundled with Grafana 13.3.0) | Grafana Labs trademark, used for identification only | scripts/cards/vendor-logos/tempo.svg |

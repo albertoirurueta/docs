@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { cards, gradients } from './manifest.mjs';
 import { ideCards, ideByName } from './ide-manifest.mjs';
 import { homeCards } from './home-cards.mjs';
+import { guideLogos } from './guide-logos.mjs';
 import { brand, variants } from './palette.mjs';
 import {
   DOWNLOAD_BUTTON, DOWNLOAD_BUTTON_COMPACT, generate, renderCompactDownloadButton, glyphs, ideCard, renderDownloadButton, restyle, sectionCard,
@@ -38,9 +39,22 @@ test('every card has a gradient, a known logo and non-empty text', () => {
   }
 });
 
-test('logos come only from Simple Icons (CC0-1.0) and Devicon (MIT)', () => {
+test('logos come only from Simple Icons (CC0-1.0), Devicon (MIT) and the vendor assets named in guide-logos.mjs', () => {
   const allowed = { 'Simple Icons': 'CC0-1.0', Devicon: 'MIT' };
-  for (const l of Object.values(logos)) assert.equal(allowed[l.source], l.license);
+  const vendor = Object.fromEntries(guideLogos.filter((g) => g.vendor).map((g) => [g.key, g.vendor]));
+  for (const [key, l] of Object.entries(logos)) {
+    if (vendor[key]) {
+      assert.equal(l.source, vendor[key].source);
+      assert.equal(l.license, vendor[key].license);
+    } else assert.equal(allowed[l.source], l.license);
+  }
+});
+
+test('every guide logo has a solid hex colour', () => {
+  for (const g of guideLogos) {
+    assert.match(g.colour, /^#[0-9A-F]{6}$/);
+    assert.equal(logos[g.key].colour, g.colour);
+  }
 });
 
 test('every palette colour comes from the top bar gradient (or its documented derivatives)', () => {

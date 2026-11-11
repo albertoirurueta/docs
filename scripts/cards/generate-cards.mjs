@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cards, gradients } from './manifest.mjs';
 import { ideCards } from './ide-manifest.mjs';
+import { guideLogos } from './guide-logos.mjs';
 import { homeCards } from './home-cards.mjs';
 import { brand, otherVariant, variants } from './palette.mjs';
 
@@ -268,6 +269,20 @@ export function renderSources() {
       const l = logos[c.logo];
       lines.push(`| ${c.file} | ${c.title} | ${c.logo.slice(3)} | ${l.source} ${l.version} | ${l.license} | ${l.file} |`);
     }
+  }
+  lines.push(
+    '',
+    '== Logos of the monitoring guide figures',
+    '',
+    'The figures of `scripts/monitoring-guides/` draw these marks in the product\'s real colour (the `colour` field of',
+    '`logos.json`, set in `guide-logos.mjs`). Same path data and licences as above; Tempo is the vendor\'s own asset.',
+    '',
+    '| Logo | Colour | Source | Licence | Source file |',
+    '|---|---|---|---|---|',
+  );
+  for (const g of guideLogos) {
+    const l = logos[g.key];
+    lines.push(`| ${g.title} | ${g.colour} | ${l.source}${l.version.startsWith('vendor') ? '' : ' ' + l.version} | ${l.license} | ${l.file} |`);
   }
   return lines.join('\n') + '\n';
 }

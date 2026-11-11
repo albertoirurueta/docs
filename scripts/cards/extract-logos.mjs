@@ -9,6 +9,8 @@ import { join, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cards } from './manifest.mjs';
 import { ideCards } from './ide-manifest.mjs';
+import { guideLogos } from './guide-logos.mjs';
+import { resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = process.argv[2];
@@ -30,8 +32,20 @@ function paths(svg) {
   return found;
 }
 
+const colourOf = Object.fromEntries(guideLogos.map((g) => [g.key, g.colour]));
 const logos = {};
-for (const key of new Set([...cards, ...ideCards].map((c) => c.logo).filter((l) => !l.startsWith('gl:')))) {
+const keys = [...cards, ...ideCards].map((c) => c.logo).concat(guideLogos.map((g) => g.key));
+for (const key of new Set(keys.filter((l) => !l.startsWith('gl:')))) {
+  if (key.startsWith('vendor:')) {
+    // Vendor asset stored in the repository (single <path>, one solid colour in the guide figures).
+    const v = guideLogos.find((g) => g.key === key).vendor;
+    const file = resolve(here, '..', '..', v.file);
+    const svg = readFileSync(file, 'utf8');
+    const vb = svg.match(/viewBox="([\d.\s-]+)"/)[1].trim().split(/\s+/).map(Number);
+    if (vb[0] !== 0 || vb[1] !== 0) throw new Error('viewBox origin must be 0 0');
+    logos[key] = { source: v.source, license: v.license, version: 'vendor asset', viewBox: [vb[2], vb[3]], file: v.file, paths: paths(svg), colour: colourOf[key] };
+    continue;
+  }
   const [src, slug] = key.split(':');
   let file, meta;
   if (src === 'si') {
@@ -44,6 +58,7 @@ for (const key of new Set([...cards, ...ideCards].map((c) => c.logo).filter((l) 
     meta = { source: 'Devicon', license: 'MIT', version: version('devicon'), viewBox: 128 };
   }
   logos[key] = { ...meta, file: relative(root, file), paths: paths(readFileSync(file, 'utf8')) };
+  if (colourOf[key]) logos[key].colour = colourOf[key];
 }
 writeFileSync(join(here, 'logos.json'), JSON.stringify(logos, null, 1) + '\n');
 console.log(`wrote ${Object.keys(logos).length} logos`);
