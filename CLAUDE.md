@@ -17,7 +17,8 @@ npm ci                                   # install the pinned antora + extension
 npx antora antora-playbook.yml           # build the site into build/site (local content only)
 npx antora --fetch antora-playbook.yml   # same, but first fetch latest branches of remote content sources
 npm run search:index                     # build the Pagefind search index into build/site/pagefind (after antora)
-npm run test:nav                         # nav-fix tests (scripts/nav-fix/): nav tree override and helper
+npm run test:nav                         # nav-fix tests (scripts/nav-fix/): nav tree override, helper and nav.adoc entries
+npm run test:nav:site                    # after antora: no dead-end nav heading or broken nav link in build/site
 ```
 
 There is no lint/test suite — the only meaningful verification is that the Antora build completes without
@@ -80,12 +81,18 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   over 1 MB). The `nav-tree` override renders children at depth 0 and 1, the branch that contains the current page
   (through the `nav-item-state` helper) and the children a parent asks to open (an untitled list wrapper and the
   "Open Source Projects" group); an item gets `is-active` for those, and a toggle is emitted only when its children
-  are. The bundle's `site.js` toggles and the "toggle all" button only flip `is-active`, so they keep working. Nav
+  are. **Every nav entry is either an `xref:` link or a text-only group heading with children** (`***** Getting
+  started`). The override prunes a linked entry's subtree outside the current branch, because readers reach it through
+  the entry's own page; a text-only heading has no page, so the override never prunes it and always emits its children
+  with a toggle, collapsed unless the current page is in them. Never add a text-only entry without children, and never
+  change the helper so that it prunes entries without a URL: that left about 200 headings listed but impossible to open
+  (#394). Their children cost HTML only on the pages inside the heading's parent. The bundle's `site.js` toggles and the "toggle all" button only flip `is-active`, so they keep working. Nav
   entries must follow the same order and the same titles as the section index's text list. **Nav entries never link
   to a `#fragment`**: on the target page that link renders as `href="#..."`, which makes the bundle's `site.js` hash
   handler strip every `is-active` class and collapse the default-open groups. The override's helper (`nav-item-state.js`) also
   matches the top-level entry text `Open Source Projects` exactly, so renaming it needs the same change there.
-  `npm run test:cards` and `npm run test:nav` check these.
+  `npm run test:cards` and `npm run test:nav` check these; after a nav or override change also run `npm run
+  test:nav:site` on a fresh build (it fails on a dead-end heading or a nav link to a missing page).
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
   `modules/ROOT/nav.adoc`. This is the site's landing/root component — its pages don't describe this repo, they
   describe the overall site and link out to each remote component.

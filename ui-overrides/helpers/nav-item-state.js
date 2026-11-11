@@ -8,7 +8,9 @@
 //   current      the entry is the current page
 //   onPath       the entry is the current page or contains it (in `items`, at any depth)
 //   active       the entry is rendered open (is-active): depth 0, its parent asked for open children, or onPath
-//   expand       its child list is emitted: depth 0 or 1 (groups and sections), parent asked for open children, or onPath
+//   heading      a text-only group heading: it has children but no url, so it has no page a reader could open
+//   expand       its child list is emitted: depth 0 or 1 (groups and sections), parent asked for open children, onPath,
+//                or a text-only group heading (never pruned: pruning it would leave a dead end in the nav, see #394)
 //   toggle       it has children and they are emitted, so it gets a toggle button
 //   openChildren its children are rendered open: an untitled list wrapper or the "Open Source Projects" group
 // Pure: Antora loads helper files on their own, so the containment check lives here rather than in a second file.
@@ -27,13 +29,15 @@ function navItemState (item, level, open, currentUrl) {
   const depth = typeof level === 'number' ? level : 0
   const parentOpen = open === true
   const onPath = containsCurrent(item, currentUrl)
-  const expand = depth <= 1 || parentOpen || onPath
   const hasItems = Array.isArray(item && item.items) && item.items.length > 0
+  const heading = hasItems && item.url == null
+  const expand = depth <= 1 || parentOpen || onPath || heading
   return {
     depth,
     childLevel: depth + 1,
     current: !!item && item.url != null && item.url === currentUrl,
     onPath,
+    heading,
     active: depth === 0 || parentOpen || onPath,
     expand,
     toggle: hasItems && expand,
