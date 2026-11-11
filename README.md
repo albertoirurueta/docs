@@ -63,3 +63,9 @@ The site search uses [Pagefind](https://pagefind.app). After `antora` has built 
 npm run search:index
 ```
 This runs `npx pagefind --site build/site`, so the same step can be used directly. Run it after every Antora build; without it the search box finds nothing.
+
+Search only works when the site is served over HTTP. Opening `build/site/index.html` directly from disk (`file://`) leaves the search box stuck on "Searching for …", because the browser blocks the index downloads and the WebAssembly worker that Pagefind loads. Serve the folder instead, for example:
+```
+python3 -m http.server 8090 --directory build/site
+```
+and open http://localhost:8090.
