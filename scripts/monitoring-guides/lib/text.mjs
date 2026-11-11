@@ -5,8 +5,8 @@ const W = {};
 const put = (chars, w) => [...chars].forEach((c) => (W[c] = w));
 put(' !,./:;[]\\ft', 278); put('Il|', 260); put('ij', 222); put('"', 355); put("'", 191); put('()-`r{}', 333);
 put('*', 389); put('#$0123456789?_abdeghnopqu', 556); put('+<=>~', 584); put('%', 889); put('&ABEKPSVXY', 667);
-put('CDHNRUw', 722); put('FTZ', 611); put('GOQ', 778); put('Lc', 556); put('M', 833); put('m', 833); put('W', 944);
-put('@', 1015); put('^', 469); put('J', 500); put('kvxyzs', 500); put('c', 500); put('B', 667); put('w', 722);
+put('CDHNRU', 722); put('FTZ', 611); put('GOQ', 778); put('L', 556); put('M', 833); put('m', 833); put('W', 944);
+put('@', 1015); put('^', 469); put('J', 500); put('kvxyzs', 500); put('c', 500); put('w', 722);
 const INTER = 1.06; // Inter is wider than Helvetica
 const BOLD = 1.06;
 const MONO = 0.6;

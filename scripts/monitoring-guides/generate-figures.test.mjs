@@ -13,6 +13,9 @@ import { textWidth } from './lib/text.mjs';
 import { mapGuides } from './lib/guide-maps.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// Every figure is rendered once for the whole file: several tests read the same 500+ figures.
+let cache;
+const allFigures = () => (cache ??= buildFigures());
 const root = resolve(here, '..', '..');
 const section = join(root, 'modules', 'ROOT', 'pages', 'backend', 'monitoring-alerting');
 const products = ['grafana', 'kibana'];
@@ -112,7 +115,7 @@ test('logos used by the library carry a colour', () => {
 
 // ---------------------------------------------------------------- specs and guides (Task 4.4)
 test('every spec has at least one figure, unique ids and file names, and non-empty alt text', async () => {
-  const built = await buildFigures();
+  const built = await allFigures();
   const names = new Set();
   for (const b of built) {
     assert.ok(b.figure.alt && b.figure.alt.trim(), `${b.file} has no alt text`);
@@ -123,32 +126,41 @@ test('every spec has at least one figure, unique ids and file names, and non-emp
 });
 
 test('each generated file is up to date with its spec', async () => {
-  for (const b of await buildFigures()) assert.ok(isUpToDate(b.file, b.svg), `${b.file} is missing or stale; run npm run guides:figures`);
+  for (const b of await allFigures()) assert.ok(isUpToDate(b.file, b.svg), `${b.file} is missing or stale; run npm run guides:figures`);
 });
 
 test('no generated guide or map file is an orphan', async () => {
-  const expected = new Set((await buildFigures()).map((b) => b.file));
+  const expected = new Set((await allFigures()).map((b) => b.file));
   for (const f of readdirSync(imagesDir)) {
     if (/^monitoring-alerting-(grafana|kibana)-(guide|map)-.*\.svg$/.test(f)) assert.ok(expected.has(f), `${f} has no spec`);
   }
 });
 
 test('every guide figure is referenced by exactly one page, by bare file name', async () => {
-  const built = (await buildFigures()).filter((b) => !b.spec.maps);
+  const built = (await allFigures()).filter((b) => !b.spec.maps);
   if (!built.length) return;
-  const pages = allPages().map((f) => ({ f, src: readFileSync(f, 'utf8') }));
+  // Index the pages once: which pages show a file with a block macro, and which mention it after a path separator.
+  const shownBy = new Map();
+  const withPath = new Map();
+  const add = (m, k, v) => m.set(k, [...(m.get(k) ?? []), v]);
+  for (const f of allPages()) {
+    const src = readFileSync(f, 'utf8');
+    if (!src.includes('monitoring-alerting-')) continue;
+    for (const m of src.matchAll(/^image::([^[\s]+)\[/gm)) add(shownBy, m[1], f);
+    for (const m of src.matchAll(/\/(monitoring-alerting-[a-z0-9-]+\.svg)/g)) add(withPath, m[1], f);
+  }
   for (const b of built) {
-    const refs = pages.filter((p) => p.src.split('\n').some((l) => l.startsWith(`image::${b.file}[`)));
+    const refs = shownBy.get(b.file) ?? [];
     assert.equal(refs.length, 1, `${b.file} is referenced by ${refs.length} pages`);
-    assert.match(refs[0].f, new RegExp(`/${b.spec.product}/guide-[a-z0-9-]+\\.adoc$`), `${b.file} must be shown by a ${b.spec.product} guide page`);
-    for (const p of pages) assert.ok(!p.src.includes(`/${b.file}`) || p.src.includes(`image::${b.file}[`), `${b.file} referenced with a path in ${p.f}`);
+    assert.match(refs[0], new RegExp(`/${b.spec.product}/guide-[a-z0-9-]+\\.adoc$`), `${b.file} must be shown by a ${b.spec.product} guide page`);
+    assert.deepEqual(withPath.get(b.file) ?? [], [], `${b.file} referenced with a path`);
   }
 });
 
 // Screen maps: each is shown by the guide named in lib/guide-maps.mjs. While that guide does not exist the map has no
 // page; once it exists, exactly that page references the map (the per-guide figures above stay at exactly one page).
 test('every screen map has a designated guide, and is shown by it once the guide exists', async () => {
-  const maps = (await buildFigures()).filter((b) => b.spec.maps);
+  const maps = (await allFigures()).filter((b) => b.spec.maps);
   const areas = new Set();
   const pages = allPages().map((f) => ({ f, src: readFileSync(f, 'utf8') }));
   for (const b of maps) {
@@ -171,7 +183,7 @@ test('every screen map has a designated guide, and is shown by it once the guide
 });
 
 test('every guide image target exists, and every step group of a guide has a figure', async () => {
-  const files = new Set((await buildFigures()).map((b) => b.file));
+  const files = new Set((await allFigures()).map((b) => b.file));
   for (const g of guidePages()) {
     const src = readFileSync(g.file, 'utf8');
     for (const m of src.matchAll(/^image::(monitoring-alerting-(?:grafana|kibana)-(?:guide|map)-[^[]+)\[/gm)) assert.ok(files.has(m[1]) && existsSync(join(imagesDir, m[1])), `${g.name}: ${m[1]} has no spec or file`);
@@ -224,5 +236,17 @@ test('no figure spec draws a map as a grid of cells', () => {
   for (const f of readdirSync(figuresDir).filter((x) => x.endsWith('.mjs'))) {
     const src = readFileSync(join(figuresDir, f), 'utf8');
     assert.doesNotMatch(src, /const MASK = \[/, `${f} draws a tile map; use the worldMap block`);
+  }
+});
+
+test('ids inside a figure are derived from its file name, so inlined figures never collide', async () => {
+  const seen = new Map();
+  for (const b of await allFigures()) {
+    const ids = [...b.svg.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1]);
+    for (const id of ids) {
+      assert.ok(id.startsWith(b.file.replace(/\.svg$/, '')), `${b.file} has id ${id}`);
+      assert.ok(!seen.has(id) || seen.get(id) === b.file, `id ${id} is used by ${seen.get(id)} and ${b.file}`);
+      seen.set(id, b.file);
+    }
   }
 });

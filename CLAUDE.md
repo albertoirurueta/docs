@@ -174,7 +174,7 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   `Checked on <date> against Grafana 13.3.x|Kibana 9.5.x` line, then exactly these `==` headings in order: `What you
   build`, `Before you start`, `Steps` (`===` phases only here, numbering continuous with `[start=N]`), `Check the
   result`, `Variations` (optional), `What can go wrong` (table), `Clean up` (when the guide creates resources),
-  `Where to go next`, `Sources`. The reader builds resources prefixed `guide-` and never edits provisioned ones. Every
+  `Where to go next`, `Sources`. The reader never edits provisioned resources: what a guide creates is named with the prefix `guide-` (contact points, users, rules) or, for the folder, dashboards and data views that the guides share and extend, `Guides` and `... (guides)` (`Bookshelf (guides)`, `Bookshelf logs (guides)`). Every
   `===` phase has a figure; a figure is attached to the last step it illustrates with a `+` list continuation, and its
   callout numbers are the page's step numbers. Labels and layouts come from the lab, never from memory; a screen nobody
   opened stays generic.

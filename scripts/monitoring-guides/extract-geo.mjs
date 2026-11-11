@@ -26,8 +26,9 @@ export const HEIGHT = Math.round((Y0 - mercY(LAT_BOTTOM)) * K * 10) / 10;
 export const project = ([lon, lat]) => [((lon + 180) / 360) * W, (Y0 - mercY(lat)) * K];
 
 // Rings that cross the antimeridian (Russia, Fiji) jump from +180 to -180 between two points. Unwrap them into one
-// continuous ring (east of 180 becomes 180..200); the caller then also draws a copy shifted one map width to the left, and
-// the figure crops both to the map, so the far-east sliver shows at the left edge as on a real Web Mercator map.
+// continuous ring (it runs past 180, or past -180 when it starts west of the line); the caller also draws a copy shifted
+// one map width back onto the map, and the figure crops both, so each sliver shows at the opposite edge as on a real Web
+// Mercator map.
 function unwrap(r) {
   const out = [];
   let shift = 0;
@@ -98,11 +99,13 @@ export function extract(topo) {
     const polys = g.type === 'Polygon' ? [g.arcs] : g.type === 'MultiPolygon' ? g.arcs : [];
     const projected = polys.map((p) => p.map((r) => unwrap(ring(arcs, r)).map(project)));
     const outer = projected.map((p) => p[0]).filter((r) => r.length >= 3);
-    const wrapped = projected.flat().filter((r) => r.some(([x]) => x > W)).map((r) => r.map(([x, y]) => [x - W, y]));
+    const shiftBy = (r, dx) => r.map(([x, y]) => [x + dx, y]);
+    const wrapped = projected.flat().flatMap((r) => [...(r.some(([x]) => x > W) ? [shiftBy(r, -W)] : []), ...(r.some(([x]) => x < 0) ? [shiftBy(r, W)] : [])]);
     if (!outer.length) continue;
     const largest = outer.reduce((a, b) => (Math.abs(area(b)) > Math.abs(area(a)) ? b : a));
     let [cx, cy] = centroid(largest);
     if (cx > W) cx -= W;
+    if (cx < 0) cx += W;
     const d = pathOf([...projected.flat(), ...wrapped]);
     if (!d) continue;
     countries.push({ id, ...(ALPHA2[id] ? { iso2: ALPHA2[id] } : {}), name: String(g.properties?.name ?? id).slice(0, 60), centroid: [round(cx), round(cy)], d });
@@ -111,7 +114,7 @@ export function extract(topo) {
   return {
     source: 'world-atlas 2.0.2 countries-110m.json (ISC), from Natural Earth 1:110m Admin 0 countries (public domain)',
     projection: `Web Mercator, latitudes ${LAT_BOTTOM}..${LAT_TOP}`,
-    width: W, height: HEIGHT, countries,
+    width: W, height: HEIGHT, latTop: LAT_TOP, countries,
   };
 }
 

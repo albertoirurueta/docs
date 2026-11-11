@@ -54,7 +54,7 @@ export async function buildFigures(names = specNames()) {
       files.set(file, name);
       let svg;
       try {
-        svg = renderSvg({ ...figure, theme });
+        svg = renderSvg({ ...figure, theme, svgId: file.replace(/\.svg$/, '') });
       } catch (e) {
         throw new Error(`${name}: ${e.message}`);
       }
@@ -70,14 +70,14 @@ export async function main(argv) {
   const all = specNames();
   for (const n of names) if (!all.includes(n)) throw new Error(`no spec figures/${n}.mjs (available: ${all.join(', ') || 'none'})`);
   const built = await buildFigures(names.length ? names : all);
-  let stale = 0;
+  let stale = 0, written = 0;
   for (const b of built) {
     if (check) {
       if (!isUpToDate(b.file, b.svg)) { stale++; console.error(`stale or missing: ${b.file}`); }
-    } else writeFigure(b.file, b.svg);
+    } else if (writeFigure(b.file, b.svg)) written++;
   }
   if (check && stale) throw new Error(`${stale} figure(s) are not up to date; run npm run guides:figures`);
-  console.log(`${check ? 'checked' : 'wrote'} ${built.length} figures from ${names.length || all.length} specs`);
+  console.log(check ? `checked ${built.length} figures from ${names.length || all.length} specs` : `rendered ${built.length} figures from ${names.length || all.length} specs, wrote ${written} that changed`);
 }
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {

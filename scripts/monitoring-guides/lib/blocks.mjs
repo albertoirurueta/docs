@@ -214,7 +214,7 @@ export function dropdown(ctx, { x, y, w, label, value, open = false, options = [
   if (label) { out += text(ctx, { x, y: y + 12, str: label, size: 'small', weight: 500, box: w }); fy = y + 20; }
   out += rect(ctx, { x, y: fy, w, h: ch, fill: 'inputBg', stroke: open ? 'focus' : 'borderStrong', radius: r, strokeWidth: open ? 2 : 1 });
   out += text(ctx, { x: x + 10, y: mid(fy, ch, 14), str: value, box: w - 40 });
-  out += icon(ctx, { x: x + w - 26, y: fy + (ch - 16) / 2, name: open ? 'chevronDown' : 'chevronDown', tone: 'textMuted' });
+  out += icon(ctx, { x: x + w - 26, y: fy + (ch - 16) / 2, name: 'chevronDown', tone: 'textMuted' });
   if (open) {
     const mh = options.length * 30 + 8;
     out += rect(ctx, { x, y: fy + ch + 4, w, h: mh, fill: 'surface', stroke: 'borderStrong', radius: r });
@@ -451,7 +451,14 @@ export function heatmap(ctx, { x, y, w, h, values, color = 'series.2', rowLabels
 //   zoom:    true draws the + and - zoom buttons at the top left, as Geomap and Maps do
 const world = JSON.parse(readFileSync(join(here, '..', 'data', 'world-110m.json'), 'utf8'));
 const byIso = new Map(world.countries.filter((c) => c.iso2).map((c) => [c.iso2, c]));
-const hex = (c) => { const m = /^#([0-9a-f]{6})$/i.exec(c); if (!m) throw new Error(`map colours must be #rrggbb, got ${c}`); return [0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16)); };
+// A theme colour as [r, g, b]: #rgb, #rrggbb and rgb()/rgba() (the token contract allows both; alpha is ignored).
+function hex(c) {
+  let m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(c);
+  if (m) { const h = m[1].length === 3 ? [...m[1]].map((d) => d + d).join('') : m[1]; return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); }
+  m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i.exec(c);
+  if (m) return m.slice(1, 4).map(Number);
+  throw new Error(`map colours must be #rrggbb or rgb(a), got ${c}`);
+}
 export function mix(a, b, t) {
   const [x, y] = [hex(a), hex(b)];
   return `#${x.map((v, i) => Math.round(v + (y[i] - v) * Math.max(0, Math.min(1, t))).toString(16).padStart(2, '0')).join('').toUpperCase()}`;
@@ -484,7 +491,7 @@ export function worldMap(ctx, { x, y, w, h, view = mapView(-180, -56, 180, 76), 
   }
   if (heat.length) {
     // A blurred stack of circles per point, cold colours wide and hot colours only where the weight is high, as the
-    // OpenLayers heatmap of Geomap draws it. The filter id is the same in every map, so repeated maps share it.
+    // OpenLayers heatmap of Geomap draws it. The filter id comes from the figure (ctx.idPrefix), so two inlined figures never share it.
     let blobs = '';
     for (const b of heat) {
       const [cx, cy] = country(b.iso).centroid;
@@ -493,7 +500,7 @@ export function worldMap(ctx, { x, y, w, h, view = mapView(-180, -56, 180, 76), 
         blobs += `<circle ${attrs({ cx, cy, r: ((30 - i * 6) * (0.5 + 0.5 * b.v)) / s, fill: colour(ctx.theme, t), 'fill-opacity': 0.35 + i * 0.1 })}/>`;
       });
     }
-    inner += `<filter id="worldmap-heat-blur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${n(7 / s)}"/></filter><g filter="url(#worldmap-heat-blur)">${blobs}</g>`;
+    inner += `<filter id="${ctx.idPrefix ?? 'figure'}-heat-blur" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${n(7 / s)}"/></filter><g filter="url(#${ctx.idPrefix ?? 'figure'}-heat-blur)">${blobs}</g>`;
   }
   const vals = markers.map((m) => m.v);
   const lo = Math.min(...vals), hi = Math.max(...vals);
@@ -523,9 +530,10 @@ export function worldMap(ctx, { x, y, w, h, view = mapView(-180, -56, 180, 76), 
 }
 // Data units of a map view around the given longitudes and latitudes (for `view`).
 export function mapView(lon0, lat0, lon1, lat1) {
+  const k = world.width / (2 * Math.PI);
+  const merc = (lat) => Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
   const px = (lon) => ((lon + 180) / 360) * world.width;
-  const top = Math.log(Math.tan(Math.PI / 4 + (84 * Math.PI) / 360));
-  const py = (lat) => (top - Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360))) * (world.width / (2 * Math.PI));
+  const py = (lat) => (merc(world.latTop) - merc(lat)) * k; // same origin as extract-geo.mjs, read from the data
   return [px(lon0), py(lat1), px(lon1), py(lat0)];
 }
 
