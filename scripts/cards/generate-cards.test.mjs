@@ -163,5 +163,5 @@ test('the nav has no fragment links and keeps the group the nav-tree override op
   assert.deepEqual([...navText().matchAll(/xref:[^[\s]*#[^[\s]*\[/g)].map((m) => m[0]), []);
   // ui-overrides/partials/nav-tree.hbs opens the children of the entry titled exactly this.
   assert.match(read(join(pagesDir, '../nav.adoc')), /^\* Open Source Projects$/m);
-  assert.ok(read(join(here, '../../ui-overrides/partials/nav-tree.hbs')).includes("'Open Source Projects'"));
+  assert.ok(read(join(here, '../../ui-overrides/helpers/nav-item-state.js')).includes("'Open Source Projects'"));
 });

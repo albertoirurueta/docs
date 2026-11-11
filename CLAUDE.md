@@ -10,12 +10,14 @@ documentation modules of several *other* GitHub repositories into a single publi
 
 ## Commands
 
-Requires Node.js (v24 in CI; see README.md for `nvm` install steps).
+Requires Node.js 20 or newer (`engines` in package.json; v24 in CI; see README.md for `nvm` install steps).
 
 ```bash
-npm install                              # install antora + extensions (see package.json)
+npm ci                                   # install the pinned antora + extensions + pagefind (see package.json)
 npx antora antora-playbook.yml           # build the site into build/site (local content only)
 npx antora --fetch antora-playbook.yml   # same, but first fetch latest branches of remote content sources
+npm run search:index                     # build the Pagefind search index into build/site/pagefind (after antora)
+npm run test:nav                         # nav-fix tests (scripts/nav-fix/): nav tree override and helper
 ```
 
 There is no lint/test suite — the only meaningful verification is that the Antora build completes without
@@ -44,28 +46,46 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   `main`; `irurueta-auth-server` does so until its 1.0.0 release). **Adding/removing a documented project means
   editing this file's `content.sources` list**, not writing new pages here.
 - The playbook also wires up the UI (`ui-bundle.zip`, a custom Antora UI bundle used with `snapshot: true`) and
-  Antora/Asciidoctor extensions: `@sntke/antora-mermaid-extension` (`[mermaid]` diagram blocks) and
-  `@djencks/asciidoctor-mathjax` (LaTeX math) are active, and so is
-  `@antora/collector-extension`, which the site now depends on: the `irurueta-auth-server` example's
-  `docs/antora.yml` uses `ext.collector` to populate its `example$` family, and the pages' includes fail without
-  it. `@antora/lunr-extension` (site search) is
-  currently commented out, so site search is disabled. Any doc content using diagrams or math depends on the
-  active extensions staying configured here.
+  Antora/Asciidoctor extensions, all pinned to exact versions in `package.json` (antora 3.2.2,
+  `@antora/collector-extension` 1.0.3, `@sntke/antora-mermaid-extension` 0.0.13, `@djencks/asciidoctor-mathjax`
+  0.0.9, `pagefind` 1.6.0): the mermaid extension (`[mermaid]` diagram blocks), the MathJax extension (LaTeX math) and
+  `@antora/collector-extension`, which the site depends on: the `irurueta-auth-server` example's `docs/antora.yml`
+  uses `ext.collector` to populate its `example$` family, and the pages' includes fail without it. Any doc content
+  using diagrams or math depends on the active extensions staying configured here. `@antora/lunr-extension` was
+  removed: site search is Pagefind (below).
+- **Site search is Pagefind.** `npm run search:index` (`pagefind --site build/site`) indexes the built site after
+  `antora` and writes `build/site/pagefind/`; CI runs it before deploying. Only the article body of the latest
+  version of each component is indexed (`data-pagefind-body` in the `article` override, set when `page.version` is
+  `page.component.latest.version`), with a hidden component filter. The search box lives in the navbar (`#search`)
+  and stays hidden until the deferred script adds `is-ready`. Search only works over HTTP (not from `file://`).
+  Pagefind and Antora never delete stale output, so `rm -rf build/site` before measuring a local build.
+- **The published site must stay under GitHub Pages' 1 GB limit.** Both workflows check `du -sk build/site` after
+  indexing: a warning above 900,000 KiB, a failure above 960,000 KiB. `node scripts/site-metrics/measure.mjs
+  build/site` reports HTML size, sample page sizes and nav sizes.
+- **UI overrides live in `ui-overrides/`** and are registered in `antora-playbook.yml` `ui.supplemental_files`
+  (`ui-bundle.zip` itself stays unmodified): `partials/nav-tree.hbs` (nav, see below), `helpers/nav-item-state.js`
+  (Handlebars helper `nav-item-state`, computing once per entry the open, expand and toggle state that `nav-tree.hbs`
+  uses),
+  `partials/article.hbs` (`data-pagefind-body` and the component filter span), `partials/header-content.hbs` (logo,
+  site title and the `#search` container; the bundle's placeholder Products/Services/Download menu and burger are not
+  rendered), `partials/footer-scripts.hbs` (site.js, highlight.js, the deferred Pagefind UI script and its init), `partials/head-styles.hbs`
+  (site.css, `pagefind/pagefind-ui.css`, then `css/pagefind-site.css`) and `css/pagefind-site.css` (search box and results dropdown). **When the
+  user supplies a new `ui-bundle.zip`, the overrides are folded into the bundle** and the matching
+  `supplemental_files` entries and files are removed; until then keep each override in step with the bundle's partial.
 - **Math needs `:stem: latexmath` in the page header** and is written as `stem:[…]` inline or as a `[stem]` block
   delimited by `++++`. Bare `\( \)` / `\[ \]` in the AsciiDoc source are not converted and render as raw LaTeX, and the
   Antora build reports nothing. Braces inside LaTeX that look like `{name}` attributes trigger "missing attribute"
   warnings, so check the build output and the rendered page.
-- **The nav panel renders its top-level groups expanded by default** through a UI override: `antora-playbook.yml`
-  `ui.supplemental_files` maps `partials/nav-tree.hbs` to `ui-overrides/partials/nav-tree.hbs`, a copy of the
-  bundle's `nav-tree` partial (extracted from `ui-bundle.zip`, which stays unmodified) with two additions: an item is
-  rendered with `is-active` when it is at depth 0 or its parent asked for open children, and the children of an
-  untitled list wrapper and of the "Open Source Projects" group are open. The bundle's `site.js` toggles and the
-  "toggle all" button only flip `is-active`, so they keep working. Keep the override in step with the bundle's own
-  partial when the bundle is rebuilt (issue #255 will fold it into the bundle source). Nav entries must follow the
-  same order and the same titles as the section index's text list. **Nav entries never link to a `#fragment`**: on
-  the target page that link renders as `href="#..."`, which makes the bundle's `site.js` hash handler strip every
-  `is-active` class and collapse the default-open groups. The override also matches the top-level entry text
-  `Open Source Projects` exactly, so renaming it needs the same change in the override. `npm run test:cards` checks both.
+- **The nav panel renders only the top levels and the current branch** (a nav of this size otherwise made every page
+  over 1 MB). The `nav-tree` override renders children at depth 0 and 1, the branch that contains the current page
+  (through the `nav-item-state` helper) and the children a parent asks to open (an untitled list wrapper and the
+  "Open Source Projects" group); an item gets `is-active` for those, and a toggle is emitted only when its children
+  are. The bundle's `site.js` toggles and the "toggle all" button only flip `is-active`, so they keep working. Nav
+  entries must follow the same order and the same titles as the section index's text list. **Nav entries never link
+  to a `#fragment`**: on the target page that link renders as `href="#..."`, which makes the bundle's `site.js` hash
+  handler strip every `is-active` class and collapse the default-open groups. The override's helper (`nav-item-state.js`) also
+  matches the top-level entry text `Open Source Projects` exactly, so renaming it needs the same change there.
+  `npm run test:cards` and `npm run test:nav` check these.
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
   `modules/ROOT/nav.adoc`. This is the site's landing/root component — its pages don't describe this repo, they
   describe the overall site and link out to each remote component.
@@ -76,8 +96,8 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   **Adding a new project to the picker means: an image in `modules/ROOT/images/`, a nav entry, and an `xref:`
   block in `index.adoc`** — in addition to the `content.sources` entry above.
 - **CI** (`.github/workflows/publish.yml` on a nightly cron, `.github/workflows/manual_publish.yml` on
-  `workflow_dispatch`) both run the same steps: install Antora + its four extensions, `npx antora
-  antora-playbook.yml`, then deploy `build/site` to the `gh-pages` branch via `crazy-max/ghaction-github-pages`.
+  `workflow_dispatch`) both run the same steps (Node 24): `npm ci`, print `npx antora -v`, `npx antora
+  antora-playbook.yml`, `npx pagefind --site build/site`, then deploy `build/site` to the `gh-pages` branch via `crazy-max/ghaction-github-pages`.
   Because the remote content sources track release branches, a fresh build can pick up newly published releases
   from any of the dependent repos without any change in this repo.
 

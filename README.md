@@ -8,7 +8,7 @@ Documentation is generated using Antora.
 To manually generate documentation follow steps below:
 
 ## Prerequisites
-To run Antora, node needs to be installed first.
+To run Antora, Node.js 20 or newer needs to be installed first (CI uses 24).
 Available node versions can be found [here](https://nodejs.org/en/download)
 
 For instance, the following steps could be followed to install node 24:
@@ -40,10 +40,9 @@ npm -v
 ```
 Should print "11.13.0".
 
-6. Install Antora: https://docs.antora.org/antora/latest/install-and-run-quickstart/
-Antora needs to be installed on the folder where documentation files will be contained. In this repository this is the root folder, but in other repositories, documentation is contained in `docs` folder
+6. Install the dependencies: Antora and its extensions are pinned to exact versions in `package.json` (antora 3.2.2, `@antora/collector-extension` 1.0.3, `@sntke/antora-mermaid-extension` 0.0.13, `@djencks/asciidoctor-mathjax` 0.0.9, pagefind 1.6.0). Run from the root folder (in other repositories documentation is contained in the `docs` folder):
 ```
-npm i -D -E antora
+npm ci
 ```
 
 ## Documentation generation
@@ -57,3 +56,16 @@ npx antora --fetch antora-playbook.yml
 ```
 
 Documentation will be generated in the `build/site` directory as a static website.
+
+### Search index
+The site search uses [Pagefind](https://pagefind.app). After `antora` has built the site, build the search index (it is written to `build/site/pagefind/`):
+```
+npm run search:index
+```
+This runs `npx pagefind --site build/site`, so the same step can be used directly. Run it after every Antora build; without it the search box finds nothing.
+
+Search only works when the site is served over HTTP. Opening `build/site/index.html` directly from disk (`file://`) leaves the search box stuck on "Searching for …", because the browser blocks the index downloads and the WebAssembly worker that Pagefind loads. Serve the folder instead, for example:
+```
+python3 -m http.server 8090 --directory build/site
+```
+and open http://localhost:8090.
