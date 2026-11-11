@@ -162,6 +162,51 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   the card order equals the order of the section's text list; the home page lists "Guides & References" before
   "Open Source Projects", with "About me" last.
 
+## Monitoring guides (Grafana and Kibana step-by-step)
+
+- **What they are.** `modules/ROOT/pages/backend/monitoring-alerting/grafana/` and `kibana/` hold 20 and 19 hands-on pages
+  named `guide-<name>.adoc` (the `guide-` prefix marks them; reference pages never carry it). They run in the lab under
+  `modules/ROOT/examples/monitoring-alerting-lab/` and are linked from the nav (a **Step-by-step guides** group after
+  **Getting started**), from each subsection's `== Reading path`, and by a one-line pointer
+  (`To do this by hand, follow xref:...[guide title].`) right after the `Checked on` line of each reference page they
+  exercise. Nav entries, index text and page titles agree (title minus the "Grafana Guide:"/"Kibana Guide:" prefix).
+- **Guide template.** Header (`:description:`, `:keywords:`), `include::partial$ai-disclaimer.adoc[]`, a
+  `Checked on <date> against Grafana 13.3.x|Kibana 9.5.x` line, then exactly these `==` headings in order: `What you
+  build`, `Before you start`, `Steps` (`===` phases only here, numbering continuous with `[start=N]`), `Check the
+  result`, `Variations` (optional), `What can go wrong` (table), `Clean up` (when the guide creates resources),
+  `Where to go next`, `Sources`. The reader never edits provisioned resources: what a guide creates is named with the prefix `guide-` (contact points, users, rules) or, for the folder, dashboards and data views that the guides share and extend, `Guides` and `... (guides)` (`Bookshelf (guides)`, `Bookshelf logs (guides)`). Every
+  `===` phase has a figure; a figure is attached to the last step it illustrates with a `+` list continuation, and its
+  callout numbers are the page's step numbers. Labels and layouts come from the lab, never from memory; a screen nobody
+  opened stays generic.
+- **Maps in figures are real geography.** The `worldMap` block of `lib/blocks.mjs` draws the Natural Earth 1:110m country
+  outlines in Web Mercator from `scripts/monitoring-guides/data/world-110m.json`, generated once by `extract-geo.mjs` from
+  the `world-atlas` npm package (`npm i --no-save world-atlas@2.0.2`, then pass it `countries-110m.json`). Basemap colours
+  are the theme tokens `colour.map.*` (Grafana: CARTO Dark Matter; Kibana: Elastic Maps Service road map, desaturated).
+  Never draw a map as a grid of cells; a country the figures colour or mark needs its ISO code in `ALPHA2` there.
+- **Figures are generated, never hand-drawn.** `scripts/monitoring-guides/` holds `lib/blocks.mjs` (building blocks:
+  window, nav, toolbar, field, dropdown, table, charts, highlight and callout), `lib/shells.mjs` (shared product screens
+  such as the Grafana panel editor and the Kibana Lens editor; add new ones there, backward compatible), `lib/render.mjs`,
+  `lib/tokens.mjs`, `figures/<product>-<id>.mjs` (one spec per guide, `grafana-g5.mjs`, `kibana-k5.mjs`; colours are token
+  names only, 1080 px wide) and `generate-figures.mjs`. `npm run guides:figures [spec]` renders the SVGs named
+  `monitoring-alerting-<product>-guide-<id>-<nn>-<what>.svg` into `modules/ROOT/images/` and fails on text wider than its
+  box. `npm run test:guides` checks the themes, that files are up to date and not orphaned, that every guide figure is
+  referenced by exactly one page, that every step group has a figure and that no spec hard-codes a colour.
+- **Screen maps.** The eight numbered overviews (`monitoring-alerting-<product>-map-<area>.svg`, specs
+  `figures/<product>-maps.mjs`) are each shown once, right under `== Steps`, by the guide designated in
+  `lib/guide-maps.mjs`; other guides link to that guide instead of repeating the map. A new map area needs a map spec and
+  an entry there.
+- **Product themes are the stated exception to the single-palette rule.** `themes/grafana.mjs` (dark) and
+  `themes/kibana.mjs` (light) hold colours read from the real UI, so guide figures look like the product; the site
+  palette of `scripts/cards/palette.mjs` still applies to cards, and only the annotation marks (highlight, callout) use the
+  site accent. A change of look is made in the theme module, never in a spec or an SVG.
+- **Logos in figures.** Coloured product marks come from `scripts/cards/guide-logos.mjs` (key into `logos.json`, a solid
+  `colour` field per product; card marks stay white and ignore it). A mark Simple Icons and Devicon lack is a vendor asset
+  (`scripts/cards/vendor-logos/tempo.svg`) with its source and licence recorded in `guide-logos.mjs` and listed in
+  `LOGO-SOURCES.md`. Run `npm run cards` and `npm run test:cards` after a change.
+- **One admonition only.** In the Monitoring & Alerting section the AI-assistance notice (`partial$ai-disclaimer.adoc`)
+  is the only admonition: no `NOTE:`, `TIP:`, `WARNING:`, `CAUTION:` or `IMPORTANT:` blocks on guides or reference
+  pages; a difference between product versions is one short sentence in the step.
+
 ## Images and figures
 
 - All images go in `modules/ROOT/images/` and are referenced by bare filename (`image::foo.svg[...]`), with no
