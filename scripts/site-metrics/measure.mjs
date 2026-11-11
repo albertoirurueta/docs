@@ -7,13 +7,39 @@
 // Sample paths are relative to the build directory. Exit code 2 if a sample page is missing.
 import { readdirSync, readFileSync, statSync, writeFileSync, existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 export const DEFAULT_SAMPLES = {
   guide: 'backend/monitoring-alerting/grafana/guide-add-a-data-source.html',
   'section-index': 'backend/monitoring-alerting/index.html',
   home: 'index.html',
-  algebra: 'irurueta-algebra/1.4.0/index.html',
-  'auth-server': 'irurueta-auth-server/1.0.0/index.html',
+  // {latest} is replaced by the highest version folder of the component found in the build
+  algebra: 'irurueta-algebra/{latest}/index.html',
+  'auth-server': 'irurueta-auth-server/{latest}/index.html',
+}
+
+// Highest version folder (by numeric segments) of a component in the build, or null when there is none.
+export function latestVersionDir (root, component) {
+  const dir = join(root, component)
+  if (!existsSync(dir)) return null
+  const versions = readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && /^\d+(\.\d+)*$/.test(e.name))
+    .map((e) => e.name)
+  if (!versions.length) return null
+  const key = (v) => v.split('.').map(Number)
+  versions.sort((a, b) => {
+    const [x, y] = [key(a), key(b)]
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0)
+    return 0
+  })
+  return versions[versions.length - 1]
+}
+
+export function resolveSample (root, rel) {
+  const m = rel.match(/^([^/]+)\/\{latest\}\/(.*)$/)
+  if (!m) return rel
+  const version = latestVersionDir(root, m[1])
+  return version ? `${m[1]}/${version}/${m[2]}` : rel
 }
 
 export function walkHtml (dir) {
@@ -57,7 +83,8 @@ export function measure (buildDir, samples = DEFAULT_SAMPLES, { nav = true } = {
   const root = resolve(buildDir)
   const { count, bytes } = walkHtml(root)
   const result = { buildDir: root, htmlFiles: count, totalHtmlBytes: bytes, samples: {}, generator: null }
-  for (const [key, rel] of Object.entries(samples)) {
+  for (const [key, sample] of Object.entries(samples)) {
+    const rel = resolveSample(root, sample)
     const file = join(root, rel)
     if (!existsSync(file)) { result.samples[key] = { path: rel, missing: true }; continue }
     const html = readFileSync(file, 'utf8')
@@ -106,4 +133,4 @@ function main (argv) {
   if (Object.values(r.samples).some((s) => s.missing)) process.exitCode = 2
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main(process.argv)
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main(process.argv)

@@ -54,16 +54,22 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   using diagrams or math depends on the active extensions staying configured here. `@antora/lunr-extension` was
   removed: site search is Pagefind (below).
 - **Site search is Pagefind.** `npm run search:index` (`pagefind --site build/site`) indexes the built site after
-  `antora` and writes `build/site/pagefind/`; CI runs it before deploying. Only the article body is indexed
-  (`data-pagefind-body` in the `article` override), with a hidden component filter. The search box lives in the
-  navbar (`#search`) and stays hidden until the script adds `is-ready`.
+  `antora` and writes `build/site/pagefind/`; CI runs it before deploying. Only the article body of the latest
+  version of each component is indexed (`data-pagefind-body` in the `article` override, set when `page.version` is
+  `page.component.latest.version`), with a hidden component filter. The search box lives in the navbar (`#search`)
+  and stays hidden until the deferred script adds `is-ready`. Search only works over HTTP (not from `file://`).
+  Pagefind and Antora never delete stale output, so `rm -rf build/site` before measuring a local build.
+- **The published site must stay under GitHub Pages' 1 GB limit.** Both workflows check `du -sk build/site` after
+  indexing: a warning above 900,000 KiB, a failure above 960,000 KiB. `node scripts/site-metrics/measure.mjs
+  build/site` reports HTML size, sample page sizes and nav sizes.
 - **UI overrides live in `ui-overrides/`** and are registered in `antora-playbook.yml` `ui.supplemental_files`
-  (`ui-bundle.zip` itself stays unmodified): `partials/nav-tree.hbs` (nav, see below), `helpers/nav-contains-current.js`
-  (Handlebars helper `nav-contains-current`, used as `(nav-contains-current this @root.page.url)`),
+  (`ui-bundle.zip` itself stays unmodified): `partials/nav-tree.hbs` (nav, see below), `helpers/nav-item-state.js`
+  (Handlebars helper `nav-item-state`, computing once per entry the open, expand and toggle state that `nav-tree.hbs`
+  uses),
   `partials/article.hbs` (`data-pagefind-body` and the component filter span), `partials/header-content.hbs` (logo,
   site title and the `#search` container; the bundle's placeholder Products/Services/Download menu and burger are not
-  rendered), `partials/footer-scripts.hbs` (site.js, highlight.js, Pagefind UI script and init), `partials/head-styles.hbs`
-  (site.css, then `css/pagefind-site.css`) and `css/pagefind-site.css` (search box and results dropdown). **When the
+  rendered), `partials/footer-scripts.hbs` (site.js, highlight.js, the deferred Pagefind UI script and its init), `partials/head-styles.hbs`
+  (site.css, `pagefind/pagefind-ui.css`, then `css/pagefind-site.css`) and `css/pagefind-site.css` (search box and results dropdown). **When the
   user supplies a new `ui-bundle.zip`, the overrides are folded into the bundle** and the matching
   `supplemental_files` entries and files are removed; until then keep each override in step with the bundle's partial.
 - **Math needs `:stem: latexmath` in the page header** and is written as `stem:[…]` inline or as a `[stem]` block
@@ -72,13 +78,13 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   warnings, so check the build output and the rendered page.
 - **The nav panel renders only the top levels and the current branch** (a nav of this size otherwise made every page
   over 1 MB). The `nav-tree` override renders children at depth 0 and 1, the branch that contains the current page
-  (through the `nav-contains-current` helper) and the children a parent asks to open (an untitled list wrapper and the
+  (through the `nav-item-state` helper) and the children a parent asks to open (an untitled list wrapper and the
   "Open Source Projects" group); an item gets `is-active` for those, and a toggle is emitted only when its children
   are. The bundle's `site.js` toggles and the "toggle all" button only flip `is-active`, so they keep working. Nav
   entries must follow the same order and the same titles as the section index's text list. **Nav entries never link
   to a `#fragment`**: on the target page that link renders as `href="#..."`, which makes the bundle's `site.js` hash
-  handler strip every `is-active` class and collapse the default-open groups. The override also matches the top-level
-  entry text `Open Source Projects` exactly, so renaming it needs the same change in the override.
+  handler strip every `is-active` class and collapse the default-open groups. The override's helper (`nav-item-state.js`) also
+  matches the top-level entry text `Open Source Projects` exactly, so renaming it needs the same change there.
   `npm run test:cards` and `npm run test:nav` check these.
 - **`antora.yml`** declares this repo's own Antora component, named `ROOT`, whose nav is
   `modules/ROOT/nav.adoc`. This is the site's landing/root component — its pages don't describe this repo, they
