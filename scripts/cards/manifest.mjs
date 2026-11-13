@@ -12,6 +12,7 @@ const rows = [
   // programming-languages
   ['programming-languages', 'c', 'C', 'Systems programming', 'si:c'],
   ['programming-languages', 'cobol', 'COBOL', 'Business and mainframes', 'gl:server'],
+  ['programming-languages', 'abap', 'ABAP', 'The language of SAP', 'gl:code'],
   ['programming-languages', 'cpp', 'C++', 'High-performance systems', 'si:cplusplus'],
   ['programming-languages', 'csharp', 'C#', 'Modern .NET language', 'gl:code'],
   ['programming-languages', 'fortran', 'Fortran', 'Scientific computing', 'si:fortran'],
@@ -143,6 +144,8 @@ const rows = [
   ['ecommerce', 'shopify', 'Shopify', 'Hosted commerce platform', 'si:shopify'],
   ['ecommerce', 'woocommerce', 'WooCommerce', 'Commerce on WordPress', 'si:woocommerce'],
   ['ecommerce', 'comparison', 'Comparison', 'Platforms side by side', 'gl:chart', 'ecommerce/comparison.adoc'],
+  // erp
+  ['erp', 'sap', 'SAP', 'ERP, platform and development', 'gl:layers'],
   // cms
   ['cms', 'drupal', 'Drupal', 'Structured content at scale', 'si:drupal'],
   ['cms', 'joomla', 'Joomla', 'Flexible open-source CMS', 'si:joomla'],

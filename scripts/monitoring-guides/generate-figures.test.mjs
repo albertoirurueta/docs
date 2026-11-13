@@ -31,7 +31,7 @@ function allPages(dir = join(root, 'modules', 'ROOT', 'pages')) {
 // ---------------------------------------------------------------- themes (Task 6.3)
 test('both themes define every token of the contract and the blocks library reads only contract tokens', async () => {
   for (const p of products) assert.deepEqual(missingTokens(await loadTheme(p)), [], `theme ${p}`);
-  const src = readFileSync(join(here, 'lib', 'blocks.mjs'), 'utf8');
+  const src = readFileSync(join(here, '..', 'figure-lib', 'blocks.mjs'), 'utf8');
   const literal = [...src.matchAll(/['"`]((?:colour|font|size|radius)\.[A-Za-z.]+)['"`]/g)].map((m) => m[1]);
   for (const t of literal) assert.ok(tokenPaths.includes(t), `blocks.mjs reads token ${t}, which is not in lib/tokens.mjs`);
 });
