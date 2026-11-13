@@ -30,6 +30,7 @@ npm run audit:index-template   # check the `==` heading order of every section/s
 npm run sap-guides:figures     # render the SAP guide figures (scripts/sap-guides/figures) into modules/ROOT/images
 npm run test:sap-guides        # SAP figure generator checks (themes, up to date, orphans, one page per figure, no colour, no logo)
 npm run audit:sap-beginner     # beginner-first audit of the ABAP and SAP pages (scripts/sap-docs)
+npm run test:sap-docs          # unit tests of the beginner-first audit (scripts/sap-docs)
 npm run cards                  # regenerate card-*/ide-*/download SVGs, restyle home cards, refresh grids and buttons
 npm run test:cards             # card structure, palette, up-to-date, orphan, IDE-grid and download-button checks
 npm run cheat-sheets [name]    # render one-page cheat-sheet PDFs from scripts/cheat-sheet-pdfs/sheets/
@@ -68,8 +69,11 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   `meta.url || url` in `processResult` (#396). Keep that hook until Pagefind UI resolves images there too, and after a
   search change check a search from the home page and from a deep page.
 - **The published site must stay under GitHub Pages' 1 GB limit.** Both workflows check `du -sk build/site` after
-  indexing: a warning above 900,000 KiB, a failure above 960,000 KiB. `node scripts/site-metrics/measure.mjs
-  build/site` reports HTML size, sample page sizes and nav sizes.
+  indexing: a warning above 900,000 KiB, a failure above 960,000 KiB. That step is temporarily commented out in both
+  workflows: with the ABAP and ERP sections the site measured about 959,000 KiB, and GitHub Pages accepted it.
+  Restore the step (or raise its thresholds) once the site has headroom again, and meanwhile measure locally before
+  adding large content. `node scripts/site-metrics/measure.mjs build/site` reports HTML size, sample page sizes and
+  nav sizes.
 - **UI overrides live in `ui-overrides/`** and are registered in `antora-playbook.yml` `ui.supplemental_files`
   (`ui-bundle.zip` itself stays unmodified): `partials/nav-tree.hbs` (nav, see below), `helpers/nav-item-state.js`
   (Handlebars helper `nav-item-state`, computing once per entry the open, expand and toggle state that `nav-tree.hbs`

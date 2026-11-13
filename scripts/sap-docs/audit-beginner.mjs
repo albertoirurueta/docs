@@ -37,14 +37,14 @@ export function collectPages(dirs = DEFAULT_DIRS) {
   return out
 }
 
-// Lines outside delimited blocks (listing, literal, example, sidebar, quote, passthrough and table blocks).
+// Lines outside delimited blocks (listing, literal, example, sidebar, quote, passthrough, comment and table blocks).
 export function proseLines(text) {
   const out = []
   let fence = null
   const lines = text.split('\n')
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
-    const f = line.match(/^(-{4,}|\.{4,}|={4,}|`{3,}|\+{4,}|_{4,}|\*{4,}|\|={3,})\s*$/)
+    const f = line.match(/^(-{4,}|\.{4,}|={4,}|`{3,}|\+{4,}|_{4,}|\*{4,}|\/{4,}|\|={3,})\s*$/)
     if (f) {
       const key = f[1][0] + f[1].length
       if (fence === null) fence = key
@@ -154,8 +154,11 @@ export function auditPage(pagePath, text = readFileSync(pagePath, 'utf8')) {
         return
       }
       for (const [, target, anchor] of links) {
+        // A target with <...> is a template placeholder (scripts/sap-docs/page-template.adoc), not a real path.
         const file = resolveGlossary(target, pagePath)
-        if (file && !glossaryAnchors(file).has(anchor)) {
+        if (!file && !target.includes('<')) {
+          problems.push(`key term ${i + 1} ("${label}") links to ${target}, which does not exist`)
+        } else if (file && !glossaryAnchors(file).has(anchor)) {
           problems.push(`key term ${i + 1} ("${label}") links to "#${anchor}", which does not exist in ${target}`)
         }
       }

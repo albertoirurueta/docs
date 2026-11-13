@@ -33,6 +33,16 @@ test('headings inside listing blocks are not sections', () => {
   assert.deepEqual(titles, [null, 'Summary'])
 })
 
+test('headings inside comment blocks are not sections', () => {
+  const titles = sections('intro\n\n////\n== Summary\nnote\n////\n\n== Key terms\n\nx\n').map((s) => s.title)
+  assert.deepEqual(titles, [null, 'Key terms'])
+})
+
+test('a key term linking to a glossary page that does not exist is reported', () => {
+  const text = `= T\n\n${'word '.repeat(30)}\n\n== Key terms\n\n* xref:no-such-dir/glossary.adoc#term[Term]: a term.\n\n== Summary\n\n* Done.\n`
+  assert.ok(auditPage(fx('passing.adoc'), text).some((p) => p.includes('no-such-dir/glossary.adoc') && p.includes('does not exist')))
+})
+
 test('introWords ignores attributes, includes, comments and list markers', () => {
   const words = introWords([':description: not counted here', 'include::partial$x.adoc[]', '// comment words', '* list item words', 'Three plain words.'])
   assert.equal(words, 3)

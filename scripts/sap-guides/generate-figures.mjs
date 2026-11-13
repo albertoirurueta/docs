@@ -55,6 +55,7 @@ export function expectedIdPattern(spec) {
 export async function buildFigures(names = specNames()) {
   const out = [];
   const files = new Map();
+  const themes = new Map();
   for (const name of names) {
     const mod = await import(pathToFileURL(join(figuresDir, `${name}.mjs`)).href);
     const spec = mod.default;
@@ -70,7 +71,8 @@ export async function buildFigures(names = specNames()) {
       if (figure.area && !areas.includes(figure.area)) throw new Error(`${name}: figure ${figure.id} names the unknown area ${figure.area}`);
       const themeName = figure.theme ?? spec.theme;
       if (!themeNames.includes(themeName)) throw new Error(`${name}: figure ${figure.id} names the unknown theme ${themeName}`);
-      const theme = await loadTheme(themeName);
+      if (!themes.has(themeName)) themes.set(themeName, await loadTheme(themeName));
+      const theme = themes.get(themeName);
       const file = figureFileName(spec, figure);
       if (files.has(file)) throw new Error(`${name}: file ${file} is also produced by ${files.get(file)}`);
       files.set(file, name);
