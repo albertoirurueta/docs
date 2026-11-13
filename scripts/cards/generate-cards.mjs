@@ -259,6 +259,10 @@ export function renderSources() {
     'those sets (Java, AWS, Microsoft products), a drawn white-line glyph is used instead; no trademark is redrawn.',
     'Logos are trademarks of their respective owners, used for identification only.',
     '',
+    'The ABAP and SAP cards use drawn glyphs and never an SAP mark. Simple Icons carries an SAP icon, but it has no',
+    'licence or brand guidelines of its own, and SAP\'s trademark policy allows its logos only with written permission,',
+    'which does not exist. ABAP is an SAP trademark as well. The ERP card is a generic grid glyph.',
+    '',
     '| Card | Title | Mark | Source | Licence | Source file |',
     '|---|---|---|---|---|---|',
   ];

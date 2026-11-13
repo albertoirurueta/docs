@@ -35,6 +35,7 @@ export const sectionVariant = {
   ai: 'pinkIndigo',
   'documentation-tools': 'indigoGreen',
   ecommerce: 'indigoPink',
+  erp: 'sweep',
   cms: 'greenIndigo',
   'ui-ux': 'pinkIndigo',
   'data-science': 'indigoGreen',

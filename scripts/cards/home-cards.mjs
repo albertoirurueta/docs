@@ -13,6 +13,7 @@ const bySection = {
   'databases.svg': 'database',
   'documentation-tools.svg': 'documentation-tools',
   'ecommerce.svg': 'ecommerce',
+  'erp.svg': 'erp',
   'git-and-github.svg': 'git-and-github',
   'graphics-games.svg': 'graphics-games',
   'ml.svg': 'ml',

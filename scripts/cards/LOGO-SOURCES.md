@@ -5,10 +5,15 @@ Simple Icons (CC0-1.0) and Devicon (MIT). Where no mark is available, or where t
 those sets (Java, AWS, Microsoft products), a drawn white-line glyph is used instead; no trademark is redrawn.
 Logos are trademarks of their respective owners, used for identification only.
 
+The ABAP and SAP cards use drawn glyphs and never an SAP mark. Simple Icons carries an SAP icon, but it has no
+licence or brand guidelines of its own, and SAP's trademark policy allows its logos only with written permission,
+which does not exist. ABAP is an SAP trademark as well. The ERP card is a generic grid glyph.
+
 | Card | Title | Mark | Source | Licence | Source file |
 |---|---|---|---|---|---|
 | card-programming-languages-c.svg | C | c | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/c.svg |
 | card-programming-languages-cobol.svg | COBOL | drawn glyph "server" | own drawing | n/a | n/a |
+| card-programming-languages-abap.svg | ABAP | drawn glyph "code" | own drawing | n/a | n/a |
 | card-programming-languages-cpp.svg | C++ | cplusplus | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/cplusplus.svg |
 | card-programming-languages-csharp.svg | C# | drawn glyph "code" | own drawing | n/a | n/a |
 | card-programming-languages-fortran.svg | Fortran | fortran | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/fortran.svg |
@@ -132,6 +137,7 @@ Logos are trademarks of their respective owners, used for identification only.
 | card-ecommerce-shopify.svg | Shopify | shopify | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/shopify.svg |
 | card-ecommerce-woocommerce.svg | WooCommerce | woocommerce | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/woocommerce.svg |
 | card-ecommerce-comparison.svg | Comparison | drawn glyph "chart" | own drawing | n/a | n/a |
+| card-erp-sap.svg | SAP | drawn glyph "layers" | own drawing | n/a | n/a |
 | card-cms-drupal.svg | Drupal | drupal | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/drupal.svg |
 | card-cms-joomla.svg | Joomla | joomla | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/joomla.svg |
 | card-cms-webflow.svg | Webflow | webflow | Simple Icons 16.37.0 | CC0-1.0 | simple-icons/icons/webflow.svg |
