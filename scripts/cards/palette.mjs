@@ -50,4 +50,5 @@ export const otherVariant = {
   'ai-catalog': 'pinkIndigo',
   'auth-server': 'greenIndigo',
   ide: 'sweep',
+  'android-projects': 'indigoPink',
 };

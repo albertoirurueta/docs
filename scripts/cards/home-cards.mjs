@@ -28,9 +28,12 @@ const javaProjects = [
   'statistics.svg', 'units.svg',
 ];
 
+const androidProjects = ['irurueta-android-test-utils.svg'];
+
 export const homeCards = [
   ...Object.entries(bySection).map(([file, section]) => ({ file, colors: variants[sectionVariant[section]] })),
   ...javaProjects.map((file) => ({ file, colors: variants[otherVariant['java-projects']] })),
   { file: 'ai-catalog.svg', colors: variants[otherVariant['ai-catalog']] },
   { file: 'irurueta-auth-server.svg', colors: variants[otherVariant['auth-server']] },
+  ...androidProjects.map((file) => ({ file, colors: variants[otherVariant['android-projects']] })),
 ];

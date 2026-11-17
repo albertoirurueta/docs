@@ -46,9 +46,10 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   (`hermes`, `irurueta-units`, `irurueta-statistics`, `irurueta-sorting`, `irurueta-algebra`,
   `irurueta-numerical`, `irurueta-geometry`, `irurueta-geometry-io`, `irurueta-ar`, `irurueta-navigation`,
   `irurueta-navigation-indoor`, `irurueta-navigation-inertial`, `irurueta-navigation-inertial-extra`,
-  `ai-catalog` and `irurueta-auth-server`), each pointed at a `start_path: docs` and a branch-glob pattern (e.g. `release_1.{4..99}*`) so only
+  `ai-catalog`, `irurueta-auth-server` and `irurueta-android-test-utils`), each pointed at a `start_path: docs` and a branch-glob pattern (e.g. `release_1.{4..99}*`) so only
   tagged release branches of each dependent repo are pulled in (`ai-catalog` and `irurueta-auth-server` track
-  `main`; `irurueta-auth-server` does so until its 1.0.0 release). **Adding/removing a documented project means
+  `main`; `irurueta-auth-server` does so until its 1.0.0 release; `irurueta-android-test-utils` is the Android
+  project, with release branches `release_1.{3..99}*` and `release_{2..99}*`, i.e. from 1.3.0). **Adding/removing a documented project means
   editing this file's `content.sources` list**, not writing new pages here.
 - The playbook also wires up the UI (`ui-bundle.zip`, a custom Antora UI bundle used with `snapshot: true`) and
   Antora/Asciidoctor extensions, all pinned to exact versions in `package.json` (antora 3.2.2,
@@ -161,10 +162,10 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
 - **One palette for every card-like SVG.** `scripts/cards/palette.mjs` derives all colours from the UI bundle's
   animated top bar (`--navbar-background1/2/3`: `#ff6ec4`, `#7873f5`, `#4ade80`, the green one step deeper at a
   gradient's end so white text stays legible). It defines six diagonal three-stop variants and assigns one per
-  section (`sectionVariant`) and per non-section group (`otherVariant`: Java projects, AI catalog, auth server, IDE
-  cards). All cards share one template in `generate-cards.mjs`: gradient, soft highlight, dark lower scrim, a
+  section (`sectionVariant`) and per non-section group (`otherVariant`: Java projects, AI catalog, auth server, Android
+  projects, IDE cards). All cards share one template in `generate-cards.mjs`: gradient, soft highlight, dark lower scrim, a
   translucent logo disc, and a white pill button with indigo text ("Explore", or "Visit" for external links). Never
-  hand-pick a colour in an SVG: change the palette and run `npm run cards`. The 30 hand-made home page cards
+  hand-pick a colour in an SVG: change the palette and run `npm run cards`. The 32 hand-made home page cards
   (`home-cards.mjs`) keep their hand-drawn logo and text layout. `npm run cards` only re-applies the palette to them
   (`restyle()`), so a new home card must keep the house structure: logo at (300,170), the button `rect` at
   `y="44x"` followed by its `text`.
