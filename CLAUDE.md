@@ -165,7 +165,7 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   section (`sectionVariant`) and per non-section group (`otherVariant`: Java projects, AI catalog, auth server, Android
   projects, IDE cards). All cards share one template in `generate-cards.mjs`: gradient, soft highlight, dark lower scrim, a
   translucent logo disc, and a white pill button with indigo text ("Explore", or "Visit" for external links). Never
-  hand-pick a colour in an SVG: change the palette and run `npm run cards`. The 30 hand-made home page cards
+  hand-pick a colour in an SVG: change the palette and run `npm run cards`. The 32 hand-made home page cards
   (`home-cards.mjs`) keep their hand-drawn logo and text layout. `npm run cards` only re-applies the palette to them
   (`restyle()`), so a new home card must keep the house structure: logo at (300,170), the button `rect` at
   `y="44x"` followed by its `text`.
