@@ -28,7 +28,7 @@ const javaProjects = [
   'statistics.svg', 'units.svg',
 ];
 
-const androidProjects = ['irurueta-android-test-utils.svg', 'irurueta-android-gesture-bitmap-view.svg'];
+const androidProjects = ['irurueta-android-test-utils.svg', 'irurueta-android-gesture-bitmap-view.svg', 'irurueta-android-recycler-view-manager.svg'];
 
 export const homeCards = [
   ...Object.entries(bySection).map(([file, section]) => ({ file, colors: variants[sectionVariant[section]] })),
