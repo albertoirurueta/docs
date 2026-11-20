@@ -47,12 +47,12 @@ node scripts/disclaimers/traceability.mjs  # disclaimer consolidation check (see
   `irurueta-numerical`, `irurueta-geometry`, `irurueta-geometry-io`, `irurueta-ar`, `irurueta-navigation`,
   `irurueta-navigation-indoor`, `irurueta-navigation-inertial`, `irurueta-navigation-inertial-extra`,
   `ai-catalog`, `irurueta-auth-server`, `irurueta-android-test-utils`, `irurueta-android-gesture-bitmap-view`,
-  `irurueta-android-recycler-view-manager` and `irurueta-android-recycler-tab-layout`), each pointed at a `start_path: docs` and a branch-glob pattern (e.g. `release_1.{4..99}*`) so only
+  `irurueta-android-recycler-view-manager`, `irurueta-android-recycler-tab-layout` and `irurueta-android-glutils`), each pointed at a `start_path: docs` and a branch-glob pattern (e.g. `release_1.{4..99}*`) so only
   tagged release branches of each dependent repo are pulled in (`ai-catalog` and `irurueta-auth-server` track
   `main`; `irurueta-auth-server` does so until its 1.0.0 release; `irurueta-android-test-utils`, `irurueta-android-gesture-bitmap-view`,
-  `irurueta-android-recycler-view-manager` and `irurueta-android-recycler-tab-layout` are the Android projects: the
-  first two use release branches `release_1.{3..99}*` and `release_{2..99}*` (from 1.3.0), the recycler view manager
-  and the recycler tab layout use `release_1.{1..99}*` and `release_{2..99}*` (from 1.1.6 and 1.1.12). **Adding/removing a documented project means
+  `irurueta-android-recycler-view-manager`, `irurueta-android-recycler-tab-layout` and `irurueta-android-glutils` are the Android projects: the
+  first two use release branches `release_1.{3..99}*` and `release_{2..99}*` (from 1.3.0), the recycler view manager,
+  the recycler tab layout and the GL utils use `release_1.{1..99}*` and `release_{2..99}*` (from 1.1.6; the other two from 1.1.12). **Adding/removing a documented project means
   editing this file's `content.sources` list**, not writing new pages here.
 - The playbook also wires up the UI (`ui-bundle.zip`, a custom Antora UI bundle used with `snapshot: true`) and
   Antora/Asciidoctor extensions, all pinned to exact versions in `package.json` (antora 3.2.2,
