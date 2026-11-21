@@ -30,7 +30,7 @@ const javaProjects = [
 
 const androidProjects = ['irurueta-android-test-utils.svg', 'irurueta-android-gesture-bitmap-view.svg', 'irurueta-android-recycler-view-manager.svg',
   'irurueta-android-recycler-tab-layout.svg', 'irurueta-android-glutils.svg',
-  'irurueta-android-gl-cube.svg'];
+  'irurueta-android-gl-cube.svg', 'irurueta-android-gl-curl.svg'];
 
 export const homeCards = [
   ...Object.entries(bySection).map(([file, section]) => ({ file, colors: variants[sectionVariant[section]] })),
